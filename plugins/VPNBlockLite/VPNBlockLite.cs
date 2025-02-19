@@ -165,19 +165,19 @@ namespace Oxide.Plugins
         private void Init()
         {
             PrintWarning("[VPNBlockLite] Demo version loaded");
-            LogToFile("startup", "[VPNBlockLite] Вы используете упрощенную версию плагина", this);
-            LogToFile("startup", "[VPNBlockLite] Для приобретения полной версии обратитесь:", this);
-            LogToFile("startup", "[VPNBlockLite] Telegram: @fakerplayers", this);
-            LogToFile("startup", "[VPNBlockLite] Discord: fakerplayers", this);
-            LogToFile("startup", "[VPNBlockLite] ", this);
-            LogToFile("startup", "[VPNBlockLite] Ограничения демо версии:", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет интеграции с Discord", this);
-            LogToFile("startup", "[VPNBlockLite] - Ограниченная база данных VPN", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет белого списка VPN", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет расширенной информации о провайдерах", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет дополнительных настроек", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет автоматических обновлений базы VPN", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет защиты от обхода блокировки", this);
+            PrintWarning("[VPNBlockLite] Вы используете упрощенную версию плагина");
+            PrintWarning("[VPNBlockLite] Для приобретения полной версии обратитесь:");
+            PrintWarning("[VPNBlockLite] Telegram: @fakerplayers");
+            PrintWarning("[VPNBlockLite] Discord: fakerplayers");
+            PrintWarning("[VPNBlockLite] ");
+            PrintWarning("[VPNBlockLite] Ограничения демо версии:");
+            PrintWarning("[VPNBlockLite] - Нет интеграции с Discord");
+            PrintWarning("[VPNBlockLite] - Ограниченная база данных VPN");
+            PrintWarning("[VPNBlockLite] - Нет белого списка VPN");
+            PrintWarning("[VPNBlockLite] - Нет расширенной информации о провайдерах");
+            PrintWarning("[VPNBlockLite] - Нет дополнительных настроек");
+            PrintWarning("[VPNBlockLite] - Нет автоматических обновлений базы VPN");
+            PrintWarning("[VPNBlockLite] - Нет защиты от обхода блокировки";
             PrintWarning("[VPNBlockLite] For full version contact: TG @fakerplayers or Discord: fakerplayers");
         }
     }
