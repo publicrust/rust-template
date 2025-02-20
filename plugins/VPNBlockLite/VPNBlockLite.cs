@@ -36,7 +36,7 @@ namespace Oxide.Plugins
             public bool KickVPNUsers = true;
 
             [JsonProperty("Сообщение при кике за VPN/Proxy")]
-            public string VPNKickMessage = "VPN/Proxy соединения запрещены. Для покупки полной версии обратитесь: TG @fakerplayers или Discord: fakerplayers";
+            public string VPNKickMessage = "VPN/Proxy соединения запрещены.";
         }
 
         protected override void LoadDefaultConfig()
@@ -150,7 +150,7 @@ namespace Oxide.Plugins
                             _ = timer.Once(0.5f, () => player.Kick(configData.VPNKickMessage));
                         }
 
-                        LogToFile("info", "Для получения полного функционала приобретите полную версию: TG @fakerplayers или Discord: fakerplayers", this);
+                        LogToFile("info", "Логи недоступны в лайт версии", this);
                     }
                     catch (Exception ex)
                     {

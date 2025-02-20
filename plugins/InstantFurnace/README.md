@@ -10,14 +10,9 @@ This plugin provides a simple yet powerful way to speed up the smelting process 
 - Permission-based system
 - Automatic wood to charcoal conversion
 
-### Commands:
-- No commands required (automatic functionality)
-
-### Permissions:
-- No permissions required (accessible to all players)
-
 ### JSON configuration:
-```{
+```json 
+{
   "Моментальная плавка в обычной печи": true,
   "Моментальная плавка в электрической печи": true,
   "Моментальная плавка в большой печи": true,

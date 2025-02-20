@@ -13,6 +13,3 @@ This plugin serves as an excellent starting point for learning Oxide plugin deve
 
 ### Commands:
 - `/hello` - Sends a personalized greeting to the player
-
-### Permissions:
-- No permissions required (accessible to all players)

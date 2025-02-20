@@ -14,15 +14,9 @@ This plugin automatically detects raid activity, creates visual domes, and preve
 - Smart positioning with CombatBlock
 - Automatic cleanup of expired zones
 
-### Commands:
-No player commands (works automatically)
-
-### Permissions:
-- No specific permissions (affects all players in raid zone)
-
 ### JSON configuration:
-json
-```{
+```json
+{
 "Block Duration": 300.0,
 "Block On Receive Raid Damage": true,
 "Remove Block On Death": true,
@@ -39,7 +33,6 @@ json
 },
 "Debug Mode": false
 }
-],
 ```
 
 ### Visual Features:

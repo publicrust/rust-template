@@ -15,14 +15,6 @@ This plugin automatically blocks certain commands and actions when players are i
 - Death handling options
 - Support for both chat and console commands
 
-### Permissions:
-- `combatblock.admin` - Access to admin commands
-- `combatblock.ignore` - Bypass combat block restrictions
-
-### Commands:
-- No player commands (works automatically)
-- Admin commands for configuration (requires combatblock.admin)
-
 ### Additional Triggers:
 - NPC attack detection
 - NPC damage received
@@ -71,7 +63,6 @@ This plugin automatically blocks certain commands and actions when players are i
 "/tpr",
 "/tpa",
 "/home"
-],
 "UI Settings": {
 "Background Color": "0.1921569 0.1921569 0.1921569 1",
 "Icon Color": "0 0.7764706 1 1",
