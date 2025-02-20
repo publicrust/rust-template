@@ -72,5 +72,4 @@ This plugin automatically blocks certain commands and actions when players are i
 "Progress Bar Background": "1 1 1 0.1019608",
 "UI Animation Delay": 0.222
 }
-}
 ```
