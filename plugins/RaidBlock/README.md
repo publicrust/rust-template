@@ -1,44 +1,86 @@
-RU:
-🌟 Описание плагина "RaidBlock" 🌟
+# RaidBlock Plugin
 
-Блокирует телепортацию и другие команды во время рейда, обеспечивая честность и порядок в игровом процессе. Создает визуальную зону рейда с помощью эффектного купола.
+RaidBlock is a comprehensive plugin that creates dynamic raid zones and manages player restrictions during raids.
+This plugin automatically detects raid activity, creates visual domes, and prevents specific actions within raid zones, featuring seamless integration with CombatBlock.
 
-Основные функции:
+## List of features:
 
-  ·  Автоматическое определение зоны рейда
-    Плагин автоматически определяет зону рейда при взрыве или получении урона.
-  ·  Блокировка команд
-    Запрещает использование команд телепортации и других настраиваемых команд во время рейда.
-  ·  Визуальное отображение зоны рейда
-    Создает визуальную границу рейда с помощью купола, чтобы все участники могли видеть зону действия.
-  ·  Настраиваемые параметры
-    Возможность настройки радиуса зоны рейда и времени блокировки команд.
-  ·  Интеграция с CombatBlock
-    Плагин интегрируется с CombatBlock для дополнительной защиты и контроля.
-  ·  UI индикатор
-    Отображает оставшееся время блокировки команд через удобный интерфейс.
-  ·  Запрет строительства
-    Запрещает строительство в зоне рейда, предотвращая злоупотребления.
+### Main functions:
+- Automatic raid zone detection and creation
+- Visual dome display for raid areas
+- Command blocking during raids
+- Building restriction in raid zones
+- Real-time UI with countdown timer
+- Smart positioning with CombatBlock
+- Automatic cleanup of expired zones
 
-EU:
-🌟 Plugin Description: "RaidBlock" 🌟
+### Commands:
+No player commands (works automatically)
 
-Blocks teleportation and other commands during a raid, ensuring fairness and order in the gameplay. Creates a visual raid zone using an impressive dome.
+### Permissions:
+- No specific permissions (affects all players in raid zone)
 
-Key Features:
+### JSON configuration:
+json
+```{
+"Block Duration": 300.0,
+"Block On Receive Raid Damage": true,
+"Remove Block On Death": true,
+"Blocked Commands": [
+"/tpr",
+"/tpa",
+"/home"
+],
+"Raid Zone Settings": {
+"Radius": 50.0,
+"Sphere Enabled": true,
+"Sphere Type": 0,
+"Dome Transparency": 7,
+"Visual Multiplier": 1.0
+},
+"Debug Mode": false
+}
+```
 
-  ·  Automatic Raid Zone Detection
-    The plugin automatically detects the raid zone upon explosion or damage.
-  ·  Command Blocking
-    Prohibits the use of teleportation commands and other customizable commands during a raid.
-  ·  Visual Raid Zone Display
-    Creates a visual boundary of the raid zone using a dome, allowing all participants to see the area of effect.
-  ·  Customizable Parameters
-    Ability to customize the raid zone radius and command blocking duration.
-  ·  Integration with CombatBlock
-    The plugin integrates with CombatBlock for additional protection and control.
-  ·  UI Indicator
-    Displays the remaining command blocking time through a convenient interface.
-  ·  Construction Prohibition
-    Prohibits construction in the raid zone, preventing abuses.
+### Visual Features:
+- Customizable raid zone dome
+- Multiple sphere types available
+- Adjustable transparency levels
+- Dynamic size scaling
+- Real-time zone visualization
 
+### Raid Detection:
+- Explosion damage monitoring
+- Structure damage tracking
+- Player combat tracking
+- Smart zone creation
+- Automatic zone extension on continued raiding
+
+### Zone Restrictions:
+- Teleportation blocking
+- Building prevention
+- Command usage restriction
+- Customizable blocked actions
+- Automatic restriction removal
+
+### UI System:
+- Modern design
+- Real-time countdown
+- Progress bar indication
+- Smart positioning with CombatBlock
+- Smooth animations
+- Multi-language support
+
+### Integration:
+- Full CombatBlock support
+- Automatic UI coordination
+- Shared restriction management
+- Event synchronization
+
+### Technical Features:
+- Optimized performance
+- Minimal server impact
+- Advanced error handling
+- Debug logging system
+- Safe zone management
+- Memory efficient

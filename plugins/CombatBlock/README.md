@@ -1,47 +1,85 @@
-RU:
-🌟 Описание плагина "CombatTeleportBlock" 🌟
+# CombatBlock Plugin
 
-Блокирует телепортацию и другие команды во время боя, · обеспечивая честность и безопасность в PVP-сражениях. · Защищает игроков от нечестной тактики, связанной с телепортацией.
+CombatBlock is a comprehensive plugin for managing combat-related restrictions on your Rust server.
+This plugin automatically blocks certain commands and actions when players are in combat, featuring a sleek UI display and integration with RaidBlock.
 
-Основные функции:
+## List of features:
 
-  ·  Автоматическое определение боевых действий
-    Плагин автоматически распознает начало и окончание боя, · основываясь на действиях игроков.
-  ·  Блокировка при нанесении урона
-    При нанесении урона другому игроку, · телепортация и выбранные команды блокируются.
-  ·  Блокировка при получении урона
-    При получении урона от другого игрока, · телепортация и выбранные команды также блокируются.
-  ·  Настраиваемый список блокируемых команд
-    Возможность настройки списка команд, · которые будут заблокированы во время боя.
-  ·  Интеграция с RaidBlock
-    Плагин интегрируется с RaidBlock, · обеспечивая комплексную защиту во время рейдов и сражений.
-  ·   UI индикатор
-    Отображает оставшееся время блокировки команд через удобный интерфейс, · информируя игроков о текущем статусе.
-  ·  Снятие блокировки при смерти
-    Возможность автоматического снятия блокировки при смерти игрока, · что позволяет быстро возобновить игру.
-  ·  Настраиваемое время блокировки
-    Гибкая настройка продолжительности блокировки команд, · в зависимости от предпочтений и требований сервера.
+### Main functions:
+- Automatic combat detection system
+- Customizable command blocking during combat
+- Modern UI with progress bar
+- Seamless integration with RaidBlock plugin
+- Multiple UI design variations
+- Configurable combat duration
+- Death handling options
+- Support for both chat and console commands
 
-EU:
-🌟 Plugin Description: "CombatTeleportBlock" 🌟
+### Permissions:
+- `combatblock.admin` - Access to admin commands
+- `combatblock.ignore` - Bypass combat block restrictions
 
-Blocks teleportation and other commands during combat, · ensuring fairness and security in PVP battles. · Protects players from unfair tactics involving teleportation.
+### Commands:
+- No player commands (works automatically)
+- Admin commands for configuration (requires combatblock.admin)
 
-Key Features:
+### Additional Triggers:
+- NPC attack detection
+- NPC damage received
+- Sleeping player damage
+- Combat block deactivation on death
 
-  ·  Automatic Combat Detection
-    The plugin automatically recognizes the start and end of combat, · based on player actions.
-  ·  Damage Infliction Blocking
-    When damage is inflicted on another player, · teleportation and selected commands are blocked.
-  ·  Damage Received Blocking
-    When damage is received from another player, · teleportation and selected commands are also blocked.
-  ·  Customizable Blocked Commands List
-    Ability to customize the list of commands that will be blocked during combat.
-  ·  Integration with RaidBlock
-    The plugin integrates with RaidBlock, · providing comprehensive protection during raids and battles.
-  ·  UI Indicator
-    Displays the remaining command blocking time through a convenient interface, · informing players of the current status.
-  ·  Unblocking on Death
-    Option to automatically remove the block upon player death, · allowing for quick resumption of gameplay.
-  ·  Customizable Blocking Duration
-    Flexible setting of the command blocking duration, · depending on server preferences and requirements.
+### Blocked Actions During Combat:
+- Teleportation commands
+- Trade system usage
+- Kit commands
+- Custom configurable commands
+
+### UI Features:
+- Multiple design variants
+- Automatic positioning with RaidBlock
+- Smooth animations
+- Progress bar indication
+- Customizable colors and transparency
+- Real-time duration updates
+
+### Integration:
+- Full RaidBlock plugin support
+- Automatic UI positioning when both plugins are present
+- Shared combat state management
+
+### Technical Features:
+- Optimized performance
+- Minimal server impact
+- Configurable debug mode
+- Error handling and logging
+- Multi-language support
+- Safe command processing
+
+### Languages Supported:
+- English (default)
+- Russian
+
+### JSON configuration:
+```json
+{
+"Block Duration": 10.0,
+"Block On Player Hit": true,
+"Block On Receive Damage": true,
+"Remove Block On Death": true,
+"Blocked Commands": [
+"/tpr",
+"/tpa",
+"/home"
+],
+"UI Settings": {
+"Background Color": "0.1921569 0.1921569 0.1921569 1",
+"Icon Color": "0 0.7764706 1 1",
+"Main Text Color": "1 1 1 1",
+"Secondary Text Color": "1 1 1 0.5019608",
+"Progress Bar Color": "0.3411765 0.5490196 0.9607843 1",
+"Progress Bar Background": "1 1 1 0.1019608",
+"UI Animation Delay": 0.222
+}
+}
+```

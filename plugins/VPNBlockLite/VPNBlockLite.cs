@@ -9,9 +9,28 @@ using Oxide.Core.Libraries;
 namespace Oxide.Plugins
 {
     [Info("VpnBlockLite", "fakerplayers", "1.0.0")]
-    [Description("Блокирует игроков использующих VPN/Proxy сервисы. Определяет страну, город и провайдера игрока. Упрощенная версия.")]
+    [Description("Blocks players using VPN/Proxy services. Detects country, city and ISP information. Lite version.")]
     public class VpnBlockLite : RustPlugin
     {
+        private void Init()
+        {
+            PrintWarning("[VPNBlockLite] Demo version loaded");
+            PrintWarning("[VPNBlockLite] You are using the lite version of the plugin");
+            PrintWarning("[VPNBlockLite] To purchase the full version, contact:");
+            PrintWarning("[VPNBlockLite] Telegram: @fakerplayers");
+            PrintWarning("[VPNBlockLite] Discord: fakerplayers");
+            PrintWarning("[VPNBlockLite] ");
+            PrintWarning("[VPNBlockLite] Demo version limitations:");
+            PrintWarning("[VPNBlockLite] - No Discord integration");
+            PrintWarning("[VPNBlockLite] - Limited VPN database");
+            PrintWarning("[VPNBlockLite] - No VPN whitelist");
+            PrintWarning("[VPNBlockLite] - No extended provider information");
+            PrintWarning("[VPNBlockLite] - No additional settings");
+            PrintWarning("[VPNBlockLite] - No automatic VPN database updates");
+            PrintWarning("[VPNBlockLite] - No bypass protection");
+            PrintWarning("[VPNBlockLite] For full version contact: TG @fakerplayers or Discord: fakerplayers");
+        }
+
         #region Configuration and Settings
         private ConfigData configData = null!;
 
@@ -160,25 +179,6 @@ namespace Oxide.Plugins
                 this,
                 RequestMethod.GET
             );
-        }
-
-        private void Init()
-        {
-            PrintWarning("[VPNBlockLite] Demo version loaded");
-            LogToFile("startup", "[VPNBlockLite] Вы используете упрощенную версию плагина", this);
-            LogToFile("startup", "[VPNBlockLite] Для приобретения полной версии обратитесь:", this);
-            LogToFile("startup", "[VPNBlockLite] Telegram: @fakerplayers", this);
-            LogToFile("startup", "[VPNBlockLite] Discord: fakerplayers", this);
-            LogToFile("startup", "[VPNBlockLite] ", this);
-            LogToFile("startup", "[VPNBlockLite] Ограничения демо версии:", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет интеграции с Discord", this);
-            LogToFile("startup", "[VPNBlockLite] - Ограниченная база данных VPN", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет белого списка VPN", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет расширенной информации о провайдерах", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет дополнительных настроек", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет автоматических обновлений базы VPN", this);
-            LogToFile("startup", "[VPNBlockLite] - Нет защиты от обхода блокировки", this);
-            PrintWarning("[VPNBlockLite] For full version contact: TG @fakerplayers or Discord: fakerplayers");
         }
     }
 }

@@ -16,13 +16,6 @@ namespace Oxide.Plugins
 
         private void Init()
         {
-            LogToFile("startup", "Для вас старался fakerplayers", this);
-            LogToFile("startup", "Переведите мне 1 рубль, я буду благодарен", this);
-            LogToFile("startup", "Карта - 2200700914172696", this);
-            PrintWarning("[NoDeathItems] Plugin created by fakerplayers");
-            PrintWarning("[NoDeathItems] If you like this plugin, please donate 1 RUB");
-            PrintWarning("[NoDeathItems] Card number: 2200700914172696");
-
             List<object> blockedItemsList = Config.Get<List<object>>("BlockedItems");
             BlockedItems = new HashSet<string>(blockedItemsList.ConvertAll(x => x.ToString()));
         }

@@ -10,12 +10,7 @@ namespace Oxide.Plugins
 
         private void Init()
         {
-            LogToFile("startup", "Для вас старался fakerplayers", this);
-            LogToFile("startup", "Переведите мне 1 рубль, я буду благодарен", this);
-            LogToFile("startup", "Карта - 2200700914172696", this);
             PrintWarning("[InstantFurnace] Plugin created by fakerplayers");
-            PrintWarning("[InstantFurnace] If you like this plugin, please donate 1 RUB");
-            PrintWarning("[InstantFurnace] Card number: 2200700914172696");
         }
 
         protected override void LoadDefaultConfig()

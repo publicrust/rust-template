@@ -1,31 +1,26 @@
-RU:
-🌟 Описание плагина "RustWelcome" 🌟
+HelloWorld Plugin
 
-Простой и удобный плагин для приветствия игроков на сервере Rust, · создающий дружелюбную и гостеприимную атмосферу.
+HelloWorld is a simple demonstration plugin that shows basic Rust plugin functionality.
+This plugin serves as an excellent starting point for learning Oxide plugin development and includes basic chat command implementation.
 
-Основные функции:
+## List of features:
 
-  ·  Приветственное сообщение при загрузке плагина
-    При активации плагина, · все игроки получают приветственное сообщение, · создающее позитивное первое впечатление.
-  ·  Команда в чате для приветствия игрока
-    Используйте команду в чате, · чтобы поприветствовать других игроков и поднять настроение на сервере.
-  ·  Персонализированное приветствие с именем игрока
-    Каждое приветствие содержит имя игрока, · делая его более личным и приятным.
+### Main functions:
+- Welcome message on plugin load
+- Chat command for greeting players
+- Personalized player greeting system
+- Simple and clean code structure
 
-· Команды: /hello - Введите эту команду в чате, · чтобы получить персонализированное приветствие.
+### Commands:
+- `/hello` - Sends a personalized greeting to the player
 
-EU:
-🌟 Plugin Description: "RustWelcome" 🌟
+### Permissions:
+- No permissions required (accessible to all players)
 
-A simple and user-friendly plugin for welcoming players on your Rust server, · creating a friendly and inviting atmosphere.
+### JSON configuration:
 
-Key Features:
-
-  ·  Welcome Message on Plugin Load
-    Upon activating the plugin, · all players receive a welcome message, · setting a positive first impression.
-  ·  Chat Command for Greeting Players
-    Use a chat command to greet other players and boost the mood on the server.
-  ·  Personalized Greeting with Player's Name
-    Each greeting includes the player's name, · making it more personal and pleasant.
-
-· Commands: /hello - Enter this command in the chat to receive a personalized greeting.
+```json
+{
+// No configuration 
+}
+```
