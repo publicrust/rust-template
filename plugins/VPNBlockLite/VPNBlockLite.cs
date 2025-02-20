@@ -161,24 +161,5 @@ namespace Oxide.Plugins
                 RequestMethod.GET
             );
         }
-
-        private void Init()
-        {
-            PrintWarning("[VPNBlockLite] Demo version loaded");
-            PrintWarning("[VPNBlockLite] Вы используете упрощенную версию плагина");
-            PrintWarning("[VPNBlockLite] Для приобретения полной версии обратитесь:");
-            PrintWarning("[VPNBlockLite] Telegram: @fakerplayers");
-            PrintWarning("[VPNBlockLite] Discord: fakerplayers");
-            PrintWarning("[VPNBlockLite] ");
-            PrintWarning("[VPNBlockLite] Ограничения демо версии:");
-            PrintWarning("[VPNBlockLite] - Нет интеграции с Discord");
-            PrintWarning("[VPNBlockLite] - Ограниченная база данных VPN");
-            PrintWarning("[VPNBlockLite] - Нет белого списка VPN");
-            PrintWarning("[VPNBlockLite] - Нет расширенной информации о провайдерах");
-            PrintWarning("[VPNBlockLite] - Нет дополнительных настроек");
-            PrintWarning("[VPNBlockLite] - Нет автоматических обновлений базы VPN");
-            PrintWarning("[VPNBlockLite] - Нет защиты от обхода блокировки";
-            PrintWarning("[VPNBlockLite] For full version contact: TG @fakerplayers or Discord: fakerplayers");
-        }
     }
 }
