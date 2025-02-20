@@ -16,11 +16,3 @@ This plugin serves as an excellent starting point for learning Oxide plugin deve
 
 ### Permissions:
 - No permissions required (accessible to all players)
-
-### JSON configuration:
-
-```json
-{
-// No configuration 
-}
-```
