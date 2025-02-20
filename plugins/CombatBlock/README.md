@@ -70,6 +70,6 @@ This plugin automatically blocks certain commands and actions when players are i
 "Secondary Text Color": "1 1 1 0.5019608",
 "Progress Bar Color": "0.3411765 0.5490196 0.9607843 1",
 "Progress Bar Background": "1 1 1 0.1019608",
-"UI Animation Delay": 0.222
+"UI Animation Delay": "0.222"
 }
 ```
