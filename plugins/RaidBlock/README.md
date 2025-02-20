@@ -60,21 +60,22 @@ This plugin automatically detects raid activity, creates visual domes, and preve
 ### JSON configuration:
 ```json
 {
-"Block Duration": 300.0,
-"Block On Receive Raid Damage": true,
-"Remove Block On Death": true,
-"Blocked Commands": [
-"/tpr",
-"/tpa",
-"/home"
-"Raid Zone Settings": {
-"Radius": 50.0,
-"Sphere Enabled": true,
-"Sphere Type": 0,
-"Dome Transparency": 7,
-"Visual Multiplier": 1.0
-},
-"Debug Mode": false
+  "Block Duration": 300.0,
+  "Block On Receive Raid Damage": true,
+  "Remove Block On Death": true,
+  "Blocked Commands": [
+    "/tpr",
+    "/tpa",
+    "/home"
+  ],
+  "Raid Zone Settings": {
+    "Radius": 50.0,
+    "Sphere Enabled": true,
+    "Sphere Type": 0,
+    "Dome Transparency": 7,
+    "Visual Multiplier": 1.0
+  },
+  "Debug Mode": false
 }
 ```
 
