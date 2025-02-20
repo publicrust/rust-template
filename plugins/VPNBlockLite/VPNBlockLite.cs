@@ -9,7 +9,7 @@ using Oxide.Core.Libraries;
 namespace Oxide.Plugins
 {
     [Info("VpnBlockLite", "fakerplayers", "1.0.0")]
-    [Description("Блокирует игроков использующих VPN/Proxy сервисы. Определяет страну, город и провайдера игрока. Упрощенная версия.")]
+    [Description("Blocks players using VPN/Proxy services. Detects country, city and ISP information. Lite version.")]
     public class VpnBlockLite : RustPlugin
     {
         #region Configuration and Settings
