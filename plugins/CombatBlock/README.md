@@ -55,21 +55,23 @@ This plugin automatically blocks certain commands and actions when players are i
 ### JSON configuration:
 ```json
 {
-"Block Duration": 10.0,
-"Block On Player Hit": true,
-"Block On Receive Damage": true,
-"Remove Block On Death": true,
-"Blocked Commands": [
-"/tpr",
-"/tpa",
-"/home"
-"UI Settings": {
-"Background Color": "0.1921569 0.1921569 0.1921569 1",
-"Icon Color": "0 0.7764706 1 1",
-"Main Text Color": "1 1 1 1",
-"Secondary Text Color": "1 1 1 0.5019608",
-"Progress Bar Color": "0.3411765 0.5490196 0.9607843 1",
-"Progress Bar Background": "1 1 1 0.1019608",
-"UI Animation Delay": "0.222"
+  "Block Duration": 10.0,
+  "Block On Player Hit": true,
+  "Block On Receive Damage": true,
+  "Remove Block On Death": true,
+  "Blocked Commands": [
+    "/tpr",
+    "/tpa",
+    "/home"
+  ],
+  "UI Settings": {
+    "Background Color": "0.1921569 0.1921569 0.1921569 1",
+    "Icon Color": "0 0.7764706 1 1",
+    "Main Text Color": "1 1 1 1",
+    "Secondary Text Color": "1 1 1 0.5019608",
+    "Progress Bar Color": "0.3411765 0.5490196 0.9607843 1",
+    "Progress Bar Background": "1 1 1 0.1019608",
+    "UI Animation Delay": "0.222"
+  }
 }
 ```
