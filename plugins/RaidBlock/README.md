@@ -30,7 +30,6 @@ json
 "/tpr",
 "/tpa",
 "/home"
-],
 "Raid Zone Settings": {
 "Radius": 50.0,
 "Sphere Enabled": true,
@@ -40,6 +39,7 @@ json
 },
 "Debug Mode": false
 }
+],
 ```
 
 ### Visual Features:
