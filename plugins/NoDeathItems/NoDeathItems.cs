@@ -1,6 +1,5 @@
 using System.Collections.Generic;
 using System.Linq;
-using Oxide.Plugins;
 
 namespace Oxide.Plugins
 {
@@ -21,15 +20,15 @@ namespace Oxide.Plugins
             BlockedItems = new HashSet<string>(blockedItemsList.ConvertAll(x => x.ToString()));
         }
 
-        private object OnPlayerDeath(BasePlayer player, HitInfo info)
+        private object? OnPlayerDeath(BasePlayer player, HitInfo info)
         {
             if (player?.inventory == null)
             {
                 return null;
             }
 
-            List<Item> items = new List<Item>();
-            player.inventory.GetAllItems(items);
+            List<Item> items = new();
+            _ = player.inventory.GetAllItems(items);
 
             items.Where(item => BlockedItems.Contains(item.info.shortname))
                  .ToList()
