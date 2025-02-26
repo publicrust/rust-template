@@ -1,13 +1,13 @@
-using Oxide.Core;
-using Oxide.Game.Rust.Cui;
 using System;
 using System.Collections.Generic;
-using System.Linq;
-using UnityEngine;
-using System.Text;
 using System.Globalization;
-using Oxide.Core.Plugins;
+using System.Linq;
+using System.Text;
 using Newtonsoft.Json;
+using Oxide.Core;
+using Oxide.Core.Plugins;
+using Oxide.Game.Rust.Cui;
+using UnityEngine;
 
 namespace Oxide.Plugins
 {
@@ -30,24 +30,31 @@ namespace Oxide.Plugins
         private readonly Dictionary<ulong, HashSet<string>> activeActions = new();
         private readonly string LayerMain = "AdminMonitor.UI";
         private readonly string LayerContent = "AdminMonitor.Content";
-        [PluginReference] private readonly Plugin? ImageLibrary;
+
+        [PluginReference]
+        private readonly Plugin? ImageLibrary;
         private readonly Dictionary<ulong, string> avatarUrls = new();
+
         /// <summary>
         /// URL Discord вебхука для отправки уведомлений
         /// </summary>
         private string DiscordWebhookUrl => Config["DiscordWebhookUrl"]?.ToString() ?? string.Empty;
+
         /// <summary>
         /// Порог движения для определения AFK (в единицах)
         /// </summary>
         private const float MovementThreshold = 0.1f;
+
         /// <summary>
         /// Порог поворота для определения AFK (в градусах)
         /// </summary>
         private const float RotationThreshold = 1f;
+
         /// <summary>
         /// Интервал проверки активности в секундах
         /// </summary>
         private readonly float checkInterval = 1f;
+
         /// <summary>
         /// Порог неактивности в секундах
         /// </summary>
@@ -156,23 +163,32 @@ namespace Oxide.Plugins
             cmd.AddConsoleCommand("amonitor.report", this, nameof(CmdGenerateReport));
 
             // Создаем папку для отчетов
-            if (!Interface.Oxide.DataFileSystem.ExistsDatafile($"{DataFolderName}/{ReportsFolderName}"))
+            if (
+                !Interface.Oxide.DataFileSystem.ExistsDatafile(
+                    $"{DataFolderName}/{ReportsFolderName}"
+                )
+            )
             {
-                _ = Interface.Oxide.DataFileSystem.GetDatafile($"{DataFolderName}/{ReportsFolderName}");
+                _ = Interface.Oxide.DataFileSystem.GetDatafile(
+                    $"{DataFolderName}/{ReportsFolderName}"
+                );
             }
 
             // Добавляем таймер для сохранения статистики каждую минуту
-            _ = timer.Every(60f, () =>
-            {
-                if (storedData == null)
+            _ = timer.Every(
+                60f,
+                () =>
                 {
-                    return;
-                }
+                    if (storedData == null)
+                    {
+                        return;
+                    }
 
-                UpdateAllAdminStats();
-                SaveData();
-                Puts("Admin statistics saved (1-minute interval)");
-            });
+                    UpdateAllAdminStats();
+                    SaveData();
+                    Puts("Admin statistics saved (1-minute interval)");
+                }
+            );
 
             ScheduleReports();
         }
@@ -213,7 +229,7 @@ namespace Oxide.Plugins
                 WipeHistory wipeHistory = new()
                 {
                     StartDate = storedData.CurrentWipeStart.Value,
-                    EndDate = DateTime.Now
+                    EndDate = DateTime.Now,
                 };
 
                 foreach (KeyValuePair<ulong, AdminStats> kvp in storedData.AdminStatistics)
@@ -224,7 +240,7 @@ namespace Oxide.Plugins
                         TotalActiveTime = kvp.Value.CurrentWipeActiveTime,
                         TotalAfkTime = kvp.Value.CurrentWipeAfkTime,
                         CommandsUsed = new Dictionary<string, int>(kvp.Value.CommandsUsed),
-                        LastActive = kvp.Value.LastActive
+                        LastActive = kvp.Value.LastActive,
                     };
 
                     // Сбрасываем статистику текущего вайпа
@@ -258,7 +274,10 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (player.IsAdmin || permission.UserHasPermission(player.UserIDString, PermissionTracked))
+            if (
+                player.IsAdmin
+                || permission.UserHasPermission(player.UserIDString, PermissionTracked)
+            )
             {
                 StartMonitoring(player);
                 LoadPlayerAvatar(player);
@@ -268,7 +287,13 @@ namespace Oxide.Plugins
 
         private void OnPlayerDisconnected(BasePlayer player, string reason)
         {
-            if (player == null || (!player.IsAdmin && !permission.UserHasPermission(player.UserIDString, PermissionTracked)))
+            if (
+                player == null
+                || (
+                    !player.IsAdmin
+                    && !permission.UserHasPermission(player.UserIDString, PermissionTracked)
+                )
+            )
             {
                 return;
             }
@@ -287,7 +312,13 @@ namespace Oxide.Plugins
 
         private object? OnPlayerCommand(BasePlayer? player, string command, string[] args)
         {
-            if (player == null || (!player.IsAdmin && !permission.UserHasPermission(player.UserIDString, PermissionTracked)))
+            if (
+                player == null
+                || (
+                    !player.IsAdmin
+                    && !permission.UserHasPermission(player.UserIDString, PermissionTracked)
+                )
+            )
             {
                 return null;
             }
@@ -356,7 +387,14 @@ namespace Oxide.Plugins
 
         private void OnPlayerInput(BasePlayer player, InputState input)
         {
-            if (player == null || input == null || (!player.IsAdmin && !permission.UserHasPermission(player.UserIDString, PermissionTracked)))
+            if (
+                player == null
+                || input == null
+                || (
+                    !player.IsAdmin
+                    && !permission.UserHasPermission(player.UserIDString, PermissionTracked)
+                )
+            )
             {
                 return;
             }
@@ -386,13 +424,16 @@ namespace Oxide.Plugins
             }
 
             // Очищаем действия через небольшую задержку
-            _ = timer.Once(1f, () =>
-            {
-                if (actions.Count > 0)
+            _ = timer.Once(
+                1f,
+                () =>
                 {
-                    actions.Clear();
+                    if (actions.Count > 0)
+                    {
+                        actions.Clear();
+                    }
                 }
-            });
+            );
         }
 
         private void OnUserPermissionGranted(string id, string permName)
@@ -442,7 +483,13 @@ namespace Oxide.Plugins
         #region Core Functions
         private void StartMonitoring(BasePlayer player)
         {
-            if (player == null || (!player.IsAdmin && !permission.UserHasPermission(player.UserIDString, PermissionTracked)))
+            if (
+                player == null
+                || (
+                    !player.IsAdmin
+                    && !permission.UserHasPermission(player.UserIDString, PermissionTracked)
+                )
+            )
             {
                 return;
             }
@@ -458,19 +505,22 @@ namespace Oxide.Plugins
                 SessionStartTime = Time.realtimeSinceStartup,
                 LastActiveTime = Time.realtimeSinceStartup,
                 LastPosition = player.transform.position,
-                IsAfk = false
+                IsAfk = false,
             };
             lastPositions[player.userID] = player.transform.position;
             lastActionTimes[player.userID] = Time.realtimeSinceStartup;
 
             activityTimers[player.userID] = timer.Every(checkInterval, () => CheckActivity(player));
 
-            if (storedData?.AdminStatistics != null && !storedData.AdminStatistics.ContainsKey(player.userID))
+            if (
+                storedData?.AdminStatistics != null
+                && !storedData.AdminStatistics.ContainsKey(player.userID)
+            )
             {
                 storedData.AdminStatistics[player.userID] = new AdminStats
                 {
                     LastName = player.displayName,
-                    LastActive = DateTime.Now
+                    LastActive = DateTime.Now,
                 };
             }
 
@@ -493,9 +543,13 @@ namespace Oxide.Plugins
             if (activeAdmins.ContainsKey(player.userID))
             {
                 AdminActivity activity = activeAdmins[player.userID];
-                float sessionTime = Time.realtimeSinceStartup - activity.SessionStartTime - activity.TotalAfkTime;
+                float sessionTime =
+                    Time.realtimeSinceStartup - activity.SessionStartTime - activity.TotalAfkTime;
 
-                if (storedData?.AdminStatistics != null && storedData.AdminStatistics.TryGetValue(player.userID, out AdminStats stats))
+                if (
+                    storedData?.AdminStatistics != null
+                    && storedData.AdminStatistics.TryGetValue(player.userID, out AdminStats stats)
+                )
                 {
                     stats.TotalActiveTime += sessionTime;
                     stats.TotalAfkTime += activity.TotalAfkTime;
@@ -526,21 +580,44 @@ namespace Oxide.Plugins
 
             // Проверяем различные типы активности
             bool hasMoved = Vector3.Distance(activity.LastPosition, currentPos) > MovementThreshold;
-            bool hasRotated = Quaternion.Angle(lastRotations.TryGetValue(player.userID, out Quaternion lastRot) ? lastRot : currentRot, currentRot) > RotationThreshold;
-            bool hasActiveActions = activeActions.TryGetValue(player.userID, out HashSet<string> actions) && actions.Count > 0;
+            bool hasRotated =
+                Quaternion.Angle(
+                    lastRotations.TryGetValue(player.userID, out Quaternion lastRot)
+                        ? lastRot
+                        : currentRot,
+                    currentRot
+                ) > RotationThreshold;
+            bool hasActiveActions =
+                activeActions.TryGetValue(player.userID, out HashSet<string> actions)
+                && actions.Count > 0;
             bool isInInventory = player.inventory.loot.IsLooting();
             bool isInCrafting = player.inventory.crafting.queue.Count > 0;
 
-            bool isActive = hasMoved || hasRotated || hasActiveActions || isInInventory || isInCrafting;
+            bool isActive =
+                hasMoved || hasRotated || hasActiveActions || isInInventory || isInCrafting;
 
             if (!isActive)
             {
-                if (!activity.IsAfk && (currentTime - activity.LastActiveTime) >= inactivityThreshold)
+                if (
+                    !activity.IsAfk
+                    && (currentTime - activity.LastActiveTime) >= inactivityThreshold
+                )
                 {
                     // Игрок только что стал AFK
                     activity.IsAfk = true;
                     activity.AfkStartTime = currentTime;
-                    RecordAction(player, "Status", "AFK Start", GetAfkReason(hasMoved, hasRotated, hasActiveActions, isInInventory, isInCrafting));
+                    RecordAction(
+                        player,
+                        "Status",
+                        "AFK Start",
+                        GetAfkReason(
+                            hasMoved,
+                            hasRotated,
+                            hasActiveActions,
+                            isInInventory,
+                            isInCrafting
+                        )
+                    );
                     SendDiscordStatusChangeMessage(player, true);
 
                     // Отправляем уведомление игроку
@@ -556,7 +633,10 @@ namespace Oxide.Plugins
                 activity.LastActiveTime = currentTime;
                 RecordAction(player, "Status", "AFK End", $"Duration: {afkDuration:F1}s");
                 SendDiscordStatusChangeMessage(player, false, afkDuration);
-                SendReply(player, $"Вы вернулись из AFK режима. Время отсутствия: {FormatTime(afkDuration)}");
+                SendReply(
+                    player,
+                    $"Вы вернулись из AFK режима. Время отсутствия: {FormatTime(afkDuration)}"
+                );
             }
 
             // Обновляем последние известные позиции и время активности
@@ -569,7 +649,13 @@ namespace Oxide.Plugins
             lastRotations[player.userID] = currentRot;
         }
 
-        private string GetAfkReason(bool hasMoved, bool hasRotated, bool hasActiveActions, bool isInInventory, bool isInCrafting)
+        private string GetAfkReason(
+            bool hasMoved,
+            bool hasRotated,
+            bool hasActiveActions,
+            bool isInInventory,
+            bool isInCrafting
+        )
         {
             List<string> reasons = new();
 
@@ -605,7 +691,7 @@ namespace Oxide.Plugins
                 {
                     LastName = displayName,
                     CommandsUsed = new Dictionary<string, int>(),
-                    RecentActions = new List<AdminAction>()
+                    RecentActions = new List<AdminAction>(),
                 };
                 storedData.AdminStatistics[userId] = stats;
             }
@@ -623,9 +709,19 @@ namespace Oxide.Plugins
             SaveAdminData(userId);
         }
 
-        private void RecordAction(BasePlayer? player, string actionType, string details, string target)
+        private void RecordAction(
+            BasePlayer? player,
+            string actionType,
+            string details,
+            string target
+        )
         {
-            if (player == null || storedData == null || player.displayName == null || player.transform == null)
+            if (
+                player == null
+                || storedData == null
+                || player.displayName == null
+                || player.transform == null
+            )
             {
                 return;
             }
@@ -639,7 +735,7 @@ namespace Oxide.Plugins
                 stats = new AdminStats
                 {
                     LastName = displayName,
-                    RecentActions = new List<AdminAction>()
+                    RecentActions = new List<AdminAction>(),
                 };
                 storedData.AdminStatistics[userId] = stats;
             }
@@ -650,7 +746,7 @@ namespace Oxide.Plugins
                 Details = details,
                 Target = target,
                 Timestamp = DateTime.Now,
-                Location = position
+                Location = position,
             };
 
             stats.RecentActions.Add(action);
@@ -727,7 +823,10 @@ namespace Oxide.Plugins
                     {
                         // Если админ сейчас AFK:
                         // 1. Считаем активное время до начала AFK
-                        activeTime = kvp.Value.AfkStartTime - kvp.Value.SessionStartTime - kvp.Value.TotalAfkTime;
+                        activeTime =
+                            kvp.Value.AfkStartTime
+                            - kvp.Value.SessionStartTime
+                            - kvp.Value.TotalAfkTime;
                         // 2. Добавляем текущее время AFK
                         afkTime += currentTime - kvp.Value.AfkStartTime;
                     }
@@ -800,7 +899,10 @@ namespace Oxide.Plugins
                     break;
 
                 default:
-                    SendReply(player, "Доступные команды:\n/amonitor - список администраторов\n/amonitor check <имя/id> - проверить статистику\n/amonitor reset - сбросить статистику");
+                    SendReply(
+                        player,
+                        "Доступные команды:\n/amonitor - список администраторов\n/amonitor check <имя/id> - проверить статистику\n/amonitor reset - сбросить статистику"
+                    );
                     break;
             }
         }
@@ -808,7 +910,10 @@ namespace Oxide.Plugins
         [ConsoleCommand("amonitor.check")]
         private void CmdCheckAdmin(ConsoleSystem.Arg arg)
         {
-            if (arg.Player() != null && !permission.UserHasPermission(arg.Player().UserIDString, PermissionView))
+            if (
+                arg.Player() != null
+                && !permission.UserHasPermission(arg.Player().UserIDString, PermissionView)
+            )
             {
                 arg.ReplyWith("У вас нет прав для использования этой команды.");
                 return;
@@ -851,7 +956,8 @@ namespace Oxide.Plugins
                 {
                     // Если админ сейчас AFK:
                     // 1. Добавляем активное время до начала AFK
-                    float activeTimeBeforeAfk = activity.AfkStartTime - activity.SessionStartTime - activity.TotalAfkTime;
+                    float activeTimeBeforeAfk =
+                        activity.AfkStartTime - activity.SessionStartTime - activity.TotalAfkTime;
                     if (activeTimeBeforeAfk > 0)
                     {
                         totalActiveTime += activeTimeBeforeAfk;
@@ -885,7 +991,11 @@ namespace Oxide.Plugins
             if (stats.CommandsUsed.Count > 0)
             {
                 _ = reply.AppendLine("\nИспользованные команды:");
-                foreach (KeyValuePair<string, int> cmd in stats.CommandsUsed.OrderByDescending(x => x.Value).Take(10))
+                foreach (
+                    KeyValuePair<string, int> cmd in stats
+                        .CommandsUsed.OrderByDescending(x => x.Value)
+                        .Take(10)
+                )
                 {
                     _ = reply.AppendLine($"- {cmd.Key}: {cmd.Value} раз");
                 }
@@ -896,7 +1006,9 @@ namespace Oxide.Plugins
                 _ = reply.AppendLine("\nПоследние действия:");
                 foreach (AdminAction action in GetCachedRecentActions(targetId, stats, 5))
                 {
-                    _ = reply.AppendLine($"- [{action.Timestamp:HH:mm:ss}] {action.ActionType}: {action.Details} {(string.IsNullOrEmpty(action.Target) ? "" : $"-> {action.Target}")}");
+                    _ = reply.AppendLine(
+                        $"- [{action.Timestamp:HH:mm:ss}] {action.ActionType}: {action.Details} {(string.IsNullOrEmpty(action.Target) ? "" : $"-> {action.Target}")}"
+                    );
                 }
             }
 
@@ -920,23 +1032,26 @@ namespace Oxide.Plugins
             }
 
             // Создаем новый таймер для обновления UI каждую секунду
-            uiUpdateTimers[player.userID] = timer.Every(1f, () =>
-            {
-                if (!player.IsConnected)
+            uiUpdateTimers[player.userID] = timer.Every(
+                1f,
+                () =>
                 {
-                    if (uiUpdateTimers.TryGetValue(player.userID, out Timer timer))
+                    if (!player.IsConnected)
                     {
-                        timer.Destroy();
-                        _ = uiUpdateTimers.Remove(player.userID);
+                        if (uiUpdateTimers.TryGetValue(player.userID, out Timer timer))
+                        {
+                            timer.Destroy();
+                            _ = uiUpdateTimers.Remove(player.userID);
+                        }
+                        return;
                     }
-                    return;
-                }
 
-                // Обновляем статистику перед обновлением UI
-                UpdateAllAdminStats();
-                // Обновляем UI
-                UpdateAdminListUI(player);
-            });
+                    // Обновляем статистику перед обновлением UI
+                    UpdateAllAdminStats();
+                    // Обновляем UI
+                    UpdateAdminListUI(player);
+                }
+            );
 
             // Показываем UI первый раз
             UpdateAllAdminStats();
@@ -955,71 +1070,170 @@ namespace Oxide.Plugins
             CuiElementContainer container = new();
 
             // Основная панель с размытым фоном и градиентом
-            _ = container.Add(new CuiPanel
-            {
-                CursorEnabled = true,
-                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
-                Image = { Color = "0.235 0.227 0.204 0.95", Material = "assets/content/ui/uibackgroundblur-ingame.mat" }
-            }, "Overlay", LayerMain);
+            _ = container.Add(
+                new CuiPanel
+                {
+                    CursorEnabled = true,
+                    RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
+                    Image =
+                    {
+                        Color = "0.235 0.227 0.204 0.95",
+                        Material = "assets/content/ui/uibackgroundblur-ingame.mat",
+                    },
+                },
+                "Overlay",
+                LayerMain
+            );
 
             // Добавляем стильный градиентный фон
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
-                Image = { Color = "0.235 0.227 0.204 0.7", Sprite = "assets/content/ui/ui.background.transparent.radial.psd" }
-            }, LayerMain);
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
+                    Image =
+                    {
+                        Color = "0.235 0.227 0.204 0.7",
+                        Sprite = "assets/content/ui/ui.background.transparent.radial.psd",
+                    },
+                },
+                LayerMain
+            );
 
             // Центральная панель с тенью
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0.5 0.5", AnchorMax = "0.5 0.5", OffsetMin = "-500 -350", OffsetMax = "500 350" },
-                Image = { Color = "0.322 0.306 0.286 0" }
-            }, LayerMain, LayerContent);
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform =
+                    {
+                        AnchorMin = "0.5 0.5",
+                        AnchorMax = "0.5 0.5",
+                        OffsetMin = "-500 -350",
+                        OffsetMax = "500 350",
+                    },
+                    Image = { Color = "0.322 0.306 0.286 0" },
+                },
+                LayerMain,
+                LayerContent
+            );
 
             // Стильный заголовок с информацией о вайпе
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0 0.92", AnchorMax = "1 1" },
-                Image = { Color = "0.235 0.227 0.204 0.95", Material = "assets/content/ui/uibackgroundblur-ingame.mat" }
-            }, LayerContent, "Header");
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform = { AnchorMin = "0 0.92", AnchorMax = "1 1" },
+                    Image =
+                    {
+                        Color = "0.235 0.227 0.204 0.95",
+                        Material = "assets/content/ui/uibackgroundblur-ingame.mat",
+                    },
+                },
+                LayerContent,
+                "Header"
+            );
 
             // Добавляем статистику сервера
             int totalAdmins = storedData.AdminStatistics.Count;
-            int onlineAdmins = storedData.AdminStatistics.Count(x => BasePlayer.FindByID(x.Key)?.IsConnected == true);
+            int onlineAdmins = storedData.AdminStatistics.Count(x =>
+                BasePlayer.FindByID(x.Key)?.IsConnected == true
+            );
             int afkAdmins = activeAdmins.Count(x => x.Value.IsAfk);
 
-            _ = container.Add(new CuiLabel
-            {
-                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
-                Text = {
-                    Text = "<size=24><color=#e67e22>⚡ Мониторинг администраторов ⚡</color></size>\n" +
-                          $"<size=14>Вайп начался: <color=#3498db>{storedData.CurrentWipeStart:dd.MM.yyyy HH:mm}</color> | " +
-                          $"Админов онлайн: <color=#2ecc71>{onlineAdmins}</color>/<color=#95a5a6>{totalAdmins}</color> | " +
-                          $"AFK: <color=#e74c3c>{afkAdmins}</color></size>",
-                    Font = "robotocondensed-bold.ttf",
-                    Align = TextAnchor.MiddleCenter
-                }
-            }, "Header");
+            _ = container.Add(
+                new CuiLabel
+                {
+                    RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
+                    Text =
+                    {
+                        Text =
+                            "<size=24><color=#e67e22>⚡ Мониторинг администраторов ⚡</color></size>\n"
+                            + $"<size=14>Вайп начался: <color=#3498db>{storedData.CurrentWipeStart:dd.MM.yyyy HH:mm}</color> | "
+                            + $"Админов онлайн: <color=#2ecc71>{onlineAdmins}</color>/<color=#95a5a6>{totalAdmins}</color> | "
+                            + $"AFK: <color=#e74c3c>{afkAdmins}</color></size>",
+                        Font = "robotocondensed-bold.ttf",
+                        Align = TextAnchor.MiddleCenter,
+                    },
+                },
+                "Header"
+            );
 
             // Панель фильтров с улучшенным дизайном
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0.05 0.85", AnchorMax = "0.95 0.91" },
-                Image = { Color = "0.15 0.15 0.15 0.98", Material = "assets/content/ui/uibackgroundblur-ingame.mat" }
-            }, LayerContent, "FilterPanel");
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform = { AnchorMin = "0.05 0.85", AnchorMax = "0.95 0.91" },
+                    Image =
+                    {
+                        Color = "0.15 0.15 0.15 0.98",
+                        Material = "assets/content/ui/uibackgroundblur-ingame.mat",
+                    },
+                },
+                LayerContent,
+                "FilterPanel"
+            );
 
             // Улучшенные кнопки фильтров с иконками
-            AddFilterButton(container, "FilterPanel", "0.02 0.2", "0.15 0.8", "🔍 Все", FilterAll, player.userID.ToString());
-            AddFilterButton(container, "FilterPanel", "0.16 0.2", "0.29 0.8", "🟢 Онлайн", FilterOnline, player.userID.ToString());
-            AddFilterButton(container, "FilterPanel", "0.30 0.2", "0.43 0.8", "⭕ Оффлайн", FilterOffline, player.userID.ToString());
-            AddFilterButton(container, "FilterPanel", "0.44 0.2", "0.57 0.8", "💤 AFK", FilterAfk, player.userID.ToString());
+            AddFilterButton(
+                container,
+                "FilterPanel",
+                "0.02 0.2",
+                "0.15 0.8",
+                "🔍 Все",
+                FilterAll,
+                player.userID.ToString()
+            );
+            AddFilterButton(
+                container,
+                "FilterPanel",
+                "0.16 0.2",
+                "0.29 0.8",
+                "🟢 Онлайн",
+                FilterOnline,
+                player.userID.ToString()
+            );
+            AddFilterButton(
+                container,
+                "FilterPanel",
+                "0.30 0.2",
+                "0.43 0.8",
+                "⭕ Оффлайн",
+                FilterOffline,
+                player.userID.ToString()
+            );
+            AddFilterButton(
+                container,
+                "FilterPanel",
+                "0.44 0.2",
+                "0.57 0.8",
+                "💤 AFK",
+                FilterAfk,
+                player.userID.ToString()
+            );
 
             // Кнопки сортировки с иконками
-            AddFilterButton(container, "FilterPanel", "0.65 0.2", "0.78 0.8", "⏱ По активности", SortTimeActive, player.userID.ToString());
-            AddFilterButton(container, "FilterPanel", "0.79 0.2", "0.92 0.8", "⌛ По AFK", SortTimeAfk, player.userID.ToString());
+            AddFilterButton(
+                container,
+                "FilterPanel",
+                "0.65 0.2",
+                "0.78 0.8",
+                "⏱ По активности",
+                SortTimeActive,
+                player.userID.ToString()
+            );
+            AddFilterButton(
+                container,
+                "FilterPanel",
+                "0.79 0.2",
+                "0.92 0.8",
+                "⌛ По AFK",
+                SortTimeAfk,
+                player.userID.ToString()
+            );
 
             // Получаем отфильтрованный список администраторов
-            IEnumerable<KeyValuePair<ulong, AdminStats>> filteredAdmins = GetFilteredAdmins(player.userID.ToString(), storedData.AdminStatistics);
+            IEnumerable<KeyValuePair<ulong, AdminStats>> filteredAdmins = GetFilteredAdmins(
+                player.userID.ToString(),
+                storedData.AdminStatistics
+            );
 
             // Список администраторов с улучшенными карточками
             float yOffset = 0.83f;
@@ -1030,19 +1244,35 @@ namespace Oxide.Plugins
                 _ = activeAdmins.TryGetValue(admin.Key, out AdminActivity? currentActivity);
 
                 string cardName = $"AdminCard_{admin.Key}";
-                _ = container.Add(new CuiPanel
-                {
-                    RectTransform = { AnchorMin = $"0.05 {yOffset - 0.15}", AnchorMax = $"0.95 {yOffset}" },
-                    Image = { Color = "0.15 0.15 0.15 0.98", Material = "assets/content/ui/uibackgroundblur-ingame.mat" }
-                }, LayerContent, cardName);
+                _ = container.Add(
+                    new CuiPanel
+                    {
+                        RectTransform =
+                        {
+                            AnchorMin = $"0.05 {yOffset - 0.15}",
+                            AnchorMax = $"0.95 {yOffset}",
+                        },
+                        Image =
+                        {
+                            Color = "0.15 0.15 0.15 0.98",
+                            Material = "assets/content/ui/uibackgroundblur-ingame.mat",
+                        },
+                    },
+                    LayerContent,
+                    cardName
+                );
 
                 // Добавляем подсветку для онлайн статуса
                 string borderColor = isOnline ? "0.18 0.8 0.44 0.3" : "0.5 0.5 0.5 0.1";
-                _ = container.Add(new CuiPanel
-                {
-                    RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
-                    Image = { Color = borderColor }
-                }, cardName, $"{cardName}_border");
+                _ = container.Add(
+                    new CuiPanel
+                    {
+                        RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
+                        Image = { Color = borderColor },
+                    },
+                    cardName,
+                    $"{cardName}_border"
+                );
 
                 // Аватар с улучшенной рамкой
                 if (ImageLibrary != null && avatarUrls.TryGetValue(admin.Key, out string avatarId))
@@ -1051,22 +1281,39 @@ namespace Oxide.Plugins
                     if (!string.IsNullOrEmpty(avatarImage))
                     {
                         // Фоновый круг для аватара
-                        _ = container.Add(new CuiPanel
-                        {
-                            RectTransform = { AnchorMin = "0.02 0.1", AnchorMax = "0.08 0.9" },
-                            Image = { Color = "0.2 0.2 0.2 1", Sprite = "assets/content/ui/ui.circle.psd" }
-                        }, cardName);
+                        _ = container.Add(
+                            new CuiPanel
+                            {
+                                RectTransform = { AnchorMin = "0.02 0.1", AnchorMax = "0.08 0.9" },
+                                Image =
+                                {
+                                    Color = "0.2 0.2 0.2 1",
+                                    Sprite = "assets/content/ui/ui.circle.psd",
+                                },
+                            },
+                            cardName
+                        );
 
                         // Аватар
-                        container.Add(new CuiElement
-                        {
-                            Parent = cardName,
-                            Components =
+                        container.Add(
+                            new CuiElement
                             {
-                                new CuiRawImageComponent { Png = avatarImage, Color = "1 1 1 1" },
-                                new CuiRectTransformComponent { AnchorMin = "0.02 0.1", AnchorMax = "0.08 0.9" }
+                                Parent = cardName,
+                                Components =
+                                {
+                                    new CuiRawImageComponent
+                                    {
+                                        Png = avatarImage,
+                                        Color = "1 1 1 1",
+                                    },
+                                    new CuiRectTransformComponent
+                                    {
+                                        AnchorMin = "0.02 0.1",
+                                        AnchorMax = "0.08 0.9",
+                                    },
+                                },
                             }
-                        });
+                        );
                     }
                 }
 
@@ -1075,135 +1322,194 @@ namespace Oxide.Plugins
                 float currentAfkTime = 0f;
                 if (currentActivity != null)
                 {
-                    currentSessionTime = Time.realtimeSinceStartup - currentActivity.SessionStartTime - currentActivity.TotalAfkTime;
+                    currentSessionTime =
+                        Time.realtimeSinceStartup
+                        - currentActivity.SessionStartTime
+                        - currentActivity.TotalAfkTime;
                     currentAfkTime = currentActivity.TotalAfkTime;
                 }
 
-                float totalActiveTime = admin.Value.CurrentWipeActiveTime + (isOnline ? currentSessionTime : 0);
-                float totalAfkTime = admin.Value.CurrentWipeAfkTime + (isOnline ? currentAfkTime : 0);
-                float activePercentage = (totalActiveTime + totalAfkTime) > 0 ? totalActiveTime / (totalActiveTime + totalAfkTime) * 100 : 0;
+                float totalActiveTime =
+                    admin.Value.CurrentWipeActiveTime + (isOnline ? currentSessionTime : 0);
+                float totalAfkTime =
+                    admin.Value.CurrentWipeAfkTime + (isOnline ? currentAfkTime : 0);
+                float activePercentage =
+                    (totalActiveTime + totalAfkTime) > 0
+                        ? totalActiveTime / (totalActiveTime + totalAfkTime) * 100
+                        : 0;
 
                 // Добавляем тренд активности
                 string trendIcon = GetActivityTrendIcon(admin.Value);
                 string trendColor = GetActivityTrendColor(admin.Value);
 
-                _ = container.Add(new CuiLabel
-                {
-                    RectTransform = { AnchorMin = "0.1 0.5", AnchorMax = "0.4 0.9" },
-                    Text = {
-                        Text = $"<size=16>{admin.Value.LastName}</size>\n<size=12><color={trendColor}>{trendIcon}</color></size>",
-                        Font = "robotocondensed-bold.ttf",
-                        Align = TextAnchor.MiddleLeft
-                    }
-                }, cardName);
+                _ = container.Add(
+                    new CuiLabel
+                    {
+                        RectTransform = { AnchorMin = "0.1 0.5", AnchorMax = "0.4 0.9" },
+                        Text =
+                        {
+                            Text =
+                                $"<size=16>{admin.Value.LastName}</size>\n<size=12><color={trendColor}>{trendIcon}</color></size>",
+                            Font = "robotocondensed-bold.ttf",
+                            Align = TextAnchor.MiddleLeft,
+                        },
+                    },
+                    cardName
+                );
 
                 // Статус с иконкой
                 string status = GetAdminStatus(isOnline, currentActivity);
                 string statusIcon = GetStatusIcon(isOnline, currentActivity);
                 string statusColor = GetStatusColor(isOnline, currentActivity);
 
-                _ = container.Add(new CuiLabel
-                {
-                    RectTransform = { AnchorMin = "0.1 0.1", AnchorMax = "0.4 0.5" },
-                    Text = {
-                        Text = $"<size=14><color={statusColor}>{statusIcon} {status}</color></size>",
-                        Font = "robotocondensed-regular.ttf",
-                        Align = TextAnchor.MiddleLeft
-                    }
-                }, cardName);
+                _ = container.Add(
+                    new CuiLabel
+                    {
+                        RectTransform = { AnchorMin = "0.1 0.1", AnchorMax = "0.4 0.5" },
+                        Text =
+                        {
+                            Text =
+                                $"<size=14><color={statusColor}>{statusIcon} {status}</color></size>",
+                            Font = "robotocondensed-regular.ttf",
+                            Align = TextAnchor.MiddleLeft,
+                        },
+                    },
+                    cardName
+                );
 
                 // Время активности с процентами
-                _ = container.Add(new CuiLabel
-                {
-                    RectTransform = { AnchorMin = "0.45 0.5", AnchorMax = "0.7 0.9" },
-                    Text = {
-                        Text = $"<size=12>Активность</size>\n<size=14><color=#2ecc71>{GetCachedFormattedTime(admin.Key, totalActiveTime)}</color> ({activePercentage:F1}%)</size>",
-                        Font = "robotocondensed-regular.ttf",
-                        Align = TextAnchor.MiddleLeft
-                    }
-                }, cardName);
+                _ = container.Add(
+                    new CuiLabel
+                    {
+                        RectTransform = { AnchorMin = "0.45 0.5", AnchorMax = "0.7 0.9" },
+                        Text =
+                        {
+                            Text =
+                                $"<size=12>Активность</size>\n<size=14><color=#2ecc71>{GetCachedFormattedTime(admin.Key, totalActiveTime)}</color> ({activePercentage:F1}%)</size>",
+                            Font = "robotocondensed-regular.ttf",
+                            Align = TextAnchor.MiddleLeft,
+                        },
+                    },
+                    cardName
+                );
 
                 // Время AFK с процентами
                 float afkPercentage = 100 - activePercentage;
-                _ = container.Add(new CuiLabel
-                {
-                    RectTransform = { AnchorMin = "0.75 0.5", AnchorMax = "0.95 0.9" },
-                    Text = {
-                        Text = $"<size=12>AFK</size>\n<size=14><color=#e74c3c>{GetCachedFormattedTime(admin.Key, totalAfkTime)}</color> ({afkPercentage:F1}%)</size>",
-                        Font = "robotocondensed-regular.ttf",
-                        Align = TextAnchor.MiddleLeft
-                    }
-                }, cardName);
+                _ = container.Add(
+                    new CuiLabel
+                    {
+                        RectTransform = { AnchorMin = "0.75 0.5", AnchorMax = "0.95 0.9" },
+                        Text =
+                        {
+                            Text =
+                                $"<size=12>AFK</size>\n<size=14><color=#e74c3c>{GetCachedFormattedTime(admin.Key, totalAfkTime)}</color> ({afkPercentage:F1}%)</size>",
+                            Font = "robotocondensed-regular.ttf",
+                            Align = TextAnchor.MiddleLeft,
+                        },
+                    },
+                    cardName
+                );
 
                 // Прогресс-бар с градиентом
-                _ = container.Add(new CuiPanel
-                {
-                    RectTransform = { AnchorMin = "0 0", AnchorMax = "1 0.05" },
-                    Image = { Color = "0.2 0.2 0.2 1" }
-                }, cardName, $"{cardName}.progress");
+                _ = container.Add(
+                    new CuiPanel
+                    {
+                        RectTransform = { AnchorMin = "0 0", AnchorMax = "1 0.05" },
+                        Image = { Color = "0.2 0.2 0.2 1" },
+                    },
+                    cardName,
+                    $"{cardName}.progress"
+                );
 
                 if (activePercentage > 0)
                 {
-                    _ = container.Add(new CuiPanel
-                    {
-                        RectTransform = { AnchorMin = "0 0", AnchorMax = $"{activePercentage / 100} 1" },
-                        Image = { Color = "0.18 0.8 0.44 1" }
-                    }, $"{cardName}.progress");
+                    _ = container.Add(
+                        new CuiPanel
+                        {
+                            RectTransform =
+                            {
+                                AnchorMin = "0 0",
+                                AnchorMax = $"{activePercentage / 100} 1",
+                            },
+                            Image = { Color = "0.18 0.8 0.44 1" },
+                        },
+                        $"{cardName}.progress"
+                    );
                 }
 
                 if (afkPercentage > 0)
                 {
-                    _ = container.Add(new CuiPanel
-                    {
-                        RectTransform = { AnchorMin = $"{activePercentage / 100} 0", AnchorMax = "1 1" },
-                        Image = { Color = "0.9 0.3 0.24 1" }
-                    }, $"{cardName}.progress");
+                    _ = container.Add(
+                        new CuiPanel
+                        {
+                            RectTransform =
+                            {
+                                AnchorMin = $"{activePercentage / 100} 0",
+                                AnchorMax = "1 1",
+                            },
+                            Image = { Color = "0.9 0.3 0.24 1" },
+                        },
+                        $"{cardName}.progress"
+                    );
                 }
 
                 yOffset -= 0.17f;
             }
 
             // Добавляем кнопку закрытия
-            _ = container.Add(new CuiButton
-            {
-                RectTransform = { AnchorMin = "0.95 0.93", AnchorMax = "0.98 0.97" },
-                Button = {
-                    Color = "0.7 0.3 0.3 0.8",
-                    Close = LayerMain,
-                    Command = "adminmonitor.close"
+            _ = container.Add(
+                new CuiButton
+                {
+                    RectTransform = { AnchorMin = "0.95 0.93", AnchorMax = "0.98 0.97" },
+                    Button =
+                    {
+                        Color = "0.7 0.3 0.3 0.8",
+                        Close = LayerMain,
+                        Command = "adminmonitor.close",
+                    },
+                    Text =
+                    {
+                        Text = "✕",
+                        Font = "robotocondensed-bold.ttf",
+                        FontSize = 20,
+                        Align = TextAnchor.MiddleCenter,
+                    },
                 },
-                Text = { Text = "✕", Font = "robotocondensed-bold.ttf", FontSize = 20, Align = TextAnchor.MiddleCenter }
-            }, LayerContent);
+                LayerContent
+            );
 
             _ = CuiHelper.AddUi(player, container);
         }
 
-        /// <summary>
-        /// Вспомогательные методы для UI
-        /// </summary>
-        /// <param name="container"></param>
-        /// <param name="parent"></param>
-        /// <param name="anchorMin"></param>
-        /// <param name="anchorMax"></param>
-        /// <param name="text"></param>
-        /// <param name="filterType"></param>
-        /// <param name="userId"></param>
-        private void AddFilterButton(CuiElementContainer container, string parent, string anchorMin, string anchorMax, string text, string filterType, string userId)
+        private void AddFilterButton(
+            CuiElementContainer container,
+            string parent,
+            string anchorMin,
+            string anchorMax,
+            string text,
+            string filterType,
+            string userId
+        )
         {
-            _ = container.Add(new CuiButton
-            {
-                RectTransform = { AnchorMin = anchorMin, AnchorMax = anchorMax },
-                Button = {
-                    Color = GetFilterButtonColor(userId, filterType),
-                    Command = $"adminmonitor.filter status {filterType}"
+            _ = container.Add(
+                new CuiButton
+                {
+                    RectTransform = { AnchorMin = anchorMin, AnchorMax = anchorMax },
+                    Button =
+                    {
+                        Color = GetFilterButtonColor(userId, filterType),
+                        Command = $"adminmonitor.filter status {filterType}",
+                    },
+                    Text =
+                    {
+                        Text = text,
+                        Font = "robotocondensed-regular.ttf",
+                        FontSize = 12,
+                        Align = TextAnchor.MiddleCenter,
+                    },
                 },
-                Text = {
-                    Text = text,
-                    Font = "robotocondensed-regular.ttf",
-                    FontSize = 12,
-                    Align = TextAnchor.MiddleCenter
-                }
-            }, parent);
+                parent
+            );
         }
 
         private string GetActivityTrendIcon(AdminStats stats)
@@ -1213,7 +1519,9 @@ namespace Oxide.Plugins
             DateTime yesterday = now.AddDays(-1);
 
             int recentActions = stats.RecentActions.Count(a => a.Timestamp >= yesterday);
-            int previousActions = stats.RecentActions.Count(a => a.Timestamp >= yesterday.AddDays(-1) && a.Timestamp < yesterday);
+            int previousActions = stats.RecentActions.Count(a =>
+                a.Timestamp >= yesterday.AddDays(-1) && a.Timestamp < yesterday
+            );
 
             // Разбиваем сложное тернарное выражение на простые условия
             if (recentActions > previousActions)
@@ -1239,7 +1547,7 @@ namespace Oxide.Plugins
             {
                 "↑" => "#2ecc71",
                 "↓" => "#e74c3c",
-                _ => "#95a5a6"
+                _ => "#95a5a6",
             };
         }
 
@@ -1291,19 +1599,22 @@ namespace Oxide.Plugins
             }
 
             // Создаем новый таймер для обновления UI каждую секунду
-            uiUpdateTimers[player.userID] = timer.Every(1f, () =>
-            {
-                if (!player.IsConnected)
+            uiUpdateTimers[player.userID] = timer.Every(
+                1f,
+                () =>
                 {
-                    if (uiUpdateTimers.TryGetValue(player.userID, out Timer timer))
+                    if (!player.IsConnected)
                     {
-                        timer.Destroy();
-                        _ = uiUpdateTimers.Remove(player.userID);
+                        if (uiUpdateTimers.TryGetValue(player.userID, out Timer timer))
+                        {
+                            timer.Destroy();
+                            _ = uiUpdateTimers.Remove(player.userID);
+                        }
+                        return;
                     }
-                    return;
+                    UpdateAdminStatsUI(player, targetPlayer);
                 }
-                UpdateAdminStatsUI(player, targetPlayer);
-            });
+            );
 
             // Показываем UI первый раз
             UpdateAdminStatsUI(player, targetPlayer);
@@ -1311,7 +1622,14 @@ namespace Oxide.Plugins
 
         private void UpdateAdminStatsUI(BasePlayer player, BasePlayer targetPlayer)
         {
-            if (storedData == null || !player.IsConnected || !storedData.AdminStatistics.TryGetValue(targetPlayer.userID, out AdminStats stats))
+            if (
+                storedData == null
+                || !player.IsConnected
+                || !storedData.AdminStatistics.TryGetValue(
+                    targetPlayer.userID,
+                    out AdminStats stats
+                )
+            )
             {
                 CleanupUI(player);
                 return;
@@ -1320,36 +1638,52 @@ namespace Oxide.Plugins
             CuiElementContainer container = CreateBaseContainer();
 
             // Создаем основную панель с новым дизайном
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0.1 0.1", AnchorMax = "0.9 0.9" },
-                Image = { Color = "0.235 0.227 0.204 1" } // #3c3a34
-            }, LayerMain, LayerContent);
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform = { AnchorMin = "0.1 0.1", AnchorMax = "0.9 0.9" },
+                    Image = { Color = "0.235 0.227 0.204 1" }, // #3c3a34
+                },
+                LayerMain,
+                LayerContent
+            );
 
             // Верхняя панель с информацией об админе
             CreateHeaderPanel(container, targetPlayer, stats);
 
             // Создаем две колонки для симметричного расположения
             // Левая колонка
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0.02 0.45", AnchorMax = "0.49 0.83" },
-                Image = { Color = "0.322 0.306 0.286 1" } // #524e49
-            }, LayerContent, "LeftColumn");
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform = { AnchorMin = "0.02 0.45", AnchorMax = "0.49 0.83" },
+                    Image = { Color = "0.322 0.306 0.286 1" }, // #524e49
+                },
+                LayerContent,
+                "LeftColumn"
+            );
 
             // Правая колонка
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0.51 0.45", AnchorMax = "0.98 0.83" },
-                Image = { Color = "0.322 0.306 0.286 1" } // #524e49
-            }, LayerContent, "RightColumn");
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform = { AnchorMin = "0.51 0.45", AnchorMax = "0.98 0.83" },
+                    Image = { Color = "0.322 0.306 0.286 1" }, // #524e49
+                },
+                LayerContent,
+                "RightColumn"
+            );
 
             // Нижняя панель на всю ширину
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0.02 0.02", AnchorMax = "0.98 0.43" },
-                Image = { Color = "0.322 0.306 0.286 1" } // #524e49
-            }, LayerContent, "BottomPanel");
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform = { AnchorMin = "0.02 0.02", AnchorMax = "0.98 0.43" },
+                    Image = { Color = "0.322 0.306 0.286 1" }, // #524e49
+                },
+                LayerContent,
+                "BottomPanel"
+            );
 
             // Заполняем контент
             CreateStatisticsPanel(container, targetPlayer, stats, "LeftColumn");
@@ -1357,57 +1691,87 @@ namespace Oxide.Plugins
             CreateTimelinePanel(container, stats, "BottomPanel");
 
             // Кнопка закрытия
-            _ = container.Add(new CuiButton
-            {
-                RectTransform = { AnchorMin = "0.94 0.85", AnchorMax = "0.98 0.89" },
-                Button = {
-                    Color = "0.7 0.3 0.3 0.8",
-                    Close = LayerMain,
-                    Command = "adminmonitor.close"
+            _ = container.Add(
+                new CuiButton
+                {
+                    RectTransform = { AnchorMin = "0.94 0.85", AnchorMax = "0.98 0.89" },
+                    Button =
+                    {
+                        Color = "0.7 0.3 0.3 0.8",
+                        Close = LayerMain,
+                        Command = "adminmonitor.close",
+                    },
+                    Text =
+                    {
+                        Text = "✕",
+                        Font = "robotocondensed-bold.ttf",
+                        FontSize = 20,
+                        Align = TextAnchor.MiddleCenter,
+                    },
                 },
-                Text = {
-                    Text = "✕",
-                    Font = "robotocondensed-bold.ttf",
-                    FontSize = 20,
-                    Align = TextAnchor.MiddleCenter
-                }
-            }, LayerContent);
+                LayerContent
+            );
 
             _ = CuiHelper.DestroyUi(player, LayerMain);
             _ = CuiHelper.AddUi(player, container);
         }
 
-        private void CreateHeaderPanel(CuiElementContainer container, BasePlayer targetPlayer, AdminStats stats)
+        private void CreateHeaderPanel(
+            CuiElementContainer container,
+            BasePlayer targetPlayer,
+            AdminStats stats
+        )
         {
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0.02 0.85", AnchorMax = "0.98 0.98" },
-                Image = { Color = "0.322 0.306 0.286 1" }
-            }, LayerContent, "HeaderPanel");
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform = { AnchorMin = "0.02 0.85", AnchorMax = "0.98 0.98" },
+                    Image = { Color = "0.322 0.306 0.286 1" },
+                },
+                LayerContent,
+                "HeaderPanel"
+            );
 
             // Аватар с круглой рамкой
-            if (ImageLibrary != null && avatarUrls.TryGetValue(targetPlayer.userID, out string avatarId))
+            if (
+                ImageLibrary != null
+                && avatarUrls.TryGetValue(targetPlayer.userID, out string avatarId)
+            )
             {
                 string? avatarImage = ImageLibrary.Call("GetImage", avatarId) as string;
                 if (!string.IsNullOrEmpty(avatarImage))
                 {
                     // Фоновый круг
-                    _ = container.Add(new CuiPanel
-                    {
-                        RectTransform = { AnchorMin = "0.02 0.1", AnchorMax = "0.12 0.9" },
-                        Image = { Color = "0.235 0.227 0.204 1", Sprite = "assets/content/ui/ui.circle.psd" }
-                    }, "HeaderPanel", "AvatarBackground");
+                    _ = container.Add(
+                        new CuiPanel
+                        {
+                            RectTransform = { AnchorMin = "0.02 0.1", AnchorMax = "0.12 0.9" },
+                            Image =
+                            {
+                                Color = "0.235 0.227 0.204 1",
+                                Sprite = "assets/content/ui/ui.circle.psd",
+                            },
+                        },
+                        "HeaderPanel",
+                        "AvatarBackground"
+                    );
 
                     // Аватар
-                    container.Add(new CuiElement
-                    {
-                        Parent = "AvatarBackground",
-                        Components =
+                    container.Add(
+                        new CuiElement
                         {
-                            new CuiRawImageComponent { Png = avatarImage, Color = "1 1 1 1" },
-                            new CuiRectTransformComponent { AnchorMin = "0.1 0.1", AnchorMax = "0.9 0.9" }
+                            Parent = "AvatarBackground",
+                            Components =
+                            {
+                                new CuiRawImageComponent { Png = avatarImage, Color = "1 1 1 1" },
+                                new CuiRectTransformComponent
+                                {
+                                    AnchorMin = "0.1 0.1",
+                                    AnchorMax = "0.9 0.9",
+                                },
+                            },
                         }
-                    });
+                    );
                 }
             }
 
@@ -1415,90 +1779,132 @@ namespace Oxide.Plugins
             _ = activeAdmins.TryGetValue(targetPlayer.userID, out AdminActivity? currentActivity);
 
             // Информация об админе с улучшенным форматированием
-            _ = container.Add(new CuiLabel
-            {
-                RectTransform = { AnchorMin = "0.14 0", AnchorMax = "0.98 1" },
-                Text = {
-                    Text = $"<size=24><color=#{ColorToHex(0.902f, 0.494f, 0.133f)}>{stats.LastName}</color></size>\n" +
-                          $"<size=14><color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>SteamID:</color> <color=#{ColorToHex(0.18f, 0.8f, 0.44f)}>{targetPlayer.UserIDString}</color> | " +
-                          $"<color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>Статус:</color> <color={GetStatusColor(isOnline, currentActivity)}>{GetStatusIcon(isOnline, currentActivity)} {GetAdminStatus(isOnline, currentActivity)}</color> | " +
-                          $"<color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>Последняя активность:</color> <color=#{ColorToHex(0.18f, 0.8f, 0.44f)}>{FormatDateTime(stats.LastActive)}</color></size>",
-                    Font = "robotocondensed-bold.ttf",
-                    Align = TextAnchor.MiddleLeft
-                }
-            }, "HeaderPanel");
+            _ = container.Add(
+                new CuiLabel
+                {
+                    RectTransform = { AnchorMin = "0.14 0", AnchorMax = "0.98 1" },
+                    Text =
+                    {
+                        Text =
+                            $"<size=24><color=#{ColorToHex(0.902f, 0.494f, 0.133f)}>{stats.LastName}</color></size>\n"
+                            + $"<size=14><color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>SteamID:</color> <color=#{ColorToHex(0.18f, 0.8f, 0.44f)}>{targetPlayer.UserIDString}</color> | "
+                            + $"<color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>Статус:</color> <color={GetStatusColor(isOnline, currentActivity)}>{GetStatusIcon(isOnline, currentActivity)} {GetAdminStatus(isOnline, currentActivity)}</color> | "
+                            + $"<color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>Последняя активность:</color> <color=#{ColorToHex(0.18f, 0.8f, 0.44f)}>{FormatDateTime(stats.LastActive)}</color></size>",
+                        Font = "robotocondensed-bold.ttf",
+                        Align = TextAnchor.MiddleLeft,
+                    },
+                },
+                "HeaderPanel"
+            );
         }
 
         private string ColorToHex(float r, float g, float b)
         {
-            return string.Format(CultureInfo.InvariantCulture, "{0:X2}{1:X2}{2:X2}",
-                (int)(r * 255), (int)(g * 255), (int)(b * 255));
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "{0:X2}{1:X2}{2:X2}",
+                (int)(r * 255),
+                (int)(g * 255),
+                (int)(b * 255)
+            );
         }
 
-        private void CreateStatisticsPanel(CuiElementContainer container, BasePlayer targetPlayer, AdminStats stats, string parent)
+        private void CreateStatisticsPanel(
+            CuiElementContainer container,
+            BasePlayer targetPlayer,
+            AdminStats stats,
+            string parent
+        )
         {
             // Заголовок
-            _ = container.Add(new CuiLabel
-            {
-                RectTransform = { AnchorMin = "0.05 0.85", AnchorMax = "0.95 0.95" },
-                Text = {
-                    Text = $"<size=18><color=#{ColorToHex(0.902f, 0.494f, 0.133f)}>📊 Общая статистика</color></size>",
-                    Font = "robotocondensed-bold.ttf",
-                    Align = TextAnchor.MiddleCenter
-                }
-            }, parent);
+            _ = container.Add(
+                new CuiLabel
+                {
+                    RectTransform = { AnchorMin = "0.05 0.85", AnchorMax = "0.95 0.95" },
+                    Text =
+                    {
+                        Text =
+                            $"<size=18><color=#{ColorToHex(0.902f, 0.494f, 0.133f)}>📊 Общая статистика</color></size>",
+                        Font = "robotocondensed-bold.ttf",
+                        Align = TextAnchor.MiddleCenter,
+                    },
+                },
+                parent
+            );
 
             float currentSessionTime = 0f;
             float currentAfkTime = 0f;
             if (activeAdmins.TryGetValue(targetPlayer.userID, out AdminActivity? currentActivity))
             {
-                currentSessionTime = Time.realtimeSinceStartup - currentActivity.SessionStartTime - currentActivity.TotalAfkTime;
+                currentSessionTime =
+                    Time.realtimeSinceStartup
+                    - currentActivity.SessionStartTime
+                    - currentActivity.TotalAfkTime;
                 currentAfkTime = currentActivity.TotalAfkTime;
             }
 
-            float totalActiveTime = stats.CurrentWipeActiveTime + (targetPlayer.IsConnected ? currentSessionTime : 0);
-            float totalAfkTime = stats.CurrentWipeAfkTime + (targetPlayer.IsConnected ? currentAfkTime : 0);
-            float activePercentage = (totalActiveTime + totalAfkTime) > 0 ? totalActiveTime / (totalActiveTime + totalAfkTime) * 100 : 0;
+            float totalActiveTime =
+                stats.CurrentWipeActiveTime + (targetPlayer.IsConnected ? currentSessionTime : 0);
+            float totalAfkTime =
+                stats.CurrentWipeAfkTime + (targetPlayer.IsConnected ? currentAfkTime : 0);
+            float activePercentage =
+                (totalActiveTime + totalAfkTime) > 0
+                    ? totalActiveTime / (totalActiveTime + totalAfkTime) * 100
+                    : 0;
 
             // Круговая диаграмма
             CreateActivityPieChart(container, parent, activePercentage);
 
             // Статистика с иконками
-            string timeStats = "<size=14>\n" +
-                              "<color=#95a5a6>За все время:</color>\n" +
-                              $"⏱ Активность: <color=#2ecc71>{FormatTime(stats.TotalActiveTime)}</color>\n" +
-                              $"💤 AFK: <color=#e74c3c>{FormatTime(stats.TotalAfkTime)}</color>\n\n" +
-                              "<color=#95a5a6>Текущий вайп:</color>\n" +
-                              $"⏱ Активность: <color=#2ecc71>{FormatTime(totalActiveTime)}</color>\n" +
-                              $"💤 AFK: <color=#e74c3c>{FormatTime(totalAfkTime)}</color>\n" +
-                              $"📈 Эффективность: <color=#f1c40f>{activePercentage:F1}%</color></size>";
+            string timeStats =
+                "<size=14>\n"
+                + "<color=#95a5a6>За все время:</color>\n"
+                + $"⏱ Активность: <color=#2ecc71>{FormatTime(stats.TotalActiveTime)}</color>\n"
+                + $"💤 AFK: <color=#e74c3c>{FormatTime(stats.TotalAfkTime)}</color>\n\n"
+                + "<color=#95a5a6>Текущий вайп:</color>\n"
+                + $"⏱ Активность: <color=#2ecc71>{FormatTime(totalActiveTime)}</color>\n"
+                + $"💤 AFK: <color=#e74c3c>{FormatTime(totalAfkTime)}</color>\n"
+                + $"📈 Эффективность: <color=#f1c40f>{activePercentage:F1}%</color></size>";
 
-            _ = container.Add(new CuiLabel
-            {
-                RectTransform = { AnchorMin = "0.4 0.1", AnchorMax = "0.95 0.8" },
-                Text = {
-                    Text = timeStats,
-                    Font = "robotocondensed-regular.ttf",
-                    Align = TextAnchor.UpperLeft
-                }
-            }, parent);
+            _ = container.Add(
+                new CuiLabel
+                {
+                    RectTransform = { AnchorMin = "0.4 0.1", AnchorMax = "0.95 0.8" },
+                    Text =
+                    {
+                        Text = timeStats,
+                        Font = "robotocondensed-regular.ttf",
+                        Align = TextAnchor.UpperLeft,
+                    },
+                },
+                parent
+            );
         }
 
-        private void CreateActivityPanel(CuiElementContainer container, AdminStats stats, string parent)
+        private void CreateActivityPanel(
+            CuiElementContainer container,
+            AdminStats stats,
+            string parent
+        )
         {
             // Заголовок
-            _ = container.Add(new CuiLabel
-            {
-                RectTransform = { AnchorMin = "0.05 0.85", AnchorMax = "0.95 0.95" },
-                Text = {
-                    Text = $"<size=18><color=#{ColorToHex(0.902f, 0.494f, 0.133f)}>🎯 Активность за 24 часа</color></size>",
-                    Font = "robotocondensed-bold.ttf",
-                    Align = TextAnchor.MiddleCenter
-                }
-            }, parent);
+            _ = container.Add(
+                new CuiLabel
+                {
+                    RectTransform = { AnchorMin = "0.05 0.85", AnchorMax = "0.95 0.95" },
+                    Text =
+                    {
+                        Text =
+                            $"<size=18><color=#{ColorToHex(0.902f, 0.494f, 0.133f)}>🎯 Активность за 24 часа</color></size>",
+                        Font = "robotocondensed-bold.ttf",
+                        Align = TextAnchor.MiddleCenter,
+                    },
+                },
+                parent
+            );
 
-            Dictionary<string, int> actionGroups = stats.RecentActions
-                .Where(a => a.Timestamp >= DateTime.Now.AddDays(-1))
+            Dictionary<string, int> actionGroups = stats
+                .RecentActions.Where(a => a.Timestamp >= DateTime.Now.AddDays(-1))
                 .GroupBy(a => a.ActionType)
                 .ToDictionary(g => g.Key, g => g.Count());
 
@@ -1508,43 +1914,61 @@ namespace Oxide.Plugins
             int violations = actionGroups.GetValueOrDefault("Violation");
             int playerInteractions = actionGroups.GetValueOrDefault("Attack");
 
-            string actionStats = "<size=14>\n" +
-                                $"⌨️ Команд: <color=#{ColorToHex(0.18f, 0.8f, 0.44f)}>{totalCommands}</color>\n" +
-                                $"🏗️ Построено: <color=#{ColorToHex(0.18f, 0.8f, 0.44f)}>{buildActions}</color>\n" +
-                                $"💥 Уничтожено: <color=#{ColorToHex(0.902f, 0.494f, 0.133f)}>{destroyActions}</color>\n" +
-                                $"👥 Взаимодействий: <color=#{ColorToHex(0.18f, 0.8f, 0.44f)}>{playerInteractions}</color>\n" +
-                                $"⚠️ Нарушений: <color=#{ColorToHex(0.905f, 0.298f, 0.235f)}>{violations}</color></size>";
+            string actionStats =
+                "<size=14>\n"
+                + $"⌨️ Команд: <color=#{ColorToHex(0.18f, 0.8f, 0.44f)}>{totalCommands}</color>\n"
+                + $"🏗️ Построено: <color=#{ColorToHex(0.18f, 0.8f, 0.44f)}>{buildActions}</color>\n"
+                + $"💥 Уничтожено: <color=#{ColorToHex(0.902f, 0.494f, 0.133f)}>{destroyActions}</color>\n"
+                + $"👥 Взаимодействий: <color=#{ColorToHex(0.18f, 0.8f, 0.44f)}>{playerInteractions}</color>\n"
+                + $"⚠️ Нарушений: <color=#{ColorToHex(0.905f, 0.298f, 0.235f)}>{violations}</color></size>";
 
-            _ = container.Add(new CuiLabel
-            {
-                RectTransform = { AnchorMin = "0.05 0.1", AnchorMax = "0.95 0.8" },
-                Text = {
-                    Text = actionStats,
-                    Font = "robotocondensed-regular.ttf",
-                    Align = TextAnchor.UpperLeft
-                }
-            }, parent);
+            _ = container.Add(
+                new CuiLabel
+                {
+                    RectTransform = { AnchorMin = "0.05 0.1", AnchorMax = "0.95 0.8" },
+                    Text =
+                    {
+                        Text = actionStats,
+                        Font = "robotocondensed-regular.ttf",
+                        Align = TextAnchor.UpperLeft,
+                    },
+                },
+                parent
+            );
         }
 
-        private void CreateTimelinePanel(CuiElementContainer container, AdminStats stats, string parent)
+        private void CreateTimelinePanel(
+            CuiElementContainer container,
+            AdminStats stats,
+            string parent
+        )
         {
             // Заголовок
-            _ = container.Add(new CuiLabel
-            {
-                RectTransform = { AnchorMin = "0.05 0.9", AnchorMax = "0.95 1" },
-                Text = {
-                    Text = $"<size=18><color=#{ColorToHex(0.902f, 0.494f, 0.133f)}>📅 История действий</color></size>",
-                    Font = "robotocondensed-bold.ttf",
-                    Align = TextAnchor.MiddleCenter
-                }
-            }, parent);
+            _ = container.Add(
+                new CuiLabel
+                {
+                    RectTransform = { AnchorMin = "0.05 0.9", AnchorMax = "0.95 1" },
+                    Text =
+                    {
+                        Text =
+                            $"<size=18><color=#{ColorToHex(0.902f, 0.494f, 0.133f)}>📅 История действий</color></size>",
+                        Font = "robotocondensed-bold.ttf",
+                        Align = TextAnchor.MiddleCenter,
+                    },
+                },
+                parent
+            );
 
             // График активности
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0.02 0.45", AnchorMax = "0.98 0.85" },
-                Image = { Color = "0.235 0.227 0.204 0.8" }
-            }, parent, "GraphPanel");
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform = { AnchorMin = "0.02 0.45", AnchorMax = "0.98 0.85" },
+                    Image = { Color = "0.235 0.227 0.204 0.8" },
+                },
+                parent,
+                "GraphPanel"
+            );
 
             AddActivityGraph(container, "GraphPanel", stats);
 
@@ -1552,57 +1976,89 @@ namespace Oxide.Plugins
             CreateRecentActionsList(container, parent, stats);
         }
 
-        private void CreateActivityPieChart(CuiElementContainer container, string parent, float activePercentage)
+        private void CreateActivityPieChart(
+            CuiElementContainer container,
+            string parent,
+            float activePercentage
+        )
         {
             const float centerX = 0.2f;
             const float centerY = 0.5f;
             const float radius = 0.15f;
 
             // Фоновый круг (AFK)
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = {
-                    AnchorMin = $"{centerX - radius} {centerY - radius}",
-                    AnchorMax = $"{centerX + radius} {centerY + radius}"
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform =
+                    {
+                        AnchorMin = $"{centerX - radius} {centerY - radius}",
+                        AnchorMax = $"{centerX + radius} {centerY + radius}",
+                    },
+                    Image =
+                    {
+                        Color = "0.905 0.298 0.235 0.8",
+                        Sprite = "assets/content/ui/ui.circle.psd",
+                    },
                 },
-                Image = { Color = "0.905 0.298 0.235 0.8", Sprite = "assets/content/ui/ui.circle.psd" }
-            }, parent, "PieChart");
+                parent,
+                "PieChart"
+            );
 
             // Активный сегмент
             if (activePercentage > 0)
             {
-                _ = container.Add(new CuiPanel
-                {
-                    RectTransform = {
-                        AnchorMin = $"{centerX - radius} {centerY - radius}",
-                        AnchorMax = $"{centerX + radius} {centerY + radius}"
+                _ = container.Add(
+                    new CuiPanel
+                    {
+                        RectTransform =
+                        {
+                            AnchorMin = $"{centerX - radius} {centerY - radius}",
+                            AnchorMax = $"{centerX + radius} {centerY + radius}",
+                        },
+                        Image =
+                        {
+                            Color = "0.18 0.8 0.44 0.8",
+                            Sprite = "assets/content/ui/ui.circle.psd",
+                        },
                     },
-                    Image = { Color = "0.18 0.8 0.44 0.8", Sprite = "assets/content/ui/ui.circle.psd" }
-                }, "PieChart");
+                    "PieChart"
+                );
             }
 
             // Процент в центре
-            _ = container.Add(new CuiLabel
-            {
-                RectTransform = {
-                    AnchorMin = $"{centerX - radius} {centerY - radius}",
-                    AnchorMax = $"{centerX + radius} {centerY + radius}"
+            _ = container.Add(
+                new CuiLabel
+                {
+                    RectTransform =
+                    {
+                        AnchorMin = $"{centerX - radius} {centerY - radius}",
+                        AnchorMax = $"{centerX + radius} {centerY + radius}",
+                    },
+                    Text =
+                    {
+                        Text =
+                            $"<size=20>{activePercentage:F0}%</size>\n<size=12>Активность</size>",
+                        Font = "robotocondensed-bold.ttf",
+                        Align = TextAnchor.MiddleCenter,
+                        Color = "1 1 1 1",
+                    },
                 },
-                Text = {
-                    Text = $"<size=20>{activePercentage:F0}%</size>\n<size=12>Активность</size>",
-                    Font = "robotocondensed-bold.ttf",
-                    Align = TextAnchor.MiddleCenter,
-                    Color = "1 1 1 1"
-                }
-            }, "PieChart");
+                "PieChart"
+            );
         }
 
-        private void CreateRecentActionsList(CuiElementContainer container, string parent, AdminStats stats)
+        private void CreateRecentActionsList(
+            CuiElementContainer container,
+            string parent,
+            AdminStats stats
+        )
         {
             // Находим userId по LastName
-            ulong userId = storedData?.AdminStatistics
-                .FirstOrDefault(x => x.Value.LastName == stats.LastName)
-                .Key ?? 0;
+            ulong userId =
+                storedData
+                    ?.AdminStatistics.FirstOrDefault(x => x.Value.LastName == stats.LastName)
+                    .Key ?? 0;
 
             List<AdminAction> recentActions = GetCachedRecentActions(userId, stats, 5);
             const float startYOffset = 0.35f;
@@ -1612,27 +2068,42 @@ namespace Oxide.Plugins
             foreach (AdminAction action in recentActions.OrderByDescending(a => a.Timestamp))
             {
                 string actionColor = GetActionColor(action.ActionType);
-                string targetInfo = string.IsNullOrEmpty(action.Target) ? "" :
-                    $" → <color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>{action.Target}</color>";
-                string locationInfo = $"<color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>({Math.Round(action.Location.x)}, {Math.Round(action.Location.y)}, {Math.Round(action.Location.z)})</color>";
+                string targetInfo = string.IsNullOrEmpty(action.Target)
+                    ? ""
+                    : $" → <color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>{action.Target}</color>";
+                string locationInfo =
+                    $"<color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>({Math.Round(action.Location.x)}, {Math.Round(action.Location.y)}, {Math.Round(action.Location.z)})</color>";
 
-                _ = container.Add(new CuiPanel
-                {
-                    RectTransform = { AnchorMin = $"0.02 {currentYOffset}", AnchorMax = $"0.98 {currentYOffset + itemHeight}" },
-                    Image = { Color = "0.235 0.227 0.204 0.5" }
-                }, parent, $"Action_{action.Timestamp.Ticks}");
+                _ = container.Add(
+                    new CuiPanel
+                    {
+                        RectTransform =
+                        {
+                            AnchorMin = $"0.02 {currentYOffset}",
+                            AnchorMax = $"0.98 {currentYOffset + itemHeight}",
+                        },
+                        Image = { Color = "0.235 0.227 0.204 0.5" },
+                    },
+                    parent,
+                    $"Action_{action.Timestamp.Ticks}"
+                );
 
-                _ = container.Add(new CuiLabel
-                {
-                    RectTransform = { AnchorMin = "0.02 0", AnchorMax = "0.98 1" },
-                    Text = {
-                        Text = $"<color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>[{action.Timestamp:HH:mm:ss}]</color> " +
-                              $"<color={actionColor}>{action.ActionType}</color>: {action.Details}{targetInfo} {locationInfo}",
-                        Font = "robotocondensed-regular.ttf",
-                        FontSize = 12,
-                        Align = TextAnchor.MiddleLeft
-                    }
-                }, $"Action_{action.Timestamp.Ticks}");
+                _ = container.Add(
+                    new CuiLabel
+                    {
+                        RectTransform = { AnchorMin = "0.02 0", AnchorMax = "0.98 1" },
+                        Text =
+                        {
+                            Text =
+                                $"<color=#{ColorToHex(0.584f, 0.647f, 0.651f)}>[{action.Timestamp:HH:mm:ss}]</color> "
+                                + $"<color={actionColor}>{action.ActionType}</color>: {action.Details}{targetInfo} {locationInfo}",
+                            Font = "robotocondensed-regular.ttf",
+                            FontSize = 12,
+                            Align = TextAnchor.MiddleLeft,
+                        },
+                    },
+                    $"Action_{action.Timestamp.Ticks}"
+                );
 
                 currentYOffset -= itemHeight + 0.01f;
             }
@@ -1648,7 +2119,11 @@ namespace Oxide.Plugins
             _ = CuiHelper.DestroyUi(player, LayerMain);
         }
 
-        private void AddActivityGraph(CuiElementContainer container, string parent, AdminStats stats)
+        private void AddActivityGraph(
+            CuiElementContainer container,
+            string parent,
+            AdminStats stats
+        )
         {
             const int hoursToShow = 24;
             const float graphHeight = 0.7f;
@@ -1661,8 +2136,8 @@ namespace Oxide.Plugins
             DateTime now = DateTime.Now;
 
             // Используем явный тип вместо var
-            IEnumerable<int> actionHours = stats.RecentActions
-                .Where(a => (now - a.Timestamp).TotalHours <= hoursToShow)
+            IEnumerable<int> actionHours = stats
+                .RecentActions.Where(a => (now - a.Timestamp).TotalHours <= hoursToShow)
                 .Select(a => a.Timestamp.Hour);
 
             foreach (int hour in actionHours)
@@ -1678,17 +2153,31 @@ namespace Oxide.Plugins
             int maxActions = hourlyActivity.Values.Count > 0 ? hourlyActivity.Values.Max() : 1;
 
             // Рисуем оси
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = $"{startX} {startY}", AnchorMax = $"{startX + 0.01f} {startY + graphHeight}" },
-                Image = { Color = "0.3 0.3 0.3 1" }
-            }, parent);
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform =
+                    {
+                        AnchorMin = $"{startX} {startY}",
+                        AnchorMax = $"{startX + 0.01f} {startY + graphHeight}",
+                    },
+                    Image = { Color = "0.3 0.3 0.3 1" },
+                },
+                parent
+            );
 
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = $"{startX} {startY}", AnchorMax = $"{startX + graphWidth} {startY + 0.01f}" },
-                Image = { Color = "0.3 0.3 0.3 1" }
-            }, parent);
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform =
+                    {
+                        AnchorMin = $"{startX} {startY}",
+                        AnchorMax = $"{startX + graphWidth} {startY + 0.01f}",
+                    },
+                    Image = { Color = "0.3 0.3 0.3 1" },
+                },
+                parent
+            );
 
             // Рисуем столбцы графика
             const float barWidth = graphWidth / hoursToShow;
@@ -1700,33 +2189,43 @@ namespace Oxide.Plugins
 
                 if (barHeight > 0)
                 {
-                    _ = container.Add(new CuiPanel
-                    {
-                        RectTransform = {
-                            AnchorMin = $"{startX + (i * barWidth)} {startY}",
-                            AnchorMax = $"{startX + ((i + 1) * barWidth) - 0.005f} {startY + barHeight}"
+                    _ = container.Add(
+                        new CuiPanel
+                        {
+                            RectTransform =
+                            {
+                                AnchorMin = $"{startX + (i * barWidth)} {startY}",
+                                AnchorMax =
+                                    $"{startX + ((i + 1) * barWidth) - 0.005f} {startY + barHeight}",
+                            },
+                            Image = { Color = "0.18 0.8 0.44 0.8" },
                         },
-                        Image = { Color = "0.18 0.8 0.44 0.8" }
-                    }, parent);
+                        parent
+                    );
                 }
 
                 // Добавляем метки времени
                 if (i % 4 == 0)
                 {
-                    _ = container.Add(new CuiLabel
-                    {
-                        RectTransform = {
-                            AnchorMin = $"{startX + (i * barWidth)} {startY - 0.05f}",
-                            AnchorMax = $"{startX + ((i + 1) * barWidth)} {startY}"
+                    _ = container.Add(
+                        new CuiLabel
+                        {
+                            RectTransform =
+                            {
+                                AnchorMin = $"{startX + (i * barWidth)} {startY - 0.05f}",
+                                AnchorMax = $"{startX + ((i + 1) * barWidth)} {startY}",
+                            },
+                            Text =
+                            {
+                                Text = $"{hour:00}:00",
+                                Font = "robotocondensed-regular.ttf",
+                                FontSize = 10,
+                                Align = TextAnchor.MiddleCenter,
+                                Color = "0.7 0.7 0.7 1",
+                            },
                         },
-                        Text = {
-                            Text = $"{hour:00}:00",
-                            Font = "robotocondensed-regular.ttf",
-                            FontSize = 10,
-                            Align = TextAnchor.MiddleCenter,
-                            Color = "0.7 0.7 0.7 1"
-                        }
-                    }, parent);
+                        parent
+                    );
                 }
             }
         }
@@ -1757,15 +2256,15 @@ namespace Oxide.Plugins
         {
             return actionType.ToLower(CultureInfo.CurrentCulture) switch
             {
-                "attack" => "0.905 0.298 0.235",    // Warning/Error
-                "build" => "0.18 0.8 0.44",         // Primary
-                "destroy" => "0.902 0.494 0.133",   // Secondary
-                "command" => "0.18 0.8 0.44",       // Primary
+                "attack" => "0.905 0.298 0.235", // Warning/Error
+                "build" => "0.18 0.8 0.44", // Primary
+                "destroy" => "0.902 0.494 0.133", // Secondary
+                "command" => "0.18 0.8 0.44", // Primary
                 "violation" => "0.905 0.298 0.235", // Warning/Error
-                "login" => "0.18 0.8 0.44",         // Primary
-                "logout" => "0.584 0.647 0.651",    // Secondary text
-                "status" => "0.18 0.8 0.44",        // Primary
-                _ => "0.584 0.647 0.651"            // Secondary text
+                "login" => "0.18 0.8 0.44", // Primary
+                "logout" => "0.584 0.647 0.651", // Secondary text
+                "status" => "0.18 0.8 0.44", // Primary
+                _ => "0.584 0.647 0.651", // Secondary text
             };
         }
 
@@ -1820,7 +2319,7 @@ namespace Oxide.Plugins
                 {
                     1 => "день",
                     2 or 3 or 4 => "дня",
-                    _ => "дней"
+                    _ => "дней",
                 };
         }
 
@@ -1832,7 +2331,7 @@ namespace Oxide.Plugins
                 {
                     1 => "час",
                     2 or 3 or 4 => "часа",
-                    _ => "часов"
+                    _ => "часов",
                 };
         }
 
@@ -1844,7 +2343,7 @@ namespace Oxide.Plugins
                 {
                     1 => "минута",
                     2 or 3 or 4 => "минуты",
-                    _ => "минут"
+                    _ => "минут",
                 };
         }
 
@@ -1856,7 +2355,7 @@ namespace Oxide.Plugins
                 {
                     1 => "секунда",
                     2 or 3 or 4 => "секунды",
-                    _ => "секунд"
+                    _ => "секунд",
                 };
         }
 
@@ -1960,7 +2459,8 @@ namespace Oxide.Plugins
                 {
                     // Если в AFK:
                     // 1. Считаем активное время до начала AFK
-                    float activeTimeBeforeAfk = activity.AfkStartTime - activity.SessionStartTime - activity.TotalAfkTime;
+                    float activeTimeBeforeAfk =
+                        activity.AfkStartTime - activity.SessionStartTime - activity.TotalAfkTime;
                     if (activeTimeBeforeAfk > 0)
                     {
                         totalSeconds += activeTimeBeforeAfk;
@@ -1985,9 +2485,11 @@ namespace Oxide.Plugins
 
         private List<AdminAction> GetCachedRecentActions(ulong userId, AdminStats stats, int count)
         {
-            if (recentActionsCache.TryGetValue(userId, out List<AdminAction> cachedActions) &&
-                lastActionsCacheUpdate.TryGetValue(userId, out DateTime lastUpdate) &&
-                (DateTime.UtcNow - lastUpdate) < actionsCacheExpiration)
+            if (
+                recentActionsCache.TryGetValue(userId, out List<AdminAction> cachedActions)
+                && lastActionsCacheUpdate.TryGetValue(userId, out DateTime lastUpdate)
+                && (DateTime.UtcNow - lastUpdate) < actionsCacheExpiration
+            )
             {
                 return cachedActions.TakeLast(count).ToList();
             }
@@ -2001,12 +2503,17 @@ namespace Oxide.Plugins
         private string GetFilterButtonColor(string userId, string filterType)
         {
             string key = $"{userId}_{filterType}";
-            return filterSettings.TryGetValue(key, out string currentFilter) && currentFilter == filterType
-                ? "0.18 0.8 0.44 1"  // Active state - Primary color
+            return
+                filterSettings.TryGetValue(key, out string currentFilter)
+                && currentFilter == filterType
+                ? "0.18 0.8 0.44 1" // Active state - Primary color
                 : "0.322 0.306 0.286 1"; // Inactive state - Panel background
         }
 
-        private IEnumerable<KeyValuePair<ulong, AdminStats>> GetFilteredAdmins(string userId, Dictionary<ulong, AdminStats> admins)
+        private List<KeyValuePair<ulong, AdminStats>> GetFilteredAdmins(
+            string userId,
+            Dictionary<ulong, AdminStats> admins
+        )
         {
             IEnumerable<KeyValuePair<ulong, AdminStats>> query = admins.AsEnumerable();
 
@@ -2016,18 +2523,30 @@ namespace Oxide.Plugins
             {
                 query = statusFilter switch
                 {
-                    FilterOnline => query.Where(x => BasePlayer.FindByID(x.Key)?.IsConnected == true),
-                    FilterOffline => query.Where(x => BasePlayer.FindByID(x.Key)?.IsConnected != true),
-                    FilterAfk => query.Where(x => activeAdmins.TryGetValue(x.Key, out AdminActivity? activity) && activity.IsAfk),
-                    _ => query
+                    FilterOnline => query.Where(x =>
+                        BasePlayer.FindByID(x.Key)?.IsConnected == true
+                    ),
+                    FilterOffline => query.Where(x =>
+                        BasePlayer.FindByID(x.Key)?.IsConnected != true
+                    ),
+                    FilterAfk => query.Where(x =>
+                        activeAdmins.TryGetValue(x.Key, out AdminActivity? activity)
+                        && activity.IsAfk
+                    ),
+                    _ => query,
                 };
             }
 
             // Применяем поиск по имени
             string searchKey = $"{userId}_search";
-            if (filterSettings.TryGetValue(searchKey, out string searchText) && !string.IsNullOrEmpty(searchText))
+            if (
+                filterSettings.TryGetValue(searchKey, out string searchText)
+                && !string.IsNullOrEmpty(searchText)
+            )
             {
-                query = query.Where(x => x.Value.LastName.Contains(searchText, StringComparison.OrdinalIgnoreCase));
+                query = query.Where(x =>
+                    x.Value.LastName.Contains(searchText, StringComparison.OrdinalIgnoreCase)
+                );
             }
 
             // Применяем сортировку
@@ -2039,7 +2558,7 @@ namespace Oxide.Plugins
                     SortTimeActive => query.OrderByDescending(x => x.Value.CurrentWipeActiveTime),
                     SortTimeAfk => query.OrderByDescending(x => x.Value.CurrentWipeAfkTime),
                     SortName => query.OrderBy(x => x.Value.LastName),
-                    _ => query
+                    _ => query,
                 };
             }
 
@@ -2050,7 +2569,10 @@ namespace Oxide.Plugins
         private void CmdFilter(ConsoleSystem.Arg arg)
         {
             BasePlayer? player = arg.Player();
-            if (player == null || !permission.UserHasPermission(player.UserIDString, PermissionView))
+            if (
+                player == null
+                || !permission.UserHasPermission(player.UserIDString, PermissionView)
+            )
             {
                 return;
             }
@@ -2090,8 +2612,13 @@ namespace Oxide.Plugins
 
         private void EnsureDataFolders()
         {
-            string[] folders = { DataFolderName, $"{DataFolderName}/{AdminDataFolder}",
-                               $"{DataFolderName}/{StatsFolder}", $"{DataFolderName}/{WipeHistoryFolder}" };
+            string[] folders =
+            {
+                DataFolderName,
+                $"{DataFolderName}/{AdminDataFolder}",
+                $"{DataFolderName}/{StatsFolder}",
+                $"{DataFolderName}/{WipeHistoryFolder}",
+            };
 
             foreach (string folder in folders)
             {
@@ -2110,13 +2637,15 @@ namespace Oxide.Plugins
                 {
                     CurrentWipeStart = DateTime.Now,
                     AdminStatistics = new Dictionary<ulong, AdminStats>(),
-                    WipeHistory = new List<WipeHistory>()
+                    WipeHistory = new List<WipeHistory>(),
                 };
                 SaveData();
             }
             else
             {
-                storedData = Interface.Oxide.DataFileSystem.ReadObject<StoredData>($"{DataFolderName}/general");
+                storedData = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(
+                    $"{DataFolderName}/general"
+                );
                 storedData.AdminStatistics ??= new Dictionary<ulong, AdminStats>();
             }
         }
@@ -2128,7 +2657,11 @@ namespace Oxide.Plugins
                 return;
             }
 
-            foreach (string file in Interface.Oxide.DataFileSystem.GetFiles($"{DataFolderName}/{AdminDataFolder}"))
+            foreach (
+                string file in Interface.Oxide.DataFileSystem.GetFiles(
+                    $"{DataFolderName}/{AdminDataFolder}"
+                )
+            )
             {
                 if (!file.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
                 {
@@ -2141,43 +2674,96 @@ namespace Oxide.Plugins
                 if (ulong.TryParse(fileName, out ulong adminId))
                 {
                     string fullPath = $"{DataFolderName}/{AdminDataFolder}/{fileName}";
-                    Dictionary<string, object> savedData = Interface.Oxide.DataFileSystem.ReadObject<Dictionary<string, object>>(fullPath);
+                    Dictionary<string, object> savedData =
+                        Interface.Oxide.DataFileSystem.ReadObject<Dictionary<string, object>>(
+                            fullPath
+                        );
 
                     if (savedData != null)
                     {
                         storedData.AdminStatistics[adminId] = new()
                         {
                             LastName = savedData["LastName"]?.ToString() ?? "Unknown",
-                            TotalActiveTime = Convert.ToSingle(savedData["TotalActiveTime"], CultureInfo.InvariantCulture),
-                            TotalAfkTime = Convert.ToSingle(savedData["TotalAfkTime"], CultureInfo.InvariantCulture),
-                            CurrentWipeActiveTime = Convert.ToSingle(savedData["CurrentWipeActiveTime"], CultureInfo.InvariantCulture),
-                            CurrentWipeAfkTime = Convert.ToSingle(savedData["CurrentWipeAfkTime"], CultureInfo.InvariantCulture),
-                            LastActive = DateTime.Parse(savedData["LastActive"]?.ToString() ?? DateTime.Now.ToString(CultureInfo.InvariantCulture), CultureInfo.InvariantCulture),
-                            CommandsUsed = JsonConvert.DeserializeObject<Dictionary<string, int>>(savedData["CommandsUsed"]?.ToString() ?? "{}"),
-                            RecentActions = JsonConvert.DeserializeObject<List<AdminAction>>(savedData["RecentActions"]?.ToString() ?? "[]")
+                            TotalActiveTime = Convert.ToSingle(
+                                savedData["TotalActiveTime"],
+                                CultureInfo.InvariantCulture
+                            ),
+                            TotalAfkTime = Convert.ToSingle(
+                                savedData["TotalAfkTime"],
+                                CultureInfo.InvariantCulture
+                            ),
+                            CurrentWipeActiveTime = Convert.ToSingle(
+                                savedData["CurrentWipeActiveTime"],
+                                CultureInfo.InvariantCulture
+                            ),
+                            CurrentWipeAfkTime = Convert.ToSingle(
+                                savedData["CurrentWipeAfkTime"],
+                                CultureInfo.InvariantCulture
+                            ),
+                            LastActive = DateTime.Parse(
+                                savedData["LastActive"]?.ToString()
+                                    ?? DateTime.Now.ToString(CultureInfo.InvariantCulture),
+                                CultureInfo.InvariantCulture
+                            ),
+                            CommandsUsed = JsonConvert.DeserializeObject<Dictionary<string, int>>(
+                                savedData["CommandsUsed"]?.ToString() ?? "{}"
+                            ),
+                            RecentActions = JsonConvert.DeserializeObject<List<AdminAction>>(
+                                savedData["RecentActions"]?.ToString() ?? "[]"
+                            ),
                         };
 
                         // Восстанавливаем сессию если игрок был онлайн
                         object currentSession = savedData["CurrentSession"];
-                        if (currentSession != null && Convert.ToBoolean(savedData["IsOnline"], CultureInfo.InvariantCulture))
+                        if (
+                            currentSession != null
+                            && Convert.ToBoolean(
+                                savedData["IsOnline"],
+                                CultureInfo.InvariantCulture
+                            )
+                        )
                         {
-                            Dictionary<string, object> sessionData = JsonConvert.DeserializeObject<Dictionary<string, object>>(currentSession.ToString() ?? "{}");
+                            Dictionary<string, object> sessionData = JsonConvert.DeserializeObject<
+                                Dictionary<string, object>
+                            >(currentSession.ToString() ?? "{}");
                             BasePlayer? player = BasePlayer.FindByID(adminId);
 
                             if (player?.IsConnected == true)
                             {
                                 activeAdmins[adminId] = new AdminActivity
                                 {
-                                    SessionStartTime = Convert.ToSingle(sessionData["SessionStartTime"], CultureInfo.InvariantCulture),
-                                    LastActiveTime = Convert.ToSingle(sessionData["LastActiveTime"], CultureInfo.InvariantCulture),
-                                    TotalAfkTime = Convert.ToSingle(sessionData["TotalAfkTime"], CultureInfo.InvariantCulture),
-                                    IsAfk = Convert.ToBoolean(sessionData["IsAfk"], CultureInfo.InvariantCulture),
-                                    LastPosition = JsonConvert.DeserializeObject<Vector3>(sessionData["LastPosition"]?.ToString() ?? /*lang=json*/ "{'x':0,'y':0,'z':0}"),
-                                    AfkStartTime = Convert.ToSingle(sessionData["AfkStartTime"], CultureInfo.InvariantCulture)
+                                    SessionStartTime = Convert.ToSingle(
+                                        sessionData["SessionStartTime"],
+                                        CultureInfo.InvariantCulture
+                                    ),
+                                    LastActiveTime = Convert.ToSingle(
+                                        sessionData["LastActiveTime"],
+                                        CultureInfo.InvariantCulture
+                                    ),
+                                    TotalAfkTime = Convert.ToSingle(
+                                        sessionData["TotalAfkTime"],
+                                        CultureInfo.InvariantCulture
+                                    ),
+                                    IsAfk = Convert.ToBoolean(
+                                        sessionData["IsAfk"],
+                                        CultureInfo.InvariantCulture
+                                    ),
+                                    LastPosition = JsonConvert.DeserializeObject<Vector3>(
+                                        sessionData["LastPosition"]?.ToString()
+                                            ?? /*lang=json*/
+                                            "{'x':0,'y':0,'z':0}"
+                                    ),
+                                    AfkStartTime = Convert.ToSingle(
+                                        sessionData["AfkStartTime"],
+                                        CultureInfo.InvariantCulture
+                                    ),
                                 };
 
                                 // Запускаем таймер проверки активности
-                                activityTimers[adminId] = timer.Every(checkInterval, () => CheckActivity(player));
+                                activityTimers[adminId] = timer.Every(
+                                    checkInterval,
+                                    () => CheckActivity(player)
+                                );
                             }
                         }
                     }
@@ -2192,7 +2778,11 @@ namespace Oxide.Plugins
                 return;
             }
 
-            foreach (string file in Interface.Oxide.DataFileSystem.GetFiles($"{DataFolderName}/{WipeHistoryFolder}"))
+            foreach (
+                string file in Interface.Oxide.DataFileSystem.GetFiles(
+                    $"{DataFolderName}/{WipeHistoryFolder}"
+                )
+            )
             {
                 if (!file.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
                 {
@@ -2202,15 +2792,22 @@ namespace Oxide.Plugins
                 string[] fileParts = file.Split('/');
                 string fileName = fileParts[fileParts.Length - 1].Replace(".json", "");
                 string fullPath = $"{DataFolderName}/{WipeHistoryFolder}/{fileName}";
-                WipeHistory? wipeData = Interface.Oxide.DataFileSystem.ReadObject<WipeHistory>(fullPath);
-                if (wipeData != null && !storedData.WipeHistory.Any(w => w.StartDate == wipeData.StartDate))
+                WipeHistory? wipeData = Interface.Oxide.DataFileSystem.ReadObject<WipeHistory>(
+                    fullPath
+                );
+                if (
+                    wipeData != null
+                    && !storedData.WipeHistory.Any(w => w.StartDate == wipeData.StartDate)
+                )
                 {
                     storedData.WipeHistory.Add(wipeData);
                 }
             }
 
             // Сортируем историю вайпов по дате
-            storedData.WipeHistory = storedData.WipeHistory.OrderByDescending(w => w.StartDate).ToList();
+            storedData.WipeHistory = storedData
+                .WipeHistory.OrderByDescending(w => w.StartDate)
+                .ToList();
         }
 
         private void SaveData()
@@ -2257,57 +2854,71 @@ namespace Oxide.Plugins
 
         private void SaveAdminData(ulong adminId)
         {
-            if (storedData?.AdminStatistics == null || !storedData.AdminStatistics.TryGetValue(adminId, out AdminStats? stats))
+            if (
+                storedData?.AdminStatistics == null
+                || !storedData.AdminStatistics.TryGetValue(adminId, out AdminStats? stats)
+            )
             {
                 return;
             }
 
             // Сохраняем полные данные в JSON
             string path = $"{DataFolderName}/{AdminDataFolder}/{adminId}";
-            Interface.Oxide.DataFileSystem.WriteObject(path, new
-            {
-                stats.LastName,
-                stats.TotalActiveTime,
-                stats.TotalAfkTime,
-                stats.CurrentWipeActiveTime,
-                stats.CurrentWipeAfkTime,
-                stats.CommandsUsed,
-                stats.RecentActions,
-                stats.LastActive,
-                SaveTime = DateTime.Now,
-                IsOnline = BasePlayer.FindByID(adminId)?.IsConnected == true,
-                CurrentSession = activeAdmins.TryGetValue(adminId, out AdminActivity activity) ? new
+            Interface.Oxide.DataFileSystem.WriteObject(
+                path,
+                new
                 {
-                    activity.SessionStartTime,
-                    activity.LastActiveTime,
-                    activity.TotalAfkTime,
-                    activity.IsAfk,
-                    activity.LastPosition,
-                    activity.AfkStartTime
-                } : null
-            });
+                    stats.LastName,
+                    stats.TotalActiveTime,
+                    stats.TotalAfkTime,
+                    stats.CurrentWipeActiveTime,
+                    stats.CurrentWipeAfkTime,
+                    stats.CommandsUsed,
+                    stats.RecentActions,
+                    stats.LastActive,
+                    SaveTime = DateTime.Now,
+                    IsOnline = BasePlayer.FindByID(adminId)?.IsConnected == true,
+                    CurrentSession = activeAdmins.TryGetValue(adminId, out AdminActivity activity)
+                        ? new
+                        {
+                            activity.SessionStartTime,
+                            activity.LastActiveTime,
+                            activity.TotalAfkTime,
+                            activity.IsAfk,
+                            activity.LastPosition,
+                            activity.AfkStartTime,
+                        }
+                        : null,
+                }
+            );
 
             // Сохраняем текущую статистику в отдельный файл для удобства просмотра
             string currentStatsPath = $"{DataFolderName}/{StatsFolder}/{adminId}_current";
-            Interface.Oxide.DataFileSystem.WriteObject(currentStatsPath, new
-            {
-                AdminName = stats.LastName,
-                ActiveTime = FormatTime(stats.CurrentWipeActiveTime),
-                AfkTime = FormatTime(stats.CurrentWipeAfkTime),
-                LastActive = FormatDateTime(stats.LastActive),
-                CommandsUsed = stats.CommandsUsed.OrderByDescending(x => x.Value)
-                    .Take(10)
-                    .ToDictionary(x => x.Key, x => x.Value),
-                RecentActions = stats.RecentActions.TakeLast(10)
-                    .Select(a => new
-                    {
-                        Time = a.Timestamp.ToString("HH:mm:ss", CultureInfo.InvariantCulture),
-                        Type = a.ActionType,
-                        a.Details,
-                        a.Target,
-                        Location = $"({Math.Round(a.Location.x)}, {Math.Round(a.Location.y)}, {Math.Round(a.Location.z)})"
-                    }).ToList()
-            });
+            Interface.Oxide.DataFileSystem.WriteObject(
+                currentStatsPath,
+                new
+                {
+                    AdminName = stats.LastName,
+                    ActiveTime = FormatTime(stats.CurrentWipeActiveTime),
+                    AfkTime = FormatTime(stats.CurrentWipeAfkTime),
+                    LastActive = FormatDateTime(stats.LastActive),
+                    CommandsUsed = stats
+                        .CommandsUsed.OrderByDescending(x => x.Value)
+                        .Take(10)
+                        .ToDictionary(x => x.Key, x => x.Value),
+                    RecentActions = stats
+                        .RecentActions.TakeLast(10)
+                        .Select(a => new
+                        {
+                            Time = a.Timestamp.ToString("HH:mm:ss", CultureInfo.InvariantCulture),
+                            Type = a.ActionType,
+                            a.Details,
+                            a.Target,
+                            Location = $"({Math.Round(a.Location.x)}, {Math.Round(a.Location.y)}, {Math.Round(a.Location.z)})",
+                        })
+                        .ToList(),
+                }
+            );
         }
 
         private void SaveWipeHistory()
@@ -2336,7 +2947,9 @@ namespace Oxide.Plugins
             _ = summary.AppendLine("=== Статистика AdminMonitor ===");
             _ = summary.AppendLine($"Всего администраторов: {storedData.AdminStatistics.Count}");
             _ = summary.AppendLine($"История вайпов: {storedData.WipeHistory.Count}");
-            _ = summary.AppendLine($"Текущий вайп начался: {storedData.CurrentWipeStart:dd.MM.yyyy HH:mm}");
+            _ = summary.AppendLine(
+                $"Текущий вайп начался: {storedData.CurrentWipeStart:dd.MM.yyyy HH:mm}"
+            );
             _ = summary.AppendLine("===========================");
 
             Puts(summary.ToString());
@@ -2344,7 +2957,12 @@ namespace Oxide.Plugins
         #endregion Data Management
 
         #region Reports
-        private void GenerateReport(BasePlayer? player, string reportType, DateTime startDate, DateTime endDate)
+        private void GenerateReport(
+            BasePlayer? player,
+            string reportType,
+            DateTime startDate,
+            DateTime endDate
+        )
         {
             if (storedData == null)
             {
@@ -2355,7 +2973,7 @@ namespace Oxide.Plugins
             {
                 GenerationDate = DateTime.Now,
                 ReportType = reportType,
-                Period = $"{startDate:dd.MM.yyyy} - {endDate:dd.MM.yyyy}"
+                Period = $"{startDate:dd.MM.yyyy} - {endDate:dd.MM.yyyy}",
             };
 
             foreach (KeyValuePair<ulong, AdminStats> kvp in storedData.AdminStatistics)
@@ -2365,12 +2983,14 @@ namespace Oxide.Plugins
                     AdminName = kvp.Value.LastName,
                     ActiveTime = kvp.Value.CurrentWipeActiveTime,
                     AfkTime = kvp.Value.CurrentWipeAfkTime,
-                    CommandsUsed = kvp.Value.CommandsUsed.Values.Sum()
+                    CommandsUsed = kvp.Value.CommandsUsed.Values.Sum(),
                 };
 
                 // Анализируем действия за период
-                IEnumerable<string> actionTypes = kvp.Value.RecentActions
-                    .Where(a => a.Timestamp >= startDate && a.Timestamp <= endDate)
+                IEnumerable<string> actionTypes = kvp
+                    .Value.RecentActions.Where(a =>
+                        a.Timestamp >= startDate && a.Timestamp <= endDate
+                    )
                     .Select(action =>
                     {
                         switch (action.ActionType.ToLower(CultureInfo.CurrentCulture))
@@ -2408,7 +3028,10 @@ namespace Oxide.Plugins
 
             // Сохраняем отчет
             string fileName = $"report_{startDate:yyyyMMdd}_{endDate:yyyyMMdd}_{reportType}.json";
-            Interface.Oxide.DataFileSystem.WriteObject($"{DataFolderName}/{ReportsFolderName}/{fileName}", report);
+            Interface.Oxide.DataFileSystem.WriteObject(
+                $"{DataFolderName}/{ReportsFolderName}/{fileName}",
+                report
+            );
 
             // Отправляем уведомление
             if (player != null)
@@ -2426,13 +3049,19 @@ namespace Oxide.Plugins
             _ = message.AppendLine($"Тип отчета: {report.ReportType}");
             _ = message.AppendLine("----------------------------------------");
 
-            foreach (AdminReportStats stats in report.Statistics.OrderByDescending(x => x.Value.ActiveTime).Select(kvp => kvp.Value))
+            foreach (
+                AdminReportStats stats in report
+                    .Statistics.OrderByDescending(x => x.Value.ActiveTime)
+                    .Select(kvp => kvp.Value)
+            )
             {
                 float totalTime = stats.ActiveTime + stats.AfkTime;
                 float activePercentage = totalTime > 0 ? stats.ActiveTime / totalTime * 100 : 0;
 
                 _ = message.AppendLine($"\nАдминистратор: {stats.AdminName}");
-                _ = message.AppendLine($"Активное время: {FormatTime(stats.ActiveTime)} ({activePercentage:F1}%)");
+                _ = message.AppendLine(
+                    $"Активное время: {FormatTime(stats.ActiveTime)} ({activePercentage:F1}%)"
+                );
                 _ = message.AppendLine($"Время AFK: {FormatTime(stats.AfkTime)}");
                 _ = message.AppendLine($"Использовано команд: {stats.CommandsUsed}");
                 _ = message.AppendLine($"Построено объектов: {stats.BuildActions}");
@@ -2442,7 +3071,11 @@ namespace Oxide.Plugins
                 if (stats.ActionTypes.Count > 0)
                 {
                     _ = message.AppendLine("\nТипы действий:");
-                    foreach (KeyValuePair<string, int> action in stats.ActionTypes.OrderByDescending(x => x.Value))
+                    foreach (
+                        KeyValuePair<string, int> action in stats.ActionTypes.OrderByDescending(x =>
+                            x.Value
+                        )
+                    )
                     {
                         _ = message.AppendLine($"- {action.Key}: {action.Value}");
                     }
@@ -2456,7 +3089,10 @@ namespace Oxide.Plugins
         private void CmdGenerateReport(ConsoleSystem.Arg arg)
         {
             BasePlayer? player = arg.Player();
-            if (player != null && !permission.UserHasPermission(player.UserIDString, PermissionReports))
+            if (
+                player != null
+                && !permission.UserHasPermission(player.UserIDString, PermissionReports)
+            )
             {
                 arg.ReplyWith("У вас нет прав для генерации отчетов.");
                 return;
@@ -2469,7 +3105,7 @@ namespace Oxide.Plugins
                 "daily" => endDate.AddDays(-1),
                 "weekly" => endDate.AddDays(-7),
                 "monthly" => endDate.AddMonths(-1),
-                _ => endDate.AddDays(-1)
+                _ => endDate.AddDays(-1),
             };
 
             GenerateReport(player, reportType, startDate, endDate);
@@ -2478,22 +3114,32 @@ namespace Oxide.Plugins
         private void ScheduleReports()
         {
             // Ежедневный отчет в 00:00
-            _ = timer.Every(86400, () =>
-            {
-                if (DateTime.Now.Hour == 0 && DateTime.Now.Minute == 0)
+            _ = timer.Every(
+                86400,
+                () =>
                 {
-                    GenerateReport(null, "daily", DateTime.Now.AddDays(-1), DateTime.Now);
+                    if (DateTime.Now.Hour == 0 && DateTime.Now.Minute == 0)
+                    {
+                        GenerateReport(null, "daily", DateTime.Now.AddDays(-1), DateTime.Now);
+                    }
                 }
-            });
+            );
 
             // Еженедельный отчет в воскресенье
-            _ = timer.Every(86400, () =>
-            {
-                if (DateTime.Now.DayOfWeek == DayOfWeek.Sunday && DateTime.Now.Hour == 0 && DateTime.Now.Minute == 0)
+            _ = timer.Every(
+                86400,
+                () =>
                 {
-                    GenerateReport(null, "weekly", DateTime.Now.AddDays(-7), DateTime.Now);
+                    if (
+                        DateTime.Now.DayOfWeek == DayOfWeek.Sunday
+                        && DateTime.Now.Hour == 0
+                        && DateTime.Now.Minute == 0
+                    )
+                    {
+                        GenerateReport(null, "weekly", DateTime.Now.AddDays(-7), DateTime.Now);
+                    }
                 }
-            });
+            );
         }
         #endregion Reports
 
@@ -2512,12 +3158,30 @@ namespace Oxide.Plugins
                 color = 3066993, // Зеленый цвет
                 fields = new[]
                 {
-                    new { name = "📝 Информация", value = $"**SteamID:** {player.UserIDString}\n**IP:** {player.net?.connection?.ipaddress}\n**Клиент:** {player.net?.connection?.os}", inline = false },
-                    new { name = "📍 Локация", value = $"**Координаты:** {Math.Round(player.transform.position.x)}, {Math.Round(player.transform.position.y)}, {Math.Round(player.transform.position.z)}", inline = false },
-                    new { name = "⏰ Время входа", value = $"{DateTime.Now:dd.MM.yyyy HH:mm:ss}", inline = false }
+                    new
+                    {
+                        name = "📝 Информация",
+                        value = $"**SteamID:** {player.UserIDString}\n**IP:** {player.net?.connection?.ipaddress}\n**Клиент:** {player.net?.connection?.os}",
+                        inline = false,
+                    },
+                    new
+                    {
+                        name = "📍 Локация",
+                        value = $"**Координаты:** {Math.Round(player.transform.position.x)}, {Math.Round(player.transform.position.y)}, {Math.Round(player.transform.position.z)}",
+                        inline = false,
+                    },
+                    new
+                    {
+                        name = "⏰ Время входа",
+                        value = $"{DateTime.Now:dd.MM.yyyy HH:mm:ss}",
+                        inline = false,
+                    },
                 },
-                thumbnail = new { url = $"https://steamcdn-a.akamaihd.net/steamcommunity/public/images/avatars//{player.UserIDString}" },
-                timestamp = DateTime.UtcNow.ToString("o")
+                thumbnail = new
+                {
+                    url = $"https://steamcdn-a.akamaihd.net/steamcommunity/public/images/avatars//{player.UserIDString}",
+                },
+                timestamp = DateTime.UtcNow.ToString("o"),
             };
 
             SendDiscordEmbed(embed);
@@ -2525,7 +3189,11 @@ namespace Oxide.Plugins
 
         private void SendDiscordLogoutMessage(BasePlayer player)
         {
-            if (string.IsNullOrEmpty(DiscordWebhookUrl) || player == null || storedData?.AdminStatistics == null)
+            if (
+                string.IsNullOrEmpty(DiscordWebhookUrl)
+                || player == null
+                || storedData?.AdminStatistics == null
+            )
             {
                 return;
             }
@@ -2555,13 +3223,15 @@ namespace Oxide.Plugins
             }
 
             // Собираем статистику действий за последние 24 часа
-            Dictionary<string, int> actionStats = stats.RecentActions
-                .Where(a => a.Timestamp >= DateTime.Now.AddHours(-24))
+            Dictionary<string, int> actionStats = stats
+                .RecentActions.Where(a => a.Timestamp >= DateTime.Now.AddHours(-24))
                 .GroupBy(a => a.ActionType)
                 .ToDictionary(g => g.Key, g => g.Count());
 
-            string activityField = string.Join("\n", actionStats.Select(kvp =>
-                $"{GetActionEmoji(kvp.Key)} **{kvp.Key}:** {kvp.Value}"));
+            string activityField = string.Join(
+                "\n",
+                actionStats.Select(kvp => $"{GetActionEmoji(kvp.Key)} **{kvp.Key}:** {kvp.Value}")
+            );
 
             if (string.IsNullOrEmpty(activityField))
             {
@@ -2575,19 +3245,46 @@ namespace Oxide.Plugins
                 color = 15158332, // Красный цвет
                 fields = new[]
                 {
-                    new { name = "📝 Информация", value = $"**SteamID:** {player.UserIDString}\n**Последняя локация:** {Math.Round(player.transform.position.x)}, {Math.Round(player.transform.position.y)}, {Math.Round(player.transform.position.z)}", inline = false },
-                    new { name = "⏱ Статистика сессии", value = $"**Активное время:** {FormatTime(totalActiveTime)}\n**Время AFK:** {FormatTime(totalAfkTime)}", inline = false },
-                    new { name = "📊 Действия за 24 часа", value = activityField, inline = false },
-                    new { name = "⏰ Время выхода", value = $"{DateTime.Now:dd.MM.yyyy HH:mm:ss}", inline = false }
+                    new
+                    {
+                        name = "📝 Информация",
+                        value = $"**SteamID:** {player.UserIDString}\n**Последняя локация:** {Math.Round(player.transform.position.x)}, {Math.Round(player.transform.position.y)}, {Math.Round(player.transform.position.z)}",
+                        inline = false,
+                    },
+                    new
+                    {
+                        name = "⏱ Статистика сессии",
+                        value = $"**Активное время:** {FormatTime(totalActiveTime)}\n**Время AFK:** {FormatTime(totalAfkTime)}",
+                        inline = false,
+                    },
+                    new
+                    {
+                        name = "📊 Действия за 24 часа",
+                        value = activityField,
+                        inline = false,
+                    },
+                    new
+                    {
+                        name = "⏰ Время выхода",
+                        value = $"{DateTime.Now:dd.MM.yyyy HH:mm:ss}",
+                        inline = false,
+                    },
                 },
-                thumbnail = new { url = $"https://steamcdn-a.akamaihd.net/steamcommunity/public/images/avatars//{player.UserIDString}" },
-                timestamp = DateTime.UtcNow.ToString("o")
+                thumbnail = new
+                {
+                    url = $"https://steamcdn-a.akamaihd.net/steamcommunity/public/images/avatars//{player.UserIDString}",
+                },
+                timestamp = DateTime.UtcNow.ToString("o"),
             };
 
             SendDiscordEmbed(embed);
         }
 
-        private void SendDiscordStatusChangeMessage(BasePlayer player, bool isAfk, float duration = 0)
+        private void SendDiscordStatusChangeMessage(
+            BasePlayer player,
+            bool isAfk,
+            float duration = 0
+        )
         {
             if (string.IsNullOrEmpty(DiscordWebhookUrl) || player == null)
             {
@@ -2596,20 +3293,35 @@ namespace Oxide.Plugins
 
             object embed = new
             {
-                title = isAfk ? "💤 Администратор перешел в AFK" : "✅ Администратор вернулся из AFK",
+                title = isAfk
+                    ? "💤 Администратор перешел в AFK"
+                    : "✅ Администратор вернулся из AFK",
                 description = isAfk
                     ? $"Администратор **{player.displayName}** перешел в режим AFK"
                     : $"Администратор **{player.displayName}** вернулся из AFK",
                 color = isAfk ? 16776960 : 3066993, // Желтый для AFK, зеленый для возвращения
                 fields = new[]
                 {
-                    new { name = "📝 Информация", value = $"**SteamID:** {player.UserIDString}\n**Локация:** {Math.Round(player.transform.position.x)}, {Math.Round(player.transform.position.y)}, {Math.Round(player.transform.position.z)}", inline = false },
-                    new { name = "⏱ Время", value = isAfk
-                        ? $"**Начало AFK:** {DateTime.Now:dd.MM.yyyy HH:mm:ss}"
-                        : $"**Длительность AFK:** {FormatTime(duration)}\n**Время возвращения:** {DateTime.Now:dd.MM.yyyy HH:mm:ss}", inline = false }
+                    new
+                    {
+                        name = "📝 Информация",
+                        value = $"**SteamID:** {player.UserIDString}\n**Локация:** {Math.Round(player.transform.position.x)}, {Math.Round(player.transform.position.y)}, {Math.Round(player.transform.position.z)}",
+                        inline = false,
+                    },
+                    new
+                    {
+                        name = "⏱ Время",
+                        value = isAfk
+                            ? $"**Начало AFK:** {DateTime.Now:dd.MM.yyyy HH:mm:ss}"
+                            : $"**Длительность AFK:** {FormatTime(duration)}\n**Время возвращения:** {DateTime.Now:dd.MM.yyyy HH:mm:ss}",
+                        inline = false,
+                    },
                 },
-                thumbnail = new { url = $"https://steamcdn-a.akamaihd.net/steamcommunity/public/images/avatars//{player.UserIDString}" },
-                timestamp = DateTime.UtcNow.ToString("o")
+                thumbnail = new
+                {
+                    url = $"https://steamcdn-a.akamaihd.net/steamcommunity/public/images/avatars//{player.UserIDString}",
+                },
+                timestamp = DateTime.UtcNow.ToString("o"),
             };
 
             SendDiscordEmbed(embed);
@@ -2617,16 +3329,22 @@ namespace Oxide.Plugins
 
         private void SendDiscordEmbed(object embed)
         {
-            webrequest.Enqueue(DiscordWebhookUrl,
+            webrequest.Enqueue(
+                DiscordWebhookUrl,
                 JsonConvert.SerializeObject(new { embeds = new[] { embed } }),
                 (code, response) =>
                 {
                     if (code != 204)
                     {
-                        PrintError($"Failed to send Discord message. Code: {code}, Response: {response}");
+                        PrintError(
+                            $"Failed to send Discord message. Code: {code}, Response: {response}"
+                        );
                     }
-                }, this, Core.Libraries.RequestMethod.POST,
-                new Dictionary<string, string> { ["Content-Type"] = "application/json" });
+                },
+                this,
+                Core.Libraries.RequestMethod.POST,
+                new Dictionary<string, string> { ["Content-Type"] = "application/json" }
+            );
         }
 
         private string GetActionEmoji(string actionType)
@@ -2641,7 +3359,7 @@ namespace Oxide.Plugins
                 "login" => "➡️",
                 "logout" => "⬅️",
                 "status" => "📊",
-                _ => "📌"
+                _ => "📌",
             };
         }
         #endregion Discord Integration
@@ -2657,26 +3375,45 @@ namespace Oxide.Plugins
             CuiElementContainer container = new();
 
             // Основной фон с новым цветом
-            _ = container.Add(new CuiPanel
-            {
-                CursorEnabled = true,
-                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
-                Image = { Color = "0.235 0.227 0.204 0.95", Material = "assets/content/ui/uibackgroundblur-ingame.mat" } // #3c3a34
-            }, "Overlay", LayerMain);
+            _ = container.Add(
+                new CuiPanel
+                {
+                    CursorEnabled = true,
+                    RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
+                    Image =
+                    {
+                        Color = "0.235 0.227 0.204 0.95",
+                        Material = "assets/content/ui/uibackgroundblur-ingame.mat",
+                    }, // #3c3a34
+                },
+                "Overlay",
+                LayerMain
+            );
 
             // Градиентный фон
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
-                Image = { Color = "0.235 0.227 0.204 0.7", Sprite = "assets/content/ui/ui.background.transparent.radial.psd" } // #3c3a34 с прозрачностью
-            }, LayerMain);
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1" },
+                    Image =
+                    {
+                        Color = "0.235 0.227 0.204 0.7",
+                        Sprite = "assets/content/ui/ui.background.transparent.radial.psd",
+                    }, // #3c3a34 с прозрачностью
+                },
+                LayerMain
+            );
 
             // Основная панель контента с новым цветом
-            _ = container.Add(new CuiPanel
-            {
-                RectTransform = { AnchorMin = "0.1 0.1", AnchorMax = "0.9 0.9" },
-                Image = { Color = "0.322 0.306 0.286 1" } // #524e49
-            }, LayerMain, LayerContent);
+            _ = container.Add(
+                new CuiPanel
+                {
+                    RectTransform = { AnchorMin = "0.1 0.1", AnchorMax = "0.9 0.9" },
+                    Image = { Color = "0.322 0.306 0.286 1" }, // #524e49
+                },
+                LayerMain,
+                LayerContent
+            );
 
             return container;
         }
