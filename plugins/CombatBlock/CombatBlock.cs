@@ -279,7 +279,11 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (entity is BasePlayer victim && info.Initiator is BasePlayer attacker && victim != attacker)
+            if (
+                entity is BasePlayer victim
+                && info.Initiator is BasePlayer attacker
+                && victim != attacker
+            )
             {
                 if (config.BlockOnReceiveDamage)
                 {
@@ -328,7 +332,12 @@ namespace Oxide.Plugins
                             // Проверяем наличие UI и активного блока
                             object? hasUI = plugin.RaidBlock.Call("HasRaidBlockUI", player.userID);
                             object? hasBlock = plugin.RaidBlock.Call("HasRaidBlock", player.userID);
-                            if (hasUI is bool hasUIValue && hasBlock is bool hasBlockValue && hasUIValue && hasBlockValue)
+                            if (
+                                hasUI is bool hasUIValue
+                                && hasBlock is bool hasBlockValue
+                                && hasUIValue
+                                && hasBlockValue
+                            )
                             {
                                 hasRaidBlock = true;
                             }
@@ -379,11 +388,7 @@ namespace Oxide.Plugins
                         new CuiPanel
                         {
                             Image = { Color = "0.97 0.92 0.88 0.16" },
-                            RectTransform =
-                            {
-                                AnchorMin = anchorMin,
-                                AnchorMax = anchorMax,
-                            },
+                            RectTransform = { AnchorMin = anchorMin, AnchorMax = anchorMax },
                             CursorEnabled = false,
                         },
                         "Hud",
@@ -425,11 +430,7 @@ namespace Oxide.Plugins
                         new CuiPanel
                         {
                             Image = { Color = "0.97 0.92 0.88 0.16" },
-                            RectTransform =
-                            {
-                                AnchorMin = anchorMin,
-                                AnchorMax = anchorMax,
-                            },
+                            RectTransform = { AnchorMin = anchorMin, AnchorMax = anchorMax },
                             CursorEnabled = false,
                         },
                         "Hud",

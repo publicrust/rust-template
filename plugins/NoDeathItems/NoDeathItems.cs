@@ -30,13 +30,14 @@ namespace Oxide.Plugins
             List<Item> items = new();
             _ = player.inventory.GetAllItems(items);
 
-            items.Where(item => BlockedItems.Contains(item.info.shortname))
-                 .ToList()
-                 .ForEach(item =>
-                 {
-                     item.RemoveFromContainer();
-                     item.Remove();
-                 });
+            items
+                .Where(item => BlockedItems.Contains(item.info.shortname))
+                .ToList()
+                .ForEach(item =>
+                {
+                    item.RemoveFromContainer();
+                    item.Remove();
+                });
 
             return null;
         }

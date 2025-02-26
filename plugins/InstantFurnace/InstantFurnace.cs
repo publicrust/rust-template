@@ -8,11 +8,6 @@ namespace Oxide.Plugins
         #region Configuration
         private PluginConfig config = null!;
 
-        private void Init()
-        {
-            PrintWarning("[InstantFurnace] Plugin created by fakerplayers");
-        }
-
         protected override void LoadDefaultConfig()
         {
             config = new PluginConfig();
@@ -66,13 +61,6 @@ namespace Oxide.Plugins
         private void OnServerInitialized(bool initial)
         {
             permission.RegisterPermission(UsePermission, this);
-
-            if (config.InstantSmeltingFurnace || config.InstantSmeltingElectricFurnace ||
-                config.InstantSmeltingLargeFurnace || config.InstantSmeltingCampfire)
-            {
-                LogToFile("startup", "Моментальная плавка включена", this);
-                PrintWarning("Instant smelting enabled");
-            }
         }
         #endregion Initialization
 
@@ -104,10 +92,12 @@ namespace Oxide.Plugins
             bool shouldProcess = oven switch
             {
                 BaseOven when oven.ShortPrefabName == "furnace" => config.InstantSmeltingFurnace,
-                BaseOven when oven.ShortPrefabName == "electric.furnace" => config.InstantSmeltingElectricFurnace,
-                BaseOven when oven.ShortPrefabName == "furnace.large" => config.InstantSmeltingLargeFurnace,
+                BaseOven when oven.ShortPrefabName == "electric.furnace" =>
+                    config.InstantSmeltingElectricFurnace,
+                BaseOven when oven.ShortPrefabName == "furnace.large" =>
+                    config.InstantSmeltingLargeFurnace,
                 BaseOven when oven.ShortPrefabName == "campfire" => config.InstantSmeltingCampfire,
-                _ => false
+                _ => false,
             };
 
             if (!shouldProcess)

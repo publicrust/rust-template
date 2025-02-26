@@ -1,15 +1,17 @@
-using Oxide.Core.Libraries.Covalence;
-using System.Collections.Generic;
 using System;
+using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using Newtonsoft.Json;
-using System.Globalization;
 using Oxide.Core.Libraries;
+using Oxide.Core.Libraries.Covalence;
 
 namespace Oxide.Plugins
 {
     [Info("VpnBlockLite", "fakerplayers", "1.0.0")]
-    [Description("Blocks players using VPN/Proxy services. Detects country, city and ISP information. Lite version.")]
+    [Description(
+        "Blocks players using VPN/Proxy services. Detects country, city and ISP information. Lite version."
+    )]
     public class VpnBlockLite : RustPlugin
     {
         #region Configuration and Settings
@@ -85,18 +87,23 @@ namespace Oxide.Plugins
             "Microsoft Azure",
             "NordVPN",
             "ExpressVPN",
-            "CloudFlare"
+            "CloudFlare",
         };
 
         private bool IsVPNOrProxy(string isp)
         {
-            if (knownVPNProviders.Any(provider => isp.Contains(provider, StringComparison.OrdinalIgnoreCase)))
+            if (
+                knownVPNProviders.Any(provider =>
+                    isp.Contains(provider, StringComparison.OrdinalIgnoreCase)
+                )
+            )
             {
                 return true;
             }
 
             string ispLower = isp.ToLower(CultureInfo.InvariantCulture);
-            string[] keywords = new[] {
+            string[] keywords = new[]
+            {
                 "hosting",
                 "datacenter",
                 "data center",
@@ -104,7 +111,7 @@ namespace Oxide.Plugins
                 "server",
                 "vps",
                 "vpn",
-                "proxy"
+                "proxy",
             };
 
             return keywords.Any(ispLower.Contains);
@@ -124,21 +131,26 @@ namespace Oxide.Plugins
                 {
                     if (code != 200 || string.IsNullOrEmpty(response))
                     {
-                        PrintError($"Ошибка получения информации об IP для {player.Name}: HTTP {code}");
+                        PrintError(
+                            $"Ошибка получения информации об IP для {player.Name}: HTTP {code}"
+                        );
                         return;
                     }
 
                     try
                     {
-                        Dictionary<string, string> ipInfo = JsonConvert.DeserializeObject<Dictionary<string, string>>(response)!;
+                        Dictionary<string, string> ipInfo = JsonConvert.DeserializeObject<
+                            Dictionary<string, string>
+                        >(response)!;
                         bool isProxy = IsVPNOrProxy(ipInfo["isp"]);
 
-                        string message = $"Игрок: {player.Name}\n" +
-                                       (configData.ShowIP ? $"IP: {ipInfo["query"]}\n" : "") +
-                                       (configData.ShowCountry ? $"Страна: {ipInfo["country"]}\n" : "") +
-                                       (configData.ShowCity ? $"Город: {ipInfo["city"]}\n" : "") +
-                                       (configData.ShowISP ? $"Провайдер: {ipInfo["isp"]}\n" : "") +
-                                       $"VPN/Proxy: {(isProxy ? "Да" : "Нет")}";
+                        string message =
+                            $"Игрок: {player.Name}\n"
+                            + (configData.ShowIP ? $"IP: {ipInfo["query"]}\n" : "")
+                            + (configData.ShowCountry ? $"Страна: {ipInfo["country"]}\n" : "")
+                            + (configData.ShowCity ? $"Город: {ipInfo["city"]}\n" : "")
+                            + (configData.ShowISP ? $"Провайдер: {ipInfo["isp"]}\n" : "")
+                            + $"VPN/Proxy: {(isProxy ? "Да" : "Нет")}";
 
                         if (configData.SaveToLogs)
                         {
@@ -154,7 +166,9 @@ namespace Oxide.Plugins
                     }
                     catch (Exception ex)
                     {
-                        PrintError($"Ошибка обработки информации об IP для {player.Name}: {ex.Message}");
+                        PrintError(
+                            $"Ошибка обработки информации об IP для {player.Name}: {ex.Message}"
+                        );
                     }
                 },
                 this,
