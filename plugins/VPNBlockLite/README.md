@@ -21,7 +21,7 @@ This demo version provides basic VPN detection functionality while maintaining c
 "Show City": true,
 "Show ISP": true,
 "Kick VPN Users": true,
-"VPN Kick Message": "VPN/Proxy connections are not allowed. For full version contact: TG @fakerplayers or Discord: fakerplayers"
+"VPN Kick Message": "VPN/Proxy connections are not allowed."
 }
 ```
 ### Demo Version Limitations:
@@ -55,7 +55,3 @@ This demo version provides basic VPN detection functionality while maintaining c
 - Additional configuration options
 - Automatic updates
 - Bypass protection
-
-### Contact Information:
-- Telegram: @fakerplayers
-- Discord: fakerplayers
