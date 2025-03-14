@@ -4,8 +4,8 @@ public class GameObjectToggleState : StateMachineBehaviour
 {
 	public bool UseCurve;
 
-	[Tooltip("The normalised range in the animation in which to apply the TargetState")]
 	[MinMax(0f, 1f)]
+	[Tooltip("The normalised range in the animation in which to apply the TargetState")]
 	public Vector2 ValidNormalisedRange;
 
 	public AnimationCurve CurveRange = AnimationCurve.Linear(0f, 0f, 1f, 0f);

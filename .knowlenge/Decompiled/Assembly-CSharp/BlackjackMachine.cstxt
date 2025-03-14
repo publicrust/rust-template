@@ -3,8 +3,8 @@ using UnityEngine;
 
 public class BlackjackMachine : BaseCardGameEntity
 {
-	[Header("Blackjack Machine")]
 	[SerializeField]
+	[Header("Blackjack Machine")]
 	private GameObjectRef mainScreenPrefab;
 
 	[SerializeField]

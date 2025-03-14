@@ -23,17 +23,8 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 	[SerializeField]
 	private NavMeshAgent agent;
 
-	private static NavMeshPath path;
-
-	[NonSerialized]
-	public UnityEvent onPathFailed = new UnityEvent();
-
-	private LockState movementLock = new LockState();
-
-	private bool isNavMeshReady;
-
-	[Header("Speed")]
 	[SerializeField]
+	[Header("Speed")]
 	private float sneakSpeed = 0.6f;
 
 	[SerializeField]
@@ -46,12 +37,10 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 	private float runSpeed = 4.4f;
 
 	[SerializeField]
-	private float sprintSpeed = 7.5f;
+	private float sprintSpeed = 6f;
 
 	[SerializeField]
 	private float fullSprintSpeed = 9f;
-
-	private float desiredSpeed;
 
 	[SerializeField]
 	public ResettableFloat acceleration = new ResettableFloat(10f);
@@ -61,6 +50,23 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 
 	[SerializeField]
 	private float maxTurnRadius = 2f;
+
+	[SerializeField]
+	private TerrainTopology.Enum preferedTopology = TerrainTopology.Enum.Field | TerrainTopology.Enum.Forest | TerrainTopology.Enum.Forestside | TerrainTopology.Enum.Lakeside | TerrainTopology.Enum.Mainland;
+
+	[SerializeField]
+	private TerrainBiome.Enum preferedBiome = TerrainBiome.Enum.Arid | TerrainBiome.Enum.Temperate | TerrainBiome.Enum.Tundra | TerrainBiome.Enum.Arctic;
+
+	private static NavMeshPath path;
+
+	[NonSerialized]
+	public UnityEvent onPathFailed = new UnityEvent();
+
+	private LockState movementLock = new LockState();
+
+	private bool isNavMeshReady;
+
+	private static ListHashSet<LimitedTurnNavAgent> steeringComponents = new ListHashSet<LimitedTurnNavAgent>();
 
 	[NonSerialized]
 	public float currentDeviation;
@@ -74,13 +80,7 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 
 	private float curSpeed;
 
-	private static ListHashSet<LimitedTurnNavAgent> steeringComponents = new ListHashSet<LimitedTurnNavAgent>();
-
-	[SerializeField]
-	private TerrainTopology.Enum preferedTopology = TerrainTopology.Enum.Field | TerrainTopology.Enum.Forest | TerrainTopology.Enum.Forestside | TerrainTopology.Enum.Lakeside | TerrainTopology.Enum.Mainland;
-
-	[SerializeField]
-	private TerrainBiome.Enum preferedBiome = TerrainBiome.Enum.Arid | TerrainBiome.Enum.Temperate | TerrainBiome.Enum.Tundra | TerrainBiome.Enum.Arctic;
+	private float desiredSpeed;
 
 	public bool IsNavmeshReady => isNavMeshReady;
 
@@ -129,6 +129,10 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 	{
 		using (TimeWarning.New("LimitedTurnNavAgent:ResetPath"))
 		{
+			shouldStopAtDestination = true;
+			acceleration.Reset();
+			deceleration.Reset();
+			currentDeviation = 0f;
 			if (agent.hasPath)
 			{
 				agent.ResetPath();
@@ -144,7 +148,7 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 			{
 				if (triggerPathFailed)
 				{
-					FailPath();
+					FailPath(location);
 				}
 				return false;
 			}
@@ -152,14 +156,14 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 			{
 				if (triggerPathFailed)
 				{
-					FailPath(path);
+					FailPath(sample, path);
 				}
 				return false;
 			}
 			bool flag = path.status == NavMeshPathStatus.PathComplete;
 			if (!flag && triggerPathFailed)
 			{
-				FailPath(path);
+				FailPath(sample, path);
 			}
 			else if (flag && triggerPathFailed)
 			{
@@ -177,15 +181,14 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 			{
 				return true;
 			}
-			ResetPath();
 			if (!CalculatePathCustom(newDestination, path))
 			{
-				FailPath(path);
+				FailPath(newDestination, path);
 				return false;
 			}
 			if (!(acceptPartialPaths ? (path.status != NavMeshPathStatus.PathInvalid) : (path.status == NavMeshPathStatus.PathComplete)))
 			{
-				FailPath(path);
+				FailPath(newDestination, path);
 				return false;
 			}
 			SetPath(path);
@@ -193,17 +196,12 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 		}
 	}
 
-	public bool SetDestinationFromDirection(Vector3 normalizedDirection, float distance = 10f, float randomPct = 0f, bool restrictTerrain = false)
+	public bool SetDestinationFromDirection(Vector3 normalizedDirection, float distance = 10f, bool restrictTerrain = false)
 	{
 		using (TimeWarning.New("LimitedTurnNavAgent:SetDestinationFromDirection"))
 		{
-			ResetPath();
 			using PooledList<Vector3> pooledList = Facepunch.Pool.Get<PooledList<Vector3>>();
-			if (!SamplePositionsInDonutShape(base.baseEntity.transform.position, pooledList, distance, distance))
-			{
-				FailPath();
-				return false;
-			}
+			SamplePositionsInDonutShape(base.baseEntity.transform.position, pooledList, distance, distance);
 			using PooledList<(Vector3, float)> pooledList2 = Facepunch.Pool.Get<PooledList<(Vector3, float)>>();
 			foreach (Vector3 item in pooledList)
 			{
@@ -224,9 +222,9 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 			{
 				pooledList[i] = pooledList2[i].Item1;
 			}
-			if (!((randomPct <= 0f) ? GetFirstReachablePoint(pooledList, ref path) : GetFirstReachablePointInShuffledTopPct(pooledList, ref path, randomPct)))
+			if (!GetFirstReachablePoint(pooledList, ref path))
 			{
-				FailPath();
+				FailPath(null);
 				return false;
 			}
 			SetPath(path);
@@ -259,15 +257,24 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 	{
 		using (TimeWarning.New("LimitedTurnNavAgent:SetPath"))
 		{
-			agent.SetPath(newPath);
+			if (agent.path != newPath)
+			{
+				agent.SetPath(newPath);
+			}
 			cachedPathLength = NavMeshPathEx.GetPathLength(newPath);
 			lastValidDestination = NavMeshPathEx.GetDestination(newPath);
 		}
 	}
 
-	private void FailPath(NavMeshPath failedPath = null)
+	private void ShowFailedPath(Vector3? destination, NavMeshPath failedPath)
 	{
+	}
+
+	private void FailPath(Vector3? destination, NavMeshPath failedPath = null)
+	{
+		ShowFailedPath(destination, failedPath);
 		onPathFailed.Invoke();
+		ResetPath();
 	}
 
 	public void SetSpeed(Speeds speed)
@@ -349,6 +356,7 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 						return;
 					}
 					agent.updateRotation = false;
+					agent.updateUpAxis = false;
 					agent.isStopped = true;
 				}
 				if (movementLock.IsLocked)
@@ -383,38 +391,44 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 
 	private void SteerTowardsWaypoint()
 	{
-		Transform transform = base.baseEntity.transform;
-		Vector3 vector = (agent.steeringTarget - transform.position).normalized;
-		if (Mathf.Abs(cachedPathLength - Vector3.Distance(transform.position, agent.destination)) < 5f)
+		using (TimeWarning.New("SteerTowardsWaypoint"))
 		{
-			vector = Quaternion.AngleAxis(currentDeviation, Vector3.up) * vector;
+			Transform transform = base.baseEntity.transform;
+			Vector3 vector = (agent.steeringTarget - transform.position).normalized;
+			if (Mathf.Abs(cachedPathLength - Vector3.Distance(transform.position, agent.destination)) < 5f)
+			{
+				vector = Quaternion.AngleAxis(currentDeviation, Vector3.up) * vector;
+			}
+			if (shouldStopAtDestination && agent.remainingDistance - maxTurnRadius < GetBrakingDistance(curSpeed, deceleration.Value))
+			{
+				curSpeed = Mathf.Max(1f, curSpeed - deceleration.Value * UnityEngine.Time.deltaTime);
+			}
+			else if (curSpeed > desiredSpeed)
+			{
+				curSpeed = Mathf.Max(desiredSpeed, curSpeed - deceleration.Value * UnityEngine.Time.deltaTime);
+			}
+			else if (curSpeed < desiredSpeed)
+			{
+				curSpeed = Mathf.Min(desiredSpeed, curSpeed + acceleration.Value * UnityEngine.Time.deltaTime);
+			}
+			agent.isStopped = true;
+			if (!(vector.magnitude < 0.01f))
+			{
+				float num = (shouldStopAtDestination ? Mathx.RemapValClamped(agent.remainingDistance, maxTurnRadius * 2f, 0f, maxTurnRadius, 0.001f) : maxTurnRadius);
+				float num2 = curSpeed / num;
+				Vector3 vector2 = Vector3.RotateTowards(transform.forward, vector, num2 * UnityEngine.Time.deltaTime, 0f);
+				Vector3 offset = vector2 * (curSpeed * UnityEngine.Time.deltaTime);
+				transform.rotation = Quaternion.LookRotation(vector2.WithY(0f));
+				Move(offset);
+			}
 		}
-		if (shouldStopAtDestination && agent.remainingDistance - maxTurnRadius < GetBrakingDistance(curSpeed, deceleration.Value))
-		{
-			curSpeed = Mathf.Max(1f, curSpeed - deceleration.Value * UnityEngine.Time.deltaTime);
-		}
-		else if (curSpeed > desiredSpeed)
-		{
-			curSpeed = Mathf.Max(desiredSpeed, curSpeed - deceleration.Value * UnityEngine.Time.deltaTime);
-		}
-		else if (curSpeed < desiredSpeed)
-		{
-			curSpeed = Mathf.Min(desiredSpeed, curSpeed + acceleration.Value * UnityEngine.Time.deltaTime);
-		}
-		float num = (shouldStopAtDestination ? Mathx.RemapValClamped(agent.remainingDistance, maxTurnRadius * 2f, 0f, maxTurnRadius, 0.001f) : maxTurnRadius);
-		float num2 = curSpeed / num;
-		Vector3 vector2 = Vector3.RotateTowards(transform.forward, vector, num2 * UnityEngine.Time.deltaTime, 0f);
-		Vector3 offset = vector2 * (curSpeed * UnityEngine.Time.deltaTime);
-		transform.rotation = Quaternion.LookRotation(vector2);
-		agent.isStopped = true;
-		Move(offset);
 	}
 
 	public bool IsPositionOnValidTerrain(Vector3 position)
 	{
 		using (TimeWarning.New("IsPositionOnValidTerrain"))
 		{
-			return NavHelpers.IsPositionAtTopologyRequirement(base.baseEntity, position, preferedTopology) && NavHelpers.IsPositionABiomeRequirement(base.baseEntity, position, preferedBiome) && NavHelpers.IsAcceptableWaterDepth(base.baseEntity, position);
+			return IsPositionAtTopologyRequirement(base.baseEntity, position, preferedTopology) && IsPositionABiomeRequirement(base.baseEntity, position, preferedBiome) && IsAcceptableWaterDepth(base.baseEntity, position);
 		}
 	}
 
@@ -423,14 +437,19 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 		return SamplePosition(position, out sample, 0.5f);
 	}
 
-	public bool SampleGroundPositionWithPhysics(Vector3 position, out Vector3 sample, float maxDistance)
+	public bool SampleGroundPositionWithPhysics(Vector3 position, out Vector3 sample, float maxDistance, float radius = 0f)
 	{
 		using (TimeWarning.New("SampleGroundPositionWithPhysics"))
 		{
 			sample = position;
-			if (GamePhysics.Trace(new Ray(position, Vector3.down), 0f, out var hitInfo, maxDistance, 1503731969, QueryTriggerInteraction.Ignore))
+			Vector3 origin = position + Vector3.up * radius * 1.5f;
+			float maxDistance2 = maxDistance + radius * 1.5f;
+			if (GamePhysics.Trace(new Ray(origin, Vector3.down), radius, out var hitInfo, maxDistance2, 1503731969, QueryTriggerInteraction.Ignore))
 			{
-				sample = hitInfo.point;
+				if (radius == 0f || hitInfo.distance > 0f)
+				{
+					sample = hitInfo.point;
+				}
 				return true;
 			}
 			return false;
@@ -451,7 +470,7 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 		}
 	}
 
-	public bool SamplePositionsInDonutShape(Vector3 center, List<Vector3> sampledPositions, float outerRadius = 10f, float innerRadius = 10f, int numRings = 1, int itemsPerRing = 8)
+	public void SamplePositionsInDonutShape(Vector3 center, List<Vector3> sampledPositions, float outerRadius = 10f, float innerRadius = 10f, int numRings = 1, int itemsPerRing = 8)
 	{
 		using (TimeWarning.New("SamplePositionsInDonutShape"))
 		{
@@ -466,7 +485,6 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 					sampledPositions.Add(item);
 				}
 			}
-			return sampledPositions.Count > 0;
 		}
 	}
 
@@ -484,32 +502,73 @@ public class LimitedTurnNavAgent : EntityComponent<BaseEntity>, IServerComponent
 		{
 			foreach (Vector3 point in points)
 			{
-				if (SamplePosition(point, out var sample, 10f) && CalculatePathCustom(sample, navPath) && navPath.status == NavMeshPathStatus.PathComplete)
+				if (!SamplePosition(point, out var sample, 10f))
 				{
-					return true;
+					continue;
+				}
+				if (CalculatePathCustom(sample, navPath))
+				{
+					if (navPath.status == NavMeshPathStatus.PathComplete)
+					{
+						return true;
+					}
+				}
+				else
+				{
+					ShowFailedPath(sample, navPath);
 				}
 			}
 			return false;
 		}
 	}
 
-	public bool GetFirstReachablePointInShuffledTopPct(List<Vector3> points, ref NavMeshPath navPath, float topPct = 0.05f)
+	public static bool IsPositionAtTopologyRequirement(BaseEntity baseEntity, Vector3 position, TerrainTopology.Enum topologyRequirement)
 	{
-		using (TimeWarning.New("GetFirstReachablePointInShuffledTopPct"))
+		using (TimeWarning.New("IsPositionAtTopologyRequirement"))
 		{
-			using PooledList<Vector3> pooledList = Facepunch.Pool.Get<PooledList<Vector3>>();
-			int a = Mathf.Max(2, Mathf.FloorToInt((float)points.Count * topPct));
-			a = Mathf.Min(a, points.Count);
-			for (int i = 0; i < a; i++)
+			if (TerrainMeta.TopologyMap == null)
 			{
-				pooledList.Add(points[i]);
+				return false;
 			}
-			pooledList.Shuffle((uint)UnityEngine.Random.Range(0, int.MaxValue));
-			if (a < points.Count)
+			TerrainTopology.Enum topology = (TerrainTopology.Enum)TerrainMeta.TopologyMap.GetTopology(position);
+			if ((topologyRequirement & topology) == 0)
 			{
-				pooledList.AddRange(points.GetRange(a, points.Count - a));
+				return false;
 			}
-			return GetFirstReachablePoint(pooledList, ref navPath);
+			return true;
+		}
+	}
+
+	public static bool IsPositionABiomeRequirement(BaseEntity baseEntity, Vector3 position, TerrainBiome.Enum biomeRequirement)
+	{
+		using (TimeWarning.New("IsPositionABiomeRequirement"))
+		{
+			if (biomeRequirement == (TerrainBiome.Enum)0)
+			{
+				return true;
+			}
+			if (TerrainMeta.BiomeMap == null)
+			{
+				return false;
+			}
+			TerrainBiome.Enum biomeMaxType = (TerrainBiome.Enum)TerrainMeta.BiomeMap.GetBiomeMaxType(position);
+			if ((biomeRequirement & biomeMaxType) == 0)
+			{
+				return false;
+			}
+			return true;
+		}
+	}
+
+	public static bool IsAcceptableWaterDepth(BaseEntity baseEntity, Vector3 position, float maxDepth = 0.1f)
+	{
+		using (TimeWarning.New("IsAcceptableWaterDepth"))
+		{
+			if (WaterLevel.GetOverallWaterDepth(position, waves: false, volumes: false) > maxDepth)
+			{
+				return false;
+			}
+			return true;
 		}
 	}
 }

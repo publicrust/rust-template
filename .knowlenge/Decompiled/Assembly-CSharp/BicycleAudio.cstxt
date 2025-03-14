@@ -2,8 +2,8 @@ using UnityEngine;
 
 public class BicycleAudio : BikeVehicleAudio
 {
-	[Header("Bicycle")]
 	[SerializeField]
+	[Header("Bicycle")]
 	private SoundDefinition pedalActiveSoundDef;
 
 	[SerializeField]

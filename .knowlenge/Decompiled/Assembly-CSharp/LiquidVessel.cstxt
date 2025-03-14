@@ -83,8 +83,8 @@ public class LiquidVessel : HeldEntity
 		return true;
 	}
 
-	[RPC_Server.IsActiveItem]
 	[RPC_Server]
+	[RPC_Server.IsActiveItem]
 	private void DoEmpty(RPCMessage msg)
 	{
 		if (!msg.player.CanInteract())

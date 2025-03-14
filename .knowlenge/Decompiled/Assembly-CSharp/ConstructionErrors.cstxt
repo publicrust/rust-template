@@ -72,6 +72,8 @@ public static class ConstructionErrors
 
 	public static readonly Translate.Phrase Antihack = new Translate.Phrase("error_antihack", "Anti hack!");
 
+	public static readonly Translate.Phrase AntihackWithReason = new Translate.Phrase("error_antihack_reason", "Anti hack! ({0})");
+
 	public static readonly Translate.Phrase CantDeployOnDoor = new Translate.Phrase("error_cantdeployondoor", "Can't deploy on door");
 
 	public static readonly Translate.Phrase DeployableMismatch = new Translate.Phrase("error_deployablemismatch", "Deployable mismatch!");

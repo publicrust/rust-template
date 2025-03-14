@@ -191,8 +191,8 @@ public class AdvancedChristmasLights : IOEntity
 		return true;
 	}
 
-	[RPC_Server.IsVisible(3f)]
 	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
 	public void SetAnimationStyle(RPCMessage msg)
 	{
 		int value = msg.read.Int32();

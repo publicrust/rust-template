@@ -19,17 +19,15 @@ public class ItemModGiveOxygen : ItemMod, IAirSupply
 
 	public GameObjectRef bubblesEffect;
 
-	private float timeRemaining;
-
 	private float cycleTime;
 
 	private bool inhaled;
 
 	public AirSupplyType AirType => airType;
 
-	public float GetAirTimeRemaining()
+	public float GetAirTimeRemaining(Item forItem)
 	{
-		return timeRemaining;
+		return ConditionToTime(forItem);
 	}
 
 	public override void ModInit()
@@ -66,15 +64,12 @@ public class ItemModGiveOxygen : ItemMod, IAirSupply
 		}
 	}
 
-	public override void OnChanged(Item item)
+	private float ConditionToTime(Item item)
 	{
-		if (item.hasCondition)
+		if (item == null || !item.hasCondition)
 		{
-			timeRemaining = item.condition * ((float)amountToConsume / cycleTime);
+			return 0f;
 		}
-		else
-		{
-			timeRemaining = 0f;
-		}
+		return item.condition * ((float)amountToConsume / cycleTime);
 	}
 }

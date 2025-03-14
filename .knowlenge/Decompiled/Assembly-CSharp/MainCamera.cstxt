@@ -14,7 +14,7 @@ public class MainCamera : RustCamera<MainCamera>
 	{
 		get
 		{
-			if (mainCamera != null)
+			if (mainCamera != null && mainCameraTransform != null)
 			{
 				return mainCamera.enabled;
 			}

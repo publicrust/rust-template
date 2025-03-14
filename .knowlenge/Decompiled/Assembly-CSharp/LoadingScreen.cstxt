@@ -35,6 +35,8 @@ public class LoadingScreen : SingletonComponent<LoadingScreen>
 
 	public ServerBrowserTagList serverTags;
 
+	public MenuTip menuTip;
+
 	public RectTransform demoInfo;
 
 	public RustText demoName;

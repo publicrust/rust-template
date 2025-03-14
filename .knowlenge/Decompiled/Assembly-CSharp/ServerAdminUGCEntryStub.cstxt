@@ -12,6 +12,8 @@ public class ServerAdminUGCEntryStub : MonoBehaviour
 
 	public ServerAdminUGCEntryVendingMachine VendingWidget;
 
+	public ServerAdminUGCEntrySculpture SculptureWidget;
+
 	public RustText PrefabName;
 
 	public RustButton HistoryButton;

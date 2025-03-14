@@ -1,9 +1,13 @@
+using System;
+using Facepunch.Extend;
 using Rust.UI;
 using UnityEngine;
 
 public class MenuTip : MonoBehaviour
 {
 	public RustText text;
+
+	public RustIcon icon;
 
 	public LoadingScreen screen;
 
@@ -48,14 +52,17 @@ public class MenuTip : MonoBehaviour
 
 	private float nextTipTime;
 
+	private bool disabled;
+
 	public void OnEnable()
 	{
-		currentTipIndex = Random.Range(0, MenuTips.Length);
+		disabled = false;
+		currentTipIndex = UnityEngine.Random.Range(0, MenuTips.Length);
 	}
 
 	public void Update()
 	{
-		if (LoadingScreen.isOpen && Time.realtimeSinceStartup >= nextTipTime)
+		if (LoadingScreen.isOpen && !disabled && Time.realtimeSinceStartup >= nextTipTime)
 		{
 			currentTipIndex++;
 			if (currentTipIndex >= MenuTips.Length)
@@ -65,6 +72,17 @@ public class MenuTip : MonoBehaviour
 			nextTipTime = Time.realtimeSinceStartup + 6f;
 			UpdateTip();
 		}
+	}
+
+	public void SetCustomTip(string iconString, string tip)
+	{
+		if (!Enum.TryParse<Icons>(iconString, ignoreCase: true, out var result))
+		{
+			result = Icons.Info;
+		}
+		icon.SetIcon(result);
+		text.SetText(tip.Truncate(200).FilterRichText(true, "color", "u", "b", "i"));
+		disabled = true;
 	}
 
 	public void UpdateTip()

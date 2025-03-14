@@ -8,14 +8,18 @@ public class SocketMod_AngleCheck : SocketMod
 
 	public float withinDegrees = 45f;
 
+	public bool usePlacementNormal;
+
 	protected override Translate.Phrase ErrorPhrase => ConstructionErrors.InvalidAngle;
 
 	public override bool DoCheck(Construction.Placement place)
 	{
-		if (worldNormal.DotDegrees(place.rotation * Vector3.up) < withinDegrees)
+		Vector3 vector = (usePlacementNormal ? Vector3.forward : Vector3.up);
+		float num = worldNormal.DotDegrees(place.rotation * vector);
+		if (!usePlacementNormal)
 		{
-			return true;
+			return num < withinDegrees;
 		}
-		return false;
+		return num >= withinDegrees;
 	}
 }

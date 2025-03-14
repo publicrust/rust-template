@@ -1,0 +1,238 @@
+using System;
+using System.Text;
+using Steamworks;
+using Steamworks.Data;
+
+public class ConnectionManager
+{
+	public Connection Connection;
+
+	public bool Connected;
+
+	public bool Connecting = true;
+
+	public IConnectionManager Interface { get; set; }
+
+	public ConnectionInfo ConnectionInfo { get; internal set; }
+
+	public string ConnectionName
+	{
+		get
+		{
+			return Connection.ConnectionName;
+		}
+		set
+		{
+			Connection.ConnectionName = value;
+		}
+	}
+
+	public long UserData
+	{
+		get
+		{
+			return Connection.UserData;
+		}
+		set
+		{
+			Connection.UserData = value;
+		}
+	}
+
+	public void Close(bool linger = false, int reasonCode = 0, string debugString = "Closing Connection")
+	{
+		Connection.Close(linger, reasonCode, debugString);
+	}
+
+	public override string ToString()
+	{
+		return Connection.ToString();
+	}
+
+	public virtual void OnConnectionChanged(ConnectionInfo info)
+	{
+		ConnectionInfo = info;
+		switch (info.State)
+		{
+		case ConnectionState.Connecting:
+			if (!Connecting && !Connected)
+			{
+				Connecting = true;
+				OnConnecting(info);
+			}
+			break;
+		case ConnectionState.Connected:
+			if (Connecting && !Connected)
+			{
+				Connecting = false;
+				Connected = true;
+				OnConnected(info);
+			}
+			break;
+		case ConnectionState.None:
+		case ConnectionState.ClosedByPeer:
+		case ConnectionState.ProblemDetectedLocally:
+			if (Connecting || Connected)
+			{
+				Connecting = false;
+				Connected = false;
+				OnDisconnected(info);
+			}
+			break;
+		case ConnectionState.FindingRoute:
+			break;
+		}
+	}
+
+	public virtual void OnConnecting(ConnectionInfo info)
+	{
+		Interface?.OnConnecting(info);
+	}
+
+	public virtual void OnConnected(ConnectionInfo info)
+	{
+		Interface?.OnConnected(info);
+	}
+
+	public virtual void OnDisconnected(ConnectionInfo info)
+	{
+		Interface?.OnDisconnected(info);
+	}
+
+	public unsafe int Receive(int bufferSize = 32, bool receiveToEnd = true)
+	{
+		if (bufferSize < 1 || bufferSize > 256)
+		{
+			throw new ArgumentOutOfRangeException("bufferSize");
+		}
+		int num = 0;
+		NetMsg** ptr = stackalloc NetMsg*[bufferSize];
+		int num2;
+		do
+		{
+			num2 = SteamNetworkingSockets.Internal.ReceiveMessagesOnConnection(Connection, new IntPtr(ptr), bufferSize);
+			num += num2;
+			try
+			{
+				for (int i = 0; i < num2; i++)
+				{
+					ReceiveMessage(ref ptr[i]);
+				}
+			}
+			catch
+			{
+				for (int j = 0; j < num2; j++)
+				{
+					if (ptr[j] != null)
+					{
+						NetMsg.InternalRelease(ptr[j]);
+					}
+				}
+				throw;
+			}
+		}
+		while (receiveToEnd && num2 >= bufferSize);
+		return num;
+	}
+
+	public unsafe void SendMessages(Connection[] connections, int connectionCount, IntPtr ptr, int size, SendType sendType = SendType.Reliable, Result[] results = null)
+	{
+		if (connections == null)
+		{
+			throw new ArgumentNullException("connections");
+		}
+		if (connectionCount < 0 || connectionCount > connections.Length)
+		{
+			throw new ArgumentException("`connectionCount` must be between 0 and `connections.Length`", "connectionCount");
+		}
+		if (results != null && connectionCount > results.Length)
+		{
+			throw new ArgumentException("`results` must have at least `connectionCount` entries", "results");
+		}
+		if (connectionCount > 1024)
+		{
+			throw new ArgumentOutOfRangeException("connectionCount");
+		}
+		if (ptr == IntPtr.Zero)
+		{
+			throw new ArgumentNullException("ptr");
+		}
+		if (size == 0)
+		{
+			throw new ArgumentException("`size` cannot be zero", "size");
+		}
+		if (connectionCount == 0)
+		{
+			return;
+		}
+		IntPtr intPtr = BufferManager.Get(size, connectionCount);
+		Buffer.MemoryCopy((void*)ptr, (void*)intPtr, size, size);
+		NetMsg** ptr2 = stackalloc NetMsg*[connectionCount];
+		long* ptr3 = stackalloc long[(results != null) ? connectionCount : 0];
+		for (int i = 0; i < connectionCount; i++)
+		{
+			ptr2[i] = SteamNetworkingUtils.AllocateMessage();
+			ptr2[i]->Connection = connections[i];
+			ptr2[i]->Flags = sendType;
+			ptr2[i]->DataPtr = intPtr;
+			ptr2[i]->DataSize = size;
+			ptr2[i]->FreeDataPtr = BufferManager.FreeFunctionPointer;
+		}
+		SteamNetworkingSockets.Internal.SendMessages(connectionCount, ptr2, ptr3);
+		if (results == null)
+		{
+			return;
+		}
+		for (int j = 0; j < connectionCount; j++)
+		{
+			if (ptr3[j] < 0)
+			{
+				results[j] = (Result)(-ptr3[j]);
+			}
+			else
+			{
+				results[j] = Result.OK;
+			}
+		}
+	}
+
+	public unsafe void SendMessages(Connection[] connections, int connectionCount, byte[] data, SendType sendType = SendType.Reliable, Result[] results = null)
+	{
+		fixed (byte* ptr = data)
+		{
+			SendMessages(connections, connectionCount, (IntPtr)ptr, data.Length, sendType, results);
+		}
+	}
+
+	public unsafe void SendMessages(Connection[] connections, int connectionCount, byte[] data, int offset, int length, SendType sendType = SendType.Reliable, Result[] results = null)
+	{
+		fixed (byte* ptr = data)
+		{
+			SendMessages(connections, connectionCount, (IntPtr)ptr + offset, length, sendType, results);
+		}
+	}
+
+	public void SendMessages(Connection[] connections, int connectionCount, string str, SendType sendType = SendType.Reliable, Result[] results = null)
+	{
+		byte[] bytes = Encoding.UTF8.GetBytes(str);
+		SendMessages(connections, connectionCount, bytes, sendType, results);
+	}
+
+	internal unsafe void ReceiveMessage(ref NetMsg* msg)
+	{
+		try
+		{
+			OnMessage(msg->DataPtr, msg->DataSize, msg->RecvTime, msg->MessageNumber, msg->Channel);
+		}
+		finally
+		{
+			NetMsg.InternalRelease(msg);
+			msg = null;
+		}
+	}
+
+	public virtual void OnMessage(IntPtr data, int size, long messageNum, long recvTime, int channel)
+	{
+		Interface?.OnMessage(data, size, messageNum, recvTime, channel);
+	}
+}

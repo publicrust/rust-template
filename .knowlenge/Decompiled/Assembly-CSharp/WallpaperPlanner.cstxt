@@ -1,3 +1,5 @@
+using Facepunch.Rust;
+
 public class WallpaperPlanner : Planner
 {
 	private static ItemDefinition _wallpaperItem;
@@ -61,6 +63,7 @@ public class WallpaperPlanner : Planner
 			}
 			buildingBlock.SetWallpaper(skinID, side);
 			PayForPlacement(ownerPlayer, component);
+			Analytics.Azure.OnWallpaperPlaced(ownerPlayer, buildingBlock, skinID, side, reskin: false);
 			if (component.deployable.placeEffect.isValid)
 			{
 				Effect.server.Run(component.deployable.placeEffect.resourcePath, buildingBlock.transform.TransformPoint(target.socket.worldPosition), buildingBlock.transform.up);

@@ -108,13 +108,12 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 	private float touchDistance = 6f;
 
 	[SerializeField]
-	private float TimeToForgetSightings = 30f;
-
-	[SerializeField]
-	private float TimeToForgetNoises = 5f;
-
-	[SerializeField]
 	private float hearingMultiplier = 1f;
+
+	[NonSerialized]
+	public ResettableFloat timeToForgetSightings = new ResettableFloat(30f);
+
+	private const float timeToForgetNoises = 5f;
 
 	private static HashSet<BaseEntity> entitiesUpdatedThisFrame = new HashSet<BaseEntity>();
 
@@ -124,9 +123,13 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 	[ServerVar]
 	public static float maxRefreshIntervalSeconds = 1f;
 
-	private double lastTickTime;
+	private double? _lastTickTime;
 
 	private double nextRefreshTime;
+
+	private double spawnTime;
+
+	private Dictionary<BaseEntity, double> _alliesWeAreAwareOf = new Dictionary<BaseEntity, double>(3);
 
 	private Dictionary<BaseEntity, VisibilityStatus> entitiesWeAreAwareOf = new Dictionary<BaseEntity, VisibilityStatus>(8);
 
@@ -192,6 +195,25 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 		}
 	}
 
+	private double LastTickTime
+	{
+		get
+		{
+			double valueOrDefault = _lastTickTime.GetValueOrDefault();
+			if (!_lastTickTime.HasValue)
+			{
+				valueOrDefault = UnityEngine.Time.timeAsDouble;
+				_lastTickTime = valueOrDefault;
+				return valueOrDefault;
+			}
+			return valueOrDefault;
+		}
+		set
+		{
+			_lastTickTime = value;
+		}
+	}
+
 	public bool HasPlayerInVicinity { get; private set; }
 
 	public bool ShouldRefreshFast
@@ -210,8 +232,6 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 		}
 	}
 
-	public List<BaseEntity> AlliesNearby { get; private set; } = new List<BaseEntity>(3);
-
 	public NpcNoiseEvent currentNoise => _currentNoise;
 
 	private bool ChangedTargetRecently
@@ -223,6 +243,26 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 				return UnityEngine.Time.timeAsDouble - lastTargetTime.Value < (double)TargetingCooldown;
 			}
 			return true;
+		}
+	}
+
+	public void GetInitialAllies(List<BaseEntity> allies)
+	{
+		using PooledList<BaseEntity> pooledList = Facepunch.Pool.Get<PooledList<BaseEntity>>();
+		foreach (var (baseEntity2, num2) in _alliesWeAreAwareOf)
+		{
+			if (!baseEntity2.IsValid() || (baseEntity2 is BaseCombatEntity baseCombatEntity && baseCombatEntity.IsDead()))
+			{
+				pooledList.Add(baseEntity2);
+			}
+			else if (!(num2 - spawnTime > (double)(maxRefreshIntervalSeconds * 2f)))
+			{
+				allies.Add(baseEntity2);
+			}
+		}
+		foreach (BaseEntity item in pooledList)
+		{
+			_alliesWeAreAwareOf.Remove(item);
 		}
 	}
 
@@ -299,19 +339,25 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 		return Matrix4x4.TRS(base.baseEntity.CenterPoint(), base.baseEntity.transform.rotation, Vector3.one);
 	}
 
+	public override void InitShared()
+	{
+		base.InitShared();
+		spawnTime = UnityEngine.Time.timeAsDouble;
+	}
+
 	public void Tick()
 	{
 		using (TimeWarning.New("SenseComponent:Tick"))
 		{
-			if (UnityEngine.Time.timeAsDouble < nextRefreshTime)
+			double timeAsDouble = UnityEngine.Time.timeAsDouble;
+			if (timeAsDouble < nextRefreshTime)
 			{
 				return;
 			}
-			float deltaTime = (float)(UnityEngine.Time.timeAsDouble - lastTickTime);
-			lastTickTime = UnityEngine.Time.timeAsDouble;
+			float deltaTime = (float)(timeAsDouble - LastTickTime);
+			LastTickTime = timeAsDouble;
 			HasPlayerInVicinity = false;
 			entitiesUpdatedThisFrame.Clear();
-			AlliesNearby.Clear();
 			using (TimeWarning.New("SenseComponent:Tick:ProcessEntities"))
 			{
 				using PooledList<BaseEntity> pooledList = Facepunch.Pool.Get<PooledList<BaseEntity>>();
@@ -324,9 +370,9 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 						{
 							HasPlayerInVicinity = true;
 						}
-						if (base.baseEntity.InSameNpcTeam(item))
+						if (base.baseEntity.InSameNpcTeam(item) && !_alliesWeAreAwareOf.ContainsKey(item))
 						{
-							AlliesNearby.Add(item);
+							_alliesWeAreAwareOf.Add(item, timeAsDouble);
 						}
 						if (CanTarget(item))
 						{
@@ -344,7 +390,7 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 					{
 						pooledList2.Add(baseEntity2);
 					}
-					else if (!visibilityStatus2.isVisible && visibilityStatus2.GetTimeNotSeen() > TimeToForgetSightings)
+					else if (!visibilityStatus2.isVisible && visibilityStatus2.GetTimeNotSeen() > timeToForgetSightings.Value)
 					{
 						pooledList2.Add(baseEntity2);
 					}
@@ -356,6 +402,10 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 				entitiesUpdatedThisFrame.Clear();
 				foreach (BaseEntity item2 in pooledList2)
 				{
+					if (_target.IsValid() && _target == item2)
+					{
+						ClearTarget();
+					}
 					Forget(item2);
 				}
 			}
@@ -367,69 +417,82 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 		}
 	}
 
-	private void ProcessEntity(BaseEntity e)
+	private void GetModifiedSenses(BaseEntity entity, out float modTouchDistance, out float modHalfAngle, out float modShortVisionRange, out Vector3 modLongVisionRectangle)
 	{
-		Vector3 vector = GetEyeTransform().rotation * Vector3.forward;
-		Vector3 position = GetEyeTransform().GetPosition();
-		Vector3 vector2 = e.transform.position - position;
-		float magnitude = vector2.magnitude;
-		float distancePenalty = GetDistancePenalty(e);
-		magnitude = Mathf.Max(0f, magnitude - distancePenalty);
-		bool flag = false;
-		using (TimeWarning.New("SenseComponent:ProcessEntity:CheckRanges"))
+		modTouchDistance = touchDistance;
+		modHalfAngle = ShortRangeVisionCone.halfAngle;
+		modShortVisionRange = ShortRangeVisionCone.range;
+		modLongVisionRectangle = LongRangeVisionRectangle;
+		if (entity.ToNonNpcPlayer(out var player))
 		{
-			if (magnitude < touchDistance)
+			if (player.IsDucked())
 			{
-				flag = true;
+				modTouchDistance = base.baseEntity.bounds.extents.z * 1.5f;
+				modHalfAngle = ShortRangeVisionCone.halfAngle * 0.85f;
+				modShortVisionRange = ShortRangeVisionCone.range * 0.5f;
+				modLongVisionRectangle = Vector3.Scale(LongRangeVisionRectangle, new Vector3(3f, 0.5f, 0.5f));
 			}
-			else if (magnitude < ShortRangeVisionCone.range && Vector3.Angle(vector, vector2.normalized) < ShortRangeVisionCone.halfAngle)
+			else if (player.IsRunning())
 			{
-				flag = true;
+				modTouchDistance = touchDistance * 3f;
+				modHalfAngle = ShortRangeVisionCone.halfAngle;
+				modShortVisionRange = ShortRangeVisionCone.range * 1.3f;
+				modLongVisionRectangle = LongRangeVisionRectangle * 1.15f;
 			}
-			else if (magnitude >= ShortRangeVisionCone.range)
-			{
-				Vector3 vector3 = LongRangeVisionRectangle + Vector3.one * distancePenalty;
-				flag = magnitude < vector3.z && Mathf.Abs(e.transform.position.y - position.y) < vector3.y * 0.5f && Vector3.Cross(vector, e.transform.position - position).magnitude < vector3.x * 0.5f;
-			}
-		}
-		bool flag2 = flag;
-		if (flag && e.ToNonNpcPlayer(out var player))
-		{
-			using (TimeWarning.New("SenseComponent:ProcessEntity:CanSee"))
-			{
-				flag2 = base.baseEntity.CanSee(position, player.eyes.position);
-			}
-		}
-		if (entitiesWeAreAwareOf.TryGetValue(e, out var value))
-		{
-			value.UpdateVisibility(flag2, flag2 ? new Vector3?(e.transform.position) : ((Vector3?)null));
-			entitiesUpdatedThisFrame.Add(e);
-		}
-		else if (flag2)
-		{
-			VisibilityStatus visibilityStatus = Facepunch.Pool.Get<VisibilityStatus>();
-			visibilityStatus.position = e.transform.position;
-			entitiesWeAreAwareOf.Add(e, visibilityStatus);
-			entitiesUpdatedThisFrame.Add(e);
 		}
 	}
 
-	private float GetDistancePenalty(BaseEntity e)
+	private bool IsInAnyRange(BaseEntity entity)
 	{
-		if (!e.ToNonNpcPlayer(out var player))
+		using (TimeWarning.New("IsInAnyRange"))
 		{
-			return 0f;
+			Vector3 position = GetEyeTransform().GetPosition();
+			Vector3 vector = GetEyeTransform().rotation * Vector3.forward;
+			Vector3 vector2 = entity.transform.position - position;
+			float magnitude = vector2.magnitude;
+			GetModifiedSenses(entity, out var modTouchDistance, out var modHalfAngle, out var modShortVisionRange, out var modLongVisionRectangle);
+			if (magnitude < modTouchDistance)
+			{
+				return true;
+			}
+			if (Vector3.Angle(vector, vector2.normalized) < modHalfAngle)
+			{
+				if (magnitude < modShortVisionRange)
+				{
+					return true;
+				}
+				if (TOD_Sky.Instance.IsDay && magnitude < modLongVisionRectangle.z && Mathf.Abs(entity.transform.position.y - position.y) < modLongVisionRectangle.y * 0.5f && Vector3.Cross(vector, entity.transform.position - position).magnitude < modLongVisionRectangle.x * 0.5f)
+				{
+					return true;
+				}
+			}
+			return false;
 		}
-		float result = 0f;
-		if (player.IsRunning())
+	}
+
+	private void ProcessEntity(BaseEntity entity)
+	{
+		bool flag = IsInAnyRange(entity);
+		if (flag && entity.ToNonNpcPlayer(out var player))
 		{
-			result = 10f;
+			using (TimeWarning.New("SenseComponent:ProcessEntity:CanSee"))
+			{
+				Vector3 position = GetEyeTransform().GetPosition();
+				flag = base.baseEntity.CanSee(position, player.eyes.position);
+			}
 		}
-		else if (!player.IsDucked())
+		if (entitiesWeAreAwareOf.TryGetValue(entity, out var value))
 		{
-			result = ((player.estimatedVelocity.magnitude > 0.1f) ? 5f : 2.5f);
+			value.UpdateVisibility(flag, flag ? new Vector3?(entity.transform.position) : ((Vector3?)null));
+			entitiesUpdatedThisFrame.Add(entity);
 		}
-		return result;
+		else if (flag)
+		{
+			VisibilityStatus visibilityStatus = Facepunch.Pool.Get<VisibilityStatus>();
+			visibilityStatus.position = entity.transform.position;
+			entitiesWeAreAwareOf.Add(entity, visibilityStatus);
+			entitiesUpdatedThisFrame.Add(entity);
+		}
 	}
 
 	private void TickHearing(float deltaTime)
@@ -449,7 +512,7 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 			NpcNoiseEvent npcNoiseEvent = null;
 			foreach (NpcNoiseEvent item in pooledList)
 			{
-				if (item.Initiator == base.baseEntity || UnityEngine.Time.timeAsDouble - item.EventTime > (double)TimeToForgetNoises || (npcNoiseEvent != null && item.Intensity < npcNoiseEvent.Intensity))
+				if (item.Initiator == base.baseEntity || UnityEngine.Time.timeAsDouble - item.EventTime > 5.0 || (npcNoiseEvent != null && item.Intensity < npcNoiseEvent.Intensity))
 				{
 					continue;
 				}
@@ -633,17 +696,30 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 		return true;
 	}
 
-	public BaseEntity GetTarget()
+	public bool FindTarget(out BaseEntity target)
 	{
 		if (!CanTarget(_target))
 		{
 			ClearTarget();
-			return null;
+			target = null;
+			return false;
 		}
-		return _target;
+		target = _target;
+		return target != null;
 	}
 
-	public bool TrySetTarget(BaseEntity newTarget, bool bypassCooldown = false)
+	public bool FindTargetPosition(out Vector3 targetPosition)
+	{
+		if (!FindTarget(out var target))
+		{
+			targetPosition = Vector3.zero;
+			return false;
+		}
+		targetPosition = target.transform.position;
+		return true;
+	}
+
+	public bool TrySetTarget(BaseEntity newTarget, bool bypassCooldown = true)
 	{
 		if (lockState.IsLocked)
 		{
@@ -742,7 +818,7 @@ public class SenseComponent : EntityComponent<BaseEntity>, IServerComponent
 			}
 			if (baseEntity != null)
 			{
-				TrySetTarget(baseEntity);
+				TrySetTarget(baseEntity, bypassCooldown: false);
 			}
 		}
 	}

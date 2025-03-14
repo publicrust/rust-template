@@ -1,7 +1,7 @@
 using UnityEngine;
 
-[ExecuteInEditMode]
 [RequireComponent(typeof(WindZone))]
+[ExecuteInEditMode]
 public class WindZoneExManager : MonoBehaviour
 {
 	private enum TestMode

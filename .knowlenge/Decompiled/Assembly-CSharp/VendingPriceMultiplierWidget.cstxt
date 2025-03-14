@@ -18,4 +18,6 @@ public class VendingPriceMultiplierWidget : MonoBehaviour
 	public GameObject RegularTooltip;
 
 	public GameObject AlwaysOnTopTooltip;
+
+	public bool Invert;
 }

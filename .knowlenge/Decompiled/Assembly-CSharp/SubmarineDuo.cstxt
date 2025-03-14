@@ -3,8 +3,8 @@ using UnityEngine;
 
 public class SubmarineDuo : BaseSubmarine
 {
-	[SerializeField]
 	[Header("Duo Sub Seating & Controls")]
+	[SerializeField]
 	private Transform steeringWheel;
 
 	[SerializeField]

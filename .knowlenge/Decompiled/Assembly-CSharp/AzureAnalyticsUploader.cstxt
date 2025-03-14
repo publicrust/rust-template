@@ -4,6 +4,9 @@ using System.IO;
 using System.IO.Compression;
 using System.Threading;
 using System.Threading.Tasks;
+using Azure;
+using Azure.Core;
+using Azure.Identity;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using ConVar;
@@ -16,6 +19,8 @@ public class AzureAnalyticsUploader : Facepunch.Pool.IPooled
 {
 	public static bool UsePooling;
 
+	public static ClientSecretCredential Credential;
+
 	private ConcurrentQueue<EventRecord> queue = new ConcurrentQueue<EventRecord>();
 
 	private BlobClient _blobClient;
@@ -27,6 +32,14 @@ public class AzureAnalyticsUploader : Facepunch.Pool.IPooled
 	private Utf8ValueStringBuilder Writer;
 
 	private bool disposed;
+
+	private BlobOpenWriteOptions blobWriteOptions = new BlobOpenWriteOptions
+	{
+		HttpHeaders = new BlobHttpHeaders
+		{
+			ContentEncoding = "gzip"
+		}
+	};
 
 	public TimeSpan LoopDelay { get; set; }
 
@@ -48,11 +61,6 @@ public class AzureAnalyticsUploader : Facepunch.Pool.IPooled
 		disposed = true;
 	}
 
-	public void LeavePool()
-	{
-		Initialize();
-	}
-
 	private void Initialize()
 	{
 		LoopDelay = TimeSpan.FromMilliseconds(250.0);
@@ -67,14 +75,19 @@ public class AzureAnalyticsUploader : Facepunch.Pool.IPooled
 		disposed = false;
 	}
 
+	public void LeavePool()
+	{
+		Initialize();
+	}
+
 	public bool TryFlush()
 	{
-		if (Expiry < DateTime.UtcNow)
+		if (Expiry >= DateTime.UtcNow)
 		{
-			disposed = true;
-			return true;
+			return false;
 		}
-		return false;
+		disposed = true;
+		return true;
 	}
 
 	public static AzureAnalyticsUploader Create(string table, TimeSpan timeout, AnalyticsDocumentMode mode = AnalyticsDocumentMode.JSON)
@@ -91,14 +104,33 @@ public class AzureAnalyticsUploader : Facepunch.Pool.IPooled
 		}
 		azureAnalyticsUploader.Expiry = DateTime.UtcNow + timeout;
 		azureAnalyticsUploader.DocumentMode = mode;
-		if (string.IsNullOrEmpty(Analytics.BulkUploadConnectionString))
+		if (string.IsNullOrEmpty(Analytics.GetContainerUrl()))
 		{
+			Debug.Log("No analytics_bulk_container_url or analytics_bulk_connection_string set, disabling bulk uploader.");
 			azureAnalyticsUploader.disposed = true;
 			return azureAnalyticsUploader;
 		}
 		string text = ((mode == AnalyticsDocumentMode.JSON) ? ".json" : ".csv");
 		string blobName = Path.Combine(table, Server.server_id, Guid.NewGuid().ToString("N") + text + ".gz");
-		BlobContainerClient blobContainerClient = new BlobContainerClient(new Uri(Analytics.BulkUploadConnectionString));
+		BlobContainerClient blobContainerClient;
+		if (!string.IsNullOrEmpty(Analytics.BulkUploadConnectionString))
+		{
+			blobContainerClient = new BlobContainerClient(new Uri(Analytics.BulkUploadConnectionString));
+		}
+		else
+		{
+			if (string.IsNullOrEmpty(Analytics.AzureTenantId) || string.IsNullOrEmpty(Analytics.AzureClientId) || string.IsNullOrEmpty(Analytics.AzureClientSecret))
+			{
+				Debug.Log("analytics_bulk_container_url set but missing Azure AD credentials, disabling bulk uploader.");
+				azureAnalyticsUploader.disposed = true;
+				return azureAnalyticsUploader;
+			}
+			if (Credential == null)
+			{
+				Credential = new ClientSecretCredential(Analytics.AzureTenantId, Analytics.AzureClientId, Analytics.AzureClientSecret);
+			}
+			blobContainerClient = new BlobContainerClient(new Uri(Analytics.BulkContainerUrl), (TokenCredential)Credential, (BlobClientOptions)null);
+		}
 		azureAnalyticsUploader._blobClient = blobContainerClient.GetBlobClient(blobName);
 		Task.Run((Func<Task>)azureAnalyticsUploader.UploadThread);
 		return azureAnalyticsUploader;
@@ -125,15 +157,29 @@ public class AzureAnalyticsUploader : Facepunch.Pool.IPooled
 	{
 		CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
 		cancellationTokenSource.CancelAfter(TimeSpan.FromSeconds(10.0));
-		BlobOpenWriteOptions options = new BlobOpenWriteOptions
+		blobWriteOptions.HttpHeaders.ContentType = ((DocumentMode == AnalyticsDocumentMode.JSON) ? "application/json" : "text/csv");
+		try
 		{
-			HttpHeaders = new BlobHttpHeaders
+			Stream = await _blobClient.OpenWriteAsync(overwrite: true, blobWriteOptions, cancellationTokenSource.Token);
+		}
+		catch (RequestFailedException ex)
+		{
+			switch (ex.Status)
 			{
-				ContentType = ((DocumentMode == AnalyticsDocumentMode.JSON) ? "application/json" : "text/csv"),
-				ContentEncoding = "gzip"
+			case 403:
+				Debug.Log("Access denied to container " + _blobClient.BlobContainerName + ", disabling bulk uploader.");
+				break;
+			case 404:
+				Debug.Log("Container " + _blobClient.BlobContainerName + " doesn't exist, disabling bulk uploader.");
+				break;
+			default:
+				Debug.Log($"Unknown error when opening Azure container, status code: {ex.Status}, disabling bulk uploader.");
+				Debug.LogException(ex);
+				break;
 			}
-		};
-		Stream = await _blobClient.OpenWriteAsync(overwrite: true, options, cancellationTokenSource.Token);
+			EmptyUploadQueue();
+			return;
+		}
 		ZipStream = new GZipStream(Stream, System.IO.Compression.CompressionLevel.Fastest);
 		Writer.Clear();
 	}
@@ -153,6 +199,12 @@ public class AzureAnalyticsUploader : Facepunch.Pool.IPooled
 						if (Stream == null)
 						{
 							await CreateBlobAsync();
+							if (Stream == null)
+							{
+								record.MarkSubmitted();
+								Facepunch.Pool.Free(ref record);
+								continue;
+							}
 						}
 						Writer.Clear();
 						if (DocumentMode == AnalyticsDocumentMode.JSON)

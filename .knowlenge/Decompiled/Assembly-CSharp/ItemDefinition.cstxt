@@ -156,6 +156,10 @@ public class ItemDefinition : MonoBehaviour
 
 	public Vector3 WorldModelDropOffset;
 
+	public bool AdjustCenterOfMassOnDrop;
+
+	public Vector3 DropCenterOfMass;
+
 	public ItemDefinition isRedirectOf;
 
 	public RedirectVendingBehaviour redirectVendingBehaviour;

@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using Facepunch.Rust;
 using Network;
 using UnityEngine;
@@ -13,21 +12,19 @@ public class OreResourceEntity : StagedResourceEntity
 
 	public bool useHotspotMinigame = true;
 
-	public OreHotSpot _hotSpot;
-
 	public SoundPlayer bonusSound;
 
 	public float heightOffset;
-
-	public bool useManualStageCentre;
-
-	public List<Vector3> stageCentres = new List<Vector3>();
 
 	private int bonusesKilled;
 
 	public int bonusesSpawned;
 
+	public OreHotSpot _hotSpot;
+
 	public Vector3 lastNodeDir = Vector3.zero;
+
+	private Ray? spawnBonusHitRay;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -44,32 +41,47 @@ public class OreResourceEntity : StagedResourceEntity
 			if (useHotspotMinigame)
 			{
 				Jackhammer jackhammer = info.Weapon as Jackhammer;
-				if ((bool)_hotSpot || (bool)jackhammer)
+				bool flag = _hotSpot == null;
+				if (_hotSpot == null)
 				{
-					if (_hotSpot == null)
+					_hotSpot = SpawnBonusSpotOnRay(new Ray(info.PointStart, info.attackNormal));
+				}
+				float num = ((_hotSpot != null) ? Vector3.Distance(info.HitPositionWorld, _hotSpot.transform.position) : float.MaxValue);
+				if (flag || num <= _hotSpot.GetComponent<SphereCollider>().radius * 1.5f || jackhammer != null)
+				{
+					float num2 = ((jackhammer == null) ? 1f : jackhammer.HotspotBonusScale);
+					bonusesKilled++;
+					info.gatherScale = 1f + Mathf.Clamp((float)bonusesKilled * 0.5f, 0f, 2f * num2);
+					if (_hotSpot != null)
 					{
-						_hotSpot = SpawnBonusSpot(lastNodeDir);
-					}
-					if (Vector3.Distance(info.HitPositionWorld, _hotSpot.transform.position) <= _hotSpot.GetComponent<SphereCollider>().radius * 1.5f || jackhammer != null)
-					{
-						float num = ((jackhammer == null) ? 1f : jackhammer.HotspotBonusScale);
-						bonusesKilled++;
-						info.gatherScale = 1f + Mathf.Clamp((float)bonusesKilled * 0.5f, 0f, 2f * num);
 						_hotSpot.FireFinishEffect();
 						ClientRPC(null, "PlayBonusLevelSound", bonusesKilled, _hotSpot.transform.position);
 					}
-					else if (bonusesKilled > 0)
-					{
-						bonusesKilled = 0;
-						Effect.server.Run(bonusFailEffect.resourcePath, base.transform.position, base.transform.up);
-					}
-					if (bonusesKilled > 0)
-					{
-						CleanupBonus();
-					}
+				}
+				else if (bonusesKilled > 0)
+				{
+					bonusesKilled = 0;
+					Effect.server.Run(bonusFailEffect.resourcePath, base.transform.position, base.transform.up);
+				}
+				if (bonusesKilled > 0)
+				{
+					CleanupBonus();
 				}
 				if (_hotSpot == null)
 				{
+					if (flag)
+					{
+						spawnBonusHitRay = new Ray(info.PointStart, info.attackNormal);
+						lastNodeDir = (info.PointStart - (base.transform.position + new Vector3(0f, 0.5f, 0f))).normalized;
+						float num3 = 0.6f;
+						if (lastNodeDir.y > num3)
+						{
+							float num4 = lastNodeDir.y - num3;
+							lastNodeDir.y = num4;
+							lastNodeDir.x += num4;
+							lastNodeDir.z += num4;
+						}
+					}
 					DelayedBonusSpawn();
 				}
 			}
@@ -113,20 +125,6 @@ public class OreResourceEntity : StagedResourceEntity
 		base.OnKilled(info);
 	}
 
-	public override void ServerInit()
-	{
-		base.ServerInit();
-		Invoke(InitialSpawnBonusSpot, 0f);
-	}
-
-	private void InitialSpawnBonusSpot()
-	{
-		if (!base.IsDestroyed)
-		{
-			_hotSpot = SpawnBonusSpot(Vector3.zero);
-		}
-	}
-
 	public void FinishBonusAssigned()
 	{
 		Effect.server.Run(finishEffect.resourcePath, base.transform.position, base.transform.up);
@@ -141,7 +139,39 @@ public class OreResourceEntity : StagedResourceEntity
 	public void RespawnBonus()
 	{
 		CleanupBonus();
-		_hotSpot = SpawnBonusSpot(lastNodeDir);
+		if (spawnBonusHitRay.HasValue)
+		{
+			_hotSpot = SpawnBonusSpotOnRay(spawnBonusHitRay.Value);
+			spawnBonusHitRay = null;
+		}
+		else
+		{
+			_hotSpot = SpawnBonusSpot(lastNodeDir);
+		}
+	}
+
+	private OreHotSpot SpawnBonusSpotOnRay(Ray r)
+	{
+		if (base.isClient)
+		{
+			return null;
+		}
+		if (!useHotspotMinigame)
+		{
+			return null;
+		}
+		if (!bonusPrefab.isValid)
+		{
+			return null;
+		}
+		if (ResourceMeshCollider.Raycast(r, out var hitInfo, 15f))
+		{
+			OreHotSpot obj = GameManager.server.CreateEntity(bonusPrefab.resourcePath, hitInfo.point - r.direction * 0.025f, Quaternion.LookRotation(hitInfo.normal, Vector3.up)) as OreHotSpot;
+			obj.Spawn();
+			obj.OreOwner(this);
+			return obj;
+		}
+		return SpawnBonusSpot(lastNodeDir);
 	}
 
 	public OreHotSpot SpawnBonusSpot(Vector3 lastDirection)
@@ -158,10 +188,9 @@ public class OreResourceEntity : StagedResourceEntity
 		{
 			return null;
 		}
-		_ = Random.insideUnitCircle.normalized;
 		Vector3 zero = Vector3.zero;
-		MeshCollider stageComponent = GetStageComponent<MeshCollider>();
-		Vector3 vector = base.transform.InverseTransformPoint(stageComponent.bounds.center);
+		MeshCollider resourceMeshCollider = ResourceMeshCollider;
+		Vector3 vector = base.transform.InverseTransformPoint(resourceMeshCollider.bounds.center);
 		if (lastDirection == Vector3.zero)
 		{
 			float num = 0.5f;
@@ -178,29 +207,20 @@ public class OreResourceEntity : StagedResourceEntity
 		else
 		{
 			Vector3 vector4 = Vector3.Cross(lastNodeDir, Vector3.up);
-			float num2 = Random.Range(0.25f, 0.5f);
+			float num2 = Random.Range(0.25f, 0.5f) + (float)stage * 0.25f;
 			float num3 = ((Random.Range(0, 2) == 0) ? (-1f) : 1f);
-			Vector3 direction = (lastNodeDir = (lastNodeDir + vector4 * num2 * num3).normalized);
+			Vector3 direction = (lastNodeDir = (lastNodeDir + vector4 * (num2 * num3)).normalized);
 			zero = base.transform.position + base.transform.TransformDirection(direction) * 2f;
 			float num4 = Random.Range(1f, 1.5f);
 			zero += base.transform.up * (vector.y + num4);
 		}
 		bonusesSpawned++;
-		Vector3 zero2 = Vector3.zero;
-		if (useManualStageCentre)
+		Vector3 normalized = (resourceMeshCollider.bounds.center - zero).normalized;
+		if (resourceMeshCollider.Raycast(new Ray(zero, normalized), out var hitInfo, 15f))
 		{
-			_ = stageCentres[stage];
-			zero2 = (base.transform.TransformPoint(stageCentres[stage]) - zero).normalized;
-		}
-		else
-		{
-			zero2 = (stageComponent.bounds.center - zero).normalized;
-		}
-		if (stageComponent.Raycast(new Ray(zero, zero2), out var hitInfo, 15f))
-		{
-			OreHotSpot obj = GameManager.server.CreateEntity(bonusPrefab.resourcePath, hitInfo.point - zero2 * 0.025f, Quaternion.LookRotation(hitInfo.normal, Vector3.up)) as OreHotSpot;
+			OreHotSpot obj = GameManager.server.CreateEntity(bonusPrefab.resourcePath, hitInfo.point - normalized * 0.025f, Quaternion.LookRotation(hitInfo.normal, Vector3.up)) as OreHotSpot;
 			obj.Spawn();
-			obj.SendMessage("OreOwner", this);
+			obj.OreOwner(this);
 			return obj;
 		}
 		return null;

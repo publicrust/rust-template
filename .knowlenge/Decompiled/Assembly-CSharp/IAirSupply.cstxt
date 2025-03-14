@@ -2,5 +2,5 @@ public interface IAirSupply
 {
 	ItemModGiveOxygen.AirSupplyType AirType { get; }
 
-	float GetAirTimeRemaining();
+	float GetAirTimeRemaining(Item forItem);
 }

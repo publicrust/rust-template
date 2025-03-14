@@ -76,8 +76,8 @@ public class Megaphone : HeldEntity
 		}
 	}
 
-	[RPC_Server.FromOwner]
 	[RPC_Server]
+	[RPC_Server.FromOwner]
 	private void Server_ToggleBroadcasting(RPCMessage msg)
 	{
 		bool flag = msg.read.Int8() == 1;

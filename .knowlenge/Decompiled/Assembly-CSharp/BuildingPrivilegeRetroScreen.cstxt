@@ -41,8 +41,8 @@ public class BuildingPrivilegeRetroScreen : FacepunchBehaviour, INotifyLOD, ICli
 
 	public RustText[] paginationTexts;
 
-	[Space]
 	[Header("BLOCKS")]
+	[Space]
 	public GameObject[] blocksType;
 
 	public RustText blockCountText;

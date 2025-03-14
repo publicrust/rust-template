@@ -21,4 +21,6 @@ public class SellOrderEntry : MonoBehaviour, IInventoryChanged
 	public UIIntegerEntry intEntry;
 
 	public VendingPriceMultiplierWidget priceMultiplier;
+
+	public VendingPriceMultiplierWidget receivedCurrencyMultiplier;
 }

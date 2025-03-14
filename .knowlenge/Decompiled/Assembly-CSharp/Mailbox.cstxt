@@ -1,8 +1,10 @@
 #define UNITY_ASSERTIONS
 using System;
 using ConVar;
+using Facepunch;
 using Network;
 using Oxide.Core;
+using ProtoBuf;
 using UnityEngine;
 using UnityEngine.Assertions;
 
@@ -18,7 +20,12 @@ public class Mailbox : StorageContainer
 
 	public bool shouldMarkAsFull;
 
-	public int mailInputSlot => inventorySlots - 1;
+	public int InputSlotCount = 1;
+
+	[NonSerialized]
+	public ItemContainer InputContainer;
+
+	public int mailInputSlot => 0;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -86,6 +93,18 @@ public class Mailbox : StorageContainer
 		return base.PlayerOpenLoot(player, PlayerIsOwner(player) ? ownerPanel : panelToOpen);
 	}
 
+	public override void AddContainers(PlayerLoot loot)
+	{
+		if (PlayerIsOwner(loot.GetCastedEntity()))
+		{
+			loot.AddContainer(base.inventory);
+		}
+		else
+		{
+			loot.AddContainer(InputContainer);
+		}
+	}
+
 	public override bool CanOpenLootPanel(BasePlayer player, string panelName)
 	{
 		if (panelName == ownerPanel)
@@ -105,29 +124,7 @@ public class Mailbox : StorageContainer
 
 	private bool HasFreeSpace()
 	{
-		return GetFreeSlot() != -1;
-	}
-
-	private int GetFreeSlot()
-	{
-		for (int i = 0; i < mailInputSlot; i++)
-		{
-			if (base.inventory.GetSlot(i) == null)
-			{
-				return i;
-			}
-		}
-		return -1;
-	}
-
-	public virtual bool MoveItemToStorage(Item item)
-	{
-		item.RemoveFromContainer();
-		if (!item.MoveToContainer(base.inventory))
-		{
-			return false;
-		}
-		return true;
+		return !base.inventory.IsFull();
 	}
 
 	public override void PlayerStoppedLooting(BasePlayer player)
@@ -159,14 +156,10 @@ public class Mailbox : StorageContainer
 
 	public void SubmitInputItems(BasePlayer fromPlayer)
 	{
-		Item slot = base.inventory.GetSlot(mailInputSlot);
-		if (IsFull() || slot == null || Interface.CallHook("OnItemSubmit", slot, this, fromPlayer) != null)
+		for (int i = 0; i < InputContainer.capacity; i++)
 		{
-			return;
-		}
-		if (MoveItemToStorage(slot))
-		{
-			if (slot.position != mailInputSlot)
+			Item slot = InputContainer.GetSlot(i);
+			if (slot != null && Interface.CallHook("OnItemSubmit", slot, this, fromPlayer) == null && slot.MoveToContainer(base.inventory))
 			{
 				Effect.server.Run(mailDropSound.resourcePath, GetDropPosition());
 				if (fromPlayer != null && !PlayerIsOwner(fromPlayer))
@@ -175,30 +168,12 @@ public class Mailbox : StorageContainer
 				}
 			}
 		}
-		else
-		{
-			slot.Drop(GetDropPosition(), GetDropVelocity());
-		}
 	}
 
 	public override void OnItemAddedOrRemoved(Item item, bool added)
 	{
 		MarkFull(!HasFreeSpace());
 		base.OnItemAddedOrRemoved(item, added);
-	}
-
-	public override bool CanMoveFrom(BasePlayer player, Item item)
-	{
-		bool flag = PlayerIsOwner(player);
-		if (!flag)
-		{
-			flag = item == base.inventory.GetSlot(mailInputSlot);
-		}
-		if (flag)
-		{
-			return base.CanMoveFrom(player, item);
-		}
-		return false;
 	}
 
 	public override bool ItemFilter(Item item, int targetSlot)
@@ -218,12 +193,40 @@ public class Mailbox : StorageContainer
 		return false;
 	}
 
-	public override int GetIdealSlot(BasePlayer player, ItemContainer container, Item item)
+	public override void Save(SaveInfo info)
 	{
-		if (player == null || PlayerIsOwner(player))
+		base.Save(info);
+		ProtoBuf.Mailbox mailbox = Facepunch.Pool.Get<ProtoBuf.Mailbox>();
+		mailbox.inventory = base.inventory.Save();
+		info.msg.mailbox = mailbox;
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (base.isServer && info.msg.mailbox != null && info.msg.mailbox.inventory != null)
 		{
-			return -1;
+			InputContainer.Load(info.msg.mailbox.inventory);
 		}
-		return mailInputSlot;
+	}
+
+	public override void ServerInit()
+	{
+		base.ServerInit();
+		if (InputContainer == null)
+		{
+			InputContainer = Facepunch.Pool.Get<ItemContainer>();
+			InputContainer.allowedContents = ((allowedContents == (ItemContainer.ContentsType)0) ? ItemContainer.ContentsType.Generic : allowedContents);
+			InputContainer.SetOnlyAllowedItem(allowedItem);
+			InputContainer.entityOwner = this;
+			InputContainer.maxStackSize = maxStackSize;
+			InputContainer.ServerInitialize(null, InputSlotCount);
+			InputContainer.GiveUID();
+			InputContainer.onDirty += OnInventoryDirty;
+			InputContainer.onItemAddedRemoved = OnItemAddedOrRemoved;
+			ItemContainer inputContainer = InputContainer;
+			inputContainer.canAcceptItem = (Func<Item, int, bool>)Delegate.Combine(inputContainer.canAcceptItem, new Func<Item, int, bool>(ItemFilter));
+			OnInventoryFirstCreated(InputContainer);
+		}
 	}
 }

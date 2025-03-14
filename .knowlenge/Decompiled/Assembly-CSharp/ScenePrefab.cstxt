@@ -30,8 +30,12 @@ public class ScenePrefab : MonoBehaviour
 
 	private void Start()
 	{
-		scenePath = GenericScene;
 		NeedsPreProcess = true;
+		scenePath = GenericScene;
+		if (Environment.OSVersion.Platform == PlatformID.Unix || Environment.OSVersion.Platform == PlatformID.MacOSX)
+		{
+			scenePath = scenePath.Replace("\\", "/");
+		}
 		sceneName = Path.GetFileNameWithoutExtension(scenePath);
 		SceneManager.LoadSceneAsync(sceneName, LoadSceneMode.Additive).completed += OnSceneLoaded;
 	}
