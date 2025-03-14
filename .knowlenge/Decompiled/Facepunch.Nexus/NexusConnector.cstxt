@@ -1,0 +1,206 @@
+using System;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Threading.Tasks;
+using Facepunch.Nexus;
+using Facepunch.Nexus.Connector;
+using Facepunch.Nexus.Logging;
+using Facepunch.Nexus.Models;
+using Newtonsoft.Json;
+
+internal class NexusConnector : INexusConnector
+{
+	private struct Request
+	{
+		public HttpMethod Method { get; set; }
+
+		public string Url { get; set; }
+
+		public HttpContent Content { get; set; }
+	}
+
+	private const int MaxRetryCount = 5;
+
+	private const double BaseRetryDelay = 3.0;
+
+	protected readonly INexusLogger Logger;
+
+	protected readonly string BaseUrl;
+
+	protected readonly HttpClient HttpClient;
+
+	private static readonly Task<int> CompletedDummyTask = Task.FromResult(0);
+
+	public NexusConnector(INexusLogger logger, string baseUrl)
+	{
+		Logger = logger ?? NullLogger.Instance;
+		BaseUrl = baseUrl?.TrimEnd(new char[1] { '/' }) ?? throw new ArgumentNullException("baseUrl");
+		HttpClient = new HttpClient();
+	}
+
+	public async Task<NexusListing> ListNexuses(string publicKey, NexusRealm realm)
+	{
+		if (string.IsNullOrWhiteSpace(publicKey))
+		{
+			throw new ArgumentNullException("publicKey");
+		}
+		return (await GetRequest<NexusListing>($"{BaseUrl}?publicKey={WebUtility.UrlEncode(publicKey)}&realm={(int)realm}")).Response;
+	}
+
+	public async Task<NexusDetails> GetNexus(int nexusId)
+	{
+		return (await GetRequest<NexusDetails>($"{BaseUrl}/{nexusId}")).Response;
+	}
+
+	protected Task<ApiResult<TResponse>> GetRequest<TResponse>(string url, string authToken = null)
+	{
+		Request request = new Request
+		{
+			Method = HttpMethod.Get,
+			Url = url
+		};
+		return SendRequest<TResponse>(in request, authToken);
+	}
+
+	protected Task<ApiResult<TResponse>> PostRequest<TResponse>(string url, string authToken = null)
+	{
+		Request request = new Request
+		{
+			Method = HttpMethod.Post,
+			Url = url
+		};
+		return SendRequest<TResponse>(in request, authToken);
+	}
+
+	protected Task<ApiResult<TResponse>> PostRequest<TRequest, TResponse>(string url, TRequest requestBody, string authToken = null)
+	{
+		StringContent content = new StringContent(JsonConvert.SerializeObject((object)requestBody), Encoding.UTF8, "application/json");
+		Request request = new Request
+		{
+			Method = HttpMethod.Post,
+			Url = url,
+			Content = content
+		};
+		return SendRequest<TResponse>(in request, authToken);
+	}
+
+	protected Task<ApiResult<TResponse>> DeleteRequest<TResponse>(string url, string authToken = null)
+	{
+		Request request = new Request
+		{
+			Method = HttpMethod.Delete,
+			Url = url
+		};
+		return SendRequest<TResponse>(in request, authToken);
+	}
+
+	protected Task<ApiResult> PostRequestWithoutResponse<TRequest>(string url, TRequest requestBody, string authToken = null)
+	{
+		StringContent content = new StringContent(JsonConvert.SerializeObject((object)requestBody), Encoding.UTF8, "application/json");
+		return SendRequestWithoutResponse(new Request
+		{
+			Method = HttpMethod.Post,
+			Url = url,
+			Content = content
+		}, authToken);
+	}
+
+	protected Task<ApiResult> PostRequestWithoutResponse(string url, string authToken = null)
+	{
+		return SendRequestWithoutResponse(new Request
+		{
+			Method = HttpMethod.Post,
+			Url = url
+		}, authToken);
+	}
+
+	protected Task<ApiResult> PostRequestRawWithoutResponse(string url, string payload, string payloadMimeType, string authToken = null)
+	{
+		return SendRequestWithoutResponse(new Request
+		{
+			Method = HttpMethod.Post,
+			Url = url,
+			Content = new StringContent(payload, Encoding.UTF8, payloadMimeType)
+		}, authToken);
+	}
+
+	protected Task<ApiResult> PostRequestRawWithoutResponse(string url, ArraySegment<byte> payload, string payloadMimeType, string authToken = null)
+	{
+		ByteArrayContent byteArrayContent = new ByteArrayContent(payload.Array, payload.Offset, payload.Count);
+		byteArrayContent.Headers.ContentType = MediaTypeHeaderValue.Parse(payloadMimeType);
+		return SendRequestWithoutResponse(new Request
+		{
+			Method = HttpMethod.Post,
+			Url = url,
+			Content = byteArrayContent
+		}, authToken);
+	}
+
+	protected Task<ApiResult> DeleteRequestWithoutResponse(string url, string authToken = null)
+	{
+		return SendRequestWithoutResponse(new Request
+		{
+			Method = HttpMethod.Delete,
+			Url = url
+		}, authToken);
+	}
+
+	private Task<ApiResult<TResponse>> SendRequest<TResponse>(in Request request, string authToken = null)
+	{
+		return SendRequestImpl(request, authToken, async (HttpResponseMessage response) => JsonConvert.DeserializeObject<TResponse>(await response.Content.ReadAsStringAsync()));
+	}
+
+	private async Task<ApiResult> SendRequestWithoutResponse(Request request, string authToken = null)
+	{
+		return new ApiResult((await SendRequestImpl(request, authToken, (HttpResponseMessage _) => CompletedDummyTask)).StatusCode);
+	}
+
+	private async Task<ApiResult<TResponse>> SendRequestImpl<TResponse>(Request request, string authToken, Func<HttpResponseMessage, Task<TResponse>> responseReader)
+	{
+		AuthenticationHeaderValue auth = ((authToken != null) ? new AuthenticationHeaderValue("Bearer", authToken) : null);
+		int retryCount = 0;
+		HttpResponseMessage response;
+		int num;
+		while (true)
+		{
+			HttpRequestMessage httpRequestMessage = new HttpRequestMessage(request.Method, request.Url);
+			httpRequestMessage.Headers.Authorization = auth;
+			httpRequestMessage.Content = request.Content;
+			HttpRequestMessage request2 = httpRequestMessage;
+			response = null;
+			try
+			{
+				response = await HttpClient.SendAsync(request2).ConfigureAwait(continueOnCapturedContext: false);
+			}
+			catch (HttpRequestException exception)
+			{
+				Logger.LogWarn("Failed to send HTTP request to Nexus", exception);
+			}
+			num = (int)(response?.StatusCode ?? ((HttpStatusCode)0));
+			if (response != null && (num < 500 || num > 599))
+			{
+				break;
+			}
+			if (retryCount > 5)
+			{
+				response?.EnsureSuccessStatusCode();
+				throw new Exception($"Expected EnsureSuccessStatusCode to throw for status {num}");
+			}
+			await Task.Delay(TimeSpan.FromSeconds(Math.Pow(3.0, retryCount))).ConfigureAwait(continueOnCapturedContext: false);
+			retryCount++;
+		}
+		if (response.StatusCode == HttpStatusCode.Unauthorized)
+		{
+			response.EnsureSuccessStatusCode();
+			throw new Exception($"Expected EnsureSuccessStatusCode to throw for status {num}");
+		}
+		if (response.StatusCode == HttpStatusCode.OK)
+		{
+			TResponse response2 = await responseReader(response).ConfigureAwait(continueOnCapturedContext: false);
+			return new ApiResult<TResponse>(response.StatusCode, response2);
+		}
+		return new ApiResult<TResponse>(response.StatusCode);
+	}
+}

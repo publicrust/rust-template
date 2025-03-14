@@ -3,8 +3,10 @@ using System;
 using System.Collections.Generic;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
+using Unity.AI.Navigation;
 using UnityEngine;
 using UnityEngine.AI;
 using UnityEngine.Assertions;
@@ -27,6 +29,8 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 
 	public bool isSecurityDoor;
 
+	public bool canReverseOpen;
+
 	public TriggerNotify[] vehiclePhysBoxes;
 
 	public bool checkPhysBoxesOnOpen;
@@ -34,6 +38,8 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 	public SoundDefinition vehicleCollisionSfx;
 
 	public GameObject[] ClosedColliderRoots;
+
+	public bool allowOnCargoShip;
 
 	[SerializeField]
 	[ReadOnly]
@@ -43,21 +49,23 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 	[ReadOnly]
 	private float closeAnimLength = 4f;
 
-	private float decayResetTimeLast = float.NegativeInfinity;
+	public const Flags ReverseOpen = Flags.Reserved1;
 
 	public NavMeshModifierVolume NavMeshVolumeAnimals;
 
 	public NavMeshModifierVolume NavMeshVolumeHumanoids;
 
-	public NavMeshLink NavMeshLink;
-
 	public NPCDoorTriggerBox NpcTriggerBox;
+
+	public NavMeshLink NavMeshLink;
 
 	private static int nonWalkableArea = -1;
 
 	private static int animalAgentTypeId = -1;
 
 	private static int humanoidAgentTypeId = -1;
+
+	private float decayResetTimeLast = float.NegativeInfinity;
 
 	private Dictionary<BasePlayer, TimeSince> woundedOpens = new Dictionary<BasePlayer, TimeSince>();
 
@@ -68,6 +76,10 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 	private static int openHash = Animator.StringToHash("open");
 
 	private static int closeHash = Animator.StringToHash("close");
+
+	private static int reverseOpenHash = Animator.StringToHash("reverseOpen");
+
+	public override bool AllowOnCargoShip => allowOnCargoShip;
 
 	private bool HasVehiclePushBoxes
 	{
@@ -90,7 +102,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_CloseDoor "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - RPC_CloseDoor ");
 				}
 				using (TimeWarning.New("RPC_CloseDoor"))
 				{
@@ -126,7 +138,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_KnockDoor "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - RPC_KnockDoor ");
 				}
 				using (TimeWarning.New("RPC_KnockDoor"))
 				{
@@ -162,7 +174,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_OpenDoor "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - RPC_OpenDoor ");
 				}
 				using (TimeWarning.New("RPC_OpenDoor"))
 				{
@@ -198,7 +210,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_ToggleHatch "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - RPC_ToggleHatch ");
 				}
 				using (TimeWarning.New("RPC_ToggleHatch"))
 				{
@@ -234,7 +246,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - Server_NotifyWoundedClose "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - Server_NotifyWoundedClose ");
 				}
 				using (TimeWarning.New("Server_NotifyWoundedClose"))
 				{
@@ -270,7 +282,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - Server_NotifyWoundedOpen "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - Server_NotifyWoundedOpen ");
 				}
 				using (TimeWarning.New("Server_NotifyWoundedOpen"))
 				{
@@ -480,11 +492,11 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 		}
 	}
 
-	[RPC_Server]
 	[RPC_Server.MaxDistance(3f)]
-	private void RPC_OpenDoor(RPCMessage rpc)
+	[RPC_Server]
+	protected void RPC_OpenDoor(RPCMessage rpc)
 	{
-		if (!rpc.player.CanInteract(usableWhileCrawling: true) || !canHandOpen || IsOpen() || IsBusy() || IsLocked())
+		if (!rpc.player.CanInteract(usableWhileCrawling: true) || !canHandOpen || IsOpen() || IsBusy() || IsLocked() || IsInvoking(DelayedDoorOpening))
 		{
 			return;
 		}
@@ -517,8 +529,19 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 				decayResetTimeLast = UnityEngine.Time.realtimeSinceStartup;
 			}
 		}
-		SetFlag(Flags.Open, b: true);
-		SendNetworkUpdateImmediate();
+		if (canReverseOpen)
+		{
+			SetFlag(Flags.Reserved1, base.transform.InverseTransformPoint(rpc.player.transform.position).x > 0f, recursive: false, networkupdate: false);
+		}
+		if (ShouldDelayOpen(rpc.player, out var delay))
+		{
+			Invoke(DelayedDoorOpening, delay);
+		}
+		else
+		{
+			SetFlag(Flags.Open, b: true);
+			SendNetworkUpdateImmediate();
+		}
 		if (isSecurityDoor && NavMeshLink != null)
 		{
 			SetNavMeshLinkEnabled(wantsOn: true);
@@ -527,16 +550,34 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 		{
 			StartCheckingForBlockages(isOpening: true);
 		}
+		Facepunch.Rust.Analytics.Azure.OnBaseInteract(rpc.player, this);
+		OnPlayerOpenedDoor(rpc.player);
 		Interface.CallHook("OnDoorOpened", this, rpc.player);
+	}
+
+	private void DelayedDoorOpening()
+	{
+		SetFlag(Flags.Open, b: true);
+		SendNetworkUpdateImmediate();
+	}
+
+	protected virtual void OnPlayerOpenedDoor(BasePlayer p)
+	{
+	}
+
+	protected virtual bool ShouldDelayOpen(BasePlayer forPlayer, out float delay)
+	{
+		delay = 0f;
+		return false;
 	}
 
 	private void StartCheckingForBlockages(bool isOpening)
 	{
 		if (HasVehiclePushBoxes)
 		{
-			Invoke(EnableVehiclePhysBoxes, 0.2f);
-			float time = (isOpening ? openAnimLength : closeAnimLength);
-			Invoke(DisableVehiclePhysBox, time);
+			float num = (isOpening ? openAnimLength : closeAnimLength);
+			Invoke(EnableVehiclePhysBoxes, num * 0.1f);
+			Invoke(DisableVehiclePhysBox, num * 0.8f);
 		}
 	}
 
@@ -574,6 +615,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 			{
 				SetNavMeshLinkEnabled(wantsOn: false);
 			}
+			Facepunch.Rust.Analytics.Azure.OnBaseInteract(rpc.player, this);
 			StartCheckingForBlockages(isOpening: false);
 			Interface.CallHook("OnDoorClosed", this, rpc.player);
 		}
@@ -642,8 +684,8 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 		}
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
 	private void Server_NotifyWoundedOpen(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
@@ -666,7 +708,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 
 	private void CheckTimedOutPlayers(Dictionary<BasePlayer, TimeSince> dictionary)
 	{
-		List<BasePlayer> obj = Facepunch.Pool.GetList<BasePlayer>();
+		List<BasePlayer> obj = Facepunch.Pool.Get<List<BasePlayer>>();
 		foreach (KeyValuePair<BasePlayer, TimeSince> item in dictionary)
 		{
 			if ((float)item.Value > 5f)
@@ -681,11 +723,11 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 				dictionary.Remove(item2);
 			}
 		}
-		Facepunch.Pool.FreeList(ref obj);
+		Facepunch.Pool.FreeUnmanaged(ref obj);
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
 	private void Server_NotifyWoundedClose(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
@@ -703,6 +745,23 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 			{
 				CheckTimedOutPlayers(woundedCloses);
 			}, 5f);
+		}
+	}
+
+	public override bool SupportsChildDeployables()
+	{
+		return true;
+	}
+
+	public override void OnPickedUp(Item createdItem, BasePlayer player)
+	{
+		base.OnPickedUp(createdItem, player);
+		foreach (BaseEntity child in children)
+		{
+			if (child is CustomDoorManipulator customDoorManipulator)
+			{
+				player.GiveItem(ItemManager.CreateByItemID(customDoorManipulator.sourceItem.itemid, 1, 0uL), GiveItemReason.PickedUp);
+			}
 		}
 	}
 
@@ -727,31 +786,61 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 			return;
 		}
 		bool flag = false;
+		BaseEntity baseEntity = null;
 		foreach (BaseEntity entityContent in trigger.entityContents)
 		{
-			if (entityContent is BaseMountable { BlocksDoors: not false })
+			if (entityContent is BaseMountable { BlocksDoors: not false } baseMountable)
 			{
 				flag = true;
+				baseEntity = baseMountable;
 				break;
 			}
 			if (entityContent is BaseVehicleModule baseVehicleModule && baseVehicleModule.Vehicle != null && baseVehicleModule.Vehicle.BlocksDoors)
 			{
 				flag = true;
+				baseEntity = baseVehicleModule.VehicleParent();
 				break;
 			}
 		}
-		if (flag)
+		if (!flag)
 		{
-			bool flag2 = HasFlag(Flags.Open);
-			SetOpen(!flag2, suppressBlockageChecks: true);
-			ReverseDoorAnimation(flag2);
-			StopCheckingForBlockages();
-			ClientRPC(null, "OnDoorInterrupted", flag2 ? 1 : 0);
+			return;
 		}
+		bool flag2 = HasFlag(Flags.Open);
+		if (checkPhysBoxesOnOpen)
+		{
+			bool flag3 = true;
+			TriggerNotify[] array = vehiclePhysBoxes;
+			foreach (TriggerNotify triggerNotify in array)
+			{
+				if (Vector3.Dot(triggerNotify.transform.forward, (baseEntity.transform.position - triggerNotify.transform.position).normalized) > 0f)
+				{
+					flag3 = false;
+					break;
+				}
+			}
+			if (flag3 == flag2)
+			{
+				return;
+			}
+		}
+		SetOpen(!flag2, suppressBlockageChecks: true);
+		ReverseDoorAnimation(flag2);
+		StopCheckingForBlockages();
+		ClientRPC(RpcTarget.NetworkGroup("OnDoorInterrupted"), flag2 ? 1 : 0);
 	}
 
 	public void OnEmpty()
 	{
+	}
+
+	protected override void ApplySubAnimationParameters(bool init, Animator toAnimator)
+	{
+		base.ApplySubAnimationParameters(init, toAnimator);
+		if (canReverseOpen)
+		{
+			toAnimator.SetBool(reverseOpenHash, HasFlag(Flags.Reserved1));
+		}
 	}
 
 	public override void OnFlagsChanged(Flags old, Flags next)

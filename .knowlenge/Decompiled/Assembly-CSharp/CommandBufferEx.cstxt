@@ -17,7 +17,7 @@ public static class CommandBufferEx
 
 	public static void BlitArray(this CommandBuffer cb, Mesh blitMesh, RenderTargetIdentifier source, Texture target, Material mat, int slice, int pass = 0)
 	{
-		cb.SetRenderTarget(target, 0, CubemapFace.PositiveX, -1);
+		cb.SetRenderTarget(target, 0, CubemapFace.Unknown, -1);
 		cb.SetGlobalTexture("_Source", source);
 		cb.SetGlobalFloat("_SourceMip", 0f);
 		if (slice >= 0)
@@ -45,7 +45,7 @@ public static class CommandBufferEx
 			cb.SetGlobalFloat("_SourceSlice", sourceSlice);
 			cb.SetGlobalInt("_TargetSlice", targetSlice);
 		}
-		cb.SetRenderTarget(target, targetMip, CubemapFace.PositiveX, -1);
+		cb.SetRenderTarget(target, targetMip, CubemapFace.Unknown, -1);
 		cb.DrawMesh(blitMesh, Matrix4x4.identity, mat, 0, pass);
 	}
 

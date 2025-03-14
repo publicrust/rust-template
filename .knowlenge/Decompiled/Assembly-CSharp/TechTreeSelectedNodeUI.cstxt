@@ -35,4 +35,10 @@ public class TechTreeSelectedNodeUI : MonoBehaviour
 	public RustText totalRequiredText;
 
 	public ItemInformationPanel[] informationPanels;
+
+	public GameObject workbenchTaxRoot;
+
+	public RustText workbenchTaxText;
+
+	public Tooltip workbenchTaxTooltip;
 }

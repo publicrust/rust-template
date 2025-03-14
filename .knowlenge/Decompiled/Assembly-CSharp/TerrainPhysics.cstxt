@@ -14,6 +14,10 @@ public class TerrainPhysics : TerrainExtension
 
 	public PhysicMaterial GetMaterial(Vector3 worldPos)
 	{
+		if (splat == null || materials.Length == 0)
+		{
+			return null;
+		}
 		return materials[splat.GetSplatMaxIndex(worldPos)];
 	}
 }

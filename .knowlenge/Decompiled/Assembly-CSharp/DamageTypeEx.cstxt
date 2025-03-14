@@ -28,4 +28,13 @@ public static class DamageTypeEx
 		}
 		return false;
 	}
+
+	public static bool InterruptsRestraintMinigame(this DamageType damageType)
+	{
+		if (damageType != DamageType.Fall && damageType != DamageType.Blunt && damageType != DamageType.Slash && damageType != DamageType.Stab && damageType != DamageType.Bullet && damageType != DamageType.Explosion)
+		{
+			return damageType == DamageType.Arrow;
+		}
+		return true;
+	}
 }

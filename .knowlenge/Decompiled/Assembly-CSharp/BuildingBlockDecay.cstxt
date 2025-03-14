@@ -21,6 +21,10 @@ public class BuildingBlockDecay : Decay
 
 	public override bool ShouldDecay(BaseEntity entity)
 	{
+		if (entity.net.group != null && entity.net.group.restricted)
+		{
+			return false;
+		}
 		if (ConVar.Decay.upkeep)
 		{
 			return true;

@@ -10,18 +10,12 @@ public class RotateObject : MonoBehaviour
 
 	public bool localSpace;
 
-	private Vector3 rotateVector;
-
-	private void Awake()
-	{
-		rotateVector = new Vector3(rotateSpeed_X, rotateSpeed_Y, rotateSpeed_Z);
-	}
-
-	private void Update()
+	protected void Update()
 	{
 		if (localSpace)
 		{
-			base.transform.Rotate(rotateVector * Time.deltaTime, Space.Self);
+			Vector3 vector = new Vector3(rotateSpeed_X, rotateSpeed_Y, rotateSpeed_Z);
+			base.transform.Rotate(vector * Time.deltaTime, Space.Self);
 			return;
 		}
 		if (rotateSpeed_X != 0f)

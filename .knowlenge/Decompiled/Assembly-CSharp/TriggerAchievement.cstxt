@@ -13,6 +13,8 @@ public class TriggerAchievement : TriggerBase
 	[Tooltip("Always set to true, clientside does not work, currently")]
 	public bool serverSide = true;
 
+	public bool allowDuringTutorial;
+
 	[NonSerialized]
 	private List<ulong> triggeredPlayers = new List<ulong>();
 
@@ -73,7 +75,7 @@ public class TriggerAchievement : TriggerBase
 		{
 			if (!string.IsNullOrEmpty(achievementOnEnter))
 			{
-				component.GiveAchievement(achievementOnEnter);
+				component.GiveAchievement(achievementOnEnter, allowDuringTutorial);
 			}
 			if (!string.IsNullOrEmpty(statToIncrease))
 			{

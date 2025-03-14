@@ -10,7 +10,7 @@ public class DestroyArcadeEntity : BaseMonoBehaviour
 
 	private void Start()
 	{
-		Invoke(DestroyAction, TimeToDie + Random.Range(TimeToDieVariance * -0.5f, TimeToDieVariance * 0.5f));
+		Invoke(DestroyAction, TimeToDie, TimeToDieVariance * 0.5f);
 	}
 
 	private void DestroyAction()

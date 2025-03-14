@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 
 public class GenerateRailBranching : ProceduralComponent
@@ -47,8 +48,6 @@ public class GenerateRailBranching : ProceduralComponent
 	{
 		if (World.Networked)
 		{
-			TerrainMeta.Path.Rails.Clear();
-			TerrainMeta.Path.Rails.AddRange(World.GetPaths("Rail"));
 			return;
 		}
 		int min = Mathf.RoundToInt(40f);
@@ -60,6 +59,21 @@ public class GenerateRailBranching : ProceduralComponent
 		int[,] array = TerrainPath.CreateRailCostmap(ref seed);
 		PathFinder pathFinder = new PathFinder(array);
 		int length = array.GetLength(0);
+		foreach (MonumentInfo monument in TerrainMeta.Path.Monuments)
+		{
+			TerrainPathConnect[] array2 = (from target in monument.GetComponentsInChildren<TerrainPathConnect>(includeInactive: true)
+				where target.Type == InfrastructureType.Rail
+				select target).ToArray();
+			foreach (TerrainPathConnect terrainPathConnect in array2)
+			{
+				pathFinder.PushPointsAdditional.Add(PathFinder.GetPoint(terrainPathConnect.transform.position, length));
+			}
+		}
+		if (pathFinder.PushPointsAdditional.Count > 0)
+		{
+			pathFinder.PushDistance = 10;
+			pathFinder.PushMultiplier = int.MaxValue;
+		}
 		List<Vector3> list2 = new List<Vector3>();
 		List<Vector3> list3 = new List<Vector3>();
 		List<Vector3> list4 = new List<Vector3>();
@@ -119,10 +133,10 @@ public class GenerateRailBranching : ProceduralComponent
 				{
 					continue;
 				}
-				PathFinder.Point pathFinderPoint = GetPathFinderPoint(vector3, length);
-				PathFinder.Point pathFinderPoint2 = GetPathFinderPoint(vector4, length);
+				PathFinder.Point point = PathFinder.GetPoint(vector3, length);
+				PathFinder.Point point2 = PathFinder.GetPoint(vector4, length);
 				l += num5;
-				PathFinder.Node node = pathFinder.FindPath(pathFinderPoint, pathFinderPoint2, 250000);
+				PathFinder.Node node = pathFinder.FindPath(point, point2, 250000);
 				if (node == null)
 				{
 					continue;
@@ -247,15 +261,5 @@ public class GenerateRailBranching : ProceduralComponent
 			rail.AdjustPlacementMap(20f);
 		}
 		TerrainMeta.Path.Rails.AddRange(list);
-	}
-
-	public PathFinder.Point GetPathFinderPoint(Vector3 worldPos, int res)
-	{
-		float num = TerrainMeta.NormalizeX(worldPos.x);
-		float num2 = TerrainMeta.NormalizeZ(worldPos.z);
-		PathFinder.Point result = default(PathFinder.Point);
-		result.x = Mathf.Clamp((int)(num * (float)res), 0, res - 1);
-		result.y = Mathf.Clamp((int)(num2 * (float)res), 0, res - 1);
-		return result;
 	}
 }

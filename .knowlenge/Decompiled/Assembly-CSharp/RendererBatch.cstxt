@@ -1,5 +1,5 @@
 using UnityEngine;
 
-public class RendererBatch : MonoBehaviour, IClientComponent
+public class RendererBatch : MonoBehaviour, IClientComponent, ICustomMaterialReplacer
 {
 }

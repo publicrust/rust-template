@@ -1,12 +1,3 @@
-using System;
-using UnityEngine.UI;
-
-public class CounterConfig : UIDialog
+public class CounterConfig : IOConfig<PowerCounter>
 {
-	[NonSerialized]
-	private PowerCounter powerCounter;
-
-	public InputField input;
-
-	public int target;
 }

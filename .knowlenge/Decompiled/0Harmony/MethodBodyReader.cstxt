@@ -5,14 +5,16 @@ using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
-using Harmony;
-using Harmony.ILCopying;
+using System.Runtime.InteropServices;
+using HarmonyLib;
+using MonoMod.Utils;
+using MonoMod.Utils.Cil;
 
-public class MethodBodyReader
+internal class MethodBodyReader
 {
 	private class ThisParameter : ParameterInfo
 	{
-		public ThisParameter(MethodBase method)
+		internal ThisParameter(MethodBase method)
 		{
 			MemberImpl = method;
 			ClassImpl = method.DeclaringType;
@@ -24,6 +26,8 @@ public class MethodBodyReader
 	private readonly ILGenerator generator;
 
 	private readonly MethodBase method;
+
+	private bool debug;
 
 	private readonly Module module;
 
@@ -37,53 +41,55 @@ public class MethodBodyReader
 
 	private readonly ParameterInfo[] parameters;
 
-	private readonly IList<LocalVariableInfo> locals;
-
 	private readonly IList<ExceptionHandlingClause> exceptions;
 
-	private List<ILInstruction> ilInstructions;
+	private readonly List<ILInstruction> ilInstructions;
+
+	private readonly List<LocalVariableInfo> localVariables;
 
 	private LocalBuilder[] variables;
 
-	private static Dictionary<OpCode, OpCode> shortJumps;
+	private static readonly Dictionary<OpCode, OpCode> shortJumps;
 
 	private static readonly OpCode[] one_byte_opcodes;
 
 	private static readonly OpCode[] two_bytes_opcodes;
 
-	private static readonly Dictionary<Type, MethodInfo> emitMethods;
-
-	public static List<ILInstruction> GetInstructions(ILGenerator generator, MethodBase method)
+	internal static List<ILInstruction> GetInstructions(ILGenerator generator, MethodBase method)
 	{
-		if (method == null)
+		if ((object)method == null)
 		{
-			throw new ArgumentNullException("Method cannot be null");
+			throw new ArgumentNullException("method");
 		}
 		MethodBodyReader methodBodyReader = new MethodBodyReader(method, generator);
 		methodBodyReader.DeclareVariables(null);
-		methodBodyReader.ReadInstructions();
+		methodBodyReader.GenerateInstructions();
 		return methodBodyReader.ilInstructions;
 	}
 
-	public MethodBodyReader(MethodBase method, ILGenerator generator)
+	internal MethodBodyReader(MethodBase method, ILGenerator generator)
 	{
 		this.generator = generator;
 		this.method = method;
 		module = method.Module;
 		MethodBody methodBody = method.GetMethodBody();
-		if (methodBody == null)
+		if ((methodBody?.GetILAsByteArray()?.Length).GetValueOrDefault() == 0)
 		{
-			throw new ArgumentException("Method " + method.FullDescription() + " has no body");
+			ilBytes = new ByteBuffer(Array.Empty<byte>());
+			ilInstructions = new List<ILInstruction>();
 		}
-		byte[] iLAsByteArray = methodBody.GetILAsByteArray();
-		if (iLAsByteArray == null)
+		else
 		{
-			throw new ArgumentException("Can not get IL bytes of method " + method.FullDescription());
+			byte[] iLAsByteArray = methodBody.GetILAsByteArray();
+			if (iLAsByteArray == null)
+			{
+				throw new ArgumentException("Can not get IL bytes of method " + method.FullDescription());
+			}
+			ilBytes = new ByteBuffer(iLAsByteArray);
+			ilInstructions = new List<ILInstruction>((iLAsByteArray.Length + 1) / 2);
 		}
-		ilBytes = new ByteBuffer(iLAsByteArray);
-		ilInstructions = new List<ILInstruction>((iLAsByteArray.Length + 1) / 2);
 		Type declaringType = method.DeclaringType;
-		if (declaringType.IsGenericType)
+		if ((object)declaringType != null && declaringType.IsGenericType)
 		{
 			try
 			{
@@ -110,11 +116,16 @@ public class MethodBodyReader
 			this_parameter = new ThisParameter(method);
 		}
 		parameters = method.GetParameters();
-		locals = methodBody.LocalVariables;
-		exceptions = methodBody.ExceptionHandlingClauses;
+		localVariables = methodBody?.LocalVariables?.ToList() ?? new List<LocalVariableInfo>();
+		exceptions = methodBody?.ExceptionHandlingClauses ?? new List<ExceptionHandlingClause>();
 	}
 
-	public void ReadInstructions()
+	internal void SetDebugging(bool debug)
+	{
+		this.debug = debug;
+	}
+
+	internal void GenerateInstructions()
 	{
 		while (ilBytes.position < ilBytes.buffer.Length)
 		{
@@ -126,11 +137,50 @@ public class MethodBodyReader
 			ReadOperand(iLInstruction);
 			ilInstructions.Add(iLInstruction);
 		}
+		HandleNativeMethod();
 		ResolveBranches();
 		ParseExceptions();
 	}
 
-	public void DeclareVariables(LocalBuilder[] existingVariables)
+	internal void HandleNativeMethod()
+	{
+		if (!(method is MethodInfo methodInfo))
+		{
+			return;
+		}
+		DllImportAttribute dllImportAttribute = methodInfo.GetCustomAttributes(inherit: false).OfType<DllImportAttribute>().FirstOrDefault();
+		if (dllImportAttribute != null)
+		{
+			string assemblyName = (methodInfo.DeclaringType?.FullName ?? "").Replace(".", "_") + "_" + methodInfo.Name;
+			AssemblyName assemblyName2 = new AssemblyName(assemblyName);
+			AssemblyBuilder assemblyBuilder = AssemblyBuilder.DefineDynamicAssembly(assemblyName2, AssemblyBuilderAccess.Run);
+			ModuleBuilder moduleBuilder = assemblyBuilder.DefineDynamicModule(assemblyName2.Name);
+			TypeBuilder typeBuilder = moduleBuilder.DefineType("NativeMethodHolder", TypeAttributes.Public | TypeAttributes.UnicodeClass);
+			MethodBuilder methodBuilder = typeBuilder.DefinePInvokeMethod(methodInfo.Name, dllImportAttribute.Value, MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.PinvokeImpl, CallingConventions.Standard, methodInfo.ReturnType, (from x in methodInfo.GetParameters()
+				select x.ParameterType).ToArray(), dllImportAttribute.CallingConvention, dllImportAttribute.CharSet);
+			methodBuilder.SetImplementationFlags(methodBuilder.GetMethodImplementationFlags() | MethodImplAttributes.PreserveSig);
+			Type type = typeBuilder.CreateType();
+			MethodInfo operand = type.GetMethod(methodInfo.Name);
+			int num = method.GetParameters().Length;
+			for (int i = 0; i < num; i++)
+			{
+				ilInstructions.Add(new ILInstruction(OpCodes.Ldarg, i)
+				{
+					offset = 0
+				});
+			}
+			ilInstructions.Add(new ILInstruction(OpCodes.Call, operand)
+			{
+				offset = num
+			});
+			ilInstructions.Add(new ILInstruction(OpCodes.Ret)
+			{
+				offset = num + 5
+			});
+		}
+	}
+
+	internal void DeclareVariables(LocalBuilder[] existingVariables)
 	{
 		if (generator == null)
 		{
@@ -141,7 +191,7 @@ public class MethodBodyReader
 			variables = existingVariables;
 			return;
 		}
-		variables = locals.Select((LocalVariableInfo lvi) => generator.DeclareLocal(lvi.LocalType, lvi.IsPinned)).ToArray();
+		variables = localVariables.Select((LocalVariableInfo lvi) => generator.DeclareLocal(lvi.LocalType, lvi.IsPinned)).ToArray();
 	}
 
 	private void ResolveBranches()
@@ -174,25 +224,24 @@ public class MethodBodyReader
 		foreach (ExceptionHandlingClause exception in exceptions)
 		{
 			int tryOffset = exception.TryOffset;
-			int num = exception.TryOffset + exception.TryLength - 1;
 			int handlerOffset = exception.HandlerOffset;
 			int offset = exception.HandlerOffset + exception.HandlerLength - 1;
 			ILInstruction instruction = GetInstruction(tryOffset, isEndOfInstruction: false);
-			instruction.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginExceptionBlock, null));
+			instruction.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginExceptionBlock));
 			ILInstruction instruction2 = GetInstruction(offset, isEndOfInstruction: true);
-			instruction2.blocks.Add(new ExceptionBlock(ExceptionBlockType.EndExceptionBlock, null));
+			instruction2.blocks.Add(new ExceptionBlock(ExceptionBlockType.EndExceptionBlock));
 			switch (exception.Flags)
 			{
 			case ExceptionHandlingClauseOptions.Filter:
 			{
 				ILInstruction instruction6 = GetInstruction(exception.FilterOffset, isEndOfInstruction: false);
-				instruction6.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginExceptFilterBlock, null));
+				instruction6.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginExceptFilterBlock));
 				break;
 			}
 			case ExceptionHandlingClauseOptions.Finally:
 			{
 				ILInstruction instruction5 = GetInstruction(handlerOffset, isEndOfInstruction: false);
-				instruction5.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginFinallyBlock, null));
+				instruction5.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginFinallyBlock));
 				break;
 			}
 			case ExceptionHandlingClauseOptions.Clause:
@@ -204,18 +253,30 @@ public class MethodBodyReader
 			case ExceptionHandlingClauseOptions.Fault:
 			{
 				ILInstruction instruction3 = GetInstruction(handlerOffset, isEndOfInstruction: false);
-				instruction3.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginFaultBlock, null));
+				instruction3.blocks.Add(new ExceptionBlock(ExceptionBlockType.BeginFaultBlock));
 				break;
 			}
 			}
 		}
 	}
 
-	public void FinalizeILCodes(List<MethodInfo> transpilers, List<Label> endLabels, List<ExceptionBlock> endBlocks)
+	private bool EndsInDeadCode(List<CodeInstruction> list)
 	{
+		int count = list.Count;
+		if (count < 2 || list.Last().opcode != OpCodes.Throw)
+		{
+			return false;
+		}
+		return list.GetRange(0, count - 1).All((CodeInstruction code) => code.opcode != OpCodes.Ret);
+	}
+
+	internal List<CodeInstruction> FinalizeILCodes(Emitter emitter, List<MethodInfo> transpilers, List<Label> endLabels, out bool hasReturnCode, out bool methodEndsInDeadCode)
+	{
+		hasReturnCode = false;
+		methodEndsInDeadCode = false;
 		if (generator == null)
 		{
-			return;
+			return null;
 		}
 		foreach (ILInstruction ilInstruction in ilInstructions)
 		{
@@ -252,6 +313,19 @@ public class MethodBodyReader
 			codeTranspiler.Add(transpiler);
 		});
 		List<CodeInstruction> result = codeTranspiler.GetResult(generator, method);
+		if (emitter == null)
+		{
+			return result;
+		}
+		emitter.LogComment("start original");
+		if (debug)
+		{
+			List<string> buffer = FileLog.GetBuffer(clear: true);
+			emitter.LogAllLocalVariables();
+			FileLog.LogBuffered(buffer);
+		}
+		hasReturnCode = result.Any((CodeInstruction code) => code.opcode == OpCodes.Ret);
+		methodEndsInDeadCode = EndsInDeadCode(result);
 		while (true)
 		{
 			CodeInstruction codeInstruction2 = result.LastOrDefault();
@@ -262,16 +336,15 @@ public class MethodBodyReader
 			endLabels.AddRange(codeInstruction2.labels);
 			result.RemoveAt(result.Count - 1);
 		}
-		int idx = 0;
 		result.Do(delegate(CodeInstruction codeInstruction)
 		{
 			codeInstruction.labels.Do(delegate(Label label)
 			{
-				Emitter.MarkLabel(generator, label);
+				emitter.MarkLabel(label);
 			});
 			codeInstruction.blocks.Do(delegate(ExceptionBlock block)
 			{
-				Emitter.MarkBlockBefore(generator, block, out var _);
+				emitter.MarkBlockBefore(block, out var _);
 			});
 			OpCode opCode = codeInstruction.opcode;
 			object obj = codeInstruction.operand;
@@ -286,50 +359,48 @@ public class MethodBodyReader
 			{
 				opCode = value;
 			}
-			if (true)
+			switch (opCode.OperandType)
 			{
-				switch (opCode.OperandType)
+			case OperandType.InlineNone:
+				emitter.Emit(opCode);
+				break;
+			case OperandType.InlineSig:
+			{
+				CecilILGenerator proxiedShim = generator.GetProxiedShim<CecilILGenerator>();
+				if (proxiedShim == null)
 				{
-				case OperandType.InlineNone:
-					Emitter.Emit(generator, opCode);
-					break;
-				case OperandType.InlineSig:
-					if (obj == null)
-					{
-						throw new Exception("Wrong null argument: " + codeInstruction);
-					}
-					if (!(obj is int))
-					{
-						throw new Exception(string.Concat("Wrong Emit argument type ", obj.GetType(), " in ", codeInstruction));
-					}
-					Emitter.Emit(generator, opCode, (int)obj);
-					break;
-				default:
+					throw new NotSupportedException();
+				}
+				if (obj == null)
 				{
-					if (obj == null)
-					{
-						throw new Exception("Wrong null argument: " + codeInstruction);
-					}
-					MethodInfo methodInfo = EmitMethodForType(obj.GetType());
-					if (methodInfo == null)
-					{
-						throw new Exception(string.Concat("Unknown Emit argument type ", obj.GetType(), " in ", codeInstruction));
-					}
-					if (HarmonyInstance.DEBUG)
-					{
-						FileLog.LogBuffered(string.Concat(Emitter.CodePos(generator), opCode, " ", Emitter.FormatArgument(obj)));
-					}
-					methodInfo.Invoke(generator, new object[2] { opCode, obj });
-					break;
+					throw new Exception($"Wrong null argument: {codeInstruction}");
 				}
+				if (!(obj is ICallSiteGenerator))
+				{
+					throw new Exception($"Wrong Emit argument type {obj.GetType()} in {codeInstruction}");
 				}
+				emitter.AddInstruction(opCode, obj);
+				emitter.LogIL(opCode, obj);
+				proxiedShim.Emit(opCode, (ICallSiteGenerator)obj);
+				break;
+			}
+			default:
+				if (obj == null)
+				{
+					throw new Exception($"Wrong null argument: {codeInstruction}");
+				}
+				emitter.AddInstruction(opCode, obj);
+				emitter.LogIL(opCode, obj);
+				generator.DynEmit(opCode, obj);
+				break;
 			}
 			codeInstruction.blocks.Do(delegate(ExceptionBlock block)
 			{
-				Emitter.MarkBlockAfter(generator, block);
+				emitter.MarkBlockAfter(block);
 			});
-			idx++;
 		});
+		emitter.LogComment("end original" + (methodEndsInDeadCode ? " (has dead code end)" : ""));
+		return result;
 	}
 
 	private static void GetMemberInfoValue(MemberInfo info, out object result)
@@ -368,14 +439,14 @@ public class MethodBodyReader
 			break;
 		case OperandType.InlineSwitch:
 		{
-			int num2 = ilBytes.ReadInt32();
-			int num3 = ilBytes.position + 4 * num2;
-			int[] array = new int[num2];
-			for (int i = 0; i < num2; i++)
+			int num3 = ilBytes.ReadInt32();
+			int num4 = ilBytes.position + 4 * num3;
+			int[] array2 = new int[num3];
+			for (int i = 0; i < num3; i++)
 			{
-				array[i] = ilBytes.ReadInt32() + num3;
+				array2[i] = ilBytes.ReadInt32() + num4;
 			}
-			instruction.operand = array;
+			instruction.operand = array2;
 			break;
 		}
 		case OperandType.ShortInlineBrTarget:
@@ -386,8 +457,8 @@ public class MethodBodyReader
 		}
 		case OperandType.InlineBrTarget:
 		{
-			int num4 = ilBytes.ReadInt32();
-			instruction.operand = num4 + ilBytes.position;
+			int num5 = ilBytes.ReadInt32();
+			instruction.operand = num5 + ilBytes.position;
 			break;
 		}
 		case OperandType.ShortInlineI:
@@ -413,31 +484,33 @@ public class MethodBodyReader
 		}
 		case OperandType.ShortInlineR:
 		{
-			float num6 = ilBytes.ReadSingle();
-			instruction.operand = num6;
+			float num2 = ilBytes.ReadSingle();
+			instruction.operand = num2;
 			instruction.argument = (float)instruction.operand;
 			break;
 		}
 		case OperandType.InlineR:
 		{
-			double num5 = ilBytes.ReadDouble();
-			instruction.operand = num5;
+			double num7 = ilBytes.ReadDouble();
+			instruction.operand = num7;
 			instruction.argument = (double)instruction.operand;
 			break;
 		}
 		case OperandType.InlineI8:
 		{
-			long num7 = ilBytes.ReadInt64();
-			instruction.operand = num7;
+			long num6 = ilBytes.ReadInt64();
+			instruction.operand = num6;
 			instruction.argument = (long)instruction.operand;
 			break;
 		}
 		case OperandType.InlineSig:
 		{
-			int metadataToken = ilBytes.ReadInt32();
-			byte[] source = (byte[])(instruction.argument = (instruction.operand = module.ResolveSignature(metadataToken)));
+			int metadataToken3 = ilBytes.ReadInt32();
+			byte[] array3 = module.ResolveSignature(metadataToken3);
+			InlineSignature value = (InlineSignature)(instruction.argument = (instruction.operand = InlineSignatureParser.ImportCallSite(module, array3)));
 			Debugger.Log(0, "TEST", "METHOD " + method.FullDescription() + "\n");
-			Debugger.Log(0, "TEST", "Signature = " + source.Select((byte b) => $"0x{b:x02}").Aggregate((string a, string b) => a + " " + b) + "\n");
+			Debugger.Log(0, "TEST", "Signature Blob = " + array3.Select((byte b) => $"0x{b:x02}").Aggregate((string a, string b) => a + " " + b) + "\n");
+			Debugger.Log(0, "TEST", $"Signature = {value}\n");
 			Debugger.Break();
 			break;
 		}
@@ -452,6 +525,7 @@ public class MethodBodyReader
 		{
 			int metadataToken5 = ilBytes.ReadInt32();
 			instruction.operand = module.ResolveMember(metadataToken5, typeArguments, methodArguments);
+			((MemberInfo)instruction.operand).DeclaringType?.FixReflectionCacheAuto();
 			GetMemberInfoValue((MemberInfo)instruction.operand, out instruction.argument);
 			break;
 		}
@@ -459,13 +533,15 @@ public class MethodBodyReader
 		{
 			int metadataToken4 = ilBytes.ReadInt32();
 			instruction.operand = module.ResolveType(metadataToken4, typeArguments, methodArguments);
+			((Type)instruction.operand).FixReflectionCacheAuto();
 			instruction.argument = (Type)instruction.operand;
 			break;
 		}
 		case OperandType.InlineMethod:
 		{
-			int metadataToken3 = ilBytes.ReadInt32();
-			instruction.operand = module.ResolveMethod(metadataToken3, typeArguments, methodArguments);
+			int metadataToken2 = ilBytes.ReadInt32();
+			instruction.operand = module.ResolveMethod(metadataToken2, typeArguments, methodArguments);
+			((MemberInfo)instruction.operand).DeclaringType?.FixReflectionCacheAuto();
 			if (instruction.operand is ConstructorInfo)
 			{
 				instruction.argument = (ConstructorInfo)instruction.operand;
@@ -478,8 +554,9 @@ public class MethodBodyReader
 		}
 		case OperandType.InlineField:
 		{
-			int metadataToken2 = ilBytes.ReadInt32();
-			instruction.operand = module.ResolveField(metadataToken2, typeArguments, methodArguments);
+			int metadataToken = ilBytes.ReadInt32();
+			instruction.operand = module.ResolveField(metadataToken, typeArguments, methodArguments);
+			((MemberInfo)instruction.operand).DeclaringType?.FixReflectionCacheAuto();
 			instruction.argument = (FieldInfo)instruction.operand;
 			break;
 		}
@@ -495,7 +572,8 @@ public class MethodBodyReader
 					break;
 				}
 				instruction.operand = localVariable2;
-				instruction.argument = variables[localVariable2.LocalIndex];
+				LocalBuilder[] array4 = variables;
+				instruction.argument = ((array4 != null) ? array4[localVariable2.LocalIndex] : null) ?? localVariable2;
 			}
 			else
 			{
@@ -516,7 +594,8 @@ public class MethodBodyReader
 					break;
 				}
 				instruction.operand = localVariable;
-				instruction.argument = variables[localVariable.LocalIndex];
+				LocalBuilder[] array = variables;
+				instruction.argument = ((array != null) ? array[localVariable.LocalIndex] : null) ?? localVariable;
 			}
 			else
 			{
@@ -532,17 +611,22 @@ public class MethodBodyReader
 
 	private ILInstruction GetInstruction(int offset, bool isEndOfInstruction)
 	{
-		int num = ilInstructions.Count - 1;
-		if (offset < 0 || offset > ilInstructions[num].offset)
+		if (offset < 0)
 		{
-			throw new Exception("Instruction offset " + offset + " is outside valid range 0 - " + ilInstructions[num].offset);
+			throw new ArgumentOutOfRangeException("offset", offset, $"Instruction offset {offset} is less than 0");
+		}
+		int num = ilInstructions.Count - 1;
+		ILInstruction iLInstruction = ilInstructions[num];
+		if (offset > iLInstruction.offset + iLInstruction.GetSize() - 1)
+		{
+			throw new ArgumentOutOfRangeException("offset", offset, $"Instruction offset {offset} is outside valid range 0 - {iLInstruction.offset + iLInstruction.GetSize() - 1}");
 		}
 		int num2 = 0;
 		int num3 = num;
 		while (num2 <= num3)
 		{
 			int num4 = num2 + (num3 - num2) / 2;
-			ILInstruction iLInstruction = ilInstructions[num4];
+			iLInstruction = ilInstructions[num4];
 			if (isEndOfInstruction)
 			{
 				if (offset == iLInstruction.offset + iLInstruction.GetSize() - 1)
@@ -563,7 +647,7 @@ public class MethodBodyReader
 				num2 = num4 + 1;
 			}
 		}
-		throw new Exception("Cannot find instruction for " + offset.ToString("X4"));
+		throw new Exception($"Cannot find instruction for {offset:X4}");
 	}
 
 	private static bool TargetsLocalVariable(OpCode opcode)
@@ -573,7 +657,7 @@ public class MethodBodyReader
 
 	private LocalVariableInfo GetLocalVariable(int index)
 	{
-		return locals?[index];
+		return localVariables?[index];
 	}
 
 	private ParameterInfo GetParameter(int index)
@@ -588,26 +672,11 @@ public class MethodBodyReader
 	private OpCode ReadOpCode()
 	{
 		byte b = ilBytes.ReadByte();
-		return (b != 254) ? one_byte_opcodes[b] : two_bytes_opcodes[ilBytes.ReadByte()];
-	}
-
-	private MethodInfo EmitMethodForType(Type type)
-	{
-		foreach (KeyValuePair<Type, MethodInfo> emitMethod in emitMethods)
+		if (b == 254)
 		{
-			if (emitMethod.Key == type)
-			{
-				return emitMethod.Value;
-			}
+			return two_bytes_opcodes[ilBytes.ReadByte()];
 		}
-		foreach (KeyValuePair<Type, MethodInfo> emitMethod2 in emitMethods)
-		{
-			if (emitMethod2.Key.IsAssignableFrom(type))
-			{
-				return emitMethod2.Value;
-			}
-		}
-		return null;
+		return one_byte_opcodes[b];
 	}
 
 	[MethodImpl(MethodImplOptions.Synchronized)]
@@ -691,21 +760,5 @@ public class MethodBodyReader
 				}
 			}
 		}
-		emitMethods = new Dictionary<Type, MethodInfo>();
-		typeof(ILGenerator).GetMethods().ToList().Do(delegate(MethodInfo method)
-		{
-			if (!(method.Name != "Emit"))
-			{
-				ParameterInfo[] array2 = method.GetParameters();
-				if (array2.Length == 2)
-				{
-					Type[] array3 = array2.Select((ParameterInfo p) => p.ParameterType).ToArray();
-					if (!(array3[0] != typeof(OpCode)))
-					{
-						emitMethods[array3[1]] = method;
-					}
-				}
-			}
-		});
 	}
 }

@@ -1,12 +1,3 @@
-using System;
-using UnityEngine.UI;
-
-public class BranchConfig : UIDialog
+public class BranchConfig : IOConfig<ElectricalBranch>
 {
-	[NonSerialized]
-	private ElectricalBranch branch;
-
-	public InputField input;
-
-	public int target;
 }

@@ -9,7 +9,7 @@ using Rust;
 using UnityEngine;
 using UnityEngine.Assertions;
 
-public sealed class ItemContainer
+public sealed class ItemContainer : IAmmoContainer, Pool.IPooled
 {
 	[Flags]
 	public enum Flag
@@ -46,11 +46,15 @@ public sealed class ItemContainer
 		CannotAcceptRightNow
 	}
 
+	public const int BackpackSlotIndex = 7;
+
 	public Flag flags;
 
 	public ContentsType allowedContents;
 
 	public ItemDefinition[] onlyAllowedItems;
+
+	public HashSet<ItemDefinition> blockedItems;
 
 	public List<ItemSlot> availableSlots = new List<ItemSlot>();
 
@@ -74,13 +78,25 @@ public sealed class ItemContainer
 
 	public int maxStackSize;
 
+	public int containerVolume;
+
 	public Func<Item, int, bool> canAcceptItem;
 
 	public Func<Item, int, bool> slotIsReserved;
 
 	public Action<Item, bool> onItemAddedRemoved;
 
+	public Action<Item, int> onItemAddedToStack;
+
+	public Action<Item, int> onItemRemovedFromStack;
+
 	public Action<Item> onPreItemRemove;
+
+	public Action<Item, float> onItemRadiationChanged;
+
+	public Action<Item, Item> onItemParentChanged;
+
+	public bool HasAvailableSlotsDefined => !CollectionEx.IsEmpty(availableSlots);
 
 	public bool HasLimitedAllowedItems
 	{
@@ -146,6 +162,15 @@ public sealed class ItemContainer
 
 	public event Action onDirty;
 
+	public void UpdateAvailableSlots(List<ItemSlot> newSlots)
+	{
+		availableSlots.Clear();
+		if (newSlots != null)
+		{
+			availableSlots.AddRange(newSlots);
+		}
+	}
+
 	public bool HasFlag(Flag f)
 	{
 		return (flags & f) == f;
@@ -173,6 +198,43 @@ public sealed class ItemContainer
 		return HasFlag(Flag.NoItemInput);
 	}
 
+	void Pool.IPooled.EnterPool()
+	{
+		flags = (Flag)0;
+		allowedContents = (ContentsType)0;
+		onlyAllowedItems = null;
+		blockedItems = null;
+		availableSlots.Clear();
+		capacity = 2;
+		if (uid.IsValid && Net.sv != null)
+		{
+			Net.sv.ReturnUID(uid.Value);
+		}
+		uid = default(ItemContainerId);
+		temperature = 15f;
+		parent = null;
+		playerOwner = null;
+		entityOwner = null;
+		isServer = false;
+		maxStackSize = 0;
+		containerVolume = 0;
+		this.onDirty = null;
+		canAcceptItem = null;
+		slotIsReserved = null;
+		onItemAddedRemoved = null;
+		onItemAddedToStack = null;
+		onItemRemovedFromStack = null;
+		onPreItemRemove = null;
+		onItemRadiationChanged = null;
+		onItemParentChanged = null;
+		Clear();
+		dirty = false;
+	}
+
+	void Pool.IPooled.LeavePool()
+	{
+	}
+
 	public float GetTemperature(int slot)
 	{
 		if (entityOwner is BaseOven baseOven)
@@ -192,6 +254,7 @@ public sealed class ItemContainer
 		{
 			allowedContents = ContentsType.Generic;
 		}
+		onItemRadiationChanged = (Action<Item, float>)Delegate.Combine(onItemRadiationChanged, new Action<Item, float>(BubbleUpRadiationChanged));
 		MarkDirty();
 	}
 
@@ -204,14 +267,8 @@ public sealed class ItemContainer
 	public void MarkDirty()
 	{
 		dirty = true;
-		if (parent != null)
-		{
-			parent.MarkDirty();
-		}
-		if (this.onDirty != null)
-		{
-			this.onDirty();
-		}
+		parent?.MarkDirty();
+		this.onDirty?.Invoke();
 	}
 
 	public DroppedItemContainer Drop(string prefab, Vector3 pos, Quaternion rot, float destroyPercent)
@@ -320,9 +377,48 @@ public sealed class ItemContainer
 		return itemList.Count >= capacity;
 	}
 
+	public bool HasSpaceFor(Item item)
+	{
+		if (!IsFull())
+		{
+			return true;
+		}
+		return HasPartialStack(item);
+	}
+
 	public bool IsEmpty()
 	{
 		return itemList.Count == 0;
+	}
+
+	public bool HasPartialStack(Item toStack, out int slot)
+	{
+		slot = -1;
+		foreach (Item item in itemList)
+		{
+			if (item.info.itemid == toStack.info.itemid && item.amount < item.MaxStackable() && toStack.CanStack(item))
+			{
+				slot = item.position;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public float GetRadioactiveMaterialInContainer()
+	{
+		float num = 0f;
+		foreach (Item item in itemList)
+		{
+			num += item.radioactivity;
+		}
+		return num;
+	}
+
+	public bool HasPartialStack(Item toStack)
+	{
+		int slot;
+		return HasPartialStack(toStack, out slot);
 	}
 
 	public bool CanAccept(Item item)
@@ -380,6 +476,14 @@ public sealed class ItemContainer
 		}
 	}
 
+	public void SetBlacklist(ItemDefinition[] defs)
+	{
+		if (defs != null && defs.Length != 0)
+		{
+			blockedItems = new HashSet<ItemDefinition>(defs);
+		}
+	}
+
 	public bool Insert(Item item)
 	{
 		if (itemList.Contains(item))
@@ -416,39 +520,55 @@ public sealed class ItemContainer
 
 	public Item GetSlot(int slot)
 	{
-		for (int i = 0; i < itemList.Count; i++)
+		if (slot == -1)
 		{
-			if (itemList[i].position == slot)
+			return null;
+		}
+		_ = itemList.Count;
+		foreach (Item item in itemList)
+		{
+			if (item.position == slot)
 			{
-				return itemList[i];
+				return item;
 			}
 		}
 		return null;
 	}
 
-	public Item GetNonFullStackWithinRange(Item def, Vector2i range)
+	public bool QuickIndustrialPreCheck(Item toTransfer, Vector2i range, out int foundSlot)
 	{
+		int num = range.y - range.x + 1;
 		int count = itemList.Count;
+		int num2 = 0;
+		foundSlot = -1;
 		for (int i = 0; i < count; i++)
 		{
-			if (itemList[i].amount >= itemList[i].info.stackable || itemList[i].position < range.x || itemList[i].position > range.y)
+			Item item = itemList[i];
+			int position = item.position;
+			if (position < range.x || position > range.y)
 			{
 				continue;
 			}
-			if (def.IsBlueprint())
+			num2++;
+			if (item.amount >= item.info.stackable || item.IsRemoved())
 			{
-				if (itemList[i].blueprintTarget != def.blueprintTarget)
+				continue;
+			}
+			if (toTransfer.IsBlueprint())
+			{
+				if (item.blueprintTarget != toTransfer.blueprintTarget)
 				{
 					continue;
 				}
 			}
-			else if (itemList[i].info != def.info)
+			else if (item.info != toTransfer.info)
 			{
 				continue;
 			}
-			return itemList[i];
+			foundSlot = position;
+			return true;
 		}
-		return null;
+		return num2 < num;
 	}
 
 	public bool FindPosition(Item item)
@@ -471,6 +591,22 @@ public sealed class ItemContainer
 		return false;
 	}
 
+	public bool HasItem(ItemDefinition searchFor)
+	{
+		if (searchFor == null)
+		{
+			return false;
+		}
+		foreach (Item item in itemList)
+		{
+			if (item != null && item.info == searchFor)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	public void SetLocked(bool isLocked)
 	{
 		SetFlag(Flag.IsLocked, isLocked);
@@ -483,52 +619,47 @@ public sealed class ItemContainer
 		{
 			return false;
 		}
-		if (onPreItemRemove != null)
-		{
-			onPreItemRemove(item);
-		}
+		onPreItemRemove?.Invoke(item);
 		itemList.Remove(item);
 		item.parent = null;
+		onItemParentChanged?.Invoke(parent, item);
+		onItemAddedRemoved?.Invoke(item, arg2: false);
 		MarkDirty();
-		if (onItemAddedRemoved != null)
-		{
-			onItemAddedRemoved(item, arg2: false);
-		}
 		Interface.CallHook("OnItemRemovedFromContainer", this, item);
 		return true;
 	}
 
 	public void Clear()
 	{
-		Item[] array = itemList.ToArray();
-		for (int i = 0; i < array.Length; i++)
+		if (itemList.Count == 0)
 		{
-			array[i].Remove();
+			return;
 		}
+		foreach (Item item in itemList)
+		{
+			onPreItemRemove?.Invoke(item);
+			item.parent = null;
+			item.Remove();
+			onItemAddedRemoved?.Invoke(item, arg2: false);
+		}
+		itemList.Clear();
+		MarkDirty();
 	}
 
 	public void Kill()
 	{
+		parent = null;
 		this.onDirty = null;
 		canAcceptItem = null;
 		slotIsReserved = null;
 		onItemAddedRemoved = null;
-		if (Net.sv != null)
+		onPreItemRemove = null;
+		if (uid.IsValid && Net.sv != null)
 		{
 			Net.sv.ReturnUID(uid.Value);
 			uid = default(ItemContainerId);
 		}
-		List<Item> obj = Pool.GetList<Item>();
-		foreach (Item item in itemList)
-		{
-			obj.Add(item);
-		}
-		foreach (Item item2 in obj)
-		{
-			item2.Remove();
-		}
-		Pool.FreeList(ref obj);
-		itemList.Clear();
+		Clear();
 	}
 
 	public int GetAmount(int itemid, bool onlyUsableAmounts)
@@ -537,6 +668,32 @@ public sealed class ItemContainer
 		foreach (Item item in itemList)
 		{
 			if (item.info.itemid == itemid && (!onlyUsableAmounts || !item.IsBusy()))
+			{
+				num += item.amount;
+			}
+		}
+		return num;
+	}
+
+	public int GetAmount(int blueprintBaseId, int itemId, bool onlyUsableAmounts)
+	{
+		int num = 0;
+		foreach (Item item in itemList)
+		{
+			if (item.info.itemid == blueprintBaseId && item.blueprintTarget == itemId && (!onlyUsableAmounts || !item.IsBusy()))
+			{
+				num += item.amount;
+			}
+		}
+		return num;
+	}
+
+	public int GetOkConditionAmount(int itemid, bool onlyUsableAmounts)
+	{
+		int num = 0;
+		foreach (Item item in itemList)
+		{
+			if (item.info.itemid == itemid && (!onlyUsableAmounts || !item.IsBusy()) && !(item.condition <= 0f))
 			{
 				num += item.amount;
 			}
@@ -556,7 +713,7 @@ public sealed class ItemContainer
 		return null;
 	}
 
-	public Item FindItemsByItemName(string name)
+	public Item FindItemByItemName(string name)
 	{
 		ItemDefinition itemDefinition = ItemManager.FindItemDefinition(name);
 		if (itemDefinition == null)
@@ -594,17 +751,17 @@ public sealed class ItemContainer
 		return itemList.FindAll((Item x) => x.info.itemid == itemid);
 	}
 
-	public ProtoBuf.ItemContainer Save()
+	public ProtoBuf.ItemContainer Save(bool bIncludeContainer = true)
 	{
 		ProtoBuf.ItemContainer itemContainer = Pool.Get<ProtoBuf.ItemContainer>();
-		itemContainer.contents = Pool.GetList<ProtoBuf.Item>();
+		itemContainer.contents = Pool.Get<List<ProtoBuf.Item>>();
 		itemContainer.UID = uid;
 		itemContainer.slots = capacity;
 		itemContainer.temperature = temperature;
 		itemContainer.allowedContents = (int)allowedContents;
 		if (HasLimitedAllowedItems)
 		{
-			itemContainer.allowedItems = Pool.GetList<int>();
+			itemContainer.allowedItems = Pool.Get<List<int>>();
 			for (int i = 0; i < onlyAllowedItems.Length; i++)
 			{
 				if (onlyAllowedItems[i] != null)
@@ -615,9 +772,10 @@ public sealed class ItemContainer
 		}
 		itemContainer.flags = (int)flags;
 		itemContainer.maxStackSize = maxStackSize;
+		itemContainer.volume = containerVolume;
 		if (availableSlots != null && availableSlots.Count > 0)
 		{
-			itemContainer.availableSlots = Pool.GetList<int>();
+			itemContainer.availableSlots = Pool.Get<List<int>>();
 			for (int j = 0; j < availableSlots.Count; j++)
 			{
 				itemContainer.availableSlots.Add((int)availableSlots[j]);
@@ -628,7 +786,7 @@ public sealed class ItemContainer
 			Item item = itemList[k];
 			if (item.IsValid())
 			{
-				itemContainer.contents.Add(item.Save(bIncludeContainer: true));
+				itemContainer.contents.Add(item.Save(bIncludeContainer));
 			}
 		}
 		return itemContainer;
@@ -641,7 +799,7 @@ public sealed class ItemContainer
 			uid = container.UID;
 			capacity = container.slots;
 			List<Item> obj = itemList;
-			itemList = Pool.GetList<Item>();
+			itemList = Pool.Get<List<Item>>();
 			temperature = container.temperature;
 			flags = (Flag)container.flags;
 			allowedContents = ((container.allowedContents == 0) ? ContentsType.Generic : ((ContentsType)container.allowedContents));
@@ -658,10 +816,14 @@ public sealed class ItemContainer
 				onlyAllowedItems = null;
 			}
 			maxStackSize = container.maxStackSize;
+			containerVolume = container.volume;
 			availableSlots.Clear();
-			for (int j = 0; j < container.availableSlots.Count; j++)
+			if (container.availableSlots != null)
 			{
-				availableSlots.Add((ItemSlot)container.availableSlots[j]);
+				for (int j = 0; j < container.availableSlots.Count; j++)
+				{
+					availableSlots.Add((ItemSlot)container.availableSlots[j]);
+				}
 			}
 			using (TimeWarning.New("container.contents"))
 			{
@@ -696,7 +858,7 @@ public sealed class ItemContainer
 				}
 			}
 			dirty = true;
-			Pool.FreeList(ref obj);
+			Pool.Free(ref obj, freeElements: false);
 		}
 	}
 
@@ -721,7 +883,7 @@ public sealed class ItemContainer
 		{
 			return num;
 		}
-		List<Item> obj = Pool.GetList<Item>();
+		List<Item> obj = Pool.Get<List<Item>>();
 		foreach (Item item2 in itemList)
 		{
 			if (item2.info.itemid != itemid)
@@ -758,8 +920,52 @@ public sealed class ItemContainer
 		{
 			item3.RemoveFromContainer();
 		}
-		Pool.FreeList(ref obj);
+		Pool.Free(ref obj, freeElements: false);
 		return num;
+	}
+
+	public bool TryTakeOne(int itemid, out Item item)
+	{
+		item = null;
+		foreach (Item item3 in itemList)
+		{
+			if (item3.info.itemid == itemid)
+			{
+				if (item3.amount > 1)
+				{
+					item3.MarkDirty();
+					item3.amount--;
+					Item item2 = ItemManager.CreateByItemID(itemid, 1, 0uL);
+					item2.amount = 1;
+					item2.CollectedForCrafting(playerOwner);
+					item = item2;
+				}
+				else
+				{
+					item = item3;
+				}
+				break;
+			}
+		}
+		if (item != null)
+		{
+			item.RemoveFromContainer();
+			return true;
+		}
+		return false;
+	}
+
+	public bool GiveItem(Item item, ItemContainer container = null)
+	{
+		if (item == null)
+		{
+			return false;
+		}
+		if (container != null && item.MoveToContainer(container))
+		{
+			return true;
+		}
+		return item.MoveToContainer(this);
 	}
 
 	public void OnCycle(float delta)
@@ -771,6 +977,19 @@ public sealed class ItemContainer
 				itemList[i].OnCycle(delta);
 			}
 		}
+	}
+
+	public Item FindAmmo(AmmoTypes ammoType)
+	{
+		for (int i = 0; i < itemList.Count; i++)
+		{
+			Item item = itemList[i].FindAmmo(ammoType);
+			if (item != null)
+			{
+				return item;
+			}
+		}
+		return null;
 	}
 
 	public void FindAmmo(List<Item> list, AmmoTypes ammoType)
@@ -793,6 +1012,16 @@ public sealed class ItemContainer
 		return false;
 	}
 
+	public int GetAmmoAmount(ItemDefinition specificAmmo)
+	{
+		int num = 0;
+		for (int i = 0; i < itemList.Count; i++)
+		{
+			num += ((itemList[i].info == specificAmmo) ? itemList[i].amount : 0);
+		}
+		return num;
+	}
+
 	public int GetAmmoAmount(AmmoTypes ammoType)
 	{
 		int num = 0;
@@ -813,6 +1042,19 @@ public sealed class ItemContainer
 		return num;
 	}
 
+	public bool HasAny(ItemDefinition itemDef)
+	{
+		for (int i = 0; i < itemList.Count; i++)
+		{
+			Item item = itemList[i];
+			if (item.info == itemDef && item.amount > 0)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	public int GetTotalItemAmount(Item item, int slotStartInclusive, int slotEndInclusive)
 	{
 		int num = 0;
@@ -830,9 +1072,27 @@ public sealed class ItemContainer
 					num += slot.amount;
 				}
 			}
-			else if (slot.info == item.info || slot.info.isRedirectOf == item.info)
+			else if (slot.info == item.info || slot.info.isRedirectOf == item.info || item.info.isRedirectOf == slot.info)
 			{
 				num += slot.amount;
+			}
+			else if (slot.info.isRedirectOf != null && slot.info.isRedirectOf == item.info.isRedirectOf)
+			{
+				num += slot.amount;
+			}
+		}
+		return num;
+	}
+
+	public int TotalItemAmount(ItemDefinition itemDef)
+	{
+		int num = 0;
+		for (int i = 0; i < itemList.Count; i++)
+		{
+			Item item = itemList[i];
+			if (item.info == itemDef)
+			{
+				num += item.amount;
 			}
 		}
 		return num;
@@ -1005,6 +1265,34 @@ public sealed class ItemContainer
 		{
 			return (CanAcceptResult)obj;
 		}
+		if (blockedItems != null && blockedItems.Contains(item.info))
+		{
+			return CanAcceptResult.CannotAccept;
+		}
+		if (item.GetItemVolume() > containerVolume)
+		{
+			return CanAcceptResult.CannotAccept;
+		}
 		return CanAcceptResult.CanAccept;
+	}
+
+	public bool HasBackpackItem()
+	{
+		foreach (Item item in itemList)
+		{
+			if (!item.isBroken && item.IsBackpack())
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public void BubbleUpRadiationChanged(Item item, float amount)
+	{
+		if (parent != null && parent.parent != null)
+		{
+			parent?.parent?.onItemRadiationChanged?.Invoke(parent, 0f);
+		}
 	}
 }

@@ -175,7 +175,7 @@ public static class GizmosUtil
 
 	public static void DrawSemiCircle(float radius)
 	{
-		float num = radius * ((float)Math.PI / 180f) * 0.5f;
+		float num = radius * (MathF.PI / 180f) * 0.5f;
 		Vector3 vector = Mathf.Cos(num) * Vector3.forward + Mathf.Sin(num) * Vector3.right;
 		Gizmos.DrawLine(Vector3.zero, vector);
 		Vector3 vector2 = Mathf.Cos(0f - num) * Vector3.forward + Mathf.Sin(0f - num) * Vector3.right;
@@ -200,6 +200,18 @@ public static class GizmosUtil
 			vector2 = vector4;
 		}
 		Gizmos.DrawLine(vector, vector2);
+	}
+
+	public static void DrawArrowHead(Vector3 pos, Vector3 dir, float arrowHeadLength = 0.25f, float arrowHeadAngle = 20f)
+	{
+		Vector3 vector = Quaternion.LookRotation(dir) * Quaternion.Euler(arrowHeadAngle, 0f, 0f) * Vector3.back;
+		Vector3 vector2 = Quaternion.LookRotation(dir) * Quaternion.Euler(0f - arrowHeadAngle, 0f, 0f) * Vector3.back;
+		Vector3 vector3 = Quaternion.LookRotation(dir) * Quaternion.Euler(0f, arrowHeadAngle, 0f) * Vector3.back;
+		Vector3 vector4 = Quaternion.LookRotation(dir) * Quaternion.Euler(0f, 0f - arrowHeadAngle, 0f) * Vector3.back;
+		Gizmos.DrawRay(pos + dir, vector * arrowHeadLength);
+		Gizmos.DrawRay(pos + dir, vector2 * arrowHeadLength);
+		Gizmos.DrawRay(pos + dir, vector3 * arrowHeadLength);
+		Gizmos.DrawRay(pos + dir, vector4 * arrowHeadLength);
 	}
 
 	public static void DrawMeshes(Transform transform)

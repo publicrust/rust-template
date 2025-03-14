@@ -26,6 +26,8 @@ public class BlendedLoopEngineSound : MonoBehaviour, IClientComponent
 
 	private EngineLoop[] engineLoops;
 
+	public bool debugPlayImmediately;
+
 	public float maxDistance => loopDefinition.engineLoops[0].soundDefinition.maxDistance;
 
 	public EngineLoop[] GetEngineLoops()

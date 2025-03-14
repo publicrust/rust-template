@@ -28,6 +28,6 @@ public abstract class TerrainExtension : MonoBehaviour
 
 	public void LogSize(object obj, ulong size)
 	{
-		Debug.Log(string.Concat(obj.GetType(), " allocated: ", size.FormatBytes()));
+		Debug.Log(obj.GetType()?.ToString() + " allocated: " + size.FormatBytes());
 	}
 }

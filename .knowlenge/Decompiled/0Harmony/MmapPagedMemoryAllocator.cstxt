@@ -1,0 +1,213 @@
+using System;
+using System.ComponentModel;
+using System.Diagnostics.CodeAnalysis;
+using MonoMod.Core.Interop;
+using MonoMod.Core.Platforms.Memory;
+
+private sealed class MmapPagedMemoryAllocator : PagedMemoryAllocator
+{
+	private sealed class SyscallNotImplementedException : Exception
+	{
+	}
+
+	private static int PageProbePipeReadFD;
+
+	private static int PageProbePipeWriteFD;
+
+	private bool canTestPageAllocation = true;
+
+	public MmapPagedMemoryAllocator(nint pageSize)
+		: base(pageSize)
+	{
+	}
+
+	unsafe static MmapPagedMemoryAllocator()
+	{
+		byte* num = stackalloc byte[8];
+		if (Unix.Pipe2((int*)num, Unix.PipeFlags.CloseOnExec) == -1)
+		{
+			throw new Win32Exception(Unix.Errno, "Failed to create pipe for page probes");
+		}
+		PageProbePipeReadFD = *(int*)num;
+		PageProbePipeWriteFD = *(int*)(num + 4);
+	}
+
+	public unsafe static bool PageAllocated(nint page)
+	{
+		byte b = default(byte);
+		if (Unix.Mincore(page, 1u, &b) == -1)
+		{
+			int errno = Unix.Errno;
+			return errno switch
+			{
+				12 => false, 
+				38 => throw new SyscallNotImplementedException(), 
+				_ => throw new NotImplementedException($"Got unimplemented errno for mincore(2); errno = {errno}"), 
+			};
+		}
+		return true;
+	}
+
+	public unsafe static bool PageReadable(nint page)
+	{
+		if (Unix.Write(PageProbePipeWriteFD, page, 1) == -1)
+		{
+			int errno = Unix.Errno;
+			if (errno == 14)
+			{
+				return false;
+			}
+			throw new NotImplementedException($"Got unimplemented errno for write(2); errno = {errno}");
+		}
+		byte b = default(byte);
+		if (Unix.Read(PageProbePipeReadFD, new IntPtr(&b), 1) == -1)
+		{
+			throw new Win32Exception("Failed to clean up page probe pipe after successful page probe");
+		}
+		return true;
+	}
+
+	protected override bool TryAllocateNewPage(AllocationRequest request, [<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MaybeNullWhen(false)] out IAllocatedMemory allocated)
+	{
+		Unix.Protection protection = (request.Executable ? Unix.Protection.Execute : Unix.Protection.None);
+		protection |= Unix.Protection.Read | Unix.Protection.Write;
+		nint num = Unix.Mmap(IntPtr.Zero, (nuint)base.PageSize, protection, Unix.MmapFlags.Private | Unix.MmapFlags.Anonymous, -1, 0);
+		long num2 = num;
+		bool isEnabled = (((ulong)(num2 - -1) <= 1uL) ? true : false);
+		if (isEnabled)
+		{
+			int errno = Unix.Errno;
+			<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogErrorStringHandler message = new <027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogErrorStringHandler(28, 2, out isEnabled);
+			if (isEnabled)
+			{
+				message.AppendLiteral("Error creating allocation: ");
+				message.AppendFormatted(errno);
+				message.AppendLiteral(" ");
+				message.AppendFormatted(new Win32Exception(errno).Message);
+			}
+			<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.Error(ref message);
+			allocated = null;
+			return false;
+		}
+		Page page = new Page(this, num, (uint)base.PageSize, request.Executable);
+		InsertAllocatedPage(page);
+		if (!page.TryAllocate((uint)request.Size, (uint)request.Alignment, out PageAllocation alloc))
+		{
+			RegisterForCleanup(page);
+			allocated = null;
+			return false;
+		}
+		allocated = alloc;
+		return true;
+	}
+
+	protected override bool TryAllocateNewPage(PositionedAllocationRequest request, nint targetPage, nint lowPageBound, nint highPageBound, [<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MaybeNullWhen(false)] out IAllocatedMemory allocated)
+	{
+		if (!canTestPageAllocation)
+		{
+			allocated = null;
+			return false;
+		}
+		Unix.Protection protection = (request.Base.Executable ? Unix.Protection.Execute : Unix.Protection.None);
+		protection |= Unix.Protection.Read | Unix.Protection.Write;
+		nint num = request.Base.Size / base.PageSize + 1;
+		nint num2 = targetPage - base.PageSize;
+		nint num3 = targetPage;
+		nint num4 = -1;
+		try
+		{
+			while (num2 >= lowPageBound || num3 <= highPageBound)
+			{
+				if (num3 <= highPageBound)
+				{
+					nint num5 = 0;
+					while (true)
+					{
+						if (num5 < num)
+						{
+							if (PageAllocated(num3 + base.PageSize * num5))
+							{
+								num3 += base.PageSize;
+								goto IL_008e;
+							}
+							num5++;
+							continue;
+						}
+						num4 = num3;
+						break;
+					}
+					break;
+				}
+				goto IL_008e;
+				IL_008e:
+				if (num2 < lowPageBound)
+				{
+					continue;
+				}
+				nint num6 = 0;
+				while (true)
+				{
+					if (num6 < num)
+					{
+						if (PageAllocated(num2 + base.PageSize * num6))
+						{
+							num2 -= base.PageSize;
+							goto IL_00c5;
+						}
+						num6++;
+						continue;
+					}
+					num4 = num2;
+					break;
+				}
+				break;
+				IL_00c5:;
+			}
+		}
+		catch (SyscallNotImplementedException)
+		{
+			canTestPageAllocation = false;
+			allocated = null;
+			return false;
+		}
+		if (num4 == -1)
+		{
+			allocated = null;
+			return false;
+		}
+		nint num7 = Unix.Mmap(num4, (nuint)base.PageSize, protection, Unix.MmapFlags.Private | Unix.MmapFlags.Anonymous | Unix.MmapFlags.FixedNoReplace, -1, 0);
+		long num8 = num7;
+		if (((ulong)(num8 - -1) <= 1uL) ? true : false)
+		{
+			allocated = null;
+			return false;
+		}
+		Page page = new Page(this, num7, (uint)base.PageSize, request.Base.Executable);
+		InsertAllocatedPage(page);
+		if (!page.TryAllocate((uint)request.Base.Size, (uint)request.Base.Alignment, out PageAllocation alloc))
+		{
+			RegisterForCleanup(page);
+			allocated = null;
+			return false;
+		}
+		if ((nint)alloc.BaseAddress < (nint)request.LowBound || (nint)alloc.BaseAddress + alloc.Size >= (nint)request.HighBound)
+		{
+			alloc.Dispose();
+			allocated = null;
+			return false;
+		}
+		allocated = alloc;
+		return true;
+	}
+
+	protected override bool TryFreePage(Page page, [<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>NotNullWhen(false)] out string? errorMsg)
+	{
+		if (Unix.Munmap(page.BaseAddr, page.Size) != 0)
+		{
+			errorMsg = new Win32Exception(Unix.Errno).Message;
+			return false;
+		}
+		errorMsg = null;
+		return true;
+	}
+}

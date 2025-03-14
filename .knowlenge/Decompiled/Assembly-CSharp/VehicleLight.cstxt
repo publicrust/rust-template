@@ -22,4 +22,8 @@ public class VehicleLight : MonoBehaviour, IClientComponent
 
 	[ColorUsage(true, true)]
 	public Color brakesOnColour;
+
+	public bool applyToTransmittance;
+
+	public bool useLightOnColourForBrake;
 }

@@ -6,7 +6,12 @@ public class MicrophoneStandIOEntity : IOEntity, IAudioConnectionSource
 
 	public bool IsStatic;
 
-	public override int DesiredPower()
+	public override int ConsumptionAmount()
+	{
+		return PowerCost;
+	}
+
+	public override int DesiredPower(int inputIndex = 0)
 	{
 		return PowerCost;
 	}

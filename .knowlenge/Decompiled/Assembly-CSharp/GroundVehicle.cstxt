@@ -5,8 +5,8 @@ using UnityEngine;
 
 public abstract class GroundVehicle : BaseVehicle, IEngineControllerUser, IEntity, TriggerHurtNotChild.IHurtTriggerUser
 {
-	[Header("GroundVehicle")]
 	[SerializeField]
+	[Header("GroundVehicle")]
 	protected GroundVehicleAudio gvAudio;
 
 	[SerializeField]
@@ -29,6 +29,9 @@ public abstract class GroundVehicle : BaseVehicle, IEngineControllerUser, IEntit
 
 	[SerializeField]
 	private float collisionDamageMultiplier = 1f;
+
+	[SerializeField]
+	private Rigidbody secondaryRigidbody;
 
 	public VehicleEngineController<GroundVehicle> engineController;
 
@@ -53,7 +56,7 @@ public abstract class GroundVehicle : BaseVehicle, IEngineControllerUser, IEntit
 	public override void InitShared()
 	{
 		base.InitShared();
-		engineController = new VehicleEngineController<GroundVehicle>(this, base.isServer, engineStartupTime, fuelStoragePrefab, waterloggedPoint);
+		engineController = new VehicleEngineController<GroundVehicle>(this, CreateFuelSystem(), base.isServer, engineStartupTime, waterloggedPoint);
 	}
 
 	public override void OnFlagsChanged(Flags old, Flags next)
@@ -65,7 +68,7 @@ public abstract class GroundVehicle : BaseVehicle, IEngineControllerUser, IEntit
 		}
 	}
 
-	public float GetSpeed()
+	public override float GetSpeed()
 	{
 		if (IsStationary())
 		{
@@ -93,6 +96,11 @@ public abstract class GroundVehicle : BaseVehicle, IEngineControllerUser, IEntit
 		return !pusher.IsStandingOnEntity(this, 8192);
 	}
 
+	protected virtual IFuelSystem CreateFuelSystem()
+	{
+		return new EntityFuelSystem(base.isServer, fuelStoragePrefab, children);
+	}
+
 	public override void ServerInit()
 	{
 		base.ServerInit();
@@ -112,35 +120,38 @@ public abstract class GroundVehicle : BaseVehicle, IEngineControllerUser, IEntit
 	{
 		if (base.isServer)
 		{
-			ProcessCollision(collision);
+			ProcessCollision(collision, rigidBody);
 		}
 	}
 
 	public override void VehicleFixedUpdate()
 	{
-		base.VehicleFixedUpdate();
-		if (base.IsMovingOrOn)
+		using (TimeWarning.New("GroundVehicle.VehicleFixedUpdate"))
 		{
-			Velocity = GetLocalVelocity();
+			base.VehicleFixedUpdate();
+			if (base.IsMovingOrOn)
+			{
+				Velocity = GetLocalVelocity();
+			}
+			else
+			{
+				Velocity = Vector3.zero;
+			}
+			if (LightsAreOn && !AnyMounted())
+			{
+				SetFlag(Flags.Reserved5, b: false);
+			}
+			if (!(Time.time >= nextCollisionDamageTime))
+			{
+				return;
+			}
+			nextCollisionDamageTime = Time.time + 0.33f;
+			foreach (KeyValuePair<BaseEntity, float> item in damageSinceLastTick)
+			{
+				DoCollisionDamage(item.Key, item.Value);
+			}
+			damageSinceLastTick.Clear();
 		}
-		else
-		{
-			Velocity = Vector3.zero;
-		}
-		if (LightsAreOn && !AnyMounted())
-		{
-			SetFlag(Flags.Reserved5, b: false);
-		}
-		if (!(Time.time >= nextCollisionDamageTime))
-		{
-			return;
-		}
-		nextCollisionDamageTime = Time.time + 0.33f;
-		foreach (KeyValuePair<BaseEntity, float> item in damageSinceLastTick)
-		{
-			DoCollisionDamage(item.Key, item.Value);
-		}
-		damageSinceLastTick.Clear();
 	}
 
 	public override void LightToggle(BasePlayer player)
@@ -162,9 +173,13 @@ public abstract class GroundVehicle : BaseVehicle, IEngineControllerUser, IEntit
 		{
 			Vector3 vector = hurtEntity.GetLocalVelocity() - Velocity;
 			Vector3 position = ClosestPoint(hurtEntity.transform.position);
-			Vector3 vector2 = hurtEntity.RealisticMass * vector;
+			Vector3 vector2 = Mathf.Min(hurtEntity.RealisticMass, RealisticMass) * vector;
 			rigidBody.AddForceAtPosition(vector2 * 1.25f, position, ForceMode.Impulse);
-			QueueCollisionDamage(this, vector2.magnitude * 0.75f / Time.deltaTime);
+			if (secondaryRigidbody != null)
+			{
+				secondaryRigidbody.AddForceAtPosition(vector2 * 1.25f, position, ForceMode.Impulse);
+			}
+			QueueCollisionDamage(this, vector2.magnitude * 0.1f / Time.deltaTime);
 			SetTempDrag(2.25f, 1f);
 		}
 	}
@@ -195,7 +210,7 @@ public abstract class GroundVehicle : BaseVehicle, IEngineControllerUser, IEntit
 		Hurt(damage, DamageType.Collision, this, useProtection: false);
 	}
 
-	private void ProcessCollision(Collision collision)
+	protected void ProcessCollision(Collision collision, Rigidbody ourRigidbody)
 	{
 		if (base.isClient || collision == null || collision.gameObject == null || collision.gameObject == null)
 		{
@@ -203,17 +218,19 @@ public abstract class GroundVehicle : BaseVehicle, IEngineControllerUser, IEntit
 		}
 		ContactPoint contact = collision.GetContact(0);
 		BaseEntity baseEntity = null;
-		if (contact.otherCollider.attachedRigidbody == rigidBody)
+		if (contact.otherCollider.attachedRigidbody == ourRigidbody)
 		{
 			baseEntity = GameObjectEx.ToBaseEntity(contact.otherCollider);
 		}
-		else if (contact.thisCollider.attachedRigidbody == rigidBody)
+		else if (contact.thisCollider.attachedRigidbody == ourRigidbody)
 		{
 			baseEntity = GameObjectEx.ToBaseEntity(contact.thisCollider);
 		}
 		if (baseEntity != null)
 		{
-			float forceMagnitude = collision.impulse.magnitude / Time.fixedDeltaTime;
+			Vector3 impulse = collision.impulse;
+			impulse.y *= 0.5f;
+			float forceMagnitude = impulse.magnitude / Time.fixedDeltaTime;
 			if (QueueCollisionDamage(baseEntity, forceMagnitude) > 0f)
 			{
 				TryShowCollisionFX(collision, collisionEffect);
@@ -226,7 +243,7 @@ public abstract class GroundVehicle : BaseVehicle, IEngineControllerUser, IEntit
 		return (1f - Mathf.InverseLerp(0f, dragModDuration, timeSinceDragModSet)) * dragMod;
 	}
 
-	public override EntityFuelSystem GetFuelSystem()
+	public override IFuelSystem GetFuelSystem()
 	{
 		return engineController.FuelSystem;
 	}

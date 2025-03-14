@@ -5,8 +5,12 @@ using System.Linq;
 using System.Reflection;
 using System.Threading;
 using Mono.Cecil;
+using Oxide;
 using Oxide.Core;
 using Oxide.Core.CSharp;
+using Oxide.Core.Logging;
+using Oxide.CSharp;
+using Oxide.Logging;
 using Oxide.Plugins;
 
 public class CompiledAssembly
@@ -20,6 +24,8 @@ public class CompiledAssembly
 	public DateTime CompiledAt;
 
 	public byte[] RawAssembly;
+
+	public byte[] Symbols;
 
 	public byte[] PatchedAssembly;
 
@@ -37,13 +43,14 @@ public class CompiledAssembly
 
 	public bool IsBatch => CompilablePlugins.Length > 1;
 
-	public CompiledAssembly(string name, CompilablePlugin[] plugins, byte[] rawAssembly, float duration)
+	public CompiledAssembly(string name, CompilablePlugin[] plugins, byte[] rawAssembly, float duration, byte[] symbols)
 	{
 		Name = name;
 		CompilablePlugins = plugins;
 		RawAssembly = rawAssembly;
 		Duration = duration;
 		PluginNames = CompilablePlugins.Select((CompilablePlugin pl) => pl.Name).ToArray();
+		Symbols = symbols;
 	}
 
 	public void LoadAssembly(Action<bool> callback)
@@ -88,7 +95,7 @@ public class CompiledAssembly
 	{
 		if (isPatching)
 		{
-			Interface.Oxide.LogWarning("Already patching plugin assembly: {0} (ignoring)", Oxide.Plugins.ExtensionMethods.ToSentence(PluginNames));
+			Interface.Oxide.RootLogger.WriteDebug(LogType.Warning, LogEvent.Compile, "CSharp", "Already patching plugin assembly: " + Oxide.Plugins.ExtensionMethods.ToSentence(PluginNames) + " (ignoring)");
 			return;
 		}
 		isPatching = true;
@@ -96,46 +103,58 @@ public class CompiledAssembly
 		{
 			try
 			{
-				AssemblyDefinition assemblyDefinition;
+				AssemblyDefinition assemblyDefinition = null;
+				ReaderParameters readerParameters = new ReaderParameters
+				{
+					AssemblyResolver = new AssemblyResolver()
+				};
 				using (MemoryStream stream = new MemoryStream(RawAssembly))
 				{
-					assemblyDefinition = AssemblyDefinition.ReadAssembly(stream);
+					assemblyDefinition = AssemblyDefinition.ReadAssembly(stream, readerParameters);
 				}
-				foreach (TypeDefinition type in assemblyDefinition.MainModule.Types)
+				int num = 0;
+				int num2 = CompilablePlugins.Count((CompilablePlugin p) => p.CompilerErrors == null);
+				for (int i = 0; i < assemblyDefinition.MainModule.Types.Count; i++)
 				{
-					if (!IsCompilerGenerated(type))
+					if (num == num2)
 					{
-						if (type.Namespace == "Oxide.Plugins")
+						Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Compile, "CSharp", $"Patched {num} of {num2} plugins");
+						break;
+					}
+					try
+					{
+						TypeDefinition type = assemblyDefinition.MainModule.Types[i];
+						if (!(type.Namespace != "Oxide.Plugins") && Oxide.Plugins.ExtensionMethods.Contains(PluginNames, type.Name))
 						{
-							if (Oxide.Plugins.ExtensionMethods.Contains(PluginNames, type.Name))
+							num++;
+							Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Compile, "CSharp", "Preparing " + type.Name + " for runtime patching. . .");
+							if (type.Methods.FirstOrDefault((MethodDefinition m) => !m.IsStatic && m.IsConstructor && !m.HasParameters && !m.IsPublic) != null)
 							{
-								if (type.Methods.FirstOrDefault((MethodDefinition m) => !m.IsStatic && m.IsConstructor && !m.HasParameters && !m.IsPublic) != null)
+								Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.Compile, "CSharp", "User defined constructors are not supported. Please remove the constructor from " + type.Name + ".cs");
+								CompilablePlugin compilablePlugin = CompilablePlugins.SingleOrDefault((CompilablePlugin p) => p.Name == type.Name);
+								if (compilablePlugin != null)
 								{
-									CompilablePlugin compilablePlugin = CompilablePlugins.SingleOrDefault((CompilablePlugin p) => p.Name == type.Name);
-									if (compilablePlugin != null)
-									{
-										compilablePlugin.CompilerErrors = "Primary constructor in main class must be public";
-									}
-								}
-								else
-								{
-									new DirectCallMethod(assemblyDefinition.MainModule, type);
+									compilablePlugin.CompilerErrors = "Primary constructor in main class must be public";
 								}
 							}
 							else
 							{
-								Interface.Oxide.LogWarning((PluginNames.Length == 1) ? (PluginNames[0] + " has polluted the global namespace by defining " + type.Name) : ("A plugin has polluted the global namespace by defining " + type.Name));
+								Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Compile, "CSharp", "Patching DirectCallMethod on " + type.Name);
+								new DirectCallMethod(assemblyDefinition.MainModule, type, readerParameters);
 							}
 						}
-						else if (type.FullName != "<Module>" && !PluginNames.Any((string plugin) => type.FullName.StartsWith("Oxide.Plugins." + plugin)))
-						{
-							Interface.Oxide.LogWarning((PluginNames.Length == 1) ? (PluginNames[0] + " has polluted the global namespace by defining " + type.FullName) : ("A plugin has polluted the global namespace by defining " + type.FullName));
-						}
+					}
+					catch (Exception exception)
+					{
+						Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.Compile, "CSharp", $"Failed to patch type at index {i}", exception);
 					}
 				}
 				using (MemoryStream memoryStream = new MemoryStream())
 				{
-					assemblyDefinition.Write(memoryStream);
+					assemblyDefinition.Write(memoryStream, new WriterParameters
+					{
+						WriteSymbols = false
+					});
 					PatchedAssembly = memoryStream.ToArray();
 				}
 				Interface.Oxide.NextTick(delegate
@@ -151,8 +170,8 @@ public class CompiledAssembly
 				Interface.Oxide.NextTick(delegate
 				{
 					isPatching = false;
-					Interface.Oxide.LogException("Exception while patching: " + Oxide.Plugins.ExtensionMethods.ToSentence(PluginNames), ex3);
-					callback(null);
+					Interface.Oxide.RootLogger.WriteDebug(LogType.Warning, LogEvent.Compile, "CSharp", "Failed to patch DirectCallHook method on plugins " + Oxide.Plugins.ExtensionMethods.ToSentence(PluginNames) + ", performance may be degraded.", ex3);
+					callback(RawAssembly);
 				});
 			}
 		});
@@ -161,10 +180,5 @@ public class CompiledAssembly
 	public bool IsOutdated()
 	{
 		return CompilablePlugins.Any((CompilablePlugin pl) => pl.GetLastModificationTime() != CompiledAt);
-	}
-
-	private bool IsCompilerGenerated(TypeDefinition type)
-	{
-		return type.CustomAttributes.Any((CustomAttribute attr) => attr.Constructor.DeclaringType.ToString().Contains("CompilerGeneratedAttribute"));
 	}
 }

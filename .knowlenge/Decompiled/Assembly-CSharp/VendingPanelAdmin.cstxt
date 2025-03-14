@@ -1,5 +1,5 @@
+using TMPro;
 using UnityEngine;
-using UnityEngine.UI;
 
 public class VendingPanelAdmin : UIDialog
 {
@@ -7,5 +7,7 @@ public class VendingPanelAdmin : UIDialog
 
 	public GameObject sellOrderAdminPrefab;
 
-	public InputField storeNameInputField;
+	public TMP_InputField storeNameInputField;
+
+	public EmojiGallery emojiGallery;
 }

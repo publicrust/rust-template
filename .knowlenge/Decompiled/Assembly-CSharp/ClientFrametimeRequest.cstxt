@@ -1,3 +1,4 @@
+[JsonModel]
 public class ClientFrametimeRequest
 {
 	public int request_id;

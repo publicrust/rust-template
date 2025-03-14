@@ -6,12 +6,20 @@ public class PrefabPoolCollection
 {
 	public Dictionary<uint, PrefabPool> storage = new Dictionary<uint, PrefabPool>();
 
+	private bool isClient;
+
+	public PrefabPoolCollection(bool client)
+	{
+		isClient = client;
+	}
+
 	public void Push(GameObject instance)
 	{
 		Poolable component = instance.GetComponent<Poolable>();
 		if (!storage.TryGetValue(component.prefabID, out var value))
 		{
-			value = new PrefabPool();
+			int targetCapacity = (isClient ? component.ClientCount : component.ServerCount);
+			value = new PrefabPool(component.prefabID, targetCapacity);
 			storage.Add(component.prefabID, value);
 		}
 		value.Push(component);

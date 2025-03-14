@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Threading.Tasks;
 using CircularBuffer;
 using CompanionServer;
 using ConVar;
@@ -21,7 +22,9 @@ public class Chat : ConsoleSystem
 		Team,
 		Server,
 		Cards,
-		Local
+		Local,
+		Clan,
+		MaxValue
 	}
 
 	public struct ChatEntry
@@ -50,8 +53,11 @@ public class Chat : ConsoleSystem
 
 	private const float textVolumeBoost = 0.2f;
 
-	[ServerVar]
+	[ReplicatedVar]
+	public static bool hideChatInTutorial = true;
+
 	[ClientVar]
+	[ServerVar]
 	public static bool enabled = true;
 
 	[ServerVar(Help = "Number of messages to keep in memory for chat history")]
@@ -109,6 +115,12 @@ public class Chat : ConsoleSystem
 		sayImpl(ChatChannel.Cards, arg);
 	}
 
+	[ServerUserVar]
+	public static void clansay(Arg arg)
+	{
+		sayImpl(ChatChannel.Clan, arg);
+	}
+
 	private static void sayImpl(ChatChannel targetChannel, Arg arg)
 	{
 		if (!enabled)
@@ -116,39 +128,76 @@ public class Chat : ConsoleSystem
 			arg.ReplyWith("Chat is disabled.");
 			return;
 		}
-		BasePlayer basePlayer = ArgEx.Player(arg);
-		if (!basePlayer || basePlayer.HasPlayerFlag(BasePlayer.PlayerFlags.ChatMute))
+		BasePlayer player = ArgEx.Player(arg);
+		if (!player || (hideChatInTutorial && player.IsInTutorial) || player.HasPlayerFlag(BasePlayer.PlayerFlags.ChatMute))
 		{
 			return;
 		}
-		if (!basePlayer.IsAdmin && !basePlayer.IsDeveloper)
+		if (!player.IsAdmin && !player.IsDeveloper)
 		{
-			if (basePlayer.NextChatTime == 0f)
+			if (player.NextChatTime == 0f)
 			{
-				basePlayer.NextChatTime = UnityEngine.Time.realtimeSinceStartup - 30f;
+				player.NextChatTime = UnityEngine.Time.realtimeSinceStartup - 30f;
 			}
-			if (basePlayer.NextChatTime > UnityEngine.Time.realtimeSinceStartup)
+			if (player.NextChatTime > UnityEngine.Time.realtimeSinceStartup)
 			{
-				basePlayer.NextChatTime += 2f;
-				float num = basePlayer.NextChatTime - UnityEngine.Time.realtimeSinceStartup;
-				ConsoleNetwork.SendClientCommand(basePlayer.net.connection, "chat.add", 2, 0, "You're chatting too fast - try again in " + (num + 0.5f).ToString("0") + " seconds");
+				player.NextChatTime += 2f;
+				float num = player.NextChatTime - UnityEngine.Time.realtimeSinceStartup;
+				ConsoleNetwork.SendClientCommand(player.net.connection, "chat.add", 2, 0, "You're chatting too fast - try again in " + (num + 0.5f).ToString("0") + " seconds");
 				if (num > 120f)
 				{
-					basePlayer.Kick("Chatting too fast");
+					player.Kick("Chatting too fast");
 				}
 				return;
 			}
 		}
 		string @string = arg.GetString(0, "text");
-		bool num2 = sayAs(targetChannel, basePlayer.userID, basePlayer.displayName, @string, basePlayer);
-		Facepunch.Rust.Analytics.Azure.OnChatMessage(basePlayer, @string, (int)targetChannel);
-		if (num2)
+		ValueTask<bool> valueTask = sayAs(targetChannel, player.userID, player.displayName, @string, player);
+		Facepunch.Rust.Analytics.Azure.OnChatMessage(player, @string, (int)targetChannel);
+		player.NextChatTime = UnityEngine.Time.realtimeSinceStartup + 1.5f;
+		if (valueTask.IsCompletedSuccessfully)
 		{
-			basePlayer.NextChatTime = UnityEngine.Time.realtimeSinceStartup + 1.5f;
+			if (!valueTask.Result)
+			{
+				player.NextChatTime = UnityEngine.Time.realtimeSinceStartup;
+			}
+			return;
 		}
+		Task<bool> task = valueTask.AsTask();
+		task.GetAwaiter().OnCompleted(delegate
+		{
+			try
+			{
+				if (!task.Result)
+				{
+					player.NextChatTime = UnityEngine.Time.realtimeSinceStartup;
+				}
+			}
+			catch (Exception message)
+			{
+				Debug.LogError(message);
+			}
+		});
 	}
 
-	internal static bool sayAs(ChatChannel targetChannel, ulong userId, string username, string message, BasePlayer player = null)
+	internal static string GetNameColor(ulong userId, BasePlayer player = null)
+	{
+		ServerUsers.UserGroup userGroup = ServerUsers.Get(userId)?.group ?? ServerUsers.UserGroup.None;
+		bool flag = userGroup == ServerUsers.UserGroup.Owner || userGroup == ServerUsers.UserGroup.Moderator;
+		bool num = ((player != null) ? player.IsDeveloper : DeveloperList.Contains(userId));
+		string result = "#5af";
+		if (flag)
+		{
+			result = "#af5";
+		}
+		if (num)
+		{
+			result = "#fa5";
+		}
+		return result;
+	}
+
+	internal static async ValueTask<bool> sayAs(ChatChannel targetChannel, ulong userId, string username, string message, BasePlayer player = null)
 	{
 		if (!player)
 		{
@@ -162,66 +211,77 @@ public class Chat : ConsoleSystem
 		{
 			return false;
 		}
-		ServerUsers.UserGroup userGroup = ServerUsers.Get(userId)?.group ?? ServerUsers.UserGroup.None;
-		if (userGroup == ServerUsers.UserGroup.Banned)
+		if ((ServerUsers.Get(userId)?.group ?? ServerUsers.UserGroup.None) == ServerUsers.UserGroup.Banned)
 		{
 			return false;
 		}
-		string text = message.Replace("\n", "").Replace("\r", "").Trim();
-		if (text.Length > 128)
+		string strChatText = message.Replace("\n", "").Replace("\r", "").Trim();
+		if (strChatText.Length > 128)
 		{
-			text = text.Substring(0, 128);
+			strChatText = strChatText.Substring(0, 128);
 		}
-		if (text.Length <= 0)
+		if (strChatText.Length <= 0)
 		{
 			return false;
 		}
-		if (text.StartsWith("/") || text.StartsWith("\\"))
-		{
-			Interface.CallHook("IOnPlayerCommand", player, message);
-			return false;
-		}
-		text = text.EscapeRichText();
-		object obj = Interface.CallHook("IOnPlayerChat", userId, username, text, targetChannel, player);
+		object obj = Interface.CallHook("IOnPlayerChat", userId, username, strChatText, targetChannel, player);
 		if (obj is bool)
 		{
 			return (bool)obj;
 		}
+		if (strChatText.StartsWith("/") || strChatText.StartsWith("\\"))
+		{
+			return false;
+		}
+		strChatText = strChatText.EscapeRichText();
+		if (ConVar.Server.emojiOwnershipCheck)
+		{
+			List<(TmProEmojiRedirector.EmojiSub, int)> obj2 = Facepunch.Pool.Get<List<(TmProEmojiRedirector.EmojiSub, int)>>();
+			TmProEmojiRedirector.FindEmojiSubstitutions(strChatText, RustEmojiLibrary.Instance, obj2, richText: false, isServer: true);
+			bool flag = true;
+			foreach (var item in obj2)
+			{
+				if (!item.Item1.targetEmojiResult.CanBeUsedBy(player))
+				{
+					flag = false;
+					break;
+				}
+			}
+			Facepunch.Pool.FreeUnmanaged(ref obj2);
+			if (!flag)
+			{
+				Debug.Log("player tried to use emoji they don't own, reject!");
+				return false;
+			}
+		}
 		if (serverlog)
 		{
-			ServerConsole.PrintColoured(ConsoleColor.DarkYellow, string.Concat("[", targetChannel, "] ", username, ": "), ConsoleColor.DarkGreen, text);
-			string text2 = player?.ToString() ?? $"{username}[{userId}]";
+			ServerConsole.PrintColoured(ConsoleColor.DarkYellow, "[" + targetChannel.ToString() + "] " + username + ": ", ConsoleColor.DarkGreen, strChatText);
+			string text = player?.ToString() ?? $"{username}[{userId}]";
 			switch (targetChannel)
 			{
 			case ChatChannel.Team:
-				DebugEx.Log("[TEAM CHAT] " + text2 + " : " + text);
+				DebugEx.Log("[TEAM CHAT] " + text + " : " + strChatText);
 				break;
 			case ChatChannel.Cards:
-				DebugEx.Log("[CARDS CHAT] " + text2 + " : " + text);
+				DebugEx.Log("[CARDS CHAT] " + text + " : " + strChatText);
+				break;
+			case ChatChannel.Clan:
+				DebugEx.Log("[CLAN CHAT] " + text + " : " + strChatText);
 				break;
 			default:
-				DebugEx.Log("[CHAT] " + text2 + " : " + text);
+				DebugEx.Log("[CHAT] " + text + " : " + strChatText);
 				break;
 			}
 		}
-		bool flag = userGroup == ServerUsers.UserGroup.Owner || userGroup == ServerUsers.UserGroup.Moderator;
-		bool num = ((player != null) ? player.IsDeveloper : DeveloperList.Contains(userId));
-		string text3 = "#5af";
-		if (flag)
-		{
-			text3 = "#af5";
-		}
-		if (num)
-		{
-			text3 = "#fa5";
-		}
-		string text4 = username.EscapeRichText();
+		string strName = username.EscapeRichText();
+		string nameColor = GetNameColor(userId, player);
 		ChatEntry ce = default(ChatEntry);
 		ce.Channel = targetChannel;
-		ce.Message = text;
+		ce.Message = strChatText;
 		ce.UserId = ((player != null) ? player.UserIDString : userId.ToString());
 		ce.Username = username;
-		ce.Color = text3;
+		ce.Color = nameColor;
 		ce.Time = Epoch.Current;
 		Record(ce);
 		switch (targetChannel)
@@ -237,21 +297,21 @@ public class Chat : ConsoleSystem
 				return false;
 			}
 			BaseCardGameEntity baseCardGameEntity = player.GetMountedVehicle() as BaseCardGameEntity;
-			if (baseCardGameEntity == null || !baseCardGameEntity.GameController.IsAtTable(player))
+			if (baseCardGameEntity == null || !(baseCardGameEntity.GameController?.IsAtTable(player) ?? false))
 			{
 				return false;
 			}
-			List<Network.Connection> obj2 = Facepunch.Pool.GetList<Network.Connection>();
-			baseCardGameEntity.GameController.GetConnectionsInGame(obj2);
-			if (obj2.Count > 0)
+			List<Network.Connection> obj3 = Facepunch.Pool.Get<List<Network.Connection>>();
+			baseCardGameEntity.GameController?.GetConnectionsInGame(obj3);
+			if (obj3.Count > 0)
 			{
-				ConsoleNetwork.SendClientCommand(obj2, "chat.add2", 3, userId, text, text4, text3, 1f);
+				ConsoleNetwork.SendClientCommand(obj3, "chat.add2", 3, userId, strChatText, strName, nameColor, 1f);
 			}
-			Facepunch.Pool.FreeList(ref obj2);
+			Facepunch.Pool.FreeUnmanaged(ref obj3);
 			return true;
 		}
 		case ChatChannel.Global:
-			ConsoleNetwork.BroadcastToAllClients("chat.add2", 0, userId, text, text4, text3, 1f);
+			ConsoleNetwork.BroadcastToAllClients("chat.add2", 0, userId, strChatText, strName, nameColor, 1f);
 			return true;
 		case ChatChannel.Local:
 		{
@@ -259,13 +319,13 @@ public class Chat : ConsoleSystem
 			{
 				break;
 			}
-			float num2 = localChatRange * localChatRange;
+			float num = localChatRange * localChatRange;
 			foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
 			{
 				float sqrMagnitude = (activePlayer.transform.position - player.transform.position).sqrMagnitude;
-				if (!(sqrMagnitude > num2))
+				if (!(sqrMagnitude > num))
 				{
-					ConsoleNetwork.SendClientCommand(activePlayer.net.connection, "chat.add2", 4, userId, text, text4, text3, Mathf.Clamp01(sqrMagnitude / num2 + 0.2f));
+					ConsoleNetwork.SendClientCommand(activePlayer.net.connection, "chat.add2", 4, userId, strChatText, strName, nameColor, Mathf.Clamp01(sqrMagnitude / num + 0.2f));
 				}
 			}
 			return true;
@@ -280,10 +340,41 @@ public class Chat : ConsoleSystem
 			List<Network.Connection> onlineMemberConnections = playerTeam.GetOnlineMemberConnections();
 			if (onlineMemberConnections != null)
 			{
-				ConsoleNetwork.SendClientCommand(onlineMemberConnections, "chat.add2", 1, userId, text, text4, text3, 1f);
+				ConsoleNetwork.SendClientCommand(onlineMemberConnections, "chat.add2", 1, userId, strChatText, strName, nameColor, 1f);
 			}
-			playerTeam.BroadcastTeamChat(userId, text4, text, text3);
+			playerTeam.BroadcastTeamChat(userId, strName, strChatText, nameColor);
 			return true;
+		}
+		case ChatChannel.Clan:
+		{
+			ClanManager serverInstance = ClanManager.ServerInstance;
+			if (serverInstance == null)
+			{
+				return false;
+			}
+			if (player != null && player.clanId == 0L)
+			{
+				return false;
+			}
+			try
+			{
+				ClanValueResult<IClan> clanValueResult = ((!(player != null) || player.clanId == 0L) ? (await serverInstance.Backend.GetByMember(userId)) : (await serverInstance.Backend.Get(player.clanId)));
+				ClanValueResult<IClan> clanValueResult2 = clanValueResult;
+				if (!clanValueResult2.IsSuccess)
+				{
+					return false;
+				}
+				if (await clanValueResult2.Value.SendChatMessage(strName, strChatText, userId) != ClanResult.Success)
+				{
+					return false;
+				}
+				return true;
+			}
+			catch (Exception message2)
+			{
+				Debug.LogError(message2);
+				return false;
+			}
 		}
 		}
 		return false;

@@ -2,7 +2,7 @@ using Rust.UI;
 using UnityEngine;
 using UnityEngine.UI;
 
-public class SignPanel : MonoBehaviour, IImageReceiver
+public class SignPanel : MonoBehaviour, IImageReceiver, IItemPanel
 {
 	public RawImage Image;
 

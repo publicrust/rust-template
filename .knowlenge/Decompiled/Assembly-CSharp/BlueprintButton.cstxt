@@ -18,4 +18,6 @@ public class BlueprintButton : MonoBehaviour, IClientComponent, IInventoryChange
 	public Tooltip Tip;
 
 	public Image FavouriteIcon;
+
+	public PingWidget TutorialHighlight;
 }

@@ -13,31 +13,46 @@ public class ConstructionPlaceholder : PrefabAttribute, IPrefabPreProcess
 
 	public bool collider;
 
+	[NonSerialized]
+	public MeshRenderer MeshRenderer;
+
+	[NonSerialized]
+	public MeshFilter MeshFilter;
+
+	[NonSerialized]
+	public MeshCollider MeshCollider;
+
 	protected override void AttributeSetup(GameObject rootObj, string name, bool serverside, bool clientside, bool bundling)
 	{
 		base.AttributeSetup(rootObj, name, serverside, clientside, bundling);
-		if (!clientside)
+		if (!clientside || !base.enabled)
 		{
 			return;
 		}
 		if (renderer)
 		{
-			MeshFilter component = rootObj.GetComponent<MeshFilter>();
-			MeshRenderer component2 = rootObj.GetComponent<MeshRenderer>();
-			if (!component)
+			MeshFilter = rootObj.GetComponent<MeshFilter>();
+			MeshRenderer = rootObj.GetComponent<MeshRenderer>();
+			if (!MeshFilter)
 			{
-				rootObj.AddComponent<MeshFilter>().sharedMesh = mesh;
+				MeshFilter = rootObj.AddComponent<MeshFilter>();
+				MeshFilter.sharedMesh = mesh;
 			}
-			if (!component2)
+			if (!MeshRenderer)
 			{
-				component2 = rootObj.AddComponent<MeshRenderer>();
-				component2.sharedMaterial = material;
-				component2.shadowCastingMode = ShadowCastingMode.Off;
+				MeshRenderer = rootObj.AddComponent<MeshRenderer>();
+				MeshRenderer.sharedMaterial = material;
+				MeshRenderer.shadowCastingMode = ShadowCastingMode.Off;
 			}
 		}
-		if (collider && !rootObj.GetComponent<MeshCollider>())
+		if (collider)
 		{
-			rootObj.AddComponent<MeshCollider>().sharedMesh = mesh;
+			MeshCollider = rootObj.GetComponent<MeshCollider>();
+			if (!MeshCollider)
+			{
+				MeshCollider = rootObj.AddComponent<MeshCollider>();
+				MeshCollider.sharedMesh = mesh;
+			}
 		}
 	}
 

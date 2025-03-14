@@ -1,4 +1,6 @@
-public class BaseDetector : IOEntity
+using UnityEngine;
+
+public class BaseDetector : IOEntity, IDetector
 {
 	public PlayerDetectionTrigger myTrigger;
 
@@ -22,6 +24,10 @@ public class BaseDetector : IOEntity
 			OnDetectorTriggered();
 			MarkDirty();
 		}
+	}
+
+	public void OnObjectAdded(GameObject obj, Collider col)
+	{
 	}
 
 	public virtual void OnEmpty()

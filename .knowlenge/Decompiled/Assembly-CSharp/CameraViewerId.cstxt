@@ -32,7 +32,10 @@ public struct CameraViewerId : IEquatable<CameraViewerId>
 
 	public override int GetHashCode()
 	{
-		return (SteamId.GetHashCode() * 397) ^ ConnectionId.GetHashCode();
+		ulong steamId = SteamId;
+		int num = steamId.GetHashCode() * 397;
+		long connectionId = ConnectionId;
+		return num ^ connectionId.GetHashCode();
 	}
 
 	public static bool operator ==(CameraViewerId left, CameraViewerId right)

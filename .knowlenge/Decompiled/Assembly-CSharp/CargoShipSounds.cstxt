@@ -2,6 +2,8 @@ using UnityEngine;
 
 public class CargoShipSounds : MonoBehaviour, IClientComponent
 {
+	public CargoShip cargoShip;
+
 	public SoundDefinition waveSoundDef;
 
 	public AnimationCurve waveSoundYGainCurve;
@@ -22,11 +24,17 @@ public class CargoShipSounds : MonoBehaviour, IClientComponent
 
 	private SoundModulation.Modulator sternWakeSoundGainMod;
 
+	public SoundDefinition idleWaveSoundDef;
+
 	public SoundDefinition engineHumSoundDef;
 
 	private Sound engineHumSound;
 
+	private SoundModulation.Modulator enginePitchMod;
+
 	public GameObject engineHumTarget;
+
+	public float enginePitchChangeSpeed = 0.03f;
 
 	public SoundDefinition hugeRumbleSoundDef;
 
@@ -51,4 +59,10 @@ public class CargoShipSounds : MonoBehaviour, IClientComponent
 	public Collider soundFollowColliderR;
 
 	public Collider sternSoundFollowCollider;
+
+	public SoundDefinition metalGroanSoundDef;
+
+	public float metalGroanMinInterval = 1f;
+
+	public float metalGroanMaxInterval = 30f;
 }

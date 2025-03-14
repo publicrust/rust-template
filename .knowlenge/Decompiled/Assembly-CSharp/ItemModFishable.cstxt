@@ -29,4 +29,9 @@ public class ItemModFishable : ItemMod
 	public float Chance;
 
 	public string SteamStatName;
+
+	[Header("Mounting")]
+	public bool CanBeMounted;
+
+	public int FishMountIndex;
 }

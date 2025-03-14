@@ -3,19 +3,48 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using Harmony;
 using Mono.Cecil;
 using UnityEngine;
 
 public static class HarmonyLoader
 {
+	private class ReflectionFields
+	{
+		public static ReflectionFields Instance;
+
+		public readonly Type type_Harmony;
+
+		public readonly Type type_FileLog;
+
+		public readonly FieldInfo field_DEBUG;
+
+		public readonly MethodInfo Harmony_PatchAll;
+
+		public readonly MethodInfo Harmony_UnpatchAll;
+
+		public readonly MethodInfo FileLog_Reset;
+
+		public readonly MethodInfo FileLog_FlushBuffer;
+
+		public ReflectionFields()
+		{
+			type_FileLog = Type.GetType("HarmonyLib.FileLog, 0Harmony", throwOnError: true);
+			type_Harmony = Type.GetType("HarmonyLib.Harmony, 0Harmony", throwOnError: true);
+			field_DEBUG = type_Harmony.GetField("DEBUG", BindingFlags.Static | BindingFlags.Public);
+			Harmony_PatchAll = type_Harmony.GetMethod("PatchAll", BindingFlags.Instance | BindingFlags.Public, null, new Type[1] { typeof(Assembly) }, null);
+			Harmony_UnpatchAll = type_Harmony.GetMethod("UnpatchAll", BindingFlags.Instance | BindingFlags.Public, null, new Type[1] { typeof(string) }, null);
+			FileLog_Reset = type_FileLog.GetMethod("Reset", BindingFlags.Static | BindingFlags.Public);
+			FileLog_FlushBuffer = type_FileLog.GetMethod("FlushBuffer", BindingFlags.Static | BindingFlags.Public);
+		}
+	}
+
 	private class HarmonyMod
 	{
 		public string Name { get; set; }
 
 		public string HarmonyId { get; set; }
 
-		public HarmonyInstance Harmony { get; set; }
+		public Harmony Harmony { get; set; }
 
 		public Assembly Assembly { get; set; }
 
@@ -24,7 +53,54 @@ public static class HarmonyLoader
 		public List<IHarmonyModHooks> Hooks { get; } = new List<IHarmonyModHooks>();
 	}
 
+	private static class FileLog
+	{
+		public static void Reset()
+		{
+			ReflectionFields.Instance.FileLog_Reset.Invoke(null, null);
+		}
+
+		public static void FlushBuffer()
+		{
+			ReflectionFields.Instance.FileLog_FlushBuffer.Invoke(null, null);
+		}
+	}
+
+	private class Harmony
+	{
+		private object harmonyObject;
+
+		public static bool DEBUG
+		{
+			get
+			{
+				return (bool)ReflectionFields.Instance.field_DEBUG.GetValue(null);
+			}
+			set
+			{
+				ReflectionFields.Instance.field_DEBUG.SetValue(null, value);
+			}
+		}
+
+		public Harmony(string id)
+		{
+			harmonyObject = Activator.CreateInstance(ReflectionFields.Instance.type_Harmony, id);
+		}
+
+		public void PatchAll(Assembly assembly)
+		{
+			ReflectionFields.Instance.Harmony_PatchAll.Invoke(harmonyObject, new object[1] { assembly });
+		}
+
+		public void UnpatchAll(string harmonyId)
+		{
+			ReflectionFields.Instance.Harmony_UnpatchAll.Invoke(harmonyObject, new object[1] { harmonyId });
+		}
+	}
+
 	private static string modPath;
+
+	private static Assembly harmonyAssembly;
 
 	private static List<HarmonyMod> loadedMods = new List<HarmonyMod>();
 
@@ -47,17 +123,41 @@ public static class HarmonyLoader
 		}).ToArray();
 	}
 
+	private static string GetHarmonyPath()
+	{
+		return Path.Combine(Application.dataPath, "Managed", "0Harmony.dll");
+	}
+
+	private static void EnsureHarmonyIsLoaded()
+	{
+		if (!(harmonyAssembly != null))
+		{
+			string harmonyPath = GetHarmonyPath();
+			if (!File.Exists(harmonyPath))
+			{
+				LogError("Failed to find 0Harmony.dll at '" + harmonyPath + "'");
+				return;
+			}
+			harmonyAssembly = Assembly.Load(File.ReadAllBytes(harmonyPath));
+			ReflectionFields.Instance = new ReflectionFields();
+		}
+	}
+
 	[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
 	public static void LoadHarmonyMods()
 	{
 		try
 		{
-			HarmonyInstance.DEBUG = true;
+			EnsureHarmonyIsLoaded();
+			Harmony.DEBUG = true;
 			string path = Path.Combine(Application.dataPath, "..");
-			FileLog.logPath = Path.Combine(path, "harmony_log.txt");
+			if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("HARMONY_LOG_FILE")))
+			{
+				Environment.SetEnvironmentVariable("HARMONY_LOG_FILE", Path.Combine(path, "harmony_log.txt"));
+			}
 			try
 			{
-				File.Delete(FileLog.logPath);
+				FileLog.Reset();
 			}
 			catch
 			{
@@ -82,7 +182,12 @@ public static class HarmonyLoader
 			Debug.Log("Set harmony directory to '" + modPath + "'");
 			AppDomain.CurrentDomain.AssemblyResolve += delegate(object sender, ResolveEventArgs args)
 			{
+				Debug.Log("Trying to load assembly: " + args.Name);
 				string text = args.Name.Split(',')[0];
+				if (text.StartsWith("MonoMod."))
+				{
+					return harmonyAssembly;
+				}
 				if (assemblyNames.TryGetValue(text, out var value))
 				{
 					return value;
@@ -99,6 +204,10 @@ public static class HarmonyLoader
 				}
 			}
 		}
+		catch (Exception exception)
+		{
+			Debug.LogException(exception);
+		}
 		finally
 		{
 			FileLog.FlushBuffer();
@@ -107,6 +216,7 @@ public static class HarmonyLoader
 
 	public static bool TryLoadMod(string dllName)
 	{
+		EnsureHarmonyIsLoaded();
 		string text = Path.GetFileName(dllName);
 		if (text.EndsWith(".dll"))
 		{
@@ -151,7 +261,7 @@ public static class HarmonyLoader
 					LogError(harmonyMod.Name, $"Failed to create hook instance {arg}");
 				}
 			}
-			harmonyMod.Harmony = HarmonyInstance.Create(text3);
+			harmonyMod.Harmony = new Harmony(text3);
 			harmonyMod.HarmonyId = text3;
 			try
 			{
@@ -187,6 +297,7 @@ public static class HarmonyLoader
 
 	public static bool TryUnloadMod(string name)
 	{
+		EnsureHarmonyIsLoaded();
 		HarmonyMod mod = GetMod(name);
 		if (mod == null)
 		{

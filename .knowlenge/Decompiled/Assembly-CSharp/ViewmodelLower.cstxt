@@ -6,6 +6,8 @@ public class ViewmodelLower : MonoBehaviour
 
 	public bool lowerWhenCantAttack = true;
 
+	public bool forceLower;
+
 	public float lowerScale = 1f;
 
 	public void SetShouldLower(bool shouldLower)

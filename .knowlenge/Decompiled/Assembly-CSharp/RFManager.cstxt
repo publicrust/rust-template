@@ -4,13 +4,15 @@ using UnityEngine;
 
 public class RFManager
 {
-	public static Dictionary<int, List<IRFObject>> _listeners = new Dictionary<int, List<IRFObject>>();
+	private static readonly Dictionary<int, HashSet<IRFObject>> _listeners = new Dictionary<int, HashSet<IRFObject>>();
 
-	public static Dictionary<int, List<IRFObject>> _broadcasters = new Dictionary<int, List<IRFObject>>();
+	private static readonly Dictionary<int, HashSet<IRFObject>> _broadcasters = new Dictionary<int, HashSet<IRFObject>>();
+
+	private static readonly Dictionary<int, bool> _isFrequencyBroadcasting = new Dictionary<int, bool>();
 
 	public static int minFreq = 1;
 
-	public static int maxFreq = 9999;
+	public static int maxFreq = 999999;
 
 	private static int reserveRangeMin = 4760;
 
@@ -23,26 +25,24 @@ public class RFManager
 		return Mathf.Clamp(freq, minFreq, maxFreq);
 	}
 
-	public static List<IRFObject> GetListenList(int frequency)
+	public static HashSet<IRFObject> GetListenerSet(int frequency)
 	{
 		frequency = ClampFrequency(frequency);
-		List<IRFObject> value = null;
-		if (!_listeners.TryGetValue(frequency, out value))
+		if (!_listeners.TryGetValue(frequency, out var value))
 		{
-			value = new List<IRFObject>();
-			_listeners.Add(frequency, value);
+			value = new HashSet<IRFObject>();
+			_listeners[frequency] = value;
 		}
 		return value;
 	}
 
-	public static List<IRFObject> GetBroadcasterList(int frequency)
+	public static HashSet<IRFObject> GetBroadcasterSet(int frequency)
 	{
 		frequency = ClampFrequency(frequency);
-		List<IRFObject> value = null;
-		if (!_broadcasters.TryGetValue(frequency, out value))
+		if (!_broadcasters.TryGetValue(frequency, out var value))
 		{
-			value = new List<IRFObject>();
-			_broadcasters.Add(frequency, value);
+			value = new HashSet<IRFObject>();
+			_broadcasters[frequency] = value;
 		}
 		return value;
 	}
@@ -52,14 +52,14 @@ public class RFManager
 		frequency = ClampFrequency(frequency);
 		if (Interface.CallHook("OnRfListenerAdd", obj, frequency) == null)
 		{
-			List<IRFObject> listenList = GetListenList(frequency);
-			if (listenList.Contains(obj))
+			if (!GetListenerSet(frequency).Add(obj))
 			{
 				Debug.Log("adding same listener twice");
 				return;
 			}
-			listenList.Add(obj);
-			MarkFrequencyDirty(frequency);
+			bool value;
+			bool on = _isFrequencyBroadcasting.TryGetValue(frequency, out value) && value;
+			obj.RFSignalUpdate(on);
 			Interface.CallHook("OnRfListenerAdded", obj, frequency);
 		}
 	}
@@ -67,13 +67,8 @@ public class RFManager
 	public static void RemoveListener(int frequency, IRFObject obj)
 	{
 		frequency = ClampFrequency(frequency);
-		if (Interface.CallHook("OnRfListenerRemove", obj, frequency) == null)
+		if (Interface.CallHook("OnRfListenerRemove", obj, frequency) == null && GetListenerSet(frequency).Remove(obj))
 		{
-			List<IRFObject> listenList = GetListenList(frequency);
-			if (listenList.Contains(obj))
-			{
-				listenList.Remove(obj);
-			}
 			obj.RFSignalUpdate(on: false);
 			Interface.CallHook("OnRfListenerRemoved", obj, frequency);
 		}
@@ -82,14 +77,22 @@ public class RFManager
 	public static void AddBroadcaster(int frequency, IRFObject obj)
 	{
 		frequency = ClampFrequency(frequency);
-		if (Interface.CallHook("OnRfBroadcasterAdd", obj, frequency) == null)
+		if (Interface.CallHook("OnRfBroadcasterAdd", obj, frequency) != null)
 		{
-			List<IRFObject> broadcasterList = GetBroadcasterList(frequency);
-			if (!broadcasterList.Contains(obj))
+			return;
+		}
+		HashSet<IRFObject> broadcasterSet = GetBroadcasterSet(frequency);
+		if (broadcasterSet.RemoveWhere((IRFObject b) => b == null || !BaseEntityEx.IsValidEntityReference(b)) > 0)
+		{
+			Debug.LogWarning($"Found null entries in the RF broadcaster set for frequency {frequency}... cleaning up.");
+		}
+		if (broadcasterSet.Add(obj))
+		{
+			Interface.CallHook("OnRfBroadcasterAdded", obj, frequency);
+			if (!_isFrequencyBroadcasting.TryGetValue(frequency, out var value) || !value)
 			{
-				broadcasterList.Add(obj);
-				MarkFrequencyDirty(frequency);
-				Interface.CallHook("OnRfBroadcasterAdded", obj, frequency);
+				_isFrequencyBroadcasting[frequency] = true;
+				UpdateListenersForFrequency(frequency, isBroadcasting: true);
 			}
 		}
 	}
@@ -97,15 +100,33 @@ public class RFManager
 	public static void RemoveBroadcaster(int frequency, IRFObject obj)
 	{
 		frequency = ClampFrequency(frequency);
-		if (Interface.CallHook("OnRfBroadcasterRemove", obj, frequency) == null)
+		if (Interface.CallHook("OnRfBroadcasterRemove", obj, frequency) != null)
 		{
-			List<IRFObject> broadcasterList = GetBroadcasterList(frequency);
-			if (broadcasterList.Contains(obj))
-			{
-				broadcasterList.Remove(obj);
-			}
-			MarkFrequencyDirty(frequency);
+			return;
+		}
+		HashSet<IRFObject> broadcasterSet = GetBroadcasterSet(frequency);
+		if (broadcasterSet.RemoveWhere((IRFObject b) => b == null || !BaseEntityEx.IsValidEntityReference(b)) > 0)
+		{
+			Debug.LogWarning($"Found null entries in the RF broadcaster set for frequency {frequency}... cleaning up.");
+		}
+		if (broadcasterSet.Remove(obj))
+		{
 			Interface.CallHook("OnRfBroadcasterRemoved", obj, frequency);
+			if (broadcasterSet.Count == 0)
+			{
+				_isFrequencyBroadcasting[frequency] = false;
+				UpdateListenersForFrequency(frequency, isBroadcasting: false);
+			}
+		}
+	}
+
+	private static void UpdateListenersForFrequency(int frequency, bool isBroadcasting)
+	{
+		HashSet<IRFObject> listenerSet = GetListenerSet(frequency);
+		listenerSet.RemoveWhere((IRFObject l) => l == null || !BaseEntityEx.IsValidEntityReference(l));
+		foreach (IRFObject item in listenerSet)
+		{
+			item.RFSignalUpdate(isBroadcasting);
 		}
 	}
 
@@ -140,67 +161,6 @@ public class RFManager
 			if (isOn)
 			{
 				AddBroadcaster(newFrequency, obj);
-			}
-		}
-	}
-
-	public static void MarkFrequencyDirty(int frequency)
-	{
-		frequency = ClampFrequency(frequency);
-		List<IRFObject> broadcasterList = GetBroadcasterList(frequency);
-		List<IRFObject> listenList = GetListenList(frequency);
-		bool flag = broadcasterList.Count > 0;
-		bool flag2 = false;
-		bool flag3 = false;
-		for (int num = listenList.Count - 1; num >= 0; num--)
-		{
-			IRFObject iRFObject = listenList[num];
-			if (!BaseEntityEx.IsValidEntityReference(iRFObject))
-			{
-				flag2 = true;
-			}
-			else
-			{
-				if (flag)
-				{
-					flag = false;
-					foreach (IRFObject item in broadcasterList)
-					{
-						if (!BaseEntityEx.IsValidEntityReference(item))
-						{
-							flag3 = true;
-						}
-						else if (Vector3.Distance(item.GetPosition(), iRFObject.GetPosition()) <= item.GetMaxRange())
-						{
-							flag = true;
-							break;
-						}
-					}
-				}
-				iRFObject.RFSignalUpdate(flag);
-			}
-		}
-		if (flag2)
-		{
-			Debug.LogWarning("Found null entries in the RF listener list for frequency " + frequency + "... cleaning up.");
-			for (int num2 = listenList.Count - 1; num2 >= 0; num2--)
-			{
-				if (listenList[num2] == null)
-				{
-					listenList.RemoveAt(num2);
-				}
-			}
-		}
-		if (!flag3)
-		{
-			return;
-		}
-		Debug.LogWarning("Found null entries in the RF broadcaster list for frequency " + frequency + "... cleaning up.");
-		for (int num3 = broadcasterList.Count - 1; num3 >= 0; num3--)
-		{
-			if (broadcasterList[num3] == null)
-			{
-				broadcasterList.RemoveAt(num3);
 			}
 		}
 	}

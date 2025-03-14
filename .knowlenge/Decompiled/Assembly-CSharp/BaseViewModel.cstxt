@@ -1,6 +1,7 @@
+using System.Collections.Generic;
 using UnityEngine;
 
-public class BaseViewModel : MonoBehaviour
+public class BaseViewModel : FacepunchBehaviour, IPrefabPreProcess
 {
 	[Header("BaseViewModel")]
 	public LazyAimProperties lazyaimRegular;
@@ -21,4 +22,11 @@ public class BaseViewModel : MonoBehaviour
 
 	[Header("Skin")]
 	public SubsurfaceProfile subsurfaceProfile;
+
+	[HideInInspector]
+	public List<SkinnedMeshRenderer> baseSkinPieces = new List<SkinnedMeshRenderer>();
+
+	public void PreProcess(IPrefabProcessor preProcess, GameObject rootObj, string name, bool serverside, bool clientside, bool bundling)
+	{
+	}
 }

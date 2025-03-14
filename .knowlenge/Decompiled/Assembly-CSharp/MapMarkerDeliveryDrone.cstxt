@@ -8,6 +8,6 @@ public class MapMarkerDeliveryDrone : MapMarker
 
 	public override bool ShouldNetworkTo(BasePlayer player)
 	{
-		return player.userID == base.OwnerID;
+		return (ulong)player.userID == base.OwnerID;
 	}
 }

@@ -1,11 +1,14 @@
+#define UNITY_ASSERTIONS
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using Facepunch;
 using Network;
 using UnityEngine;
+using UnityEngine.Assertions;
 
 public abstract class BaseNetwork
 {
@@ -40,11 +43,15 @@ public abstract class BaseNetwork
 
 	private ConcurrentQueue<NetWrite> writeQueue;
 
+	private ConcurrentQueue<DemoQueueItem> demoQueue;
+
 	private ConcurrentQueue<NetRead> decryptQueue;
 
 	private int readQueueSizeInBytes;
 
 	private int writeQueueSizeInBytes;
+
+	private int demoQueueSizeInBytes;
 
 	private int decryptQueueSizeInBytes;
 
@@ -56,13 +63,21 @@ public abstract class BaseNetwork
 
 	private AutoResetEvent decryptThreadReset;
 
+	private AutoResetEvent demoThreadReset;
+
 	private Thread readThread;
 
 	private Thread writeThread;
 
 	private Thread decryptThread;
 
+	private Thread demoThread;
+
 	public INetworkCryptography cryptography;
+
+	private List<Connection> tempBufferReadConnections = new List<Connection>();
+
+	public FullServerDemos serverDemos;
 
 	protected abstract int MaxReceiveTimeValue { get; }
 
@@ -98,6 +113,14 @@ public abstract class BaseNetwork
 
 	public int DecryptQueueBytes => decryptQueueSizeInBytes;
 
+	protected int MaxDemoQueueLengthValue => 5000;
+
+	protected int MaxDemoQueueBytesValue => 524288000;
+
+	protected int MaxDemoThreadWaitValue => 100;
+
+	public abstract bool SupportsServerDemos { get; }
+
 	protected void MultithreadingInit()
 	{
 		if (readThread != null)
@@ -120,6 +143,7 @@ public abstract class BaseNetwork
 			readQueue = new ConcurrentQueue<NetRead>();
 			writeQueue = new ConcurrentQueue<NetWrite>();
 			decryptQueue = new ConcurrentQueue<NetRead>();
+			demoQueue = new ConcurrentQueue<DemoQueueItem>();
 			readQueueSizeInBytes = 0;
 			writeQueueSizeInBytes = 0;
 			decryptQueueSizeInBytes = 0;
@@ -127,6 +151,7 @@ public abstract class BaseNetwork
 			readThreadReset = new AutoResetEvent(initialState: false);
 			writeThreadReset = new AutoResetEvent(initialState: false);
 			decryptThreadReset = new AutoResetEvent(initialState: false);
+			demoThreadReset = new AutoResetEvent(initialState: false);
 			readThread = new Thread(ReadThread);
 			readThread.IsBackground = true;
 			readThread.Start();
@@ -136,6 +161,12 @@ public abstract class BaseNetwork
 			decryptThread = new Thread(DecryptThread);
 			decryptThread.IsBackground = true;
 			decryptThread.Start();
+			if (SupportsServerDemos)
+			{
+				demoThread = new Thread(DemoThread);
+				demoThread.IsBackground = true;
+				demoThread.Start();
+			}
 		}
 	}
 
@@ -151,6 +182,12 @@ public abstract class BaseNetwork
 
 	public void EnqueueWrite(NetWrite write)
 	{
+		Assert.IsNotNull(write, "write != null");
+		Assert.IsNotNull(write.connections, "write.connections != null");
+		foreach (Connection connection in write.connections)
+		{
+			Assert.IsNotNull(connection, "connection != null");
+		}
 		if (writeQueue.Count >= MaxWriteQueueLengthValue || writeQueueSizeInBytes >= MaxWriteQueueBytesValue)
 		{
 			UnityEngine.Debug.LogWarning("Main thread stalling: Write queue at capacity, waiting for write thread...");
@@ -185,6 +222,10 @@ public abstract class BaseNetwork
 	public void ProcessDecrypt(NetRead read)
 	{
 		Decrypt(read.connection, read);
+		if (DemoConVars.ServerDemosEnabled && SupportsServerDemos)
+		{
+			EnqueueToDemoThread(new DemoQueueItem(read));
+		}
 		if (Multithreading)
 		{
 			EnqueueRead(read);
@@ -411,7 +452,7 @@ public abstract class BaseNetwork
 		return cryptography.EncryptCopy(connection, arraySegment);
 	}
 
-	public void Record(Connection connection, Stream stream)
+	public void RecordReadForConnection(Connection connection, Stream stream)
 	{
 		connection?.RecordPacket(stream);
 	}
@@ -424,5 +465,118 @@ public abstract class BaseNetwork
 	public virtual ulong GetStat(Connection connection, StatTypeLong type)
 	{
 		return 0uL;
+	}
+
+	private void DemoThread()
+	{
+		serverDemos = new FullServerDemos(IsConnected);
+		while (IsConnected())
+		{
+			if (!DemoConVars.ServerDemosEnabled)
+			{
+				Thread.Sleep(1000);
+				continue;
+			}
+			try
+			{
+				serverDemos.OnDemoThreadStart();
+			}
+			catch (Exception exception)
+			{
+				UnityEngine.Debug.LogException(exception);
+				Thread.Sleep(10000);
+			}
+			while (IsConnected() && DemoConVars.ServerDemosEnabled)
+			{
+				try
+				{
+					DemoThreadCycle();
+				}
+				catch (Exception exception2)
+				{
+					UnityEngine.Debug.LogException(exception2);
+				}
+				if (demoQueue.Count <= 0)
+				{
+					demoThreadReset.WaitOne(MaxDemoThreadWaitValue);
+				}
+			}
+			try
+			{
+				serverDemos.OnDemoThreadStop();
+			}
+			catch (Exception exception3)
+			{
+				UnityEngine.Debug.LogException(exception3);
+				Thread.Sleep(10000);
+			}
+		}
+	}
+
+	private void DemoThreadCycle()
+	{
+		serverDemos.CycleDiskQuota();
+		DemoQueueItem result;
+		while (demoQueue.TryDequeue(out result))
+		{
+			if (result.write != null)
+			{
+				int num = (int)result.write.Length;
+				Interlocked.Add(ref demoQueueSizeInBytes, -num);
+				if (result.IgnoreNoConnections || (result.write.connections != null && result.write.connections.Count > 0))
+				{
+					serverDemos.RecordServerDemoPacket(result.write.connections, result.write.Data, num, isOutgoing: true);
+				}
+				result.write.RemoveReference();
+			}
+			else if (result.read != null)
+			{
+				int num2 = (int)result.read.Length;
+				Interlocked.Add(ref demoQueueSizeInBytes, -num2);
+				if (result.IgnoreNoConnections || result.read.connection != null)
+				{
+					tempBufferReadConnections.Clear();
+					tempBufferReadConnections.Add(result.read.connection);
+					serverDemos.RecordServerDemoPacket(tempBufferReadConnections, result.read.Data, num2, isOutgoing: false);
+				}
+				result.read.RemoveReference();
+			}
+		}
+	}
+
+	public void RecordDisconnection(Connection connection)
+	{
+		NetWrite netWrite = StartWrite();
+		netWrite.PacketID(Message.Type.DemoDisconnection);
+		netWrite.UInt64(connection.guid);
+		EnqueueToDemoThread(new DemoQueueItem(netWrite)
+		{
+			IgnoreNoConnections = true
+		});
+		netWrite.RemoveReference();
+	}
+
+	public void EnqueueToDemoThread(DemoQueueItem item)
+	{
+		if (DemoConVars.ServerDemosEnabled)
+		{
+			if (item.write != null)
+			{
+				Interlocked.Add(ref demoQueueSizeInBytes, (int)item.write.Length);
+				item.write.AddReference();
+			}
+			else if (item.read != null)
+			{
+				Interlocked.Add(ref demoQueueSizeInBytes, (int)item.read.Length);
+				item.read.AddReference();
+			}
+			if (demoQueue.Count >= MaxDemoQueueBytesValue)
+			{
+				UnityEngine.Debug.LogWarning("Main thread stalling: Demo queue at capacity, waiting for demo thread...");
+				mainThreadReset.WaitOne(MaxMainThreadWaitValue);
+			}
+			demoQueue.Enqueue(item);
+			demoThreadReset.Set();
+		}
 	}
 }

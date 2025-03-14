@@ -1,176 +1,272 @@
 using System;
-using System.Collections.Generic;
+using System.Buffers;
 using System.ComponentModel;
-using System.Reflection;
-using System.Reflection.Emit;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using Harmony.ILCopying;
 
-public static class Memory
+[DebuggerTypeProxy(typeof(System.MemoryDebugView<>))]
+[DebuggerDisplay("{ToString(),raw}")]
+internal readonly struct Memory<T>
 {
-	private static readonly HashSet<PlatformID> WindowsPlatformIDSet = new HashSet<PlatformID>
+	private readonly object? _object;
+
+	private readonly int _index;
+
+	private readonly int _length;
+
+	private const int RemoveFlagsBitMask = int.MaxValue;
+
+	public static Memory<T> Empty => default(Memory<T>);
+
+	public int Length => _length & 0x7FFFFFFF;
+
+	public bool IsEmpty => (_length & 0x7FFFFFFF) == 0;
+
+	public Span<T> Span
 	{
-		PlatformID.Win32NT,
-		PlatformID.Win32S,
-		PlatformID.Win32Windows,
-		PlatformID.WinCE
-	};
-
-	public static bool IsWindows => WindowsPlatformIDSet.Contains(Environment.OSVersion.Platform);
-
-	[DllImport("kernel32.dll")]
-	public static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, Protection flNewProtect, out Protection lpflOldProtect);
-
-	public static void UnprotectMemoryPage(long memory)
-	{
-		if (IsWindows && !VirtualProtect(new IntPtr(memory), new UIntPtr(1u), Protection.PAGE_EXECUTE_READWRITE, out var _))
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		get
 		{
-			throw new Win32Exception();
-		}
-	}
-
-	public static string DetourMethod(MethodBase original, MethodBase replacement)
-	{
-		Exception exception;
-		long methodStart = GetMethodStart(original, out exception);
-		if (methodStart == 0)
-		{
-			return exception.Message;
-		}
-		long methodStart2 = GetMethodStart(replacement, out exception);
-		if (methodStart2 == 0)
-		{
-			return exception.Message;
-		}
-		return WriteJump(methodStart, methodStart2);
-	}
-
-	public static string WriteJump(long memory, long destination)
-	{
-		UnprotectMemoryPage(memory);
-		if (IntPtr.Size == 8)
-		{
-			if (CompareBytes(memory, new byte[1] { 233 }))
+			Span<T> result;
+			if (_index < 0)
 			{
-				int num = ReadInt(memory + 1);
-				memory += 5 + num;
+				result = ((MemoryManager<T>)_object).GetSpan();
+				return result.Slice(_index & 0x7FFFFFFF, _length);
 			}
-			memory = WriteBytes(memory, new byte[2] { 72, 184 });
-			memory = WriteLong(memory, destination);
-			memory = WriteBytes(memory, new byte[2] { 255, 224 });
-		}
-		else
-		{
-			memory = WriteByte(memory, 104);
-			memory = WriteInt(memory, (int)destination);
-			memory = WriteByte(memory, 195);
-		}
-		return null;
-	}
-
-	private static RuntimeMethodHandle GetRuntimeMethodHandle(MethodBase method)
-	{
-		if (method is DynamicMethod)
-		{
-			BindingFlags bindingAttr = BindingFlags.Instance | BindingFlags.NonPublic;
-			MethodInfo method2 = typeof(DynamicMethod).GetMethod("GetMethodDescriptor", bindingAttr);
-			if (method2 != null)
+			if (typeof(T) == typeof(char) && _object is string text)
 			{
-				return (RuntimeMethodHandle)method2.Invoke(method, new object[0]);
+				result = new Span<T>(System.Runtime.CompilerServices.Unsafe.As<System.Pinnable<T>>(text), MemoryExtensions.StringAdjustment, text.Length);
+				return result.Slice(_index, _length);
 			}
-			FieldInfo field = typeof(DynamicMethod).GetField("m_method", bindingAttr);
-			if (field != null)
+			if (_object != null)
 			{
-				return (RuntimeMethodHandle)field.GetValue(method);
+				return new Span<T>((T[])_object, _index, _length & 0x7FFFFFFF);
 			}
-			FieldInfo field2 = typeof(DynamicMethod).GetField("mhandle", bindingAttr);
-			return (RuntimeMethodHandle)field2.GetValue(method);
-		}
-		return method.MethodHandle;
-	}
-
-	public static long GetMethodStart(MethodBase method, out Exception exception)
-	{
-		RuntimeMethodHandle runtimeMethodHandle = GetRuntimeMethodHandle(method);
-		try
-		{
-			RuntimeHelpers.PrepareMethod(runtimeMethodHandle);
-		}
-		catch (Exception)
-		{
-		}
-		try
-		{
-			exception = null;
-			return runtimeMethodHandle.GetFunctionPointer().ToInt64();
-		}
-		catch (Exception ex2)
-		{
-			exception = ex2;
-			return 0L;
+			result = default(Span<T>);
+			return result;
 		}
 	}
 
-	public unsafe static bool CompareBytes(long memory, byte[] values)
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	public Memory(T[]? array)
 	{
-		byte* ptr = (byte*)memory;
-		foreach (byte b in values)
+		if (array == null)
 		{
-			if (b != *ptr)
+			this = default(Memory<T>);
+			return;
+		}
+		if (default(T) == null && array.GetType() != typeof(T[]))
+		{
+			System.ThrowHelper.ThrowArrayTypeMismatchException();
+		}
+		_object = array;
+		_index = 0;
+		_length = array.Length;
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal Memory(T[]? array, int start)
+	{
+		if (array == null)
+		{
+			if (start != 0)
 			{
-				return false;
+				System.ThrowHelper.ThrowArgumentOutOfRangeException();
 			}
-			ptr++;
+			this = default(Memory<T>);
+			return;
 		}
-		return true;
-	}
-
-	public unsafe static byte ReadByte(long memory)
-	{
-		byte* ptr = (byte*)memory;
-		return *ptr;
-	}
-
-	public unsafe static int ReadInt(long memory)
-	{
-		int* ptr = (int*)memory;
-		return *ptr;
-	}
-
-	public unsafe static long ReadLong(long memory)
-	{
-		long* ptr = (long*)memory;
-		return *ptr;
-	}
-
-	public unsafe static long WriteByte(long memory, byte value)
-	{
-		byte* ptr = (byte*)memory;
-		*ptr = value;
-		return memory + 1;
-	}
-
-	public static long WriteBytes(long memory, byte[] values)
-	{
-		foreach (byte value in values)
+		if (default(T) == null && array.GetType() != typeof(T[]))
 		{
-			memory = WriteByte(memory, value);
+			System.ThrowHelper.ThrowArrayTypeMismatchException();
 		}
-		return memory;
+		if ((uint)start > (uint)array.Length)
+		{
+			System.ThrowHelper.ThrowArgumentOutOfRangeException();
+		}
+		_object = array;
+		_index = start;
+		_length = array.Length - start;
 	}
 
-	public unsafe static long WriteInt(long memory, int value)
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	public Memory(T[]? array, int start, int length)
 	{
-		int* ptr = (int*)memory;
-		*ptr = value;
-		return memory + 4;
+		if (array == null)
+		{
+			if (start != 0 || length != 0)
+			{
+				System.ThrowHelper.ThrowArgumentOutOfRangeException();
+			}
+			this = default(Memory<T>);
+			return;
+		}
+		if (default(T) == null && array.GetType() != typeof(T[]))
+		{
+			System.ThrowHelper.ThrowArrayTypeMismatchException();
+		}
+		if ((uint)start > (uint)array.Length || (uint)length > (uint)(array.Length - start))
+		{
+			System.ThrowHelper.ThrowArgumentOutOfRangeException();
+		}
+		_object = array;
+		_index = start;
+		_length = length;
 	}
 
-	public unsafe static long WriteLong(long memory, long value)
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal Memory(MemoryManager<T> manager, int length)
 	{
-		long* ptr = (long*)memory;
-		*ptr = value;
-		return memory + 8;
+		if (length < 0)
+		{
+			System.ThrowHelper.ThrowArgumentOutOfRangeException();
+		}
+		_object = manager;
+		_index = int.MinValue;
+		_length = length;
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal Memory(MemoryManager<T> manager, int start, int length)
+	{
+		if (length < 0 || start < 0)
+		{
+			System.ThrowHelper.ThrowArgumentOutOfRangeException();
+		}
+		_object = manager;
+		_index = start | int.MinValue;
+		_length = length;
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	internal Memory(object? obj, int start, int length)
+	{
+		_object = obj;
+		_index = start;
+		_length = length;
+	}
+
+	public static implicit operator Memory<T>(T[]? array)
+	{
+		return new Memory<T>(array);
+	}
+
+	public static implicit operator Memory<T>(ArraySegment<T> segment)
+	{
+		return new Memory<T>(segment.Array, segment.Offset, segment.Count);
+	}
+
+	public static implicit operator ReadOnlyMemory<T>(Memory<T> memory)
+	{
+		return System.Runtime.CompilerServices.Unsafe.As<Memory<T>, ReadOnlyMemory<T>>(ref memory);
+	}
+
+	public override string ToString()
+	{
+		if (typeof(T) == typeof(char))
+		{
+			if (!(_object is string text))
+			{
+				return Span.ToString();
+			}
+			return text.Substring(_index, _length & 0x7FFFFFFF);
+		}
+		return $"System.Memory<{typeof(T).Name}>[{_length & 0x7FFFFFFF}]";
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	public Memory<T> Slice(int start)
+	{
+		int length = _length;
+		int num = length & 0x7FFFFFFF;
+		if ((uint)start > (uint)num)
+		{
+			System.ThrowHelper.ThrowArgumentOutOfRangeException(System.ExceptionArgument.start);
+		}
+		return new Memory<T>(_object, _index + start, length - start);
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	public Memory<T> Slice(int start, int length)
+	{
+		int length2 = _length;
+		int num = length2 & 0x7FFFFFFF;
+		if ((uint)start > (uint)num || (uint)length > (uint)(num - start))
+		{
+			System.ThrowHelper.ThrowArgumentOutOfRangeException();
+		}
+		return new Memory<T>(_object, _index + start, length | (length2 & int.MinValue));
+	}
+
+	public void CopyTo(Memory<T> destination)
+	{
+		Span.CopyTo(destination.Span);
+	}
+
+	public bool TryCopyTo(Memory<T> destination)
+	{
+		return Span.TryCopyTo(destination.Span);
+	}
+
+	public unsafe MemoryHandle Pin()
+	{
+		if (_index < 0)
+		{
+			return ((MemoryManager<T>)_object).Pin(_index & 0x7FFFFFFF);
+		}
+		if (typeof(T) == typeof(char) && _object is string value)
+		{
+			GCHandle handle = GCHandle.Alloc(value, GCHandleType.Pinned);
+			return new MemoryHandle(System.Runtime.CompilerServices.Unsafe.Add<T>((void*)handle.AddrOfPinnedObject(), _index), handle);
+		}
+		if (_object is T[] array)
+		{
+			if (_length < 0)
+			{
+				return new MemoryHandle(System.Runtime.CompilerServices.Unsafe.Add<T>(System.Runtime.CompilerServices.Unsafe.AsPointer(ref MemoryMarshal.GetReference<T>(array)), _index));
+			}
+			GCHandle handle2 = GCHandle.Alloc(array, GCHandleType.Pinned);
+			return new MemoryHandle(System.Runtime.CompilerServices.Unsafe.Add<T>((void*)handle2.AddrOfPinnedObject(), _index), handle2);
+		}
+		return default(MemoryHandle);
+	}
+
+	public T[] ToArray()
+	{
+		return Span.ToArray();
+	}
+
+	[EditorBrowsable(EditorBrowsableState.Never)]
+	public override bool Equals(object? obj)
+	{
+		if (obj is ReadOnlyMemory<T> readOnlyMemory)
+		{
+			return readOnlyMemory.Equals(this);
+		}
+		if (obj is Memory<T> other)
+		{
+			return Equals(other);
+		}
+		return false;
+	}
+
+	public bool Equals(Memory<T> other)
+	{
+		if (_object == other._object && _index == other._index)
+		{
+			return _length == other._length;
+		}
+		return false;
+	}
+
+	[EditorBrowsable(EditorBrowsableState.Never)]
+	public override int GetHashCode()
+	{
+		if (_object == null)
+		{
+			return 0;
+		}
+		return HashCode.Combine(_object, _index, _length);
 	}
 }

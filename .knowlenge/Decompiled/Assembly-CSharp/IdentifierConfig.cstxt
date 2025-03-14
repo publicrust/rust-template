@@ -1,12 +1,7 @@
-using System;
-using UnityEngine.UI;
+using UnityEngine;
 
-public class IdentifierConfig : UIDialog
+public class IdentifierConfig : IOConfig<IRemoteControllable>
 {
-	[NonSerialized]
-	private IRemoteControllable rc;
-
-	public InputField input;
-
+	[HideInInspector]
 	public string id;
 }

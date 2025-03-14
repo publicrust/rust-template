@@ -4,11 +4,14 @@ using System.IO;
 using System.Reflection;
 using System.Text;
 using System.Threading;
+using Oxide;
 using Oxide.Core;
 using Oxide.Core.Libraries;
 using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Logging;
 using Oxide.Core.Plugins;
 using Oxide.Core.Plugins.Watchers;
+using Oxide.Logging;
 using Oxide.Plugins;
 
 public abstract class CSharpPlugin : CSPlugin
@@ -87,7 +90,7 @@ public abstract class CSharpPlugin : CSPlugin
 
 	protected HashSet<PluginFieldInfo> onlinePlayerFields = new HashSet<PluginFieldInfo>();
 
-	private Dictionary<string, FieldInfo> pluginReferenceFields = new Dictionary<string, FieldInfo>();
+	private Dictionary<string, MemberInfo> pluginReferenceMembers = new Dictionary<string, MemberInfo>();
 
 	private bool hookDispatchFallback;
 
@@ -99,28 +102,38 @@ public abstract class CSharpPlugin : CSPlugin
 	{
 		timer = new PluginTimers(this);
 		Type type = GetType();
-		FieldInfo[] fields = type.GetFields(BindingFlags.Instance | BindingFlags.NonPublic);
-		foreach (FieldInfo fieldInfo in fields)
+		MemberInfo[] members = type.GetMembers(BindingFlags.Instance | BindingFlags.NonPublic);
+		foreach (MemberInfo memberInfo in members)
 		{
-			object[] customAttributes = fieldInfo.GetCustomAttributes(typeof(PluginReferenceAttribute), inherit: true);
-			if (customAttributes.Length != 0)
+			if (memberInfo.MemberType == MemberTypes.Property || memberInfo.MemberType == MemberTypes.Field)
 			{
-				PluginReferenceAttribute pluginReferenceAttribute = customAttributes[0] as PluginReferenceAttribute;
-				pluginReferenceFields[pluginReferenceAttribute.Name ?? fieldInfo.Name] = fieldInfo;
-			}
-		}
-		MethodInfo[] methods = type.GetMethods(BindingFlags.Instance | BindingFlags.NonPublic);
-		foreach (MethodInfo methodInfo in methods)
-		{
-			if (methodInfo.GetCustomAttributes(typeof(HookMethodAttribute), inherit: true).Length == 0)
-			{
-				if (methodInfo.Name.Equals("OnFrame"))
+				if (memberInfo.MemberType != MemberTypes.Property || (memberInfo as PropertyInfo).CanWrite)
 				{
-					HookedOnFrame = true;
+					object[] customAttributes = memberInfo.GetCustomAttributes(typeof(PluginReferenceAttribute), inherit: true);
+					if (customAttributes.Length != 0)
+					{
+						PluginReferenceAttribute pluginReferenceAttribute = customAttributes[0] as PluginReferenceAttribute;
+						pluginReferenceMembers[pluginReferenceAttribute.Name ?? memberInfo.Name] = memberInfo;
+					}
 				}
-				if (methodInfo.DeclaringType.Name == type.Name)
+			}
+			else
+			{
+				if (memberInfo.MemberType != MemberTypes.Method)
 				{
-					AddHookMethod(methodInfo.Name, methodInfo);
+					continue;
+				}
+				MethodInfo methodInfo = memberInfo as MethodInfo;
+				if (methodInfo.GetCustomAttributes(typeof(HookMethodAttribute), inherit: true).Length == 0)
+				{
+					if (methodInfo.Name.Equals("OnFrame"))
+					{
+						HookedOnFrame = true;
+					}
+					if (methodInfo.DeclaringType.Name == type.Name)
+					{
+						AddHookMethod(methodInfo.Name, methodInfo);
+					}
 				}
 			}
 		}
@@ -161,9 +174,18 @@ public abstract class CSharpPlugin : CSPlugin
 		{
 			Watcher.AddMapping(base.Name);
 		}
-		foreach (string key in pluginReferenceFields.Keys)
+		base.Manager.OnPluginAdded += OnPluginLoaded;
+		base.Manager.OnPluginRemoved += OnPluginUnloaded;
+		foreach (KeyValuePair<string, MemberInfo> pluginReferenceMember in pluginReferenceMembers)
 		{
-			pluginReferenceFields[key].SetValue(this, manager.GetPlugin(key));
+			if (pluginReferenceMember.Value.MemberType == MemberTypes.Property)
+			{
+				((PropertyInfo)pluginReferenceMember.Value).SetValue(this, manager.GetPlugin(pluginReferenceMember.Key), null);
+			}
+			else
+			{
+				((FieldInfo)pluginReferenceMember.Value).SetValue(this, manager.GetPlugin(pluginReferenceMember.Key));
+			}
 		}
 		try
 		{
@@ -183,9 +205,18 @@ public abstract class CSharpPlugin : CSPlugin
 			CallHook("Unload", null);
 		}
 		Watcher.RemoveMapping(base.Name);
-		foreach (string key in pluginReferenceFields.Keys)
+		base.Manager.OnPluginAdded -= OnPluginLoaded;
+		base.Manager.OnPluginRemoved -= OnPluginUnloaded;
+		foreach (KeyValuePair<string, MemberInfo> pluginReferenceMember in pluginReferenceMembers)
 		{
-			pluginReferenceFields[key].SetValue(this, null);
+			if (pluginReferenceMember.Value.MemberType == MemberTypes.Property)
+			{
+				((PropertyInfo)pluginReferenceMember.Value).SetValue(this, null, null);
+			}
+			else
+			{
+				((FieldInfo)pluginReferenceMember.Value).SetValue(this, null);
+			}
 		}
 		base.HandleRemovedFromManager(manager);
 	}
@@ -227,7 +258,8 @@ public abstract class CSharpPlugin : CSPlugin
 				{
 					return ret;
 				}
-				PrintWarning("Unable to call hook directly: " + method.Name);
+				Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.HookCall, base.Name, "DirectCallHook method is not patched, falling back to reflection based dispatch.");
+				hookDispatchFallback = true;
 			}
 			catch (InvalidProgramException ex)
 			{
@@ -249,21 +281,33 @@ public abstract class CSharpPlugin : CSPlugin
 		throw new PluginLoadFailure(reason);
 	}
 
-	[HookMethod("OnPluginLoaded")]
-	private void base_OnPluginLoaded(Plugin plugin)
+	private void OnPluginLoaded(Plugin plugin)
 	{
-		if (pluginReferenceFields.TryGetValue(plugin.Name, out var value))
+		if (pluginReferenceMembers.TryGetValue(plugin.Name, out var value))
 		{
-			value.SetValue(this, plugin);
+			if (value.MemberType == MemberTypes.Property)
+			{
+				((PropertyInfo)value).SetValue(this, plugin, null);
+			}
+			else
+			{
+				((FieldInfo)value).SetValue(this, plugin);
+			}
 		}
 	}
 
-	[HookMethod("OnPluginUnloaded")]
-	private void base_OnPluginUnloaded(Plugin plugin)
+	private void OnPluginUnloaded(Plugin plugin)
 	{
-		if (pluginReferenceFields.TryGetValue(plugin.Name, out var value))
+		if (pluginReferenceMembers.TryGetValue(plugin.Name, out var value))
 		{
-			value.SetValue(this, null);
+			if (value.MemberType == MemberTypes.Property)
+			{
+				((PropertyInfo)value).SetValue(this, null, null);
+			}
+			else
+			{
+				((FieldInfo)value).SetValue(this, null);
+			}
 		}
 	}
 

@@ -121,7 +121,7 @@ public class VisualStorageContainer : LootContainer
 		{
 			ItemDefinition itemDefinition = ItemManager.FindItemDefinition(content.itemid);
 			GameObject gameObject = null;
-			gameObject = ((itemDefinition.worldModelPrefab == null || !itemDefinition.worldModelPrefab.isValid) ? UnityEngine.Object.Instantiate(defaultDisplayModel) : itemDefinition.worldModelPrefab.Instantiate());
+			gameObject = ((itemDefinition.GetWorldModel(content.amount) == null || !itemDefinition.GetWorldModel(content.amount).isValid) ? UnityEngine.Object.Instantiate(defaultDisplayModel) : itemDefinition.GetWorldModel(content.amount).Instantiate());
 			if ((bool)gameObject)
 			{
 				gameObject.transform.SetPositionAndRotation(displayNodes[content.slot].transform.position + new Vector3(0f, 0.25f, 0f), displayNodes[content.slot].transform.rotation);

@@ -1,10 +1,13 @@
+using System.Collections.Generic;
+using Facepunch;
 using Rust;
 using UnityEngine;
 
+[RequireComponent(typeof(Collider))]
 public class TriggerParent : TriggerBase, IServerComponent
 {
-	[Tooltip("Deparent if the parented entity clips into an obstacle")]
 	[SerializeField]
+	[Tooltip("Deparent if the parented entity clips into an obstacle")]
 	public bool doClippingCheck;
 
 	[Tooltip("If deparenting via clipping, this will be used (if assigned) to also move the entity to a valid dismount position")]
@@ -21,9 +24,20 @@ public class TriggerParent : TriggerBase, IServerComponent
 	[Tooltip("If the player is already parented to something else, they'll switch over to another parent only if this is true")]
 	public bool overrideOtherTriggers;
 
+	[Tooltip("Requires associatedMountable to be set. Prevents players entering the trigger if there's something between their feet and the bottom of the parent trigger")]
+	public bool checkForObjUnderFeet;
+
 	public const int CLIP_CHECK_MASK = 1218511105;
 
+	protected float triggerHeight;
+
 	private BasePlayer killPlayerTemp;
+
+	protected void Awake()
+	{
+		Collider component = GetComponent<Collider>();
+		triggerHeight = component.bounds.size.y;
+	}
 
 	public override GameObject InterestedInObject(GameObject obj)
 	{
@@ -80,10 +94,10 @@ public class TriggerParent : TriggerBase, IServerComponent
 		{
 			return false;
 		}
-		if (!bypassOtherTriggerCheck)
+		if (!bypassOtherTriggerCheck && !overrideOtherTriggers)
 		{
 			BaseEntity parentEntity = ent.GetParentEntity();
-			if (!overrideOtherTriggers && parentEntity.IsValid() && parentEntity != GameObjectEx.ToBaseEntity(base.gameObject))
+			if (parentEntity.IsValid() && parentEntity != GameObjectEx.ToBaseEntity(base.gameObject))
 			{
 				return false;
 			}
@@ -92,26 +106,74 @@ public class TriggerParent : TriggerBase, IServerComponent
 		{
 			return false;
 		}
-		if (doClippingCheck && IsClipping(ent))
+		if (doClippingCheck && IsClipping(ent) && !(ent is BaseCorpse))
 		{
 			return false;
 		}
-		if (!parentMountedPlayers || !parentSleepers)
+		if (checkForObjUnderFeet && HasObjUnderFeet(ent))
 		{
-			BasePlayer basePlayer = ent.ToPlayer();
-			if (basePlayer != null)
+			return false;
+		}
+		BasePlayer basePlayer = ent.ToPlayer();
+		if (basePlayer != null)
+		{
+			if (basePlayer.IsSwimming())
 			{
-				if (!parentMountedPlayers && basePlayer.isMounted)
-				{
-					return false;
-				}
-				if (!parentSleepers && basePlayer.IsSleeping())
-				{
-					return false;
-				}
+				return false;
+			}
+			if (!parentMountedPlayers && basePlayer.isMounted)
+			{
+				return false;
+			}
+			if (!parentSleepers && basePlayer.IsSleeping())
+			{
+				return false;
+			}
+			if (basePlayer.isMounted && associatedMountable != null && !IsParentedToUs(basePlayer) && !associatedMountable.HasValidDismountPosition(basePlayer))
+			{
+				return false;
 			}
 		}
 		return true;
+	}
+
+	public void ForceParentEarly(BaseEntity ent)
+	{
+		OnEntityEnter(ent);
+		Invoke(CheckAllParenting, 0.1f);
+	}
+
+	private void CheckAllParenting()
+	{
+		List<BaseEntity> obj = Pool.Get<List<BaseEntity>>();
+		if (contents != null)
+		{
+			foreach (GameObject content in contents)
+			{
+				if (!(content == null))
+				{
+					BaseEntity baseEntity = GameObjectEx.ToBaseEntity(content);
+					if (baseEntity != null && !obj.Contains(baseEntity))
+					{
+						obj.Add(baseEntity);
+					}
+				}
+			}
+		}
+		List<BaseEntity> obj2 = Pool.Get<List<BaseEntity>>();
+		foreach (BaseEntity entityContent in entityContents)
+		{
+			if (!obj.Contains(entityContent))
+			{
+				obj2.Add(entityContent);
+			}
+		}
+		foreach (BaseEntity item in obj2)
+		{
+			OnEntityLeave(item);
+		}
+		Pool.FreeUnmanaged(ref obj2);
+		Pool.FreeUnmanaged(ref obj);
 	}
 
 	protected void Parent(BaseEntity ent)
@@ -152,8 +214,9 @@ public class TriggerParent : TriggerBase, IServerComponent
 			if (associatedMountable.GetDismountPosition(basePlayer, out var res))
 			{
 				basePlayer.MovePosition(res);
+				basePlayer.transform.rotation = Quaternion.identity;
 				basePlayer.SendNetworkUpdateImmediate();
-				basePlayer.ClientRPCPlayer(null, basePlayer, "ForcePositionTo", res);
+				basePlayer.ClientRPC(RpcTarget.Player("ForcePositionTo", basePlayer), res);
 			}
 			else
 			{
@@ -161,6 +224,12 @@ public class TriggerParent : TriggerBase, IServerComponent
 				Invoke(KillPlayerDelayed, 0f);
 			}
 		}
+	}
+
+	private bool IsParentedToUs(BaseEntity ent)
+	{
+		BaseEntity baseEntity = GameObjectEx.ToBaseEntity(base.gameObject);
+		return ent.GetParentEntity() == baseEntity;
 	}
 
 	private void KillPlayerDelayed()
@@ -202,5 +271,21 @@ public class TriggerParent : TriggerBase, IServerComponent
 	protected virtual bool IsClipping(BaseEntity ent)
 	{
 		return GamePhysics.CheckOBB(ent.WorldSpaceBounds(), 1218511105, QueryTriggerInteraction.Ignore);
+	}
+
+	private bool HasObjUnderFeet(BaseEntity ent)
+	{
+		Vector3 origin = ent.PivotPoint() + ent.transform.up * 0.1f;
+		float maxDistance = triggerHeight + 0.1f;
+		if (GamePhysics.Trace(new Ray(origin, -base.transform.up), 0f, out var hitInfo, maxDistance, 1503731969, QueryTriggerInteraction.Ignore, ent) && hitInfo.collider != null)
+		{
+			BaseEntity toFind = GameObjectEx.ToBaseEntity(base.gameObject);
+			BaseEntity baseEntity = GameObjectEx.ToBaseEntity(hitInfo.collider);
+			if (baseEntity == null || !baseEntity.HasEntityInParents(toFind))
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 }

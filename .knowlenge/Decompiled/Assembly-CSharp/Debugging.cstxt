@@ -3,8 +3,11 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
+using ConVar;
 using Facepunch;
+using Facepunch.Extend;
 using Facepunch.Unity;
 using Rust;
 using UnityEngine;
@@ -12,8 +15,8 @@ using UnityEngine;
 [Factory("debug")]
 public class Debugging : ConsoleSystem
 {
-	[ServerVar]
 	[ClientVar]
+	[ServerVar]
 	public static bool checktriggers = false;
 
 	[ServerVar]
@@ -26,12 +29,18 @@ public class Debugging : ConsoleSystem
 	[ServerVar(Help = "Do not damage any items")]
 	public static bool disablecondition = false;
 
-	[ClientVar]
 	[ServerVar]
-	public static bool callbacks = false;
+	public static int tutorial_start_cooldown = 60;
+
+	[ServerVar]
+	public static bool printMissionSpeakInfo = false;
 
 	[ServerVar]
 	[ClientVar]
+	public static bool callbacks = false;
+
+	[ClientVar]
+	[ServerVar]
 	public static bool log
 	{
 		get
@@ -44,8 +53,8 @@ public class Debugging : ConsoleSystem
 		}
 	}
 
+	[ClientVar(ClientAdmin = true)]
 	[ServerVar]
-	[ClientVar]
 	public static void renderinfo(Arg arg)
 	{
 		RenderInfo.GenerateReport();
@@ -63,7 +72,7 @@ public class Debugging : ConsoleSystem
 				arg.ReplyWith("Must be called from client with player model");
 				return;
 			}
-			basePlayer.ClientRPCPlayer(null, basePlayer, "TogglePlayerMovement", @bool);
+			basePlayer.ClientRPC(RpcTarget.Player("TogglePlayerMovement", basePlayer), @bool);
 			arg.ReplyWith((@bool ? "enabled" : "disabled") + " player movement");
 		}
 	}
@@ -75,6 +84,133 @@ public class Debugging : ConsoleSystem
 		float num = Mathf.Clamp(arg.GetFloat(0), 0f, 1f);
 		arg.ReplyWith("Stalling for " + num + " seconds...");
 		Thread.Sleep(Mathf.RoundToInt(num * 1000f));
+	}
+
+	[ServerVar(Help = "Repair all items in inventory")]
+	public static void repair_inventory(Arg args)
+	{
+		BasePlayer basePlayer = ArgEx.Player(args);
+		if (!basePlayer)
+		{
+			return;
+		}
+		List<Item> obj = Facepunch.Pool.Get<List<Item>>();
+		basePlayer.inventory.GetAllItems(obj);
+		foreach (Item item in obj)
+		{
+			if (item != null)
+			{
+				item.maxCondition = item.info.condition.max;
+				item.condition = item.maxCondition;
+				item.MarkDirty();
+			}
+			if (item.contents == null)
+			{
+				continue;
+			}
+			foreach (Item item2 in item.contents.itemList)
+			{
+				item2.maxCondition = item2.info.condition.max;
+				item2.condition = item2.maxCondition;
+				item2.MarkDirty();
+			}
+		}
+		Facepunch.Pool.Free(ref obj, freeElements: false);
+	}
+
+	[ServerVar]
+	public static void spawnParachuteTester(Arg arg)
+	{
+		float @float = arg.GetFloat(0, 50f);
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		BasePlayer basePlayer2 = GameManager.server.CreateEntity("assets/prefabs/player/player.prefab", basePlayer.transform.position + Vector3.up * @float, Quaternion.LookRotation(basePlayer.eyes.BodyForward())) as BasePlayer;
+		basePlayer2.Spawn();
+		basePlayer2.eyes.rotation = basePlayer.eyes.rotation;
+		basePlayer2.SendNetworkUpdate();
+		Inventory.copyTo(basePlayer, basePlayer2);
+		if (!basePlayer2.HasValidParachuteEquipped())
+		{
+			basePlayer2.inventory.containerWear.GiveItem(ItemManager.CreateByName("parachute", 1, 0uL));
+		}
+		basePlayer2.RequestParachuteDeploy();
+	}
+
+	[ServerVar]
+	public static string testTutorialCinematic(Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer == null || !basePlayer.IsInTutorial)
+		{
+			return "Requires a player";
+		}
+		TutorialIsland currentTutorialIsland = basePlayer.GetCurrentTutorialIsland();
+		if (currentTutorialIsland == null)
+		{
+			return "Invalid island";
+		}
+		Transform transform = currentTutorialIsland.transform.FindChildRecursive("KayakMissionPoint");
+		if (transform == null)
+		{
+			return "Can't find KayakMissionPoint on island";
+		}
+		Kayak obj = GameManager.server.CreateEntity("assets/content/vehicles/boats/kayak/kayak.prefab", transform.position, transform.rotation) as Kayak;
+		obj.Spawn();
+		obj.WantsMount(basePlayer);
+		currentTutorialIsland.StartEndingCinematic(basePlayer);
+		return "Playing cinematic";
+	}
+
+	[ServerVar(Help = "If a player ends up stuck on a tutorial for any reason this will clear the island and reset the player (will also kill player)")]
+	public static void clearTutorialForPlayer(Arg arg)
+	{
+		BasePlayer player = ArgEx.GetPlayer(arg, 0);
+		if (player == null)
+		{
+			arg.ReplyWith("Please provide a player");
+		}
+		else if (player.IsInTutorial)
+		{
+			TutorialIsland currentTutorialIsland = player.GetCurrentTutorialIsland();
+			if (currentTutorialIsland != null)
+			{
+				currentTutorialIsland.Return();
+			}
+			player.ClearTutorial();
+			player.Hurt(99999f);
+			player.ClearTutorial_PostDeath();
+		}
+	}
+
+	[ServerVar]
+	public static void deleteEntitiesByShortname(Arg arg)
+	{
+		string text = arg.GetString(0).ToLower();
+		float @float = arg.GetFloat(1);
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		List<BaseNetworkable> obj = Facepunch.Pool.Get<List<BaseNetworkable>>();
+		foreach (BaseNetworkable serverEntity in BaseNetworkable.serverEntities)
+		{
+			if (serverEntity.ShortPrefabName == text && (@float == 0f || (basePlayer != null && basePlayer.Distance(serverEntity as BaseEntity) <= @float)))
+			{
+				obj.Add(serverEntity);
+			}
+		}
+		Debug.Log($"Deleting {obj.Count} {text}...");
+		foreach (BaseNetworkable item in obj)
+		{
+			item.Kill();
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	[ServerVar]
+	public static void printgroups(Arg arg)
+	{
+		Debug.Log("Server");
+		foreach (BaseNetworkable serverEntity in BaseNetworkable.serverEntities)
+		{
+			Debug.Log(string.Format("{0}:{1}{2}", serverEntity.PrefabName, serverEntity.net.group.ID, serverEntity.net.group.restricted ? "/Restricted" : string.Empty));
+		}
 	}
 
 	[ServerVar(Help = "Takes you in and out of your current network group, causing you to delete and then download all entities in your PVS again")]
@@ -95,6 +231,16 @@ public class Debugging : ConsoleSystem
 		activeItem?.LoseCondition(activeItem.condition * 2f);
 	}
 
+	[ServerVar(Help = "Almost break the current held object")]
+	public static void breakheld_almost(Arg arg)
+	{
+		Item activeItem = ArgEx.Player(arg).GetActiveItem();
+		if (activeItem != null && activeItem.hasCondition)
+		{
+			activeItem.condition = 1f;
+		}
+	}
+
 	[ServerVar(Help = "reset all puzzles")]
 	public static void puzzlereset(Arg arg)
 	{
@@ -105,7 +251,7 @@ public class Debugging : ConsoleSystem
 			PuzzleReset[] array2 = array;
 			foreach (PuzzleReset puzzleReset in array2)
 			{
-				Debug.Log("resetting puzzle at :" + puzzleReset.transform.position);
+				Debug.Log("resetting puzzle at :" + puzzleReset.transform.position.ToString());
 				puzzleReset.DoReset();
 				puzzleReset.ResetTimer();
 			}
@@ -142,14 +288,14 @@ public class Debugging : ConsoleSystem
 				DoorManipulator doorManipulator = newEntity as DoorManipulator;
 				if (doorManipulator != null)
 				{
-					List<Door> obj = Pool.GetList<Door>();
+					List<Door> obj = Facepunch.Pool.Get<List<Door>>();
 					Vis.Entities(newEntity.transform.position, 10f, obj);
 					Door door = obj.OrderBy((Door x) => x.Distance(newEntity.transform.position)).FirstOrDefault();
 					if (door != null)
 					{
 						doorManipulator.targetDoor = door;
 					}
-					Pool.FreeList(ref obj);
+					Facepunch.Pool.FreeUnmanaged(ref obj);
 				}
 				CardReader cardReader = newEntity as CardReader;
 				if (cardReader != null)
@@ -204,12 +350,65 @@ public class Debugging : ConsoleSystem
 		}
 	}
 
-	[ServerVar]
+	[ServerVar(ClientAdmin = true, Help = "Refills the vital of a target player. eg. debug.refillsvital jim - leave blank to target yourself, can take multiple players at once")]
 	public static void refillvitals(Arg arg)
 	{
-		AdjustHealth(ArgEx.Player(arg), 1000f);
-		AdjustCalories(ArgEx.Player(arg), 1000f);
-		AdjustHydration(ArgEx.Player(arg), 1000f);
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer == null)
+		{
+			return;
+		}
+		if (arg.Args == null || arg.Args.Length == 0)
+		{
+			RefillPlayerVitals(basePlayer);
+			return;
+		}
+		StringBuilder stringBuilder = new StringBuilder();
+		for (int i = 0; i < arg.Args.Length; i++)
+		{
+			string @string = arg.GetString(i);
+			BasePlayer basePlayer2 = ((!(@string == basePlayer.displayName)) ? (string.IsNullOrEmpty(@string) ? null : ArgEx.GetPlayerOrSleeperOrBot(arg, i)) : basePlayer);
+			if (basePlayer2 == null)
+			{
+				stringBuilder.AppendLine("Could not find player '" + @string + "'");
+				continue;
+			}
+			RefillPlayerVitals(basePlayer2);
+			stringBuilder.AppendLine("Refilled '" + @string + "' vitals");
+		}
+		arg.ReplyWith(stringBuilder.ToString());
+	}
+
+	[ServerVar(ClientAdmin = true, Help = "Refills the vitals of all active players on the server")]
+	public static void refillvitalsall(Arg arg)
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+		foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+		{
+			if (!(activePlayer == null))
+			{
+				RefillPlayerVitals(activePlayer);
+				stringBuilder.AppendLine("Refilled player '" + activePlayer.displayName + "' vitals");
+			}
+		}
+		foreach (BasePlayer bot in BasePlayer.bots)
+		{
+			if (!(bot == null))
+			{
+				RefillPlayerVitals(bot);
+				stringBuilder.AppendLine("Refilled bot '" + bot.displayName + "' vitals");
+			}
+		}
+		arg.ReplyWith(stringBuilder.ToString());
+	}
+
+	private static void RefillPlayerVitals(BasePlayer player)
+	{
+		AdjustHealth(player, 1000f);
+		AdjustCalories(player, 1000f);
+		AdjustHydration(player, 1000f);
+		AdjustRadiation(player, -10000f);
+		AdjustBleeding(player, -10000f);
 	}
 
 	[ServerVar]
@@ -221,7 +420,15 @@ public class Debugging : ConsoleSystem
 	[ServerVar]
 	public static void hurt(Arg arg)
 	{
-		AdjustHealth(ArgEx.Player(arg), -arg.GetInt(0, 1), arg.GetString(1, string.Empty));
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		int @int = arg.GetInt(0, 1);
+		string @string = arg.GetString(1, string.Empty);
+		HitInfo hitInfo = new HitInfo(basePlayer, basePlayer, DamageType.Bullet, @int);
+		if (!string.IsNullOrEmpty(@string))
+		{
+			hitInfo.HitBone = StringPool.Get(@string);
+		}
+		basePlayer.OnAttacked(hitInfo);
 	}
 
 	[ServerVar]
@@ -236,14 +443,62 @@ public class Debugging : ConsoleSystem
 		AdjustHydration(ArgEx.Player(arg), arg.GetInt(0, 1), arg.GetInt(1, 1));
 	}
 
+	[ServerVar]
+	public static void sethealth(Arg arg)
+	{
+		if (!arg.HasArgs())
+		{
+			arg.ReplyWith("Please enter an amount.");
+			return;
+		}
+		int @int = arg.GetInt(0);
+		BasePlayer usePlayer = GetUsePlayer(arg, 1);
+		if ((bool)usePlayer)
+		{
+			usePlayer.SetHealth(@int);
+		}
+	}
+
+	[ServerVar]
+	public static void setdamage(Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (!arg.HasArgs())
+		{
+			arg.ReplyWith("Please enter an amount.");
+			return;
+		}
+		int @int = arg.GetInt(0);
+		BasePlayer usePlayer = GetUsePlayer(arg, 1);
+		if ((bool)usePlayer)
+		{
+			float damageAmount = usePlayer.health - (float)@int;
+			HitInfo info = new HitInfo(basePlayer, basePlayer, DamageType.Bullet, damageAmount);
+			usePlayer.OnAttacked(info);
+		}
+	}
+
+	[ServerVar]
+	public static void setfood(Arg arg)
+	{
+		setattribute(arg, MetabolismAttribute.Type.Calories);
+	}
+
+	[ServerVar]
+	public static void setwater(Arg arg)
+	{
+		setattribute(arg, MetabolismAttribute.Type.Hydration);
+	}
+
+	[ServerVar]
+	public static void setradiation(Arg arg)
+	{
+		setattribute(arg, MetabolismAttribute.Type.Radiation);
+	}
+
 	private static void AdjustHealth(BasePlayer player, float amount, string bone = null)
 	{
-		HitInfo hitInfo = new HitInfo(player, player, DamageType.Bullet, 0f - amount);
-		if (!string.IsNullOrEmpty(bone))
-		{
-			hitInfo.HitBone = StringPool.Get(bone);
-		}
-		player.OnAttacked(hitInfo);
+		player.health += amount;
 	}
 
 	private static void AdjustCalories(BasePlayer player, float amount, float time = 1f)
@@ -254,6 +509,46 @@ public class Debugging : ConsoleSystem
 	private static void AdjustHydration(BasePlayer player, float amount, float time = 1f)
 	{
 		player.metabolism.ApplyChange(MetabolismAttribute.Type.Hydration, amount, time);
+	}
+
+	private static void AdjustRadiation(BasePlayer player, float amount, float time = 1f)
+	{
+		player.metabolism.SetAttribute(MetabolismAttribute.Type.Radiation, amount);
+	}
+
+	private static void AdjustBleeding(BasePlayer player, float amount, float time = 1f)
+	{
+		player.metabolism.SetAttribute(MetabolismAttribute.Type.Bleeding, amount);
+	}
+
+	private static void setattribute(Arg arg, MetabolismAttribute.Type type)
+	{
+		if (!arg.HasArgs())
+		{
+			arg.ReplyWith("Please enter an amount.");
+			return;
+		}
+		int @int = arg.GetInt(0);
+		BasePlayer usePlayer = GetUsePlayer(arg, 1);
+		if ((bool)usePlayer)
+		{
+			usePlayer.metabolism.SetAttribute(type, @int);
+		}
+	}
+
+	private static BasePlayer GetUsePlayer(Arg arg, int playerArgument)
+	{
+		BasePlayer basePlayer = null;
+		if (arg.HasArgs(playerArgument + 1))
+		{
+			BasePlayer player = ArgEx.GetPlayer(arg, playerArgument);
+			if (!player)
+			{
+				return null;
+			}
+			return player;
+		}
+		return ArgEx.Player(arg);
 	}
 
 	[ServerVar]
@@ -323,7 +618,7 @@ public class Debugging : ConsoleSystem
 		{
 			int num = 0;
 			int num2 = 0;
-			WireTool.WireColour wireColour = WireTool.WireColour.Default;
+			WireTool.WireColour wireColour = WireTool.WireColour.Gray;
 			IOEntity.IOSlot iOSlot = InputIOEnt.inputs[num];
 			IOEntity.IOSlot obj = OutputIOEnt.outputs[num2];
 			iOSlot.connectedTo.Set(OutputIOEnt);
@@ -344,5 +639,113 @@ public class Debugging : ConsoleSystem
 			InputIOEnt.SendNetworkUpdate();
 			OutputIOEnt.SendChangedToRoot(forceUpdate: true);
 		}
+	}
+
+	[ServerVar]
+	public static void completeMissionStage(Arg arg)
+	{
+		int @int = arg.GetInt(0, -1);
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (!(basePlayer != null) || basePlayer.GetActiveMission() == -1)
+		{
+			return;
+		}
+		BaseMission.MissionInstance missionInstance = basePlayer.missions[basePlayer.GetActiveMission()];
+		if (missionInstance == null)
+		{
+			return;
+		}
+		for (int i = 0; i < missionInstance.objectiveStatuses.Length; i++)
+		{
+			if (!missionInstance.objectiveStatuses[i].completed && (i == @int || (@int == -1 && !missionInstance.objectiveStatuses[i].completed)))
+			{
+				missionInstance.GetMission().objectives[i].objective.ObjectiveStarted(basePlayer, i, missionInstance);
+				missionInstance.GetMission().objectives[i].objective.CompleteObjective(i, missionInstance, basePlayer);
+				break;
+			}
+		}
+	}
+
+	[ServerVar]
+	public static void completeMission(Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (!(basePlayer != null) || basePlayer.GetActiveMission() == -1)
+		{
+			return;
+		}
+		BaseMission.MissionInstance missionInstance = basePlayer.missions[basePlayer.GetActiveMission()];
+		if (missionInstance == null)
+		{
+			return;
+		}
+		for (int i = 0; i < missionInstance.objectiveStatuses.Length; i++)
+		{
+			if (!missionInstance.objectiveStatuses[i].completed)
+			{
+				missionInstance.GetMission().objectives[i].objective.CompleteObjective(i, missionInstance, basePlayer);
+			}
+		}
+	}
+
+	[ServerUserVar]
+	public static void startTutorial(Arg arg)
+	{
+		if (!ConVar.Server.tutorialEnabled)
+		{
+			arg.ReplyWith("Tutorial is not enabled on this server");
+			return;
+		}
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer != null && !basePlayer.IsInTutorial)
+		{
+			basePlayer.StartTutorial(triggerAnalytics: false);
+		}
+	}
+
+	[ServerVar]
+	public static void completeTutorial(Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer != null && basePlayer.IsInTutorial)
+		{
+			TutorialIsland currentTutorialIsland = basePlayer.GetCurrentTutorialIsland();
+			if (currentTutorialIsland != null)
+			{
+				currentTutorialIsland.OnPlayerCompletedTutorial(basePlayer, isQuit: false, triggerAnalytics: false);
+			}
+		}
+	}
+
+	[ServerUserVar(ServerAdmin = false)]
+	public static void quitTutorial(Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer != null && basePlayer.IsInTutorial)
+		{
+			TutorialIsland currentTutorialIsland = basePlayer.GetCurrentTutorialIsland();
+			if (currentTutorialIsland != null)
+			{
+				currentTutorialIsland.OnPlayerCompletedTutorial(basePlayer, isQuit: true, triggerAnalytics: true);
+			}
+		}
+	}
+
+	[ServerVar]
+	public static void tutorialStatus(Arg arg)
+	{
+		ListHashSet<TutorialIsland> tutorialList = TutorialIsland.GetTutorialList(isServer: true);
+		TextTable textTable = new TextTable();
+		textTable.AddColumns("Index", "ID", "Player Name", "Duration", "IsConnected");
+		int num = 0;
+		foreach (TutorialIsland item in tutorialList)
+		{
+			BasePlayer basePlayer = item.ForPlayer.Get(serverside: true);
+			textTable.AddRow(num++.ToString(), (item.net.group.ID - 1).ToString(), (basePlayer != null) ? basePlayer.displayName : "NULL", TimeSpanEx.ToShortString(item.TutorialDuration), (basePlayer != null) ? basePlayer.IsConnected.ToString() : "NULL");
+		}
+		StringBuilder stringBuilder = new StringBuilder();
+		stringBuilder.AppendLine($"Tutorial islands in use: {num}/{TutorialIsland.MaxTutorialIslandCount}");
+		stringBuilder.AppendLine(textTable.ToString());
+		arg.ReplyWith(stringBuilder.ToString());
 	}
 }

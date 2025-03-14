@@ -1,3 +1,4 @@
+[JsonModel]
 public struct ClientPerformanceReport
 {
 	public int request_id;

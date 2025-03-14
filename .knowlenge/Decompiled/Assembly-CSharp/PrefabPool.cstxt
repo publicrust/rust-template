@@ -5,10 +5,27 @@ public class PrefabPool
 {
 	public Stack<Poolable> stack = new Stack<Poolable>();
 
+	public string PrefabName { get; private set; }
+
+	public int Missed { get; private set; }
+
+	public int Pushed { get; private set; }
+
+	public int Popped { get; private set; }
+
 	public int Count => stack.Count;
+
+	public int TargetCapacity { get; private set; }
+
+	public PrefabPool(uint prefabId, int targetCapacity)
+	{
+		PrefabName = StringPool.Get(prefabId);
+		TargetCapacity = targetCapacity;
+	}
 
 	public void Push(Poolable info)
 	{
+		Pushed++;
 		stack.Push(info);
 		info.EnterPool();
 	}
@@ -24,6 +41,7 @@ public class PrefabPool
 		while (stack.Count > 0)
 		{
 			Poolable poolable = stack.Pop();
+			Popped++;
 			if ((bool)poolable)
 			{
 				poolable.transform.position = pos;
@@ -32,6 +50,7 @@ public class PrefabPool
 				return poolable.gameObject;
 			}
 		}
+		Missed++;
 		return null;
 	}
 

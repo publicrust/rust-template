@@ -22,7 +22,10 @@ public class HLODBounds : MonoBehaviour, IEditorComponent
 
 	public MeshTrimSettings Settings = MeshTrimSettings.Default;
 
-	public RendererLOD DebugComponent;
+	public LODComponent DebugComponent;
 
 	public bool ShowTrimSettings;
+
+	[Tooltip("Prints out information about what the baker is doing, helpful for diagnosing errors")]
+	public bool DebugMode;
 }

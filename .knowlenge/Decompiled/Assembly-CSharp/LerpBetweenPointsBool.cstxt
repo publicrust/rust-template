@@ -6,6 +6,8 @@ public class LerpBetweenPointsBool : MonoBehaviour, IClientComponent
 
 	public float speed;
 
+	public bool UseAsOffset;
+
 	public void SetAtOffset(bool should)
 	{
 	}

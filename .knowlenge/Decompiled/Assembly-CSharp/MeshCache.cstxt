@@ -26,6 +26,8 @@ public static class MeshCache
 		public Vector2[] uv3;
 
 		public Vector2[] uv4;
+
+		public Bounds bounds;
 	}
 
 	public static Dictionary<Mesh, Data> dictionary = new Dictionary<Mesh, Data>();
@@ -45,6 +47,7 @@ public static class MeshCache
 			value.uv2 = mesh.uv2;
 			value.uv3 = mesh.uv3;
 			value.uv4 = mesh.uv4;
+			value.bounds = mesh.bounds;
 			dictionary.Add(mesh, value);
 		}
 		return value;

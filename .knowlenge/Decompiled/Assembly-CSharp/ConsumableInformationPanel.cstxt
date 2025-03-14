@@ -16,4 +16,6 @@ public class ConsumableInformationPanel : ItemInformationPanel
 	public ItemTextValue durationValue;
 
 	public ItemTextValue baitValue;
+
+	public ItemTextValue baitStackSize;
 }

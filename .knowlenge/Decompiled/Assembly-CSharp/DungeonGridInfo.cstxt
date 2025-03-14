@@ -12,7 +12,7 @@ public class DungeonGridInfo : LandmarkInfo
 
 	internal List<GameObject> Links = new List<GameObject>();
 
-	public float MinDistance => (float)CellSize * 2f;
+	public float MinDistance => (float)CellSize * 2.5f;
 
 	public float Distance(Vector3 position)
 	{

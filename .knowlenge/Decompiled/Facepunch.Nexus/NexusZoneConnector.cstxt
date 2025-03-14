@@ -1,0 +1,558 @@
+using System;
+using System.Buffers;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Threading.Tasks;
+using Facepunch.Nexus;
+using Facepunch.Nexus.Connector;
+using Facepunch.Nexus.Logging;
+using Facepunch.Nexus.Models;
+
+internal class NexusZoneConnector : NexusConnector, INexusZoneConnector, INexusConnector
+{
+	private struct NewClanLogEntry
+	{
+		public string EventKey { get; set; }
+
+		public string Arg1 { get; set; }
+
+		public string Arg2 { get; set; }
+
+		public string Arg3 { get; set; }
+
+		public string Arg4 { get; set; }
+	}
+
+	private readonly string _getZoneInfoEndpoint;
+
+	private readonly string _getPlayerInfoEndpoint;
+
+	private readonly string _playerLoginEndpoint;
+
+	private readonly string _assignEndpoint;
+
+	private readonly string _registerTransferEndpoint;
+
+	private readonly string _completeTransferEndpoint;
+
+	private readonly string _messageEndpoint;
+
+	private readonly string _setNexusVariableEndpoint;
+
+	private readonly string _setZoneVariableEndpoint;
+
+	private readonly string _setPlayerVariableEndpoint;
+
+	private readonly string _findPlayersWithVariableEndpoint;
+
+	private readonly string _mapEndpoint;
+
+	private readonly string _clanEndpoint;
+
+	public NexusZoneConnector(INexusLogger logger, string baseUrl, string secretKey)
+		: base(logger, baseUrl)
+	{
+		if (string.IsNullOrWhiteSpace(secretKey))
+		{
+			throw new ArgumentNullException("secretKey");
+		}
+		_getZoneInfoEndpoint = BaseUrl + "/zone/info";
+		_getPlayerInfoEndpoint = BaseUrl + "/zone/player/info?playerId=";
+		_playerLoginEndpoint = BaseUrl + "/zone/login?playerId=";
+		_assignEndpoint = BaseUrl + "/zone/assign";
+		_registerTransferEndpoint = BaseUrl + "/zone/transfer/register";
+		_completeTransferEndpoint = BaseUrl + "/zone/transfer/complete";
+		_messageEndpoint = BaseUrl + "/zone/message";
+		_setNexusVariableEndpoint = BaseUrl + "/zone/variables/nexus";
+		_setZoneVariableEndpoint = BaseUrl + "/zone/variables/zone";
+		_setPlayerVariableEndpoint = BaseUrl + "/zone/variables/player";
+		_findPlayersWithVariableEndpoint = BaseUrl + "/zone/query";
+		_mapEndpoint = BaseUrl + "/zone/map";
+		_clanEndpoint = BaseUrl + "/zone/clan";
+		HttpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", secretKey);
+	}
+
+	public async Task<ZoneDetails> GetZoneDetails()
+	{
+		return (await GetRequest<ZoneDetails>(_getZoneInfoEndpoint)).Response;
+	}
+
+	public async Task<ZonePlayerDetails> GetPlayerDetails(string playerId)
+	{
+		return (await GetRequest<ZonePlayerDetails>(_getPlayerInfoEndpoint + playerId)).Response;
+	}
+
+	public async Task<ZonePlayerLogin> PlayerLogin(string playerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		return (await PostRequest<ZonePlayerLogin>(_playerLoginEndpoint + playerId)).Response;
+	}
+
+	public async Task Assign(string playerId, string toZone)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		(await PostRequestWithoutResponse(_assignEndpoint + "?playerId=" + playerId + "&toZone=" + toZone).ConfigureAwait(continueOnCapturedContext: false)).EnsureSuccessful();
+	}
+
+	public async Task RegisterTransfers(string toZone, IEnumerable<string> playerIds)
+	{
+		if (string.IsNullOrWhiteSpace(toZone))
+		{
+			throw new ArgumentNullException("toZone");
+		}
+		if (playerIds == null)
+		{
+			throw new ArgumentNullException("playerIds");
+		}
+		(await PostRequest<RegisterTransfersRequest, RegisterTransfersResponse>(_registerTransferEndpoint, new RegisterTransfersRequest
+		{
+			PlayerIds = playerIds,
+			ToZoneKey = toZone
+		})).EnsureSuccessfulWithResponse();
+	}
+
+	public async Task CompleteTransfers(IEnumerable<string> playerIds)
+	{
+		if (playerIds == null)
+		{
+			throw new ArgumentNullException("playerIds");
+		}
+		(await PostRequest<CompleteTransfersRequest, CompleteTransfersResponse>(_completeTransferEndpoint, new CompleteTransfersRequest
+		{
+			PlayerIds = playerIds
+		})).EnsureSuccessfulWithResponse();
+	}
+
+	public async Task SendMessage(string toZone, Guid id, string message, int? ttl, string contentType = "text/plain")
+	{
+		if (id == Guid.Empty)
+		{
+			throw new ArgumentNullException("id");
+		}
+		if (string.IsNullOrWhiteSpace(message))
+		{
+			throw new ArgumentNullException("message");
+		}
+		(await PostRequestRawWithoutResponse($"{_messageEndpoint}?toZone={toZone}&id={id}&ttl={ttl}", message, contentType).ConfigureAwait(continueOnCapturedContext: false)).EnsureSuccessful();
+	}
+
+	public async Task SendMessage(string toZone, Guid id, Memory<byte> message, int? ttl, string contentType = "application/octet-stream")
+	{
+		if (id == Guid.Empty)
+		{
+			throw new ArgumentNullException("id");
+		}
+		if (message.IsEmpty)
+		{
+			throw new ArgumentNullException("message");
+		}
+		byte[] copyBuffer = ArrayPool<byte>.Shared.Rent(message.Length);
+		try
+		{
+			ArraySegment<byte> arraySegment = new ArraySegment<byte>(copyBuffer, 0, message.Length);
+			message.CopyTo(arraySegment);
+			(await PostRequestRawWithoutResponse($"{_messageEndpoint}?toZone={toZone}&id={id}&ttl={ttl}", arraySegment, contentType).ConfigureAwait(continueOnCapturedContext: false)).EnsureSuccessful();
+		}
+		finally
+		{
+			ArrayPool<byte>.Shared.Return(copyBuffer);
+		}
+	}
+
+	public Task SetNexusVariable(string key, string value, bool transient, bool secret)
+	{
+		if (string.IsNullOrWhiteSpace(key))
+		{
+			throw new ArgumentNullException("key");
+		}
+		return SetVariableImpl(_setNexusVariableEndpoint, key, value, transient, secret);
+	}
+
+	public Task SetNexusVariable(string key, Memory<byte> value, bool transient, bool secret)
+	{
+		if (string.IsNullOrWhiteSpace(key))
+		{
+			throw new ArgumentNullException("key");
+		}
+		return SetVariableImpl(_setNexusVariableEndpoint, key, value, transient, secret);
+	}
+
+	public Task SetZoneVariable(string key, string value, bool transient, bool secret)
+	{
+		if (string.IsNullOrWhiteSpace(key))
+		{
+			throw new ArgumentNullException("key");
+		}
+		return SetVariableImpl(_setZoneVariableEndpoint, key, value, transient, secret);
+	}
+
+	public Task SetZoneVariable(string key, Memory<byte> value, bool transient, bool secret)
+	{
+		if (string.IsNullOrWhiteSpace(key))
+		{
+			throw new ArgumentNullException("key");
+		}
+		return SetVariableImpl(_setZoneVariableEndpoint, key, value, transient, secret);
+	}
+
+	public Task SetPlayerVariable(string playerId, string key, string value, bool transient, bool secret)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		if (string.IsNullOrWhiteSpace(key))
+		{
+			throw new ArgumentNullException("key");
+		}
+		string endpoint = _setPlayerVariableEndpoint + "?playerId=" + playerId;
+		return SetVariableImpl(endpoint, key, value, transient, secret);
+	}
+
+	public Task SetPlayerVariable(string playerId, string key, Memory<byte> value, bool transient, bool secret)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		if (string.IsNullOrWhiteSpace(key))
+		{
+			throw new ArgumentNullException("key");
+		}
+		string endpoint = _setPlayerVariableEndpoint + "?playerId=" + playerId;
+		return SetVariableImpl(endpoint, key, value, transient, secret);
+	}
+
+	private async Task SetVariableImpl(string endpoint, string key, string value, bool transient, bool secret)
+	{
+		VariableUpdate[] updateArray = ArrayPool<VariableUpdate>.Shared.Rent(1);
+		try
+		{
+			updateArray[0] = new VariableUpdate(key, value, transient, secret);
+			ArraySegment<VariableUpdate> requestBody = new ArraySegment<VariableUpdate>(updateArray, 0, 1);
+			(await PostRequestWithoutResponse(endpoint, requestBody).ConfigureAwait(continueOnCapturedContext: false)).EnsureSuccessful();
+		}
+		finally
+		{
+			ArrayPool<VariableUpdate>.Shared.Return(updateArray);
+		}
+	}
+
+	private async Task SetVariableImpl(string endpoint, string key, Memory<byte> value, bool transient, bool secret)
+	{
+		VariableUpdate[] updateArray = ArrayPool<VariableUpdate>.Shared.Rent(1);
+		try
+		{
+			updateArray[0] = new VariableUpdate(key, value, transient, secret);
+			ArraySegment<VariableUpdate> requestBody = new ArraySegment<VariableUpdate>(updateArray, 0, 1);
+			(await PostRequestWithoutResponse(endpoint, requestBody).ConfigureAwait(continueOnCapturedContext: false)).EnsureSuccessful();
+		}
+		finally
+		{
+			ArrayPool<VariableUpdate>.Shared.Return(updateArray);
+		}
+	}
+
+	public async Task<List<string>> FindPlayersWithVariable(string key, string value)
+	{
+		if (string.IsNullOrWhiteSpace(key))
+		{
+			throw new ArgumentNullException("key");
+		}
+		if (!key.StartsWith("id."))
+		{
+			throw new ArgumentException("Key must begin with 'id.'", "key");
+		}
+		if (string.IsNullOrWhiteSpace(value))
+		{
+			throw new ArgumentNullException("value");
+		}
+		return (await GetRequest<List<string>>(_findPlayersWithVariableEndpoint + "?key=" + key + "&value=" + value)).Response;
+	}
+
+	public async Task<ZoneMapCheckResult> CheckUploadedMap()
+	{
+		return (await GetRequest<ZoneMapCheckResult>(_mapEndpoint)).Response;
+	}
+
+	public async Task UploadMap(string key, byte[] pngMapImage)
+	{
+		if (string.IsNullOrWhiteSpace(key))
+		{
+			throw new ArgumentNullException("key");
+		}
+		if (pngMapImage == null)
+		{
+			throw new ArgumentNullException("pngMapImage");
+		}
+		if (pngMapImage.Length == 0)
+		{
+			throw new ArgumentException("Image cannot be empty.", "pngMapImage");
+		}
+		await PostRequestRawWithoutResponse(_mapEndpoint + "?key=" + WebUtility.UrlEncode(key), new ArraySegment<byte>(pngMapImage, 0, pngMapImage.Length), "image/png");
+	}
+
+	public Task<ApiResult<ClanDetails>> CreateClan(ClanCreateParameters parameters)
+	{
+		if (string.IsNullOrWhiteSpace(parameters.ClanName))
+		{
+			throw new ArgumentException("Clan name must be set.", "parameters");
+		}
+		if (string.IsNullOrWhiteSpace(parameters.ClanNameNormalized))
+		{
+			throw new ArgumentException("Normalized clan name must be set.", "parameters");
+		}
+		if (string.IsNullOrWhiteSpace(parameters.LeaderPlayerId))
+		{
+			throw new ArgumentException("Leader player ID must be set.", "parameters");
+		}
+		if (string.IsNullOrWhiteSpace(parameters.LeaderRoleName))
+		{
+			throw new ArgumentException("Leader role name must be set.", "parameters");
+		}
+		if (string.IsNullOrWhiteSpace(parameters.MemberRoleName))
+		{
+			throw new ArgumentException("Member role name must be set.", "parameters");
+		}
+		return PostRequest<ClanCreateParameters, ClanDetails>(_clanEndpoint, parameters);
+	}
+
+	public Task<ApiResult<ClanDetails>> GetClan(long clanId)
+	{
+		return GetRequest<ClanDetails>($"{_clanEndpoint}/{clanId}");
+	}
+
+	public Task<ApiResult<ClanDetails>> GetClanByMember(string playerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		return GetRequest<ClanDetails>(_clanEndpoint + "?playerId=" + playerId);
+	}
+
+	public Task<ApiResult> DisbandClan(long clanId, string byPlayerId)
+	{
+		if (string.IsNullOrWhiteSpace(byPlayerId))
+		{
+			throw new ArgumentNullException("byPlayerId");
+		}
+		return DeleteRequestWithoutResponse($"{_clanEndpoint}/{clanId}?byPlayerId={byPlayerId}");
+	}
+
+	public Task<ApiResult<ClanDetails>> UpdateClanVariables(long clanId, ClanVariablesUpdate update)
+	{
+		return PostRequest<ClanVariablesUpdate, ClanDetails>($"{_clanEndpoint}/{clanId}/variables", update);
+	}
+
+	public Task<ApiResult<List<ClanLeaderboardEntry>>> GetClanLeaderboard(int limit = 100)
+	{
+		return GetRequest<List<ClanLeaderboardEntry>>($"{_clanEndpoint}/leaderboard?limit={limit}");
+	}
+
+	public Task<ApiResult<ClanDetails>> CreateRole(long clanId, ClanRoleParameters parameters, string byPlayerId)
+	{
+		if (string.IsNullOrWhiteSpace(parameters.Name))
+		{
+			throw new ArgumentException("Role name must be set.", "parameters");
+		}
+		if (string.IsNullOrWhiteSpace(byPlayerId))
+		{
+			throw new ArgumentNullException("byPlayerId");
+		}
+		return PostRequest<ClanRoleParameters, ClanDetails>($"{_clanEndpoint}/{clanId}/roles?byPlayerId={byPlayerId}", parameters);
+	}
+
+	public Task<ApiResult<ClanDetails>> UpdateRole(long clanId, int roleId, ClanRoleParameters parameters, string byPlayerId)
+	{
+		if (string.IsNullOrWhiteSpace(byPlayerId))
+		{
+			throw new ArgumentNullException("byPlayerId");
+		}
+		return PostRequest<ClanRoleParameters, ClanDetails>($"{_clanEndpoint}/{clanId}/roles/{roleId}?byPlayerId={byPlayerId}", parameters);
+	}
+
+	public Task<ApiResult<ClanDetails>> DeleteRole(long clanId, int roleId, string byPlayerId)
+	{
+		if (string.IsNullOrWhiteSpace(byPlayerId))
+		{
+			throw new ArgumentNullException("byPlayerId");
+		}
+		return DeleteRequest<ClanDetails>($"{_clanEndpoint}/{clanId}/roles/{roleId}?byPlayerId={byPlayerId}");
+	}
+
+	public Task<ApiResult<ClanDetails>> SwapRoleRanks(long clanId, int roleIdA, int roleIdB, string byPlayerId)
+	{
+		if (string.IsNullOrWhiteSpace(byPlayerId))
+		{
+			throw new ArgumentNullException("byPlayerId");
+		}
+		return PostRequest<ClanDetails>($"{_clanEndpoint}/{clanId}/roles/swap?roleIdA={roleIdA}&roleIdB={roleIdB}&byPlayerId={byPlayerId}");
+	}
+
+	public Task<ApiResult<ClanDetails>> CreateInvite(long clanId, string playerId, string byPlayerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		if (string.IsNullOrWhiteSpace(byPlayerId))
+		{
+			throw new ArgumentNullException("byPlayerId");
+		}
+		return PostRequest<ClanDetails>($"{_clanEndpoint}/{clanId}/invite?playerId={playerId}&byPlayerId={byPlayerId}");
+	}
+
+	public Task<ApiResult<ClanDetails>> AcceptInvite(long clanId, string playerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		return PostRequest<ClanDetails>($"{_clanEndpoint}/{clanId}/invite/accept?playerId={playerId}");
+	}
+
+	public Task<ApiResult<ClanDetails>> CancelInvite(long clanId, string playerId, string byPlayerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		if (string.IsNullOrWhiteSpace(byPlayerId))
+		{
+			throw new ArgumentNullException("byPlayerId");
+		}
+		return PostRequest<ClanDetails>($"{_clanEndpoint}/{clanId}/invite/cancel?playerId={playerId}&byPlayerId={byPlayerId}");
+	}
+
+	public Task<ApiResult<ClanDetails>> Kick(long clanId, string playerId, string byPlayerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		if (string.IsNullOrWhiteSpace(byPlayerId))
+		{
+			throw new ArgumentNullException("byPlayerId");
+		}
+		return DeleteRequest<ClanDetails>($"{_clanEndpoint}/{clanId}/player/{playerId}?byPlayerId={byPlayerId}");
+	}
+
+	public Task<ApiResult<List<ClanInvitation>>> ListInvitations(string playerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		return GetRequest<List<ClanInvitation>>(_clanEndpoint + "/invitations?playerId=" + playerId);
+	}
+
+	public Task<ApiResult> UpdateLastSeen(long clanId, string playerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		return PostRequestWithoutResponse($"{_clanEndpoint}/{clanId}/player/{playerId}/seen");
+	}
+
+	public Task<ApiResult<ClanDetails>> UpdatePlayerClanVariables(long clanId, string playerId, ClanVariablesUpdate update)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		return PostRequest<ClanVariablesUpdate, ClanDetails>($"{_clanEndpoint}/{clanId}/player/{playerId}/variables", update);
+	}
+
+	public Task<ApiResult<ClanDetails>> SetPlayerRole(long clanId, string playerId, int roleId, string byPlayerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		if (string.IsNullOrWhiteSpace(byPlayerId))
+		{
+			throw new ArgumentNullException("byPlayerId");
+		}
+		return PostRequest<ClanDetails>($"{_clanEndpoint}/{clanId}/player/{playerId}/role?roleId={roleId}&byPlayerId={byPlayerId}");
+	}
+
+	public Task<ApiResult<List<ClanLogEntry>>> GetClanLogs(long clanId, string byPlayerId, int limit = 100)
+	{
+		if (string.IsNullOrWhiteSpace(byPlayerId))
+		{
+			throw new ArgumentNullException("byPlayerId");
+		}
+		return GetRequest<List<ClanLogEntry>>($"{_clanEndpoint}/{clanId}/logs?byPlayerId={byPlayerId}&limit={limit}");
+	}
+
+	public Task<ApiResult> AddClanLog(long clanId, string eventKey, string arg1 = null, string arg2 = null, string arg3 = null, string arg4 = null)
+	{
+		if (string.IsNullOrWhiteSpace(eventKey))
+		{
+			throw new ArgumentNullException("eventKey");
+		}
+		return PostRequestWithoutResponse($"{_clanEndpoint}/{clanId}/logs", new NewClanLogEntry
+		{
+			EventKey = eventKey,
+			Arg1 = arg1,
+			Arg2 = arg2,
+			Arg3 = arg3,
+			Arg4 = arg4
+		});
+	}
+
+	public Task<ApiResult<List<ClanScoreEventEntry>>> GetClanScoreEvents(long clanId, string byPlayerId, int limit = 100)
+	{
+		if (string.IsNullOrWhiteSpace(byPlayerId))
+		{
+			throw new ArgumentNullException("byPlayerId");
+		}
+		return GetRequest<List<ClanScoreEventEntry>>($"{_clanEndpoint}/{clanId}/scoreEvents?byPlayerId={byPlayerId}&limit={limit}");
+	}
+
+	public Task<ApiResult> AddClanScoreEvent(long clanId, NewClanScoreEventEntry entry)
+	{
+		if (entry.Score == 0)
+		{
+			throw new ArgumentException("Score cannot be zero.", "entry");
+		}
+		if (entry.Multiplier == 0)
+		{
+			throw new ArgumentException("Multiplier cannot be zero.", "entry");
+		}
+		return PostRequestWithoutResponse($"{_clanEndpoint}/{clanId}/scoreEvents", entry);
+	}
+
+	public Task<ApiResult> AddClanScoreEventBatch(List<NewClanScoreEventBatchEntry> entries)
+	{
+		if (entries == null)
+		{
+			throw new ArgumentNullException("entries");
+		}
+		if (entries.Count == 0)
+		{
+			return Task.FromResult(new ApiResult(HttpStatusCode.NoContent));
+		}
+		foreach (NewClanScoreEventBatchEntry entry in entries)
+		{
+			if (entry.Score == 0)
+			{
+				throw new ArgumentException("Score cannot be zero.", "entry");
+			}
+			if (entry.Multiplier == 0)
+			{
+				throw new ArgumentException("Multiplier cannot be zero.", "entry");
+			}
+		}
+		return PostRequestWithoutResponse(_clanEndpoint + "/scoreEventsBatch", entries);
+	}
+}

@@ -6,22 +6,10 @@ using ProtoBuf;
 using Rust.Modular;
 using UnityEngine;
 
-public abstract class BaseModularVehicle : GroundVehicle, PlayerInventory.ICanMoveFrom, IPrefabPreProcess
+public abstract class BaseModularVehicle : GroundVehicle, IPrefabPreProcess, PlayerInventory.ICanMoveFrom
 {
-	public bool inEditableLocation;
-
-	public bool prevEditable;
-
-	public bool immuneToDecay;
-
-	public Vector3 realLocalCOM;
-
-	public Item AssociatedItemInstance;
-
-	private bool disablePhysics;
-
-	[Header("Modular Vehicle")]
 	[SerializeField]
+	[Header("Modular Vehicle")]
 	public List<ModularVehicleSocket> moduleSockets;
 
 	[SerializeField]
@@ -41,7 +29,17 @@ public abstract class BaseModularVehicle : GroundVehicle, PlayerInventory.ICanMo
 
 	public Dictionary<BaseVehicleModule, Action> moduleAddActions = new Dictionary<BaseVehicleModule, Action>();
 
-	public ModularVehicleInventory Inventory { get; set; }
+	public bool inEditableLocation;
+
+	public bool prevEditable;
+
+	public bool immuneToDecay;
+
+	public Vector3 realLocalCOM;
+
+	public Item AssociatedItemInstance;
+
+	private bool disablePhysics;
 
 	public Vector3 CentreOfMass => centreOfMassTransform.localPosition;
 
@@ -104,6 +102,231 @@ public abstract class BaseModularVehicle : GroundVehicle, PlayerInventory.ICanMo
 		}
 	}
 
+	public ModularVehicleInventory Inventory { get; set; }
+
+	public override void InitShared()
+	{
+		base.InitShared();
+		AddMass(Mass, CentreOfMass, base.transform.position);
+		HasInited = true;
+		foreach (BaseVehicleModule attachedModuleEntity in AttachedModuleEntities)
+		{
+			attachedModuleEntity.RefreshConditionals(canGib: false);
+		}
+	}
+
+	public virtual bool PlayerCanUseThis(BasePlayer player, ModularCarCodeLock.LockType lockType)
+	{
+		return true;
+	}
+
+	public bool TryDeduceSocketIndex(BaseVehicleModule addedModule, out int index)
+	{
+		if (addedModule.FirstSocketIndex >= 0)
+		{
+			index = addedModule.FirstSocketIndex;
+			return index >= 0;
+		}
+		index = -1;
+		for (int i = 0; i < moduleSockets.Count; i++)
+		{
+			if (Vector3.SqrMagnitude(moduleSockets[i].WorldPosition - addedModule.transform.position) < 0.1f)
+			{
+				index = i;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public void AddMass(float moduleMass, Vector3 moduleCOM, Vector3 moduleWorldPos)
+	{
+		if (base.isServer)
+		{
+			Vector3 vector = base.transform.InverseTransformPoint(moduleWorldPos) + moduleCOM;
+			if (TotalMass == 0f)
+			{
+				SetMass(moduleMass);
+				SetCOM(vector);
+				return;
+			}
+			float num = TotalMass + moduleMass;
+			Vector3 cOM = realLocalCOM * (TotalMass / num) + vector * (moduleMass / num);
+			SetMass(num);
+			SetCOM(cOM);
+		}
+	}
+
+	public void RemoveMass(float moduleMass, Vector3 moduleCOM, Vector3 moduleWorldPos)
+	{
+		if (base.isServer)
+		{
+			float num = TotalMass - moduleMass;
+			Vector3 vector = base.transform.InverseTransformPoint(moduleWorldPos) + moduleCOM;
+			Vector3 cOM = (realLocalCOM - vector * (moduleMass / TotalMass)) / (num / TotalMass);
+			SetMass(num);
+			SetCOM(cOM);
+		}
+	}
+
+	public bool TryGetModuleAt(int socketIndex, out BaseVehicleModule result)
+	{
+		if (socketIndex < 0 || socketIndex >= moduleSockets.Count)
+		{
+			result = null;
+			return false;
+		}
+		foreach (BaseVehicleModule attachedModuleEntity in AttachedModuleEntities)
+		{
+			int firstSocketIndex = attachedModuleEntity.FirstSocketIndex;
+			int num = firstSocketIndex + attachedModuleEntity.GetNumSocketsTaken() - 1;
+			if (firstSocketIndex <= socketIndex && num >= socketIndex)
+			{
+				result = attachedModuleEntity;
+				return true;
+			}
+		}
+		result = null;
+		return false;
+	}
+
+	public ModularVehicleSocket GetSocket(int index)
+	{
+		if (index < 0 || index >= moduleSockets.Count)
+		{
+			return null;
+		}
+		return moduleSockets[index];
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		_ = info.msg.modularVehicle;
+	}
+
+	public override bool CanPushNow(BasePlayer pusher)
+	{
+		if (!base.CanPushNow(pusher))
+		{
+			return false;
+		}
+		if (!IsKinematic)
+		{
+			return !IsEditableNow;
+		}
+		return false;
+	}
+
+	public override void OnChildAdded(BaseEntity childEntity)
+	{
+		base.OnChildAdded(childEntity);
+		BaseVehicleModule module = childEntity as BaseVehicleModule;
+		if ((object)module != null)
+		{
+			Action action = delegate
+			{
+				ModuleEntityAdded(module);
+			};
+			moduleAddActions[module] = action;
+			module.Invoke(action, 0f);
+		}
+	}
+
+	public override void OnChildRemoved(BaseEntity childEntity)
+	{
+		base.OnChildRemoved(childEntity);
+		if (childEntity is BaseVehicleModule removedModule)
+		{
+			ModuleEntityRemoved(removedModule);
+		}
+	}
+
+	public virtual void ModuleEntityAdded(BaseVehicleModule addedModule)
+	{
+		if (AttachedModuleEntities.Contains(addedModule))
+		{
+			return;
+		}
+		if (base.isServer && (this == null || IsDead() || base.IsDestroyed))
+		{
+			if (addedModule != null && !addedModule.IsDestroyed)
+			{
+				addedModule.Kill();
+			}
+			return;
+		}
+		int index = -1;
+		if (base.isServer && addedModule.AssociatedItemInstance != null)
+		{
+			index = addedModule.AssociatedItemInstance.position;
+		}
+		if (index == -1 && !TryDeduceSocketIndex(addedModule, out index))
+		{
+			string text = $"{GetType().Name}: Couldn't get socket index from position ({addedModule.transform.position}).";
+			for (int i = 0; i < moduleSockets.Count; i++)
+			{
+				text += $" Sqr dist to socket {i} at {moduleSockets[i].WorldPosition} is {Vector3.SqrMagnitude(moduleSockets[i].WorldPosition - addedModule.transform.position)}.";
+			}
+			Debug.LogError(text, addedModule.gameObject);
+			return;
+		}
+		if (moduleAddActions.ContainsKey(addedModule))
+		{
+			moduleAddActions.Remove(addedModule);
+		}
+		AttachedModuleEntities.Add(addedModule);
+		addedModule.ModuleAdded(this, index);
+		AddMass(addedModule.Mass, addedModule.CentreOfMass, addedModule.transform.position);
+		if (base.isServer && !Inventory.TrySyncModuleInventory(addedModule, index))
+		{
+			Debug.LogError($"{GetType().Name}: Unable to add module {addedModule.name} to socket ({index}). Destroying it.", base.gameObject);
+			addedModule.Kill();
+			AttachedModuleEntities.Remove(addedModule);
+			return;
+		}
+		RefreshModulesExcept(addedModule);
+		if (base.isServer)
+		{
+			UpdateMountFlags();
+		}
+	}
+
+	public virtual void ModuleEntityRemoved(BaseVehicleModule removedModule)
+	{
+		if (base.IsDestroyed)
+		{
+			return;
+		}
+		if (moduleAddActions.ContainsKey(removedModule))
+		{
+			removedModule.CancelInvoke(moduleAddActions[removedModule]);
+			moduleAddActions.Remove(removedModule);
+		}
+		if (AttachedModuleEntities.Contains(removedModule))
+		{
+			RemoveMass(removedModule.Mass, removedModule.CentreOfMass, removedModule.transform.position);
+			AttachedModuleEntities.Remove(removedModule);
+			removedModule.ModuleRemoved();
+			RefreshModulesExcept(removedModule);
+			if (base.isServer)
+			{
+				UpdateMountFlags();
+			}
+		}
+	}
+
+	public void RefreshModulesExcept(BaseVehicleModule ignoredModule)
+	{
+		foreach (BaseVehicleModule attachedModuleEntity in AttachedModuleEntities)
+		{
+			if (attachedModuleEntity != ignoredModule)
+			{
+				attachedModuleEntity.OtherVehicleModulesChanged();
+			}
+		}
+	}
+
 	public override void ServerInit()
 	{
 		base.ServerInit();
@@ -143,6 +366,7 @@ public abstract class BaseModularVehicle : GroundVehicle, PlayerInventory.ICanMo
 		if (Inventory != null)
 		{
 			Inventory.Dispose();
+			Inventory = null;
 		}
 	}
 
@@ -176,13 +400,16 @@ public abstract class BaseModularVehicle : GroundVehicle, PlayerInventory.ICanMo
 
 	public override void VehicleFixedUpdate()
 	{
-		base.VehicleFixedUpdate();
-		if (IsEditableNow != prevEditable)
+		using (TimeWarning.New("BaseModularVehicle.VehicleFixedUpdate"))
 		{
-			SendNetworkUpdate();
-			prevEditable = IsEditableNow;
+			base.VehicleFixedUpdate();
+			if (IsEditableNow != prevEditable)
+			{
+				SendNetworkUpdate();
+				prevEditable = IsEditableNow;
+			}
+			SetFlag(Flags.Reserved6, rigidBody.isKinematic);
 		}
-		SetFlag(Flags.Reserved6, rigidBody.isKinematic);
 	}
 
 	public override bool MountEligable(BasePlayer player)
@@ -230,7 +457,10 @@ public abstract class BaseModularVehicle : GroundVehicle, PlayerInventory.ICanMo
 
 	protected abstract Vector3 GetCOMMultiplier();
 
-	public abstract void ModuleHurt(BaseVehicleModule hurtModule, HitInfo info);
+	public virtual void ModuleHurt(BaseVehicleModule hurtModule, HitInfo info)
+	{
+		DoExplosionForce(info);
+	}
 
 	public abstract void ModuleReachedZeroHealth();
 
@@ -357,228 +587,5 @@ public abstract class BaseModularVehicle : GroundVehicle, PlayerInventory.ICanMo
 	{
 		realLocalCOM = com;
 		rigidBody.centerOfMass = Vector3.Scale(realLocalCOM, GetCOMMultiplier());
-	}
-
-	public override void InitShared()
-	{
-		base.InitShared();
-		AddMass(Mass, CentreOfMass, base.transform.position);
-		HasInited = true;
-		foreach (BaseVehicleModule attachedModuleEntity in AttachedModuleEntities)
-		{
-			attachedModuleEntity.RefreshConditionals(canGib: false);
-		}
-	}
-
-	public virtual bool PlayerCanUseThis(BasePlayer player, ModularCarCodeLock.LockType lockType)
-	{
-		return true;
-	}
-
-	public bool TryDeduceSocketIndex(BaseVehicleModule addedModule, out int index)
-	{
-		if (addedModule.FirstSocketIndex >= 0)
-		{
-			index = addedModule.FirstSocketIndex;
-			return index >= 0;
-		}
-		index = -1;
-		for (int i = 0; i < moduleSockets.Count; i++)
-		{
-			if (Vector3.SqrMagnitude(moduleSockets[i].WorldPosition - addedModule.transform.position) < 0.1f)
-			{
-				index = i;
-				return true;
-			}
-		}
-		return false;
-	}
-
-	public void AddMass(float moduleMass, Vector3 moduleCOM, Vector3 moduleWorldPos)
-	{
-		if (base.isServer)
-		{
-			Vector3 vector = base.transform.InverseTransformPoint(moduleWorldPos) + moduleCOM;
-			if (TotalMass == 0f)
-			{
-				SetMass(moduleMass);
-				SetCOM(vector);
-				return;
-			}
-			float num = TotalMass + moduleMass;
-			Vector3 cOM = realLocalCOM * (TotalMass / num) + vector * (moduleMass / num);
-			SetMass(num);
-			SetCOM(cOM);
-		}
-	}
-
-	public void RemoveMass(float moduleMass, Vector3 moduleCOM, Vector3 moduleWorldPos)
-	{
-		if (base.isServer)
-		{
-			float num = TotalMass - moduleMass;
-			Vector3 vector = base.transform.InverseTransformPoint(moduleWorldPos) + moduleCOM;
-			Vector3 cOM = (realLocalCOM - vector * (moduleMass / TotalMass)) / (num / TotalMass);
-			SetMass(num);
-			SetCOM(cOM);
-		}
-	}
-
-	public bool TryGetModuleAt(int socketIndex, out BaseVehicleModule result)
-	{
-		if (socketIndex < 0 || socketIndex >= moduleSockets.Count)
-		{
-			result = null;
-			return false;
-		}
-		foreach (BaseVehicleModule attachedModuleEntity in AttachedModuleEntities)
-		{
-			int firstSocketIndex = attachedModuleEntity.FirstSocketIndex;
-			int num = firstSocketIndex + attachedModuleEntity.GetNumSocketsTaken() - 1;
-			if (firstSocketIndex <= socketIndex && num >= socketIndex)
-			{
-				result = attachedModuleEntity;
-				return true;
-			}
-		}
-		result = null;
-		return false;
-	}
-
-	public ModularVehicleSocket GetSocket(int index)
-	{
-		if (index < 0 || index >= moduleSockets.Count)
-		{
-			return null;
-		}
-		return moduleSockets[index];
-	}
-
-	public override void Load(LoadInfo info)
-	{
-		base.Load(info);
-		_ = info.msg.modularVehicle;
-	}
-
-	public override bool CanPushNow(BasePlayer pusher)
-	{
-		if (!base.CanPushNow(pusher))
-		{
-			return false;
-		}
-		if (!IsKinematic)
-		{
-			return !IsEditableNow;
-		}
-		return false;
-	}
-
-	public override void OnChildAdded(BaseEntity childEntity)
-	{
-		base.OnChildAdded(childEntity);
-		BaseVehicleModule module;
-		if ((object)(module = childEntity as BaseVehicleModule) != null)
-		{
-			Action action = delegate
-			{
-				ModuleEntityAdded(module);
-			};
-			moduleAddActions[module] = action;
-			module.Invoke(action, 0f);
-		}
-	}
-
-	public override void OnChildRemoved(BaseEntity childEntity)
-	{
-		base.OnChildRemoved(childEntity);
-		if (childEntity is BaseVehicleModule removedModule)
-		{
-			ModuleEntityRemoved(removedModule);
-		}
-	}
-
-	public virtual void ModuleEntityAdded(BaseVehicleModule addedModule)
-	{
-		if (AttachedModuleEntities.Contains(addedModule))
-		{
-			return;
-		}
-		if (base.isServer && (this == null || IsDead() || base.IsDestroyed))
-		{
-			if (addedModule != null && !addedModule.IsDestroyed)
-			{
-				addedModule.Kill();
-			}
-			return;
-		}
-		int index = -1;
-		if (base.isServer && addedModule.AssociatedItemInstance != null)
-		{
-			index = addedModule.AssociatedItemInstance.position;
-		}
-		if (index == -1 && !TryDeduceSocketIndex(addedModule, out index))
-		{
-			string text = $"{GetType().Name}: Couldn't get socket index from position ({addedModule.transform.position}).";
-			for (int i = 0; i < moduleSockets.Count; i++)
-			{
-				text += $" Sqr dist to socket {i} at {moduleSockets[i].WorldPosition} is {Vector3.SqrMagnitude(moduleSockets[i].WorldPosition - addedModule.transform.position)}.";
-			}
-			Debug.LogError(text, addedModule.gameObject);
-			return;
-		}
-		if (moduleAddActions.ContainsKey(addedModule))
-		{
-			moduleAddActions.Remove(addedModule);
-		}
-		AttachedModuleEntities.Add(addedModule);
-		addedModule.ModuleAdded(this, index);
-		AddMass(addedModule.Mass, addedModule.CentreOfMass, addedModule.transform.position);
-		if (base.isServer && !Inventory.TrySyncModuleInventory(addedModule, index))
-		{
-			Debug.LogError($"{GetType().Name}: Unable to add module {addedModule.name} to socket ({index}). Destroying it.", base.gameObject);
-			addedModule.Kill();
-			AttachedModuleEntities.Remove(addedModule);
-			return;
-		}
-		RefreshModulesExcept(addedModule);
-		if (base.isServer)
-		{
-			UpdateMountFlags();
-		}
-	}
-
-	public virtual void ModuleEntityRemoved(BaseVehicleModule removedModule)
-	{
-		if (base.IsDestroyed)
-		{
-			return;
-		}
-		if (moduleAddActions.ContainsKey(removedModule))
-		{
-			removedModule.CancelInvoke(moduleAddActions[removedModule]);
-			moduleAddActions.Remove(removedModule);
-		}
-		if (AttachedModuleEntities.Contains(removedModule))
-		{
-			RemoveMass(removedModule.Mass, removedModule.CentreOfMass, removedModule.transform.position);
-			AttachedModuleEntities.Remove(removedModule);
-			removedModule.ModuleRemoved();
-			RefreshModulesExcept(removedModule);
-			if (base.isServer)
-			{
-				UpdateMountFlags();
-			}
-		}
-	}
-
-	public void RefreshModulesExcept(BaseVehicleModule ignoredModule)
-	{
-		foreach (BaseVehicleModule attachedModuleEntity in AttachedModuleEntities)
-		{
-			if (attachedModuleEntity != ignoredModule)
-			{
-				attachedModuleEntity.OtherVehicleModulesChanged();
-			}
-		}
 	}
 }

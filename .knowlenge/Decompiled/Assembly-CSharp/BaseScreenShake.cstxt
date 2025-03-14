@@ -12,6 +12,8 @@ public abstract class BaseScreenShake : MonoBehaviour
 
 	internal static float animPunchMagnitude = 10f;
 
+	internal static AnimationCurve InverseCurve = AnimationCurve.Linear(0f, 1f, 1f, 0.05f);
+
 	public float length = 2f;
 
 	internal float timeTaken;

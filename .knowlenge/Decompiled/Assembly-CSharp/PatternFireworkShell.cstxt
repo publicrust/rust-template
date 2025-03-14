@@ -10,8 +10,8 @@ public class PatternFireworkShell : FireworkShell
 
 	public float Scale = 5f;
 
-	[Header("Random Design")]
 	[MinMax(0f, 1f)]
+	[Header("Random Design")]
 	public MinMax RandomSaturation = new MinMax(0f, 0.5f);
 
 	[MinMax(0f, 1f)]

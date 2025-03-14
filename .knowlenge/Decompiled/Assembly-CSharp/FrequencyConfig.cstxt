@@ -1,16 +1,3 @@
-using System;
-using UnityEngine.UI;
-
-public class FrequencyConfig : UIDialog
+public class FrequencyConfig : IOConfig<IRFObject>
 {
-	[NonSerialized]
-	private IRFObject rfObject;
-
-	public InputField input;
-
-	public int target;
-
-	private ItemContainer tempContainer;
-
-	private ItemId tempItemID;
 }

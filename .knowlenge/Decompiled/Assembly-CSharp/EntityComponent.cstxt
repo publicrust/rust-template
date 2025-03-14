@@ -26,7 +26,7 @@ public class EntityComponent<T> : EntityComponentBase where T : BaseEntity
 		}
 	}
 
-	protected override BaseEntity GetBaseEntity()
+	public override BaseEntity GetBaseEntity()
 	{
 		return baseEntity;
 	}

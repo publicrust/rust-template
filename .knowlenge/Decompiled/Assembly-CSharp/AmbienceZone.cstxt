@@ -10,6 +10,8 @@ public class AmbienceZone : TriggerBase, IClientComponentEx
 
 	public float crossfadeTime = 1f;
 
+	public float ambienceGain = 1f;
+
 	public virtual void PreClientComponentCull(IPrefabProcessor p)
 	{
 		p.RemoveComponent(this);

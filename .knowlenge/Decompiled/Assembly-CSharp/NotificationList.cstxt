@@ -47,7 +47,7 @@ public class NotificationList
 
 	public List<ulong> ToList()
 	{
-		List<ulong> list = Facepunch.Pool.GetList<ulong>();
+		List<ulong> list = Facepunch.Pool.Get<List<ulong>>();
 		foreach (ulong subscription in _subscriptions)
 		{
 			list.Add(subscription);
@@ -68,15 +68,15 @@ public class NotificationList
 		}
 	}
 
-	public void IntersectWith(List<PlayerNameID> players)
+	public void IntersectWith(HashSet<PlayerNameID> players)
 	{
-		List<ulong> obj = Facepunch.Pool.GetList<ulong>();
+		List<ulong> obj = Facepunch.Pool.Get<List<ulong>>();
 		foreach (PlayerNameID player in players)
 		{
 			obj.Add(player.userid);
 		}
 		_subscriptions.IntersectWith(obj);
-		Facepunch.Pool.FreeList(ref obj);
+		Facepunch.Pool.FreeUnmanaged(ref obj);
 	}
 
 	public Task<NotificationSendResult> SendNotification(NotificationChannel channel, string title, string body, string type)
@@ -112,7 +112,7 @@ public class NotificationList
 		set.Add(steamId);
 		NotificationSendResult result = await SendNotificationImpl(set, channel, title, body, data);
 		set.Clear();
-		Facepunch.Pool.Free(ref set);
+		Facepunch.Pool.FreeUnmanaged(ref set);
 		return result;
 	}
 
@@ -130,18 +130,76 @@ public class NotificationList
 		{
 			return NotificationSendResult.Sent;
 		}
+		List<List<ulong>> batches = Facepunch.Pool.Get<List<List<ulong>>>();
+		List<ulong> list = null;
+		foreach (ulong steamId in steamIds)
+		{
+			if (list == null)
+			{
+				list = Facepunch.Pool.Get<List<ulong>>();
+			}
+			list.Add(steamId);
+			if (list.Count >= 100)
+			{
+				batches.Add(list);
+				list = null;
+			}
+		}
+		if (list != null && list.Count > 0)
+		{
+			batches.Add(list);
+		}
+		NotificationSendResult? errorResult = null;
+		bool anySent = false;
+		foreach (List<ulong> item in batches)
+		{
+			List<ulong> batchCopy = item;
+			NotificationSendResult notificationSendResult = await SendNotificationBatchImpl(batchCopy, channel, title, body, data);
+			Facepunch.Pool.FreeUnmanaged(ref batchCopy);
+			switch (notificationSendResult)
+			{
+			case NotificationSendResult.Failed:
+				errorResult = NotificationSendResult.Failed;
+				break;
+			case NotificationSendResult.ServerError:
+				if (errorResult != NotificationSendResult.Failed)
+				{
+					errorResult = NotificationSendResult.ServerError;
+				}
+				break;
+			}
+			if (notificationSendResult == NotificationSendResult.Sent)
+			{
+				anySent = true;
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref batches);
+		if (data != null)
+		{
+			data.Clear();
+			Facepunch.Pool.FreeUnmanaged(ref data);
+		}
+		if (errorResult.HasValue)
+		{
+			return errorResult.Value;
+		}
+		return anySent ? NotificationSendResult.Sent : NotificationSendResult.NoTargetsFound;
+	}
+
+	private static async Task<NotificationSendResult> SendNotificationBatchImpl(IEnumerable<ulong> steamIds, NotificationChannel channel, string title, string body, Dictionary<string, string> data)
+	{
 		PushRequest obj = Facepunch.Pool.Get<PushRequest>();
 		obj.ServerToken = CompanionServer.Server.Token;
 		obj.Channel = channel;
 		obj.Title = title;
 		obj.Body = body;
 		obj.Data = data;
-		obj.SteamIds = Facepunch.Pool.GetList<ulong>();
+		obj.SteamIds = Facepunch.Pool.Get<List<ulong>>();
 		foreach (ulong steamId in steamIds)
 		{
 			obj.SteamIds.Add(steamId);
 		}
-		string content = JsonConvert.SerializeObject(obj);
+		string content = JsonConvert.SerializeObject((object)obj);
 		Facepunch.Pool.Free(ref obj);
 		try
 		{

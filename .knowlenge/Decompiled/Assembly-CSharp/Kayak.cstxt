@@ -51,7 +51,15 @@ public class Kayak : BaseBoat, IPoolVehicle
 
 	private Vector3 lastTravelPos;
 
+	private bool inCinematic;
+
+	private Quaternion cinematicWorldRotation;
+
+	private int lastDownhillUpdate;
+
 	private float distanceRemainder;
+
+	protected override bool SkipBoatForcedUpdate => buoyancy.BuoyancyPriority == Buoyancy.Priority.Low;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -64,30 +72,38 @@ public class Kayak : BaseBoat, IPoolVehicle
 	public override void ServerInit()
 	{
 		base.ServerInit();
+		inCinematic = false;
 		timeSinceLastUsed = 0f;
 		InvokeRandomized(BoatDecay, Random.Range(30f, 60f), 60f, 6f);
+		InvokeRandomized(LowPriorityCheck, 0f, 5f, 2.5f);
+	}
+
+	public override void OnDeployed(BaseEntity parent, BasePlayer deployedBy, Item fromItem)
+	{
+		base.OnDeployed(parent, deployedBy, fromItem);
+		buoyancy.wavesEffect = ((deployedBy != null && deployedBy.IsInTutorial) ? 0f : 1f);
 	}
 
 	public override void OnPlayerMounted()
 	{
 		base.OnPlayerMounted();
-		if (IsInvoking(TravelDistanceUpdate) || !Rust.GameInfo.HasAchievements)
+		if (!IsInvoking(TravelDistanceUpdate) && Rust.GameInfo.HasAchievements)
 		{
-			return;
-		}
-		int num = 0;
-		foreach (MountPointInfo allMountPoint in base.allMountPoints)
-		{
-			if (allMountPoint.mountable != null && allMountPoint.mountable.AnyMounted())
+			int num = 0;
+			foreach (MountPointInfo allMountPoint in base.allMountPoints)
 			{
-				num++;
+				if (allMountPoint.mountable != null && allMountPoint.mountable.AnyMounted())
+				{
+					num++;
+				}
+			}
+			if (num == 2)
+			{
+				lastTravelPos = base.transform.position.WithY(0f);
+				InvokeRandomized(TravelDistanceUpdate, 5f, 5f, 3f);
 			}
 		}
-		if (num == 2)
-		{
-			lastTravelPos = base.transform.position.WithY(0f);
-			InvokeRandomized(TravelDistanceUpdate, 5f, 5f, 3f);
-		}
+		buoyancy.LowPriorityCheck(forceHighPriority: true);
 	}
 
 	public override void OnPlayerDismounted(BasePlayer player)
@@ -128,14 +144,14 @@ public class Kayak : BaseBoat, IPoolVehicle
 			flag2 = true;
 			rigidBody.AddForceAtPosition(vector * num, GetPaddlePoint(playerSeat, PaddleDirection.Left), ForceMode.Impulse);
 			rigidBody.angularVelocity += -base.transform.up * rotatePaddleForce;
-			ClientRPC(null, "OnPaddled", flag ? 2 : 0, playerSeat);
+			ClientRPC(RpcTarget.NetworkGroup("OnPaddled"), flag ? 2 : 0, playerSeat);
 		}
 		else if (inputState.IsDown(BUTTON.RIGHT) || inputState.IsDown(BUTTON.FIRE_SECONDARY))
 		{
 			flag2 = true;
 			rigidBody.AddForceAtPosition(vector * num, GetPaddlePoint(playerSeat, PaddleDirection.Right), ForceMode.Impulse);
 			rigidBody.angularVelocity += base.transform.up * rotatePaddleForce;
-			ClientRPC(null, "OnPaddled", (!flag) ? 1 : 3, playerSeat);
+			ClientRPC(RpcTarget.NetworkGroup("OnPaddled"), (!flag) ? 1 : 3, playerSeat);
 		}
 		if (flag2)
 		{
@@ -207,17 +223,30 @@ public class Kayak : BaseBoat, IPoolVehicle
 
 	public override void VehicleFixedUpdate()
 	{
-		base.VehicleFixedUpdate();
-		if (fixedDragUpdate == null)
+		using (TimeWarning.New("Kayak.VehicleFixedUpdate"))
 		{
-			fixedDragUpdate = new TimeCachedValue<float>
+			base.VehicleFixedUpdate();
+			if (fixedDragUpdate == null)
 			{
-				refreshCooldown = 0.5f,
-				refreshRandomRange = 0.2f,
-				updateValue = CalculateDesiredDrag
-			};
+				fixedDragUpdate = new TimeCachedValue<float>
+				{
+					refreshCooldown = 0.5f,
+					refreshRandomRange = 0.2f,
+					updateValue = CalculateDesiredDrag
+				};
+			}
+			if (inCinematic)
+			{
+				if (!rigidBody.isKinematic)
+				{
+					Vector3 velocity = rigidBody.velocity;
+					velocity = Vector3.MoveTowards(velocity, velocity.WithX(0f).WithZ(0f), Time.fixedDeltaTime);
+					rigidBody.velocity = velocity;
+				}
+				base.transform.rotation = Quaternion.RotateTowards(base.transform.rotation, cinematicWorldRotation, 180f * Time.fixedDeltaTime);
+			}
+			rigidBody.drag = fixedDragUpdate.Get(force: false);
 		}
-		rigidBody.drag = fixedDragUpdate.Get(force: false);
 	}
 
 	public float CalculateDesiredDrag()
@@ -225,7 +254,7 @@ public class Kayak : BaseBoat, IPoolVehicle
 		int num = NumMounted();
 		if (num == 0)
 		{
-			return 0.5f;
+			return 1f;
 		}
 		if (num < 2)
 		{
@@ -236,7 +265,12 @@ public class Kayak : BaseBoat, IPoolVehicle
 
 	public void BoatDecay()
 	{
-		BaseBoat.WaterVehicleDecay(this, 60f, timeSinceLastUsed, MotorRowboat.outsidedecayminutes, MotorRowboat.deepwaterdecayminutes);
+		BaseBoat.WaterVehicleDecay(this, 60f, timeSinceLastUsed, MotorRowboat.outsidedecayminutes, MotorRowboat.deepwaterdecayminutes, MotorRowboat.decaystartdelayminutes, preventDecayIndoors);
+	}
+
+	private void LowPriorityCheck()
+	{
+		buoyancy.LowPriorityCheck(AnyMounted());
 	}
 
 	public override bool CanPickup(BasePlayer player)
@@ -246,6 +280,12 @@ public class Kayak : BaseBoat, IPoolVehicle
 			return base.CanPickup(player);
 		}
 		return false;
+	}
+
+	public void PrepareForTutorialCinematic(Quaternion worldRotation)
+	{
+		inCinematic = true;
+		cinematicWorldRotation = worldRotation;
 	}
 
 	public bool IsPlayerHoldingPaddle(BasePlayer player)

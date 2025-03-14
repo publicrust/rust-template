@@ -50,13 +50,13 @@ public class HairDye
 		new MaterialPropertyDesc("_HairRoughness", typeof(float))
 	};
 
-	private static int _HairBaseColorUV1 = Shader.PropertyToID("_HairBaseColorUV1");
+	public static int _HairBaseColorUV1 = Shader.PropertyToID("_HairBaseColorUV1");
 
-	private static int _HairBaseColorUV2 = Shader.PropertyToID("_HairBaseColorUV2");
+	public static int _HairBaseColorUV2 = Shader.PropertyToID("_HairBaseColorUV2");
 
-	private static int _HairPackedMapUV1 = Shader.PropertyToID("_HairPackedMapUV1");
+	public static int _HairPackedMapUV1 = Shader.PropertyToID("_HairPackedMapUV1");
 
-	private static int _HairPackedMapUV2 = Shader.PropertyToID("_HairPackedMapUV2");
+	public static int _HairPackedMapUV2 = Shader.PropertyToID("_HairPackedMapUV2");
 
 	public void Apply(HairDyeCollection collection, MaterialPropertyBlock block)
 	{

@@ -14,6 +14,7 @@ public class TriggerSafeZone : TriggerBase
 	protected void Awake()
 	{
 		triggerCollider = GetComponent<Collider>();
+		interestLayers.value |= 512;
 	}
 
 	protected void OnEnable()

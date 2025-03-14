@@ -21,6 +21,10 @@ public class PhysicsEffects : MonoBehaviour
 
 	public LayerMask ignoreLayers;
 
+	public bool useCollisionPositionInsteadOfTransform;
+
+	public float minimumRigidbodyImpactWeight;
+
 	private float lastEffectPlayed;
 
 	private float enabledAt = float.PositiveInfinity;
@@ -42,14 +46,21 @@ public class PhysicsEffects : MonoBehaviour
 		}
 		float magnitude = collision.relativeVelocity.magnitude;
 		magnitude = magnitude * 0.055f * hardnessScale;
-		if (!(magnitude <= ignoreImpactThreshold) && (!(Vector3.Distance(base.transform.position, lastCollisionPos) < minDistBetweenEffects) || lastEffectPlayed == 0f))
+		if (!(magnitude <= ignoreImpactThreshold) && (!((useCollisionPositionInsteadOfTransform ? Vector3.Distance(collision.contacts[0].point, lastCollisionPos) : Vector3.Distance(base.transform.position, lastCollisionPos)) < minDistBetweenEffects) || lastEffectPlayed == 0f) && (!(minimumRigidbodyImpactWeight > 0f) || !collision.gameObject.TryGetComponent<Rigidbody>(out var component) || !(component.mass < minimumRigidbodyImpactWeight)))
 		{
 			if (entity != null)
 			{
 				entity.SignalBroadcast(BaseEntity.Signal.PhysImpact, magnitude.ToString());
 			}
 			lastEffectPlayed = UnityEngine.Time.time;
-			lastCollisionPos = base.transform.position;
+			if (useCollisionPositionInsteadOfTransform)
+			{
+				lastCollisionPos = base.transform.InverseTransformPoint(collision.contacts[0].point);
+			}
+			else
+			{
+				lastCollisionPos = base.transform.position;
+			}
 		}
 	}
 }

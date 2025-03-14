@@ -1,18 +1,21 @@
-using System.Collections.Generic;
 using Rust.UI;
 using UnityEngine;
 
 public class TechTreeDialog : UIDialog, IInventoryChanged
 {
-	public TechTreeData data;
+	private const string techTreeLevelPrefKey = "techTreeLevel";
+
+	private TechTreeData[] dataOptions;
 
 	public float graphScale = 1f;
 
-	public TechTreeEntry entryPrefab;
+	public RustButton[] tierButtons;
 
-	public TechTreeGroup groupPrefab;
+	public GameObjectRef entryPrefab;
 
-	public TechTreeLine linePrefab;
+	public GameObjectRef groupPrefab;
+
+	public GameObjectRef linePrefab;
 
 	public RectTransform contents;
 
@@ -30,11 +33,29 @@ public class TechTreeDialog : UIDialog, IInventoryChanged
 
 	private Vector2 startPos = Vector2.zero;
 
-	public List<int> processed = new List<int>();
-
-	public Dictionary<int, TechTreeWidget> widgets = new Dictionary<int, TechTreeWidget>();
-
-	public List<TechTreeLine> lines = new List<TechTreeLine>();
-
 	public ScrollRectZoom zoom;
+
+	public TechTreeData data
+	{
+		get
+		{
+			if (dataOptions == null)
+			{
+				return null;
+			}
+			return dataOptions[selectedDataIndex];
+		}
+	}
+
+	private int selectedDataIndex
+	{
+		get
+		{
+			return PlayerPrefs.GetInt("techTreeLevel", 0);
+		}
+		set
+		{
+			PlayerPrefs.SetInt("techTreeLevel", value);
+		}
+	}
 }

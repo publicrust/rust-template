@@ -1,11 +1,11 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-public class ClientIOLine : BaseMonoBehaviour
+public class ClientIOLine : BaseMonoBehaviour, INotifyLOD
 {
-	public RendererLOD _lod;
-
 	public LineRenderer _line;
+
+	public NotifyLOD lod;
 
 	public Material directionalMaterial;
 
@@ -13,9 +13,9 @@ public class ClientIOLine : BaseMonoBehaviour
 
 	public IOEntity.IOType lineType;
 
-	public static List<ClientIOLine> _allLines = new List<ClientIOLine>();
-
 	public WireTool.WireColour colour;
+
+	public static List<ClientIOLine> allLines = new List<ClientIOLine>();
 
 	public IOEntity ownerIOEnt;
 }

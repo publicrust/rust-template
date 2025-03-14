@@ -1,5 +1,6 @@
 using System;
 using Rust;
+using Unity.AI.Navigation;
 using UnityEngine;
 using UnityEngine.AI;
 

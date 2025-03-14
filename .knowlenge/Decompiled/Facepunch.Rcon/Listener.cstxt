@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
+using Facepunch.Rcon;
+using Facepunch.Rust.Profiling;
 using Fleck;
 using Oxide.Core;
 using UnityEngine;
@@ -23,7 +25,7 @@ public class Listener
 
 	private int nextClientId;
 
-	private readonly Dictionary<int, IWebSocketConnection> clients = new Dictionary<int, IWebSocketConnection>();
+	private readonly Dictionary<int, RconConnection> clients = new Dictionary<int, RconConnection>();
 
 	private readonly List<int> deadClients = new List<int>();
 
@@ -54,17 +56,22 @@ public class Listener
 			IWebSocketConnection socket2 = socket;
 			if (Interface.CallHook("OnRconConnection", socket.ConnectionInfo.ClientIpAddress) != null || socket2.ConnectionInfo.Path != requiredPath)
 			{
+				RconProfiler.OnFailedConnection(socket2, socket2.ConnectionInfo.Path);
 				socket2.Close();
 			}
 			else
 			{
 				int id = Interlocked.Increment(ref nextClientId);
 				IPAddress ipAddress = socket2.ConnectionInfo.ClientIpAddress;
+				string ipString = ipAddress.ToString();
+				int port = socket2.ConnectionInfo.ClientPort;
+				RconProfiler.OnNewConnection(socket2, id);
 				socket2.OnOpen = delegate
 				{
 					lock (clients)
 					{
-						clients.Add(id, socket2);
+						clients.Add(id, new RconConnection(socket2, id));
+						RconProfiler.UpdateClientCount(clients.Count);
 					}
 				};
 				socket2.OnClose = delegate
@@ -72,12 +79,21 @@ public class Listener
 					lock (clients)
 					{
 						clients.Remove(id);
+						RconProfiler.UpdateClientCount(clients.Count);
 					}
 				};
 				socket2.OnMessage = delegate(string s)
 				{
 					if (Interface.CallHook("IOnRconMessage", socket2.ConnectionInfo.ClientIpAddress, s) == null)
 					{
+						lock (clients)
+						{
+							if (clients.TryGetValue(id, out var value))
+							{
+								value.Stats.RecievedMessages++;
+							}
+						}
+						RconProfiler.OnRconMessage(ipString, port, id, s);
 						OnMessage?.Invoke(ipAddress, id, s);
 					}
 				};
@@ -107,11 +123,12 @@ public class Listener
 		lock (clients)
 		{
 			deadClients.Clear();
-			foreach (KeyValuePair<int, IWebSocketConnection> client in clients)
+			foreach (KeyValuePair<int, RconConnection> client in clients)
 			{
-				if (client.Value.IsAvailable)
+				if (client.Value.Socket.IsAvailable)
 				{
-					client.Value.Send(str);
+					client.Value.Socket.Send(str);
+					client.Value.Stats.BroadcastedMessages++;
 				}
 				else
 				{
@@ -122,10 +139,11 @@ public class Listener
 			{
 				if (clients.TryGetValue(deadClient, out var value))
 				{
-					value.Close();
+					value.Socket.Close();
 					clients.Remove(deadClient);
 				}
 			}
+			RconProfiler.UpdateClientCount(clients.Count);
 		}
 	}
 
@@ -139,16 +157,31 @@ public class Listener
 		{
 			if (clients.TryGetValue(target, out var value))
 			{
-				if (!value.IsAvailable)
+				if (!value.Socket.IsAvailable)
 				{
-					value.Close();
+					value.Socket.Close();
 					clients.Remove(target);
 				}
 				else
 				{
-					value.Send(str);
+					value.Socket.Send(str);
+					value.Stats.SentMessages++;
+					RconProfiler.UpdateClientCount(clients.Count);
 				}
 			}
+		}
+	}
+
+	public IList<RconClientStats> GetClientStats()
+	{
+		List<RconClientStats> list = new List<RconClientStats>();
+		lock (clients)
+		{
+			foreach (KeyValuePair<int, RconConnection> client in clients)
+			{
+				list.Add(client.Value.Stats);
+			}
+			return list;
 		}
 	}
 }

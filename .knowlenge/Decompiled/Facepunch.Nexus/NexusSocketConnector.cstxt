@@ -1,0 +1,260 @@
+using System;
+using System.Buffers;
+using System.Collections.Generic;
+using System.Net.WebSockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using Facepunch.Nexus;
+using Facepunch.Nexus.Connector;
+using Facepunch.Nexus.Logging;
+using Facepunch.Nexus.Models;
+using Newtonsoft.Json;
+
+internal class NexusSocketConnector : INexusSocketConnector, IDisposable
+{
+	private const int MaxMessageIdLength = 64;
+
+	private readonly INexusLogger _logger;
+
+	private readonly CancellationTokenSource _cts;
+
+	private readonly Uri _socketEndpoint;
+
+	private readonly string _secretKey;
+
+	private readonly Queue<NexusMessage> _incoming;
+
+	private readonly Channel<string> _outgoing;
+
+	private bool _started;
+
+	private ClientWebSocket _socket;
+
+	public bool IsStarted => _started;
+
+	public bool IsConnected
+	{
+		get
+		{
+			if (_started && _socket != null)
+			{
+				return _socket.State == WebSocketState.Open;
+			}
+			return false;
+		}
+	}
+
+	public NexusSocketConnector(INexusLogger logger, string baseUrl, string secretKey, int lockDuration)
+	{
+		_logger = logger ?? NullLogger.Instance;
+		baseUrl = baseUrl?.TrimEnd(new char[1] { '/' }) ?? throw new ArgumentNullException("baseUrl");
+		if (baseUrl.StartsWith("http://"))
+		{
+			baseUrl = baseUrl.Replace("http://", "ws://");
+		}
+		if (baseUrl.StartsWith("https://"))
+		{
+			baseUrl = baseUrl.Replace("https://", "wss://");
+		}
+		_cts = new CancellationTokenSource();
+		_socketEndpoint = new Uri($"{baseUrl}/zone/socket?lockDuration={lockDuration}");
+		_secretKey = secretKey ?? throw new ArgumentNullException("secretKey");
+		_incoming = new Queue<NexusMessage>();
+		_outgoing = Channel.CreateBounded<string>(new BoundedChannelOptions(10)
+		{
+			SingleReader = true,
+			SingleWriter = false
+		});
+	}
+
+	public void Dispose()
+	{
+		_outgoing.Writer.Complete();
+		_cts.Cancel();
+		_cts.Dispose();
+		_socket?.Dispose();
+		_socket = null;
+	}
+
+	public void Start()
+	{
+		if (_started)
+		{
+			throw new InvalidOperationException("The socket connector was already started.");
+		}
+		Task.Run(() => ReconnectLoop(_cts.Token));
+		_started = true;
+	}
+
+	public bool TryReceive(out NexusMessage message)
+	{
+		lock (_incoming)
+		{
+			if (_incoming.Count == 0)
+			{
+				message = default(NexusMessage);
+				return false;
+			}
+			message = _incoming.Dequeue();
+			return true;
+		}
+	}
+
+	public void Acknowledge(string messageId)
+	{
+		if (string.IsNullOrWhiteSpace(messageId))
+		{
+			throw new ArgumentNullException("messageId");
+		}
+		if (Encoding.UTF8.GetByteCount(messageId) >= 64)
+		{
+			throw new ArgumentException(string.Format("{0} cannot exceed {1} bytes", "messageId", 64));
+		}
+		if (!_outgoing.Writer.TryWrite(messageId))
+		{
+			throw new InvalidOperationException("Failed to enqueue message acknowledgement");
+		}
+	}
+
+	private async Task ReconnectLoop(CancellationToken ct)
+	{
+		_ = 2;
+		try
+		{
+			while (!ct.IsCancellationRequested)
+			{
+				try
+				{
+					_logger.LogInfo("Connecting to nexus socket...");
+					_socket = await Connect(ct);
+					_logger.LogInfo("Connected to nexus socket!");
+					using (CancellationTokenSource connCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+					{
+						await Task.WhenAny(HandleIncoming(connCts.Token), HandleOutgoing(connCts.Token));
+						connCts.Cancel();
+					}
+					_logger.LogInfo("Nexus socket handlers terminated");
+				}
+				catch (Exception exception) when (!ct.IsCancellationRequested)
+				{
+					_logger.LogError("Lost connection to Nexus zone socket", exception);
+					_socket?.Dispose();
+					_socket = null;
+					await Task.Delay(5000, ct);
+				}
+			}
+		}
+		catch (OperationCanceledException)
+		{
+		}
+		finally
+		{
+			_logger.LogInfo("Nexus socket reconnect loop is exiting");
+		}
+	}
+
+	private async Task HandleIncoming(CancellationToken ct)
+	{
+		while (!ct.IsCancellationRequested && IsConnected)
+		{
+			byte[] buffer2 = ArrayPool<byte>.Shared.Rent(1048576);
+			try
+			{
+				int offset = 0;
+				WebSocketReceiveResult webSocketReceiveResult;
+				do
+				{
+					ArraySegment<byte> buffer3 = new ArraySegment<byte>(buffer2, offset, buffer2.Length - offset);
+					webSocketReceiveResult = await _socket.ReceiveAsync(buffer3, ct);
+					if (webSocketReceiveResult.MessageType == WebSocketMessageType.Close)
+					{
+						await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", ct);
+						return;
+					}
+					if (webSocketReceiveResult.MessageType != 0)
+					{
+						throw new InvalidOperationException($"Unexpected message type {webSocketReceiveResult.MessageType}");
+					}
+					if (webSocketReceiveResult.Count == 0)
+					{
+						throw new InvalidOperationException("Received no data");
+					}
+					offset += webSocketReceiveResult.Count;
+					if (offset >= buffer2.Length)
+					{
+						if (buffer2.Length >= 67108864)
+						{
+							throw new InvalidOperationException("Message too large");
+						}
+						byte[] array = ArrayPool<byte>.Shared.Rent(buffer2.Length * 2);
+						Buffer.BlockCopy(buffer2, 0, array, 0, buffer2.Length);
+						ArrayPool<byte>.Shared.Return(buffer2);
+						buffer2 = array;
+					}
+				}
+				while (!webSocketReceiveResult.EndOfMessage);
+				NexusMessage item = ReadMessage(buffer2, offset);
+				lock (_incoming)
+				{
+					_incoming.Enqueue(item);
+				}
+			}
+			catch (Exception exception) when (!ct.IsCancellationRequested)
+			{
+				_logger.LogError("Error handling incoming message", exception);
+				throw;
+			}
+			finally
+			{
+				ArrayPool<byte>.Shared.Return(buffer2);
+			}
+		}
+		_logger.LogInfo("Nexus socket incoming handler terminating");
+		static NexusMessage ReadMessage(byte[] buffer, int length)
+		{
+			IncomingMessage incomingMessage = JsonConvert.DeserializeObject<IncomingMessage>(Encoding.UTF8.GetString(buffer, 0, length));
+			if (incomingMessage.ContentType.StartsWith("text/") || incomingMessage.ContentType.StartsWith("application/json"))
+			{
+				string @string = Encoding.UTF8.GetString(incomingMessage.Data);
+				return new NexusMessage(incomingMessage.MessageId, incomingMessage.Id, incomingMessage.ContentType, @string);
+			}
+			return new NexusMessage(incomingMessage.MessageId, incomingMessage.Id, incomingMessage.ContentType, incomingMessage.Data);
+		}
+	}
+
+	private async Task HandleOutgoing(CancellationToken ct)
+	{
+		while (!ct.IsCancellationRequested && IsConnected)
+		{
+			byte[] buffer = ArrayPool<byte>.Shared.Rent(64);
+			try
+			{
+				string text = await _outgoing.Reader.ReadAsync(ct);
+				int bytes = Encoding.UTF8.GetBytes(text, 0, text.Length, buffer, 0);
+				ArraySegment<byte> buffer2 = new ArraySegment<byte>(buffer, 0, bytes);
+				await _socket.SendAsync(buffer2, WebSocketMessageType.Text, endOfMessage: true, ct);
+			}
+			catch (Exception exception) when (!ct.IsCancellationRequested)
+			{
+				_logger.LogError("Error handling outgoing message", exception);
+				throw;
+			}
+			finally
+			{
+				ArrayPool<byte>.Shared.Return(buffer);
+			}
+		}
+		_logger.LogInfo("Nexus socket incoming handler terminating");
+	}
+
+	private async Task<ClientWebSocket> Connect(CancellationToken ct)
+	{
+		ClientWebSocket socket = new ClientWebSocket();
+		socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(30.0);
+		socket.Options.SetRequestHeader("Authorization", "Bearer " + _secretKey);
+		await socket.ConnectAsync(_socketEndpoint, ct);
+		return socket;
+	}
+}

@@ -3,40 +3,97 @@ using UnityEngine;
 [CreateAssetMenu(menuName = "Rust/Missions/OBJECTIVES/Harvest")]
 public class MissionObjective_Harvest : MissionObjective
 {
-	public string[] itemShortnames;
+	[ItemSelector(ItemCategory.All)]
+	public ItemDefinition[] targetItems;
 
 	public int targetItemAmount;
+
+	public ItemDefinition[] pingResourceDispensers;
+
+	public BasePlayer.PingType pingType = BasePlayer.PingType.GoTo;
+
+	public bool countExisting;
+
+	public override void PostServerLoad(BasePlayer player, BaseMission.MissionInstance.ObjectiveStatus status)
+	{
+		base.PostServerLoad(player, status);
+		if (status.started && !status.completed)
+		{
+			InitialiseResourcePings(player);
+		}
+	}
+
+	public override void MissionStarted(int index, BaseMission.MissionInstance instance, BasePlayer forPlayer)
+	{
+		base.MissionStarted(index, instance, forPlayer);
+		instance.objectiveStatuses[index].progressCurrent = 0f;
+		instance.objectiveStatuses[index].progressTarget = targetItemAmount;
+	}
 
 	public override void ObjectiveStarted(BasePlayer playerFor, int index, BaseMission.MissionInstance instance)
 	{
 		base.ObjectiveStarted(playerFor, index, instance);
+		InitialiseResourcePings(playerFor);
+		if (countExisting && targetItems.Length != 0)
+		{
+			int num = 0;
+			ItemDefinition[] array = targetItems;
+			foreach (ItemDefinition definition in array)
+			{
+				num += playerFor.inventory.GetAmount(definition);
+			}
+			ProcessMissionEvent(playerFor, instance, index, BaseMission.MissionEventType.HARVEST, new BaseMission.MissionEventPayload
+			{
+				IntIdentifier = targetItems[0].itemid
+			}, num);
+		}
 	}
 
-	public override void ProcessMissionEvent(BasePlayer playerFor, BaseMission.MissionInstance instance, int index, BaseMission.MissionEventType type, string identifier, float amount)
+	private void InitialiseResourcePings(BasePlayer forPlayer)
 	{
-		base.ProcessMissionEvent(playerFor, instance, index, type, identifier, amount);
-		if (IsCompleted(index, instance) || !CanProgress(index, instance) || type != BaseMission.MissionEventType.HARVEST)
+		if (pingResourceDispensers != null)
+		{
+			ItemDefinition[] array = pingResourceDispensers;
+			foreach (ItemDefinition forItem in array)
+			{
+				forPlayer.EnableResourcePings(forItem, pingType);
+			}
+		}
+	}
+
+	public override void ProcessMissionEvent(BasePlayer playerFor, BaseMission.MissionInstance instance, int index, BaseMission.MissionEventType type, BaseMission.MissionEventPayload payload, float amount)
+	{
+		base.ProcessMissionEvent(playerFor, instance, index, type, payload, amount);
+		if (type != BaseMission.MissionEventType.HARVEST || IsCompleted(index, instance) || !CanProgress(index, instance))
 		{
 			return;
 		}
-		string[] array = itemShortnames;
+		ItemDefinition[] array = targetItems;
 		for (int i = 0; i < array.Length; i++)
 		{
-			if (array[i] == identifier)
+			if (array[i].itemid == payload.IntIdentifier)
 			{
-				instance.objectiveStatuses[index].genericInt1 += (int)amount;
-				if (instance.objectiveStatuses[index].genericInt1 >= targetItemAmount)
+				instance.objectiveStatuses[index].progressCurrent += (int)amount;
+				if (instance.objectiveStatuses[index].progressCurrent >= (float)targetItemAmount)
 				{
 					CompleteObjective(index, instance, playerFor);
-					playerFor.MissionDirty();
 				}
+				playerFor.MissionDirty();
 				break;
 			}
 		}
 	}
 
-	public override void Think(int index, BaseMission.MissionInstance instance, BasePlayer assignee, float delta)
+	public override void ObjectiveCompleted(BasePlayer playerFor, int index, BaseMission.MissionInstance instance)
 	{
-		base.Think(index, instance, assignee, delta);
+		base.ObjectiveCompleted(playerFor, index, instance);
+		if (pingResourceDispensers != null)
+		{
+			ItemDefinition[] array = pingResourceDispensers;
+			foreach (ItemDefinition forItem in array)
+			{
+				playerFor.DisableResourcePings(forItem, pingType);
+			}
+		}
 	}
 }

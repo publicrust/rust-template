@@ -12,6 +12,4 @@ public class LootPanelHorse : LootPanel
 	public Text healthText;
 
 	public GameObject[] storageSlots;
-
-	public GameObject storageWindow;
 }

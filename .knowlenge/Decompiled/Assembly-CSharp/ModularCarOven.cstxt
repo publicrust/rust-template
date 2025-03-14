@@ -31,7 +31,7 @@ public class ModularCarOven : BaseOven
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - SVSwitch "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SVSwitch ");
 				}
 				using (TimeWarning.New("SVSwitch"))
 				{
@@ -74,7 +74,7 @@ public class ModularCarOven : BaseOven
 
 	protected override void SVSwitch(RPCMessage msg)
 	{
-		if (!(ModuleParent == null) && ModuleParent.CanBeLooted(msg.player) && !WaterLevel.Test(base.transform.position))
+		if (!(ModuleParent == null) && ModuleParent.CanBeLooted(msg.player) && !WaterLevel.Test(base.transform.position, waves: true, volumes: false))
 		{
 			base.SVSwitch(msg);
 		}
@@ -92,7 +92,7 @@ public class ModularCarOven : BaseOven
 	protected override void OnCooked()
 	{
 		base.OnCooked();
-		if (WaterLevel.Test(base.transform.position))
+		if (WaterLevel.Test(base.transform.position, waves: true, volumes: false))
 		{
 			StopCooking();
 		}

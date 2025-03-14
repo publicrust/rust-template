@@ -17,6 +17,9 @@ public abstract class LODComponent : BaseMonoBehaviour, IClientComponent, ILOD
 
 		[Tooltip("Show culling bounds via gizmos; editor only")]
 		public bool showBounds;
+
+		[Tooltip("Force Occludee always visible?")]
+		public bool forceVisible;
 	}
 
 	public LODDistanceMode DistanceMode;
@@ -26,6 +29,7 @@ public abstract class LODComponent : BaseMonoBehaviour, IClientComponent, ILOD
 		isDynamic = false,
 		dynamicUpdateInterval = 0.2f,
 		shadowRangeScale = 3f,
-		showBounds = false
+		showBounds = false,
+		forceVisible = false
 	};
 }

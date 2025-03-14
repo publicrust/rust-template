@@ -2,11 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Permissions;
+using System.Text;
 using System.Text.RegularExpressions;
-using Mono.Posix;
+using Mono.Unix.Native;
 using Oxide.Core;
 using Oxide.Core.Libraries;
 using Oxide.Core.Plugins.Watchers;
+using Oxide.Pooling;
 
 public sealed class FSWatcher : PluginChangeWatcher
 {
@@ -27,8 +29,11 @@ public sealed class FSWatcher : PluginChangeWatcher
 
 	private Dictionary<string, FileSystemWatcher> m_symlinkWatchers = new Dictionary<string, FileSystemWatcher>();
 
+	private IPoolProvider<StringBuilder> StringPool { get; }
+
 	public FSWatcher(string directory, string filter)
 	{
+		StringPool = Interface.Oxide.PoolFactory.GetProvider<StringBuilder>();
 		watchedPlugins = new HashSet<string>();
 		changeQueue = new Dictionary<string, QueuedChange>();
 		timers = Interface.Oxide.GetLibrary<Timer>();
@@ -62,18 +67,36 @@ public sealed class FSWatcher : PluginChangeWatcher
 	[PermissionSet(SecurityAction.Demand, Name = "FullTrust")]
 	private void LoadWatcherSymlink(string path)
 	{
-		string path2 = Syscall.readlink(path);
-		string directoryName = Path.GetDirectoryName(path2);
-		string fileName = Path.GetFileName(path2);
-		FileSystemWatcher fileSystemWatcher = new FileSystemWatcher(directoryName, fileName);
-		m_symlinkWatchers[path] = fileSystemWatcher;
-		fileSystemWatcher.Changed += symlinkTarget_Changed;
-		fileSystemWatcher.Created += symlinkTarget_Changed;
-		fileSystemWatcher.Deleted += symlinkTarget_Changed;
-		fileSystemWatcher.Error += watcher_Error;
-		fileSystemWatcher.NotifyFilter = NotifyFilters.LastWrite;
-		fileSystemWatcher.IncludeSubdirectories = false;
-		fileSystemWatcher.EnableRaisingEvents = true;
+		StringBuilder stringBuilder = StringPool.Take();
+		try
+		{
+			int num = Syscall.readlink(path, stringBuilder);
+			if (num == -1)
+			{
+				Errno lastError = Stdlib.GetLastError();
+				if (lastError != Errno.EINVAL)
+				{
+					throw new IOException($"Unable to process symlink | {lastError}", (int)lastError);
+				}
+				return;
+			}
+			string path2 = stringBuilder.ToString(0, num);
+			string directoryName = Path.GetDirectoryName(path2);
+			string fileName = Path.GetFileName(path2);
+			FileSystemWatcher fileSystemWatcher = new FileSystemWatcher(directoryName, fileName);
+			m_symlinkWatchers[path] = fileSystemWatcher;
+			fileSystemWatcher.Changed += symlinkTarget_Changed;
+			fileSystemWatcher.Created += symlinkTarget_Changed;
+			fileSystemWatcher.Deleted += symlinkTarget_Changed;
+			fileSystemWatcher.Error += watcher_Error;
+			fileSystemWatcher.NotifyFilter = NotifyFilters.LastWrite;
+			fileSystemWatcher.IncludeSubdirectories = false;
+			fileSystemWatcher.EnableRaisingEvents = true;
+		}
+		finally
+		{
+			StringPool.Return(stringBuilder);
+		}
 		void symlinkTarget_Changed(object sender, FileSystemEventArgs e)
 		{
 			watcher_Changed(sender, e);
@@ -88,7 +111,7 @@ public sealed class FSWatcher : PluginChangeWatcher
 		watcher.Created += watcher_Changed;
 		watcher.Deleted += watcher_Changed;
 		watcher.Error += watcher_Error;
-		watcher.NotifyFilter = NotifyFilters.LastWrite;
+		watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite;
 		watcher.IncludeSubdirectories = true;
 		watcher.EnableRaisingEvents = true;
 		GC.KeepAlive(watcher);

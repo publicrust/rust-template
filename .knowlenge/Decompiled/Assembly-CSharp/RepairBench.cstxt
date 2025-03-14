@@ -18,7 +18,7 @@ public class RepairBench : StorageContainer
 
 	public const float REPAIR_COST_FRACTION = 0.2f;
 
-	private float nextSkinChangeTime;
+	private float nextSkinChangeAudioTime;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -29,7 +29,7 @@ public class RepairBench : StorageContainer
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - ChangeSkin "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - ChangeSkin ");
 				}
 				using (TimeWarning.New("ChangeSkin"))
 				{
@@ -65,7 +65,7 @@ public class RepairBench : StorageContainer
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RepairItem "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - RepairItem ");
 				}
 				using (TimeWarning.New("RepairItem"))
 				{
@@ -112,6 +112,11 @@ public class RepairBench : StorageContainer
 
 	public static void GetRepairCostList(ItemBlueprint bp, List<ItemAmount> allIngredients)
 	{
+		ItemModRepair itemModRepair = bp.targetItem?.GetComponent<ItemModRepair>();
+		if (itemModRepair != null && itemModRepair.canUseRepairBench)
+		{
+			return;
+		}
 		foreach (ItemAmount ingredient in bp.ingredients)
 		{
 			allIngredients.Add(new ItemAmount(ingredient.itemDef, ingredient.amount));
@@ -119,7 +124,7 @@ public class RepairBench : StorageContainer
 		StripComponentRepairCost(allIngredients);
 	}
 
-	public static void StripComponentRepairCost(List<ItemAmount> allIngredients)
+	public static void StripComponentRepairCost(List<ItemAmount> allIngredients, float repairCostMultiplier = 1f)
 	{
 		if (allIngredients == null)
 		{
@@ -128,7 +133,7 @@ public class RepairBench : StorageContainer
 		for (int i = 0; i < allIngredients.Count; i++)
 		{
 			ItemAmount itemAmount = allIngredients[i];
-			if (itemAmount.itemDef.category != ItemCategory.Component)
+			if (itemAmount.itemDef.category != ItemCategory.Component && !itemAmount.itemDef.treatAsComponentForRepairs)
 			{
 				continue;
 			}
@@ -140,14 +145,14 @@ public class RepairBench : StorageContainer
 				{
 					if (allIngredient.itemDef == itemAmount2.itemDef)
 					{
-						allIngredient.amount += itemAmount2.amount * itemAmount.amount;
+						allIngredient.amount += Mathf.Max(itemAmount2.amount * itemAmount.amount * repairCostMultiplier, 1f);
 						flag = true;
 						break;
 					}
 				}
 				if (!flag)
 				{
-					allIngredients.Add(new ItemAmount(itemAmount2.itemDef, itemAmount2.amount * itemAmount.amount));
+					allIngredients.Add(new ItemAmount(itemAmount2.itemDef, Mathf.Max(itemAmount2.amount * itemAmount.amount * repairCostMultiplier, 1f)));
 				}
 			}
 			allIngredients.RemoveAt(i);
@@ -167,23 +172,22 @@ public class RepairBench : StorageContainer
 	[RPC_Server.IsVisible(3f)]
 	public void ChangeSkin(RPCMessage msg)
 	{
-		if (UnityEngine.Time.realtimeSinceStartup < nextSkinChangeTime)
-		{
-			return;
-		}
 		BasePlayer player = msg.player;
 		int num = msg.read.Int32();
+		ItemId itemId = new ItemId(msg.read.UInt64());
+		bool isValid = itemId.IsValid;
+		bool flag = !isValid || UnityEngine.Time.realtimeSinceStartup > nextSkinChangeAudioTime;
 		Item slot = base.inventory.GetSlot(0);
-		if (slot == null || Interface.CallHook("OnItemSkinChange", num, slot, this, msg.player) != null)
+		if (slot == null || Interface.CallHook("OnItemSkinChange", num, slot, this, player) != null || (isValid && slot.uid != itemId))
 		{
 			return;
 		}
-		bool flag = false;
+		bool flag2 = false;
 		if (msg.player.UnlockAllSkins)
 		{
-			flag = true;
+			flag2 = true;
 		}
-		if (num != 0 && !flag && !player.blueprints.CheckSkinOwnership(num, player.userID))
+		if (num != 0 && !flag2 && !player.blueprints.CheckSkinOwnership(num, player.userID))
 		{
 			debugprint("RepairBench.ChangeSkin player does not have item :" + num + ":");
 			return;
@@ -194,7 +198,10 @@ public class RepairBench : StorageContainer
 			debugprint("RepairBench.ChangeSkin cannot apply same skin twice : " + Skin + ": " + slot.skin);
 			return;
 		}
-		nextSkinChangeTime = UnityEngine.Time.realtimeSinceStartup + 0.75f;
+		if (flag)
+		{
+			nextSkinChangeAudioTime = UnityEngine.Time.realtimeSinceStartup + 0.75f;
+		}
 		ItemSkinDirectory.Skin skin = slot.info.skins.FirstOrDefault((ItemSkinDirectory.Skin x) => (ulong)x.id == Skin);
 		if (slot.info.isRedirectOf != null)
 		{
@@ -205,25 +212,29 @@ public class RepairBench : StorageContainer
 		if (((bool)itemSkin && (itemSkin.Redirect != null || slot.info.isRedirectOf != null)) || (!itemSkin && slot.info.isRedirectOf != null))
 		{
 			ItemDefinition template = ((itemSkin != null) ? itemSkin.Redirect : slot.info.isRedirectOf);
-			bool flag2 = false;
+			bool flag3 = false;
 			if (itemSkin != null && itemSkin.Redirect == null && slot.info.isRedirectOf != null)
 			{
 				template = slot.info.isRedirectOf;
-				flag2 = num != 0;
+				flag3 = num != 0;
 			}
 			float condition = slot.condition;
 			float maxCondition = slot.maxCondition;
 			int amount = slot.amount;
-			int contents = 0;
+			int ammoCount = 0;
 			ItemDefinition ammoType = null;
 			if (slot.GetHeldEntity() != null && slot.GetHeldEntity() is BaseProjectile { primaryMagazine: not null } baseProjectile)
 			{
-				contents = baseProjectile.primaryMagazine.contents;
+				ammoCount = baseProjectile.primaryMagazine.contents;
 				ammoType = baseProjectile.primaryMagazine.ammoType;
 			}
-			List<Item> obj = Facepunch.Pool.GetList<Item>();
+			List<Item> obj = Facepunch.Pool.Get<List<Item>>();
 			if (slot.contents != null && slot.contents.itemList != null && slot.contents.itemList.Count > 0)
 			{
+				if (slot.contents.itemList.Count > obj.Capacity)
+				{
+					obj.Capacity = slot.contents.itemList.Count;
+				}
 				foreach (Item item2 in slot.contents.itemList)
 				{
 					obj.Add(item2);
@@ -244,7 +255,7 @@ public class RepairBench : StorageContainer
 			{
 				if (baseProjectile2.primaryMagazine != null)
 				{
-					baseProjectile2.primaryMagazine.contents = contents;
+					baseProjectile2.SetAmmoCount(ammoCount);
 					baseProjectile2.primaryMagazine.ammoType = ammoType;
 				}
 				baseProjectile2.ForceModsChanged();
@@ -256,8 +267,8 @@ public class RepairBench : StorageContainer
 					item4.MoveToContainer(item.contents);
 				}
 			}
-			Facepunch.Pool.FreeList(ref obj);
-			if (flag2)
+			Facepunch.Pool.Free(ref obj, freeElements: false);
+			if (flag3)
 			{
 				ApplySkinToItem(item, Skin);
 			}
@@ -270,7 +281,7 @@ public class RepairBench : StorageContainer
 			Facepunch.Rust.Analytics.Server.SkinUsed(slot.info.shortname, num);
 			Facepunch.Rust.Analytics.Azure.OnSkinChanged(player, this, slot, Skin);
 		}
-		if (skinchangeEffect.isValid)
+		if (flag && skinchangeEffect.isValid)
 		{
 			Effect.server.Run(skinchangeEffect.resourcePath, this, 0u, new Vector3(0f, 1.5f, 0f), Vector3.zero);
 		}
@@ -293,11 +304,20 @@ public class RepairBench : StorageContainer
 	public void RepairItem(RPCMessage msg)
 	{
 		Item slot = base.inventory.GetSlot(0);
-		BasePlayer player = msg.player;
-		RepairAnItem(slot, player, this, maxConditionLostOnRepair, mustKnowBlueprint: true);
+		if (slot != null)
+		{
+			BasePlayer player = msg.player;
+			float conditionLost = maxConditionLostOnRepair;
+			ItemModRepair component = slot.info.GetComponent<ItemModRepair>();
+			if (component != null)
+			{
+				conditionLost = component.conditionLost;
+			}
+			RepairAnItem(slot, player, this, conditionLost, mustKnowBlueprint: true);
+		}
 	}
 
-	public override int GetIdealSlot(BasePlayer player, Item item)
+	public override int GetIdealSlot(BasePlayer player, ItemContainer container, Item item)
 	{
 		return 0;
 	}
@@ -310,7 +330,12 @@ public class RepairBench : StorageContainer
 		}
 		ItemDefinition info = itemToRepair.info;
 		ItemBlueprint component = info.GetComponent<ItemBlueprint>();
-		if (!component || !info.condition.repairable || itemToRepair.condition == itemToRepair.maxCondition)
+		if (!component)
+		{
+			return;
+		}
+		ItemModRepair component2 = itemToRepair.info.GetComponent<ItemModRepair>();
+		if (!info.condition.repairable || itemToRepair.condition == itemToRepair.maxCondition)
 		{
 			return;
 		}
@@ -328,7 +353,7 @@ public class RepairBench : StorageContainer
 		}
 		float num = RepairCostFraction(itemToRepair);
 		bool flag = false;
-		List<ItemAmount> obj = Facepunch.Pool.GetList<ItemAmount>();
+		List<ItemAmount> obj = Facepunch.Pool.Get<List<ItemAmount>>();
 		GetRepairCostList(component, obj);
 		foreach (ItemAmount item in obj)
 		{
@@ -344,7 +369,7 @@ public class RepairBench : StorageContainer
 		}
 		if (flag)
 		{
-			Facepunch.Pool.FreeList(ref obj);
+			Facepunch.Pool.FreeUnmanaged(ref obj);
 			return;
 		}
 		foreach (ItemAmount item2 in obj)
@@ -356,7 +381,7 @@ public class RepairBench : StorageContainer
 				Facepunch.Rust.Analytics.Azure.LogResource(Facepunch.Rust.Analytics.Azure.ResourceMode.Consumed, "repair", item2.itemDef.shortname, amount2, repairBenchEntity, null, safezone: false, null, 0uL, null, itemToRepair);
 			}
 		}
-		Facepunch.Pool.FreeList(ref obj);
+		Facepunch.Pool.FreeUnmanaged(ref obj);
 		float conditionNormalized = itemToRepair.conditionNormalized;
 		float maxConditionNormalized = itemToRepair.maxConditionNormalized;
 		itemToRepair.DoRepair(maxConditionLostOnRepair);
@@ -365,6 +390,11 @@ public class RepairBench : StorageContainer
 		{
 			Debug.Log("Item repaired! condition : " + itemToRepair.condition + "/" + itemToRepair.maxCondition);
 		}
-		Effect.server.Run("assets/bundled/prefabs/fx/repairbench/itemrepair.prefab", repairBenchEntity, 0u, Vector3.zero, Vector3.zero);
+		string strName = "assets/bundled/prefabs/fx/repairbench/itemrepair.prefab";
+		if (component2 != null && component2.successEffect?.Get() != null)
+		{
+			strName = component2.successEffect.resourcePath;
+		}
+		Effect.server.Run(strName, repairBenchEntity, 0u, Vector3.zero, Vector3.zero);
 	}
 }

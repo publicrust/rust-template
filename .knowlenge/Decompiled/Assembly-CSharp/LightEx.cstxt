@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 public class LightEx : UpdateBehaviour, IClientComponent
@@ -27,6 +28,8 @@ public class LightEx : UpdateBehaviour, IClientComponent
 	public bool randomOffset;
 
 	public float randomIntensityStartScale = -1f;
+
+	public List<Light> syncLights = new List<Light>(0);
 
 	protected void OnValidate()
 	{

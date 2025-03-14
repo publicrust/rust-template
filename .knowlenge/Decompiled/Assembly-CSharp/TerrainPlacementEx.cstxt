@@ -6,10 +6,13 @@ public static class TerrainPlacementEx
 	{
 		if (placements.Length != 0)
 		{
-			Matrix4x4 localToWorld = Matrix4x4.TRS(pos, rot, scale);
-			Matrix4x4 inverse = localToWorld.inverse;
 			for (int i = 0; i < placements.Length; i++)
 			{
+				TerrainPlacement terrainPlacement = placements[i];
+				Vector3 pos2 = pos + rot * Vector3.Scale(terrainPlacement.worldPosition, scale);
+				Quaternion q = rot * terrainPlacement.worldRotation;
+				Matrix4x4 localToWorld = Matrix4x4.TRS(pos2, q, scale);
+				Matrix4x4 inverse = localToWorld.inverse;
 				placements[i].Apply(localToWorld, inverse);
 			}
 		}

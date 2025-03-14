@@ -1,7 +1,7 @@
 using UnityEngine;
 using UnityEngine.UI;
 
-public class VendingMachineScreen : MonoBehaviour
+public class VendingMachineScreen : MonoBehaviour, INotifyLOD, IClientComponent
 {
 	public enum vmScreenState
 	{
@@ -36,7 +36,5 @@ public class VendingMachineScreen : MonoBehaviour
 
 	public Renderer light2;
 
-	public float nextImageTime;
-
-	public int currentImageIndex;
+	public bool isUpdatedWithNotifySystem;
 }

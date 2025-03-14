@@ -218,7 +218,7 @@ public class CoverageQueries : MonoBehaviour
 		public bool IsRegistered => intern.id >= 0;
 	}
 
-	public bool debug;
-
 	public float depthBias = -0.1f;
+
+	public bool debug;
 }

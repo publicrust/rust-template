@@ -1,11 +1,15 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Threading.Tasks;
+using Cysharp.Text;
 using Network;
+using Rust;
+using Steamworks;
 using UnityEngine;
 
 public class AzureWebInterface
@@ -13,6 +17,8 @@ public class AzureWebInterface
 	public static readonly AzureWebInterface client = new AzureWebInterface(isClient: true);
 
 	public static readonly AzureWebInterface server = new AzureWebInterface(isClient: false);
+
+	private AzureAnalyticsUploader GameplayBulkUploader;
 
 	public bool IsClient;
 
@@ -24,7 +30,7 @@ public class AzureWebInterface
 
 	private DateTime nextFlush;
 
-	private List<EventRecord> pending = new List<EventRecord>();
+	private ConcurrentQueue<EventRecord> uploadQueue = new ConcurrentQueue<EventRecord>();
 
 	private HttpClient HttpClient = new HttpClient();
 
@@ -33,150 +39,108 @@ public class AzureWebInterface
 		CharSet = Encoding.UTF8.WebName
 	};
 
-	public int PendingCount => pending.Count;
+	public int PendingCount => uploadQueue.Count;
 
 	public AzureWebInterface(bool isClient)
 	{
 		IsClient = isClient;
+		Task.Run((Func<Task>)UploadSchedulingThread);
 	}
 
 	public void EnqueueEvent(EventRecord point)
 	{
-		DateTime utcNow = DateTime.UtcNow;
-		pending.Add(point);
-		if (pending.Count > FlushSize || utcNow > nextFlush)
+		if (!IsClient && !string.IsNullOrEmpty(BulkUploadConnectionString))
 		{
-			nextFlush = utcNow.Add(FlushDelay);
-			List<EventRecord> toUpload = pending;
-			Task.Run(async delegate
+			if (GameplayBulkUploader.NeedsCreation())
 			{
-				await UploadAsync(toUpload);
-			});
-			pending = Pool.GetList<EventRecord>();
+				GameplayBulkUploader = AzureAnalyticsUploader.Create("gameplay_events", TimeSpan.FromMinutes(5.0));
+				GameplayBulkUploader.UseJsonDataObject = true;
+			}
+			GameplayBulkUploader.Append(point);
+		}
+		else
+		{
+			point.MarkSubmitted();
+			uploadQueue.Enqueue(point);
+		}
+	}
+
+	private async Task UploadSchedulingThread()
+	{
+		while (!global::Rust.Application.isQuitting)
+		{
+			try
+			{
+				DateTime utcNow = DateTime.UtcNow;
+				if (uploadQueue.IsEmpty || (uploadQueue.Count < FlushSize && nextFlush > utcNow))
+				{
+					await Task.Delay(1000);
+					continue;
+				}
+				nextFlush = utcNow.Add(FlushDelay);
+				List<EventRecord> list = Pool.Get<List<EventRecord>>();
+				EventRecord result;
+				while (uploadQueue.TryDequeue(out result))
+				{
+					list.Add(result);
+				}
+				Task.Run(async delegate
+				{
+					await UploadAsync(list);
+				});
+			}
+			catch (Exception exception)
+			{
+				Debug.LogException(exception);
+				await Task.Delay(1000);
+			}
 		}
 	}
 
 	private void SerializeEvents(List<EventRecord> records, MemoryStream stream)
 	{
 		int num = 0;
-		using StreamWriter streamWriter = new StreamWriter(stream, Encoding.UTF8, 1024, leaveOpen: true);
-		streamWriter.Write("[");
-		foreach (EventRecord record in records)
+		Utf8ValueStringBuilder writer = ZString.CreateUtf8StringBuilder();
+		try
 		{
-			SerializeEvent(record, streamWriter, num);
-			num++;
-		}
-		streamWriter.Write("]");
-		streamWriter.Flush();
-	}
-
-	private void SerializeEvent(EventRecord record, StreamWriter writer, int index)
-	{
-		if (index > 0)
-		{
-			writer.Write(',');
-		}
-		writer.Write("{\"Timestamp\":\"");
-		writer.Write(record.Timestamp.ToString("o"));
-		writer.Write("\",\"Data\":{");
-		bool flag = true;
-		foreach (EventRecordField datum in record.Data)
-		{
-			if (flag)
+			writer.Append("[");
+			foreach (EventRecord record in records)
 			{
-				flag = false;
-			}
-			else
-			{
-				writer.Write(',');
-			}
-			writer.Write("\"");
-			writer.Write(datum.Key1);
-			if (datum.Key2 != null)
-			{
-				writer.Write(datum.Key2);
-			}
-			writer.Write("\":");
-			if (!datum.IsObject)
-			{
-				writer.Write('"');
-			}
-			if (datum.String != null)
-			{
-				if (datum.IsObject)
+				if (num > 0)
 				{
-					writer.Write(datum.String);
+					writer.Append(',');
 				}
-				else
-				{
-					string @string = datum.String;
-					int length = datum.String.Length;
-					for (int i = 0; i < length; i++)
-					{
-						char c = @string[i];
-						switch (c)
-						{
-						case '"':
-						case '\\':
-							writer.Write('\\');
-							writer.Write(c);
-							break;
-						case '\n':
-							writer.Write("\\n");
-							break;
-						case '\r':
-							writer.Write("\\r");
-							break;
-						case '\t':
-							writer.Write("\\t");
-							break;
-						default:
-							writer.Write(c);
-							break;
-						}
-					}
-				}
+				record.SerializeAsJson(ref writer);
+				num++;
 			}
-			else if (datum.Float.HasValue)
-			{
-				writer.Write(datum.Float.Value);
-			}
-			else if (datum.Number.HasValue)
-			{
-				writer.Write(datum.Number.Value);
-			}
-			else if (datum.Guid.HasValue)
-			{
-				writer.Write(datum.Guid.Value.ToString("N"));
-			}
-			else if (datum.Vector.HasValue)
-			{
-				writer.Write('(');
-				Vector3 value = datum.Vector.Value;
-				writer.Write(value.x);
-				writer.Write(',');
-				writer.Write(value.y);
-				writer.Write(',');
-				writer.Write(value.z);
-				writer.Write(')');
-			}
-			if (!datum.IsObject)
-			{
-				writer.Write("\"");
-			}
+			writer.Append("]");
+			writer.WriteTo(stream);
 		}
-		writer.Write('}');
-		writer.Write('}');
+		finally
+		{
+			writer.Dispose();
+		}
 	}
 
 	private async Task UploadAsync(List<EventRecord> records)
 	{
+		if (!(IsClient ? (Application.Manifest?.Features?.ClientAnalytics == true) : (Application.Manifest?.Features?.ServerAnalytics == true)))
+		{
+			Pool.Free(ref records, freeElements: true);
+			return;
+		}
+		if (records.Count == 0)
+		{
+			Pool.Free(ref records, freeElements: false);
+			return;
+		}
 		MemoryStream stream = Pool.Get<MemoryStream>();
 		stream.Position = 0L;
 		stream.SetLength(0L);
 		try
 		{
 			SerializeEvents(records, stream);
+			AuthTicket ticket = null;
 			for (int attempt = 0; attempt < MaxRetries; attempt++)
 			{
 				try
@@ -197,7 +161,6 @@ public class AzureWebInterface
 						content.Headers.Add("X-SERVER-PORT", Net.sv.port.ToString());
 					}
 					(await HttpClient.PostAsync(IsClient ? ClientAnalyticsUrl : ServerAnalyticsUrl, content)).EnsureSuccessStatusCode();
-					break;
 				}
 				catch (Exception ex)
 				{
@@ -205,29 +168,38 @@ public class AzureWebInterface
 					{
 						Debug.LogException(ex);
 					}
+					goto IL_028f;
+				}
+				break;
+				IL_028f:
+				if (ticket != null)
+				{
+					try
+					{
+						ticket.Cancel();
+					}
+					catch (Exception ex2)
+					{
+						Debug.LogError("Failed to cancel auth ticket in analytics: " + ex2.ToString());
+					}
 				}
 			}
 		}
-		catch (Exception ex2)
+		catch (Exception ex3)
 		{
 			if (IsClient)
 			{
-				Debug.LogWarning(ex2.ToString());
+				Debug.LogWarning(ex3.ToString());
 			}
 			else
 			{
-				Debug.LogException(ex2);
+				Debug.LogException(ex3);
 			}
 		}
 		finally
 		{
-			foreach (EventRecord record in records)
-			{
-				EventRecord obj = record;
-				Pool.Free(ref obj);
-			}
-			Pool.FreeList(ref records);
-			Pool.FreeMemoryStream(ref stream);
+			Pool.Free(ref records, freeElements: true);
+			Pool.FreeUnmanaged(ref stream);
 		}
 	}
 }

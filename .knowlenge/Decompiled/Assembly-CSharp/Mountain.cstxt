@@ -4,6 +4,10 @@ public class Mountain : TerrainPlacement
 {
 	public float Fade = 10f;
 
+	public bool AutoCliffSplat;
+
+	public bool AutoCliffTopology = true;
+
 	protected void OnDrawGizmosSelected()
 	{
 		Vector3 vector = Vector3.up * (0.5f * Fade);
@@ -61,6 +65,10 @@ public class Mountain : TerrainPlacement
 		Vector3 v4 = localToWorld.MultiplyPoint3x4(offset + new Vector3(extents.x, 0f, extents.z));
 		TerrainMeta.SplatMap.ForEachParallel(v, v2, v3, v4, delegate(int x, int z)
 		{
+			if (AutoCliffSplat)
+			{
+				GenerateCliffSplat.Process(x, z);
+			}
 			float normZ = TerrainMeta.SplatMap.Coordinate(z);
 			float normX = TerrainMeta.SplatMap.Coordinate(x);
 			Vector3 point = new Vector3(TerrainMeta.DenormalizeX(normX), 0f, TerrainMeta.DenormalizeZ(normZ));
@@ -170,7 +178,10 @@ public class Mountain : TerrainPlacement
 		Vector3 v4 = localToWorld.MultiplyPoint3x4(offset + new Vector3(extents.x, 0f, extents.z));
 		TerrainMeta.TopologyMap.ForEachParallel(v, v2, v3, v4, delegate(int x, int z)
 		{
-			GenerateCliffTopology.Process(x, z);
+			if (AutoCliffTopology)
+			{
+				GenerateCliffTopology.Process(x, z);
+			}
 			float normZ = TerrainMeta.TopologyMap.Coordinate(z);
 			float normX = TerrainMeta.TopologyMap.Coordinate(x);
 			Vector3 point = new Vector3(TerrainMeta.DenormalizeX(normX), 0f, TerrainMeta.DenormalizeZ(normZ));

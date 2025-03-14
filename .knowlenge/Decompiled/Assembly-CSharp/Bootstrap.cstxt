@@ -1,13 +1,18 @@
+using System;
 using System.Collections;
+using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using CompanionServer;
 using ConVar;
 using Facepunch;
 using Facepunch.Network;
 using Facepunch.Network.Raknet;
 using Facepunch.Rust;
+using Facepunch.Rust.Profiling;
 using Facepunch.Utility;
 using Network;
 using Oxide.Core;
@@ -45,7 +50,7 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 			{
 				return true;
 			}
-			if (Object.FindObjectsOfType<GameSetup>().Count() > 0)
+			if (UnityEngine.Object.FindObjectsOfType<GameSetup>().Count() > 0)
 			{
 				return true;
 			}
@@ -68,12 +73,14 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		GameSetup.RunOnce = true;
 		bootstrapInitRun = true;
 		ConsoleSystem.Index.Initialize(ConsoleGen.All);
+		ConsoleSystem.Index.Reset();
 		UnityButtons.Register();
 		Output.Install();
 		Facepunch.Pool.ResizeBuffer<NetRead>(16384);
 		Facepunch.Pool.ResizeBuffer<NetWrite>(16384);
 		Facepunch.Pool.ResizeBuffer<Networkable>(65536);
 		Facepunch.Pool.ResizeBuffer<EntityLink>(65536);
+		Facepunch.Pool.ResizeBuffer<EventRecord>(16384);
 		Facepunch.Pool.FillBuffer<Networkable>();
 		Facepunch.Pool.FillBuffer<EntityLink>();
 		if (Facepunch.CommandLine.HasSwitch("-nonetworkthread"))
@@ -103,6 +110,31 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 			WriteToLog("Command Line: " + text);
 		}
 		Interface.Initialize();
+		int parentProcessId = Facepunch.CommandLine.GetSwitchInt("-parent-pid", 0);
+		if (parentProcessId != 0)
+		{
+			try
+			{
+				SynchronizationContext syncContext = SynchronizationContext.Current;
+				Process processById = Process.GetProcessById(parentProcessId);
+				processById.EnableRaisingEvents = true;
+				processById.Exited += delegate
+				{
+					syncContext.Post(delegate
+					{
+						WriteToLog($"Parent process ID {parentProcessId} exited. Exiting the server now...");
+						ConsoleSystem.Run(ConsoleSystem.Option.Server, "quit");
+					}, null);
+				};
+				WriteToLog($"Watching parent process ID {parentProcessId}...");
+			}
+			catch (ArgumentException)
+			{
+				WriteToLog($"Parent process ID {parentProcessId} has exited during boot! Exiting now...");
+				Rust.Application.Quit();
+			}
+		}
+		UnityHookHandler.EnsureCreated();
 	}
 
 	public static void Init_Systems()
@@ -125,6 +157,20 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		ConsoleSystem.UpdateValuesFromCommandLine();
 		ConsoleSystem.Run(ConsoleSystem.Option.Server, "server.readcfg");
 		ServerUsers.Load();
+		if (string.IsNullOrEmpty(ConVar.Server.server_id))
+		{
+			ConVar.Server.server_id = Guid.NewGuid().ToString("N");
+			ConsoleSystem.Run(ConsoleSystem.Option.Server, "server.writecfg");
+		}
+		if (Facepunch.CommandLine.HasSwitch("-server-occlusion"))
+		{
+			ServerOcclusion.OcclusionEnabled = true;
+		}
+		HttpManager.UpdateMaxConnections();
+		if (!RuntimeProfiler.runtime_profiling_persist)
+		{
+			RuntimeProfiler.Disable();
+		}
 	}
 
 	public static void NetworkInitRaknet()
@@ -140,6 +186,7 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 	private IEnumerator Start()
 	{
 		WriteToLog("Bootstrap Startup");
+		EarlyInitialize();
 		BenchmarkTimer.Enabled = Facepunch.Utility.CommandLine.Full.Contains("+autobench");
 		BenchmarkTimer timer = BenchmarkTimer.New("bootstrap");
 		if (!UnityEngine.Application.isEditor)
@@ -248,15 +295,17 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		yield return CoroutineEx.waitForEndOfFrame;
 		yield return CoroutineEx.waitForEndOfFrame;
 		GameManifest.LoadAssets();
+		WriteToLog("Initializing Nexus");
+		yield return StartCoroutine(StartNexusServer());
 		WriteToLog("Loading Scene");
 		yield return CoroutineEx.waitForEndOfFrame;
 		yield return CoroutineEx.waitForEndOfFrame;
-		UnityEngine.Physics.solverIterationCount = 3;
+		UnityEngine.Physics.defaultSolverIterations = 3;
 		int @int = PlayerPrefs.GetInt("UnityGraphicsQuality");
 		QualitySettings.SetQualityLevel(0);
 		PlayerPrefs.SetInt("UnityGraphicsQuality", @int);
-		Object.DontDestroyOnLoad(base.gameObject);
-		Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/server_console.prefab"));
+		UnityEngine.Object.DontDestroyOnLoad(base.gameObject);
+		UnityEngine.Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/server_console.prefab"));
 		StartupShared();
 		World.InitSize(ConVar.Server.worldsize);
 		World.InitSeed(ConVar.Server.seed);
@@ -269,12 +318,43 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		string[] assetList = FileSystem_Warmup.GetAssetList(null);
 		yield return StartCoroutine(FileSystem_Warmup.Run(assetList, WriteToLog, "Asset Warmup ({0}/{1})"));
 		yield return StartCoroutine(StartServer(!Facepunch.CommandLine.HasSwitch("-skipload"), "", allowOutOfDateSaves: false));
-		if (!Object.FindObjectOfType<Performance>())
+		if (!UnityEngine.Object.FindObjectOfType<Performance>())
 		{
-			Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/performance.prefab"));
+			UnityEngine.Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/performance.prefab"));
 		}
 		Rust.GC.Collect();
+		DemoConVars.Level = LevelManager.CurrentLevelName;
+		DemoConVars.Seed = World.Seed.ToString();
+		DemoConVars.WorldSize = World.Size.ToString();
+		DemoConVars.LevelUrl = World.Url;
+		DemoConVars.Checksum = World.Checksum;
+		DemoConVars.Hostname = ConVar.Server.hostname;
+		DemoConVars.NetworkVersion = 2567;
+		DemoConVars.Changeset = BuildInfo.Current?.Scm?.ChangeId ?? "0";
 		Rust.Application.isLoading = false;
+	}
+
+	private static void EnsureRootFolderCreated()
+	{
+		try
+		{
+			Directory.CreateDirectory(ConVar.Server.rootFolder);
+		}
+		catch (Exception arg)
+		{
+			UnityEngine.Debug.LogWarning($"Failed to automatically create the save directory: {ConVar.Server.rootFolder}\n\n{arg}");
+		}
+	}
+
+	public static IEnumerator StartNexusServer()
+	{
+		EnsureRootFolderCreated();
+		yield return NexusServer.Initialize();
+		if (NexusServer.FailedToStart)
+		{
+			UnityEngine.Debug.LogError("Nexus server failed to start, terminating");
+			Rust.Application.Quit();
+		}
 	}
 
 	public static IEnumerator StartServer(bool doLoad, string saveFileOverride, bool allowOutOfDateSaves)
@@ -286,6 +366,7 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		}
 		RCon.Initialize();
 		BaseEntity.Query.Server = new BaseEntity.Query.EntityTree(8096f);
+		EnsureRootFolderCreated();
 		if ((bool)SingletonComponent<WorldSetup>.Instance)
 		{
 			yield return SingletonComponent<WorldSetup>.Instance.StartCoroutine(SingletonComponent<WorldSetup>.Instance.InitCoroutine());
@@ -315,7 +396,7 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 				}
 				else
 				{
-					Debug.LogError("Failed to find DungeonGridRoot, NOT generating Dungeon navmesh");
+					UnityEngine.Debug.LogError("Failed to find DungeonGridRoot, NOT generating Dungeon navmesh");
 				}
 				if ((bool)TerrainMeta.Path && (bool)TerrainMeta.Path.DungeonBaseRoot)
 				{
@@ -327,15 +408,16 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 				}
 				else
 				{
-					Debug.LogError("Failed to find DungeonBaseRoot , NOT generating Dungeon navmesh");
+					UnityEngine.Debug.LogError("Failed to find DungeonBaseRoot , NOT generating Dungeon navmesh");
 				}
 				GenerateDungeonBase.SetupAI();
 			}
 		}
+		UnityEngine.Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/shared.prefab"));
 		GameObject gameObject = GameManager.server.CreatePrefab("assets/bundled/prefabs/system/server.prefab");
-		Object.DontDestroyOnLoad(gameObject);
+		UnityEngine.Object.DontDestroyOnLoad(gameObject);
 		ServerMgr serverMgr = gameObject.GetComponent<ServerMgr>();
-		serverMgr.Initialize(doLoad, saveFileOverride, allowOutOfDateSaves);
+		bool saveWasLoaded = serverMgr.Initialize(doLoad, saveFileOverride, allowOutOfDateSaves);
 		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
 		SaveRestore.InitializeEntityLinks();
 		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
@@ -349,12 +431,42 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
 		MissionManifest.Get();
 		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		if (Clan.enabled)
+		{
+			ClanManager clanManager = ClanManager.ServerInstance;
+			if (clanManager == null)
+			{
+				UnityEngine.Debug.LogError("ClanManager was not spawned!");
+				Rust.Application.Quit();
+				yield break;
+			}
+			Task initializeTask = clanManager.Initialize();
+			yield return new WaitUntil(() => initializeTask.IsCompleted);
+			initializeTask.Wait();
+			clanManager.LoadClanInfoForSleepers();
+		}
+		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		if (ServerOcclusion.OcclusionEnabled)
+		{
+			ServerOcclusion.SetupGrid();
+		}
+		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		if (NexusServer.Started)
+		{
+			NexusServer.UploadMapImage();
+			if (saveWasLoaded)
+			{
+				NexusServer.RestoreUnsavedState();
+			}
+			NexusServer.ZoneClient.StartListening();
+		}
 		serverMgr.OpenConnection();
 		CompanionServer.Server.Initialize();
 		using (BenchmarkTimer.New("Boombox.LoadStations"))
 		{
 			BoomBox.LoadStations();
 		}
+		RustEmojiLibrary.FindAllServerEmoji();
 		if (ConVar.Time.pausewhileloading)
 		{
 			UnityEngine.Time.timeScale = timeScale;
@@ -370,7 +482,7 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 
 	public void ThrowError(string error)
 	{
-		Debug.Log("ThrowError: " + error);
+		UnityEngine.Debug.Log("ThrowError: " + error);
 		errorPanel.SetActive(value: true);
 		errorText.text = error;
 		isErrored = true;
@@ -378,7 +490,7 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 
 	public void ExitGame()
 	{
-		Debug.Log("Exiting due to Exit Game button on bootstrap error panel");
+		UnityEngine.Debug.Log("Exiting due to Exit Game button on bootstrap error panel");
 		Rust.Application.Quit();
 	}
 
@@ -398,6 +510,58 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		{
 			DebugEx.Log(str);
 			lastWrittenValue = str;
+		}
+	}
+
+	private static void EarlyInitialize()
+	{
+	}
+
+	[Conditional("DEVELOPMENT_BUILD")]
+	private static void EncryptionSmokeTest()
+	{
+		WriteToLog("Running encryption smoke test...");
+		TestEncryption<byte>(170);
+		TestEncryption<uint>(3735928559u);
+		TestEncryption<ulong>(1311768467294899695uL);
+		HiddenValue<string> hiddenValue = new HiddenValue<string>();
+		if (hiddenValue.Get() != null)
+		{
+			UnityEngine.Debug.LogError("HiddenValue: default value is not null");
+		}
+		hiddenValue.Set("hello");
+		if (hiddenValue.Get() != "hello")
+		{
+			UnityEngine.Debug.LogError("HiddenValue: returned incorrect value after set");
+		}
+		hiddenValue.Dispose();
+		HiddenValue<string> hiddenValue2 = new HiddenValue<string>("hello");
+		if (hiddenValue2.Get() != "hello")
+		{
+			UnityEngine.Debug.LogError("HiddenValue: returned incorrect value after constructor");
+		}
+		hiddenValue2.Dispose();
+		WriteToLog("Finished encryption smoke test");
+		static void TestEncryption<T>(T value) where T : unmanaged
+		{
+			EncryptedValue<T> encryptedValue = default(EncryptedValue<T>);
+			if (object.Equals(encryptedValue.Get(), default(T)))
+			{
+				UnityEngine.Debug.LogError($"EncryptedValue<{typeof(T)}>: default value is 0 - missing encryption?");
+			}
+			else
+			{
+				encryptedValue.Set(value);
+				if (!object.Equals(encryptedValue.Get(), value))
+				{
+					UnityEngine.Debug.LogError($"EncryptedValue<{typeof(T)}>: decrypted value is {encryptedValue.Get()} - expected {value}");
+				}
+				encryptedValue = value;
+				if (!object.Equals((T)encryptedValue, value))
+				{
+					UnityEngine.Debug.LogError($"EncryptedValue<{typeof(T)}>: implicit decrypted value is {(T)encryptedValue} - expected {value}");
+				}
+			}
 		}
 	}
 }

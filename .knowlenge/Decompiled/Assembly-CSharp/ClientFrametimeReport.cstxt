@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 
+[JsonModel]
 public class ClientFrametimeReport
 {
 	public int request_id;

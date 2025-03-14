@@ -8,6 +8,7 @@ public class HumanBodyResourceDispenser : ResourceDispenser
 			if ((bool)component)
 			{
 				item.name = CreateSkullName(component.playerName);
+				item.streamerName = CreateSkullName(component.streamerName);
 				return true;
 			}
 		}

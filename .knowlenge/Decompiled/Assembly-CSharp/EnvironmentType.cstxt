@@ -12,5 +12,6 @@ public enum EnvironmentType
 	UnderwaterLab = 0x40,
 	Submarine = 0x80,
 	BuildingDark = 0x100,
-	BuildingVeryDark = 0x200
+	BuildingVeryDark = 0x200,
+	NoSunlight = 0x400
 }

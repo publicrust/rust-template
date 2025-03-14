@@ -1,0 +1,142 @@
+using System;
+using System.Collections.Generic;
+using Oxide.Core.Libraries;
+using Oxide.Core.Plugins;
+using Oxide.Ext.Discord.Clients;
+using Oxide.Ext.Discord.Entities;
+using Oxide.Ext.Discord.Exceptions;
+using Oxide.Ext.Discord.Extensions;
+using Oxide.Ext.Discord.Interfaces;
+using Oxide.Ext.Discord.Libraries;
+using Oxide.Ext.Discord.Logging;
+using Oxide.Plugins;
+
+public class DiscordSubscriptions : BaseDiscordLibrary<DiscordSubscriptions>, IDebugLoggable
+{
+	private readonly Hash<Snowflake, List<DiscordSubscription>> _subscriptions = new Hash<Snowflake, List<DiscordSubscription>>();
+
+	private readonly ILogger _logger;
+
+	internal DiscordSubscriptions(ILogger logger)
+	{
+		_logger = logger;
+	}
+
+	[LibraryFunction("HasSubscriptions")]
+	public bool HasSubscriptions()
+	{
+		return _subscriptions.Count != 0;
+	}
+
+	[LibraryFunction("AddChannelSubscription")]
+	public void AddChannelSubscription(DiscordClient client, Snowflake channelId, Action<DiscordMessage> message)
+	{
+		InvalidSnowflakeException.ThrowIfInvalid(channelId);
+		if (client == null)
+		{
+			throw new ArgumentNullException("client");
+		}
+		if (message == null)
+		{
+			throw new ArgumentNullException("message");
+		}
+		Plugin plugin = client.Plugin;
+		_logger.Debug("DiscordSubscriptions.AddChannelSubscription {0} added subscription to channel {1}", plugin.FullName(), channelId);
+		List<DiscordSubscription> list = _subscriptions[channelId];
+		if (list == null)
+		{
+			list = new List<DiscordSubscription>();
+			_subscriptions[channelId] = list;
+		}
+		list.RemoveAll((DiscordSubscription s) => s.IsForPlugin(plugin));
+		list.Add(new DiscordSubscription(client, channelId, message));
+	}
+
+	[LibraryFunction("RemoveChannelSubscription")]
+	public void RemoveChannelSubscription(Plugin plugin, Snowflake channelId)
+	{
+		if (plugin == null)
+		{
+			throw new ArgumentNullException("plugin");
+		}
+		InvalidSnowflakeException.ThrowIfInvalid(channelId);
+		List<DiscordSubscription> list = _subscriptions[channelId];
+		if (list != null)
+		{
+			list.RemoveAll((DiscordSubscription s) => s.IsForPlugin(plugin) && s.IsForChannel(channelId));
+			_logger.Debug("DiscordSubscriptions.RemoveChannelSubscription {0} removed subscription to channel {1}", plugin.Id(), channelId);
+		}
+	}
+
+	protected override void OnPluginUnloaded(Plugin plugin)
+	{
+		RemovePluginSubscriptions(plugin);
+	}
+
+	public void RemovePluginSubscriptions(Plugin plugin)
+	{
+		if (plugin == null)
+		{
+			throw new ArgumentNullException("plugin");
+		}
+		List<Snowflake> list = new List<Snowflake>();
+		foreach (KeyValuePair<Snowflake, List<DiscordSubscription>> subscription in _subscriptions)
+		{
+			RemoveChannelSubscription(plugin, subscription.Key);
+			if (subscription.Value.Count == 0)
+			{
+				list.Add(subscription.Key);
+			}
+		}
+		if (list.Count != 0)
+		{
+			for (int i = 0; i < list.Count; i++)
+			{
+				Snowflake key = list[i];
+				_subscriptions.Remove(key);
+			}
+		}
+		_logger.Debug("DiscordSubscriptions.RemovePluginSubscriptions Removed subscriptions for plugin {0}", plugin.FullName());
+	}
+
+	internal void HandleMessage(DiscordMessage message, DiscordChannel channel, BotClient client)
+	{
+		RunSubs(_subscriptions[message.ChannelId], message, client);
+		if (channel.ParentId.HasValue)
+		{
+			RunSubs(_subscriptions[channel.ParentId.Value], message, client);
+		}
+	}
+
+	private void RunSubs(List<DiscordSubscription> subs, DiscordMessage message, BotClient client)
+	{
+		if (subs == null)
+		{
+			return;
+		}
+		for (int i = 0; i < subs.Count; i++)
+		{
+			DiscordSubscription discordSubscription = subs[i];
+			if (discordSubscription.CanRun(client))
+			{
+				discordSubscription.Invoke(message);
+			}
+		}
+	}
+
+	public void LogDebug(DebugLogger logger)
+	{
+		logger.AppendList("Subscriptions", GetSubscriptions());
+	}
+
+	private IEnumerable<DiscordSubscription> GetSubscriptions()
+	{
+		foreach (List<DiscordSubscription> pluginSubscriptions in _subscriptions.Values)
+		{
+			for (int index = 0; index < pluginSubscriptions.Count; index++)
+			{
+				yield return pluginSubscriptions[index];
+			}
+		}
+	}
+}

@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using ConVar;
 using Facepunch;
 using Network;
+using Oxide.Core;
 using ProtoBuf;
 using Rust;
 using UnityEngine;
@@ -17,17 +18,20 @@ public class PlanterBox : StorageContainer, ISplashable
 
 	public MeshRenderer soilRenderer;
 
+	[ServerVar]
+	public static float outsideTestDistance = 100f;
+
 	private static readonly float MinimumSaturationTriggerLevel = ConVar.Server.optimalPlanterQualitySaturation - 0.2f;
 
 	private static readonly float MaximumSaturationTriggerLevel = ConVar.Server.optimalPlanterQualitySaturation + 0.1f;
 
-	private TimeCachedValue<float> sunExposure;
+	public TimeCachedValue<float> sunExposure;
 
-	private TimeCachedValue<float> artificialLightExposure;
+	public TimeCachedValue<float> artificialLightExposure;
 
-	private TimeCachedValue<float> plantTemperature;
+	public TimeCachedValue<float> plantTemperature;
 
-	private TimeCachedValue<float> plantArtificalTemperature;
+	public TimeCachedValue<float> plantArtificalTemperature;
 
 	private TimeSince lastSplashNetworkUpdate;
 
@@ -54,7 +58,7 @@ public class PlanterBox : StorageContainer, ISplashable
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_RequestSaturationUpdate "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - RPC_RequestSaturationUpdate ");
 				}
 				using (TimeWarning.New("RPC_RequestSaturationUpdate"))
 				{
@@ -96,6 +100,11 @@ public class PlanterBox : StorageContainer, ISplashable
 		base.inventory.SetOnlyAllowedItem(allowedItem);
 		ItemContainer itemContainer = base.inventory;
 		itemContainer.canAcceptItem = (Func<Item, int, bool>)Delegate.Combine(itemContainer.canAcceptItem, new Func<Item, int, bool>(InventoryItemFilter));
+		SetupTimeCaches();
+	}
+
+	public virtual void SetupTimeCaches()
+	{
 		sunExposure = new TimeCachedValue<float>
 		{
 			refreshCooldown = 30f,
@@ -146,6 +155,15 @@ public class PlanterBox : StorageContainer, ISplashable
 		return false;
 	}
 
+	public override bool CanPickup(BasePlayer player)
+	{
+		if (base.CanPickup(player))
+		{
+			return !HasPlants();
+		}
+		return false;
+	}
+
 	private bool ItemIsFertilizer(Item item)
 	{
 		return item.info.shortname == "fertilizer";
@@ -169,6 +187,10 @@ public class PlanterBox : StorageContainer, ISplashable
 
 	public void FertilizeGrowables()
 	{
+		if (Interface.CallHook("OnPlanterBoxFertilize", this) != null)
+		{
+			return;
+		}
 		int num = GetFertilizerCount();
 		if (num <= 0)
 		{
@@ -244,7 +266,7 @@ public class PlanterBox : StorageContainer, ISplashable
 		{
 			return false;
 		}
-		if (!(splashType.shortname == "water.salt"))
+		if (!(splashType == WaterTypes.SaltWaterItemDef) && !(splashType == WaterTypes.RadioactiveWaterItemDef))
 		{
 			return soilSaturation < soilSaturationMax;
 		}
@@ -253,10 +275,21 @@ public class PlanterBox : StorageContainer, ISplashable
 
 	public int DoSplash(ItemDefinition splashType, int amount)
 	{
-		if (splashType.shortname == "water.salt")
+		if (splashType == WaterTypes.SaltWaterItemDef)
 		{
 			soilSaturation = 0;
 			RefreshGrowables();
+			if ((float)lastSplashNetworkUpdate > 60f)
+			{
+				SendNetworkUpdate();
+				lastSplashNetworkUpdate = 0f;
+			}
+			return amount;
+		}
+		if (splashType == WaterTypes.RadioactiveWaterItemDef)
+		{
+			soilSaturation = 0;
+			KillAllPlants();
 			if ((float)lastSplashNetworkUpdate > 60f)
 			{
 				SendNetworkUpdate();
@@ -275,7 +308,23 @@ public class PlanterBox : StorageContainer, ISplashable
 		return num;
 	}
 
-	private void RefreshGrowables(GrowableEntity ignoreEntity = null)
+	private void KillAllPlants()
+	{
+		if (children == null)
+		{
+			return;
+		}
+		for (int num = children.Count - 1; num >= 0; num--)
+		{
+			BaseEntity baseEntity = children[num];
+			if (!(baseEntity == null) && baseEntity is GrowableEntity growableEntity)
+			{
+				growableEntity.ForceRemove();
+			}
+		}
+	}
+
+	public virtual void RefreshGrowables(GrowableEntity ignoreEntity = null)
 	{
 		if (children == null)
 		{
@@ -306,7 +355,7 @@ public class PlanterBox : StorageContainer, ISplashable
 		return sunExposure?.Get(force: false) ?? 0f;
 	}
 
-	private float CalculateSunExposure()
+	public float CalculateSunExposure()
 	{
 		return GrowableEntity.SunRaycast(base.transform.position + new Vector3(0f, 1f, 0f));
 	}
@@ -316,7 +365,7 @@ public class PlanterBox : StorageContainer, ISplashable
 		return artificialLightExposure?.Get(force: false) ?? 0f;
 	}
 
-	private float CalculateArtificialLightExposure()
+	public float CalculateArtificialLightExposure()
 	{
 		return GrowableEntity.CalculateArtificialLightExposure(base.transform);
 	}
@@ -326,29 +375,42 @@ public class PlanterBox : StorageContainer, ISplashable
 		return (plantTemperature?.Get(force: false) ?? 0f) + (plantArtificalTemperature?.Get(force: false) ?? 0f);
 	}
 
-	private float CalculatePlantTemperature()
+	public float CalculatePlantTemperature()
 	{
 		return Mathf.Max(Climate.GetTemperature(base.transform.position), 15f);
 	}
 
-	private void CalculateRainFactor()
+	private bool HasPlants()
 	{
-		if (sunExposure.Get(force: false) > 0f)
+		foreach (BaseEntity child in children)
 		{
-			float rain = Climate.GetRain(base.transform.position);
-			if (rain > 0f)
+			if (child is GrowableEntity)
 			{
-				soilSaturation = Mathf.Clamp(soilSaturation + Mathf.RoundToInt(4f * rain * (float)lastRainCheck), 0, soilSaturationMax);
-				RefreshGrowables();
-				SendNetworkUpdate();
+				return true;
 			}
+		}
+		return false;
+	}
+
+	public void CalculateRainFactor()
+	{
+		float rain = Climate.GetRain(base.transform.position);
+		if (rain > 0f && WaterCatcher.TestIsOutside(base.transform, Vector3.up, 0.5f, outsideTestDistance))
+		{
+			soilSaturation = Mathf.Clamp(soilSaturation + Mathf.RoundToInt(4f * rain * (float)lastRainCheck), 0, soilSaturationMax);
+			RefreshGrowables();
+			SendNetworkUpdate();
 		}
 		lastRainCheck = 0f;
 	}
 
-	private float CalculateArtificialTemperature()
+	public float CalculateArtificialTemperature()
 	{
 		return GrowableEntity.CalculateArtificialTemperature(base.transform);
+	}
+
+	public virtual void OnPlantRemoved(GrowableEntity entity, BasePlayer byPlayer)
+	{
 	}
 
 	public void OnPlantInserted(GrowableEntity entity, BasePlayer byPlayer)
@@ -357,7 +419,7 @@ public class PlanterBox : StorageContainer, ISplashable
 		{
 			return;
 		}
-		List<uint> obj = Facepunch.Pool.GetList<uint>();
+		List<uint> obj = Facepunch.Pool.Get<List<uint>>();
 		foreach (BaseEntity child in children)
 		{
 			if (child is GrowableEntity growableEntity && !obj.Contains(growableEntity.prefabID))
@@ -369,16 +431,16 @@ public class PlanterBox : StorageContainer, ISplashable
 		{
 			byPlayer.GiveAchievement("HONEST_WORK");
 		}
-		Facepunch.Pool.FreeList(ref obj);
+		Facepunch.Pool.FreeUnmanaged(ref obj);
 	}
 
-	[RPC_Server]
 	[RPC_Server.MaxDistance(3f)]
+	[RPC_Server]
 	private void RPC_RequestSaturationUpdate(RPCMessage msg)
 	{
 		if (msg.player != null)
 		{
-			ClientRPCPlayer(null, msg.player, "RPC_ReceiveSaturationUpdate", soilSaturation);
+			ClientRPC(RpcTarget.Player("RPC_ReceiveSaturationUpdate", msg.player), soilSaturation);
 		}
 	}
 

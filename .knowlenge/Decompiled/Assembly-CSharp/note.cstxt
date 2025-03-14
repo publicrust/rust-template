@@ -9,7 +9,7 @@ public class note : ConsoleSystem
 	{
 		ItemId itemID = ArgEx.GetItemID(arg, 0);
 		string @string = arg.GetString(1);
-		Item item = ArgEx.Player(arg).inventory.FindItemUID(itemID);
+		Item item = ArgEx.Player(arg).inventory.FindItemByUID(itemID);
 		if (item != null)
 		{
 			item.text = @string.Truncate(1024);

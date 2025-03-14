@@ -1,0 +1,278 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Threading;
+using MonoMod.Utils;
+
+private sealed class Detour : DetourBase, ICoreDetour, ICoreDetourBase, IDisposable
+{
+	private sealed class ManagedDetourBox : DetourBoxBase
+	{
+		private readonly MethodBase src;
+
+		private readonly MethodBase target;
+
+		public ManagedDetourBox(PlatformTriple triple, MethodBase src, MethodBase target)
+			: base(triple)
+		{
+			this.src = src;
+			this.target = target;
+			Detour = null;
+		}
+
+		public void SubscribeCompileMethod()
+		{
+			AddRelatedDetour(src, this);
+		}
+
+		public void UnsubscribeCompileMethod()
+		{
+			RemoveRelatedDetour(src, this);
+		}
+
+		public void OnMethodCompiled(MethodBase method, IntPtr codeStart, IntPtr codeStartRw, ulong codeSize)
+		{
+			if (!base.IsApplied)
+			{
+				return;
+			}
+			method = Triple.GetIdentifiable(method);
+			lock (Sync)
+			{
+				if (!base.IsApplied || base.IsApplying)
+				{
+					return;
+				}
+				bool isEnabled;
+				<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogTraceStringHandler message = new <027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogTraceStringHandler(43, 4, out isEnabled);
+				if (isEnabled)
+				{
+					message.AppendLiteral("Updating detour from ");
+					message.AppendFormatted(src);
+					message.AppendLiteral(" to ");
+					message.AppendFormatted(target);
+					message.AppendLiteral(" (recompiled ");
+					message.AppendFormatted(method);
+					message.AppendLiteral(" to ");
+					message.AppendFormatted(codeStart, "x16");
+					message.AppendLiteral(")");
+				}
+				<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.Trace(ref message);
+				try
+				{
+					base.IsApplying = true;
+					SimpleNativeDetour detour = Detour;
+					IntPtr to;
+					IntPtr from;
+					IntPtr fromRw;
+					if (detour != null)
+					{
+						_ = detour.Source;
+						to = detour.Destination;
+						from = codeStart;
+						fromRw = codeStartRw;
+					}
+					else
+					{
+						from = codeStart;
+						fromRw = codeStartRw;
+						to = Triple.Runtime.GetMethodHandle(target).GetFunctionPointer();
+					}
+					SimpleNativeDetour newDetour = Triple.CreateSimpleDetour(from, to, (int)codeSize, fromRw);
+					DetourBase.ReplaceDetourInLock(this, newDetour, out SimpleNativeDetour _);
+				}
+				finally
+				{
+					base.IsApplying = false;
+				}
+			}
+		}
+	}
+
+	private sealed class RelatedDetourBag
+	{
+		public readonly MethodBase Method;
+
+		public readonly List<ManagedDetourBox> RelatedDetours = new List<ManagedDetourBox>();
+
+		public bool IsValid = true;
+
+		public RelatedDetourBag(MethodBase method)
+		{
+			Method = method;
+		}
+	}
+
+	private readonly MethodBase realTarget;
+
+	private static readonly object subLock = new object();
+
+	private static bool hasSubscribed;
+
+	private static readonly ConcurrentDictionary<MethodBase, RelatedDetourBag> relatedDetours = new ConcurrentDictionary<MethodBase, RelatedDetourBag>();
+
+	private IDisposable? srcPin;
+
+	private IDisposable? dstPin;
+
+	private new ManagedDetourBox DetourBox => GetDetourBox<ManagedDetourBox>();
+
+	public MethodBase Source { get; }
+
+	public MethodBase Target { get; }
+
+	public Detour(PlatformTriple triple, MethodBase src, MethodBase dst)
+		: base(triple)
+	{
+		Source = triple.GetIdentifiable(src);
+		Target = dst;
+		realTarget = triple.GetRealDetourTarget(src, dst);
+		base.DetourBox = new ManagedDetourBox(triple, Source, realTarget);
+		if (triple.SupportedFeatures.Has(RuntimeFeature.CompileMethodHook))
+		{
+			EnsureSubscribed(triple);
+			DetourBox.SubscribeCompileMethod();
+		}
+	}
+
+	private static void EnsureSubscribed(PlatformTriple triple)
+	{
+		if (Volatile.Read(ref hasSubscribed))
+		{
+			return;
+		}
+		lock (subLock)
+		{
+			if (!Volatile.Read(ref hasSubscribed))
+			{
+				Volatile.Write(ref hasSubscribed, value: true);
+				triple.Runtime.OnMethodCompiled += OnMethodCompiled;
+			}
+		}
+	}
+
+	private static void AddRelatedDetour(MethodBase m, ManagedDetourBox cmh)
+	{
+		while (true)
+		{
+			RelatedDetourBag orAdd = relatedDetours.GetOrAdd(m, (MethodBase m) => new RelatedDetourBag(m));
+			lock (orAdd)
+			{
+				if (!orAdd.IsValid)
+				{
+					continue;
+				}
+				orAdd.RelatedDetours.Add(cmh);
+				if (orAdd.RelatedDetours.Count > 1)
+				{
+					bool isEnabled;
+					<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogWarningStringHandler message = new <027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogWarningStringHandler(115, 1, out isEnabled);
+					if (isEnabled)
+					{
+						message.AppendLiteral("Multiple related detours for method ");
+						message.AppendFormatted(m);
+						message.AppendLiteral("! This means that the method has been detoured twice. Detour cleanup will fail.");
+					}
+					<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.Warning(ref message);
+				}
+				break;
+			}
+		}
+	}
+
+	private static void RemoveRelatedDetour(MethodBase m, ManagedDetourBox cmh)
+	{
+		if (relatedDetours.TryGetValue(m, out RelatedDetourBag value))
+		{
+			lock (value)
+			{
+				value.RelatedDetours.Remove(cmh);
+				if (value.RelatedDetours.Count == 0)
+				{
+					value.IsValid = false;
+					Helpers.Assert(relatedDetours.TryRemove(value.Method, out RelatedDetourBag _), null, "relatedDetours.TryRemove(related.Method, out _)");
+				}
+				return;
+			}
+		}
+		bool isEnabled;
+		<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogWarningStringHandler message = new <027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogWarningStringHandler(79, 1, out isEnabled);
+		if (isEnabled)
+		{
+			message.AppendLiteral("Attempted to remove a related detour from method ");
+			message.AppendFormatted(m);
+			message.AppendLiteral(" which has no RelatedDetourBag");
+		}
+		<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.Warning(ref message);
+	}
+
+	private static void OnMethodCompiled(RuntimeMethodHandle methodHandle, MethodBase? method, IntPtr codeStart, IntPtr codeStartRw, ulong codeSize)
+	{
+		if ((object)method == null)
+		{
+			return;
+		}
+		method = PlatformTriple.Current.GetIdentifiable(method);
+		if (!relatedDetours.TryGetValue(method, out RelatedDetourBag value))
+		{
+			return;
+		}
+		lock (value)
+		{
+			foreach (ManagedDetourBox relatedDetour in value.RelatedDetours)
+			{
+				relatedDetour.OnMethodCompiled(method, codeStart, codeStartRw, codeSize);
+			}
+		}
+	}
+
+	protected override SimpleNativeDetour CreateDetour()
+	{
+		bool isEnabled;
+		<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogTraceStringHandler message = new <027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogTraceStringHandler(33, 2, out isEnabled);
+		if (isEnabled)
+		{
+			message.AppendLiteral("Applying managed detour from ");
+			message.AppendFormatted(Source);
+			message.AppendLiteral(" to ");
+			message.AppendFormatted(realTarget);
+		}
+		<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.Trace(ref message);
+		srcPin = Triple.PinMethodIfNeeded(Source);
+		dstPin = Triple.PinMethodIfNeeded(realTarget);
+		Triple.Compile(Source);
+		IntPtr nativeMethodBody = Triple.GetNativeMethodBody(Source);
+		Triple.Compile(realTarget);
+		IntPtr functionPointer = Triple.Runtime.GetMethodHandle(realTarget).GetFunctionPointer();
+		return Triple.CreateSimpleDetour(nativeMethodBody, functionPointer, -1, (IntPtr)0);
+	}
+
+	protected override void BeforeUndo()
+	{
+		bool isEnabled;
+		<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogTraceStringHandler message = new <027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.DebugLogTraceStringHandler(32, 2, out isEnabled);
+		if (isEnabled)
+		{
+			message.AppendLiteral("Undoing managed detour from ");
+			message.AppendFormatted(Source);
+			message.AppendLiteral(" to ");
+			message.AppendFormatted(realTarget);
+		}
+		<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MMDbgLog.Trace(ref message);
+	}
+
+	protected override void AfterUndo()
+	{
+		Interlocked.Exchange(ref srcPin, null)?.Dispose();
+		Interlocked.Exchange(ref dstPin, null)?.Dispose();
+	}
+
+	protected override void BeforeDispose()
+	{
+		if (Triple.SupportedFeatures.Has(RuntimeFeature.CompileMethodHook))
+		{
+			DetourBox.UnsubscribeCompileMethod();
+		}
+	}
+}

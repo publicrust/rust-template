@@ -66,15 +66,15 @@ public class SkeletonProperties : ScriptableObject
 				Debug.LogWarning("Bone error in SkeletonProperties.BuildDictionary for " + boneReference.name);
 				continue;
 			}
-			uint num = StringPool.Get(boneProperty.bone.name);
-			if (!quickLookup.ContainsKey(num))
+			uint key = StringPool.Get(boneProperty.bone.name);
+			if (!quickLookup.ContainsKey(key))
 			{
-				quickLookup.Add(num, boneProperty);
+				quickLookup.Add(key, boneProperty);
 				continue;
 			}
 			string text = boneProperty.bone.name;
-			string text2 = quickLookup[num].bone.name;
-			Debug.LogWarning("Duplicate bone id " + num + " for " + text + " and " + text2);
+			string text2 = quickLookup[key].bone.name;
+			Debug.LogWarning("Duplicate bone id " + key + " for " + text + " and " + text2);
 		}
 	}
 

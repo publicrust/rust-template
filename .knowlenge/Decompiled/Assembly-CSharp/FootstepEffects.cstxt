@@ -11,4 +11,6 @@ public class FootstepEffects : BaseFootstepEffect
 	public string jumpStartEffectName = "jump-start/barefoot";
 
 	public string jumpLandEffectName = "jump-land/barefoot";
+
+	public SoundDefinition accentSound;
 }

@@ -10,6 +10,7 @@ using Oxide.Core;
 using ProtoBuf;
 using UnityEngine;
 using UnityEngine.Assertions;
+using UnityEngine.Serialization;
 
 public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 {
@@ -65,7 +66,10 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 
 	public ItemDefinition fuelType;
 
-	public bool canModFire;
+	[FormerlySerializedAs("canModFire")]
+	public bool hasFireDeploySlot;
+
+	public bool hasOpenFlame;
 
 	public bool disabledBySplash = true;
 
@@ -78,6 +82,8 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 	public int outputSlots = 1;
 
 	public IndustrialSlotMode IndustrialMode;
+
+	public const Flags Flag_CookingPaused = Flags.Reserved8;
 
 	public int _activeCookingSlot = -1;
 
@@ -111,7 +117,7 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - SVSwitch "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SVSwitch ");
 				}
 				using (TimeWarning.New("SVSwitch"))
 				{
@@ -197,10 +203,10 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 		base.OnItemAddedOrRemoved(item, bAdded);
 		if (item != null)
 		{
-			ItemModCookable component = item.info.GetComponent<ItemModCookable>();
-			if (component != null)
+			ItemModCookable itemModCookable = item.info.ItemModCookable;
+			if (itemModCookable != null)
 			{
-				item.cookTimeLeft = component.cookTime;
+				item.cookTimeLeft = itemModCookable.cookTime;
 			}
 			if (item.HasFlag(Item.Flag.OnFire))
 			{
@@ -275,7 +281,7 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 		return new MinMax(_outputSlotIndex, _outputSlotIndex + outputSlots - 1);
 	}
 
-	public override int GetIdealSlot(BasePlayer player, Item item)
+	public override int GetIdealSlot(BasePlayer player, ItemContainer container, Item item)
 	{
 		MinMax? allowedSlots = GetAllowedSlots(item);
 		if (!allowedSlots.HasValue)
@@ -290,10 +296,10 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 				return i;
 			}
 		}
-		return base.GetIdealSlot(player, item);
+		return base.GetIdealSlot(player, container, item);
 	}
 
-	public void OvenFull()
+	public virtual void OvenFull()
 	{
 		StopCooking();
 	}
@@ -310,6 +316,10 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 
 	public void Cook()
 	{
+		if (HasFlag(Flags.Reserved8))
+		{
+			return;
+		}
 		Item item = FindBurnable();
 		if (Interface.CallHook("OnOvenCook", this, item) != null)
 		{
@@ -336,7 +346,7 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 		}
 		if (item != null)
 		{
-			ItemModBurnable component = item.info.GetComponent<ItemModBurnable>();
+			ItemModBurnable itemModBurnable = item.info.ItemModBurnable;
 			item.fuel -= 0.5f * (cookingTemperature / 200f);
 			if (!item.HasFlag(Item.Flag.OnFire))
 			{
@@ -345,7 +355,7 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 			}
 			if (item.fuel <= 0f)
 			{
-				ConsumeFuel(item, component);
+				ConsumeFuel(item, itemModBurnable);
 			}
 		}
 		OnCooked();
@@ -389,16 +399,25 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 	protected virtual void SVSwitch(RPCMessage msg)
 	{
 		bool flag = msg.read.Bit();
-		if (Interface.CallHook("OnOvenToggle", this, msg.player) == null && flag != IsOn() && (!needsBuildingPrivilegeToUse || msg.player.CanBuild()))
+		if (Interface.CallHook("OnOvenToggle", this, msg.player) != null || flag == IsOn() || (needsBuildingPrivilegeToUse && !msg.player.CanBuild()))
 		{
-			if (flag)
+			return;
+		}
+		if (flag)
+		{
+			StartCooking();
+			if (msg.player != null)
 			{
-				StartCooking();
+				msg.player.ProcessMissionEvent(BaseMission.MissionEventType.STARTOVEN, new BaseMission.MissionEventPayload
+				{
+					UintIdentifier = prefabID,
+					NetworkIdentifier = net.ID
+				}, 1f);
 			}
-			else
-			{
-				StopCooking();
-			}
+		}
+		else
+		{
+			StopCooking();
 		}
 	}
 
@@ -434,6 +453,10 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 			InvokeRepeating(Cook, 0.5f, 0.5f);
 			SetFlag(Flags.On, b: true);
 			Interface.CallHook("OnOvenStarted", this);
+			if (hasOpenFlame)
+			{
+				SingletonComponent<NpcFireManager>.Instance.Add(this);
+			}
 		}
 	}
 
@@ -459,6 +482,10 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 		}
 		CancelInvoke(Cook);
 		SetFlag(Flags.On, b: false);
+		if (hasOpenFlame)
+		{
+			SingletonComponent<NpcFireManager>.Instance.Remove(this);
+		}
 	}
 
 	public bool WantsSplash(ItemDefinition splashType, int amount)
@@ -499,7 +526,7 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 
 	public void IncreaseCookTime(float amount)
 	{
-		List<Item> obj = Facepunch.Pool.GetList<Item>();
+		List<Item> obj = Facepunch.Pool.Get<List<Item>>();
 		foreach (Item item in base.inventory.itemList)
 		{
 			if (item.HasFlag(Item.Flag.Cooking))
@@ -512,7 +539,7 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 		{
 			item2.OnCycle(delta);
 		}
-		Facepunch.Pool.FreeList(ref obj);
+		Facepunch.Pool.Free(ref obj, freeElements: false);
 	}
 
 	public Vector2i InputSlotRange(int slotIndex)
@@ -568,7 +595,7 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 
 	public bool IsBurnableItem(Item item)
 	{
-		if ((bool)item.info.GetComponent<ItemModBurnable>() && (fuelType == null || item.info == fuelType))
+		if ((bool)item.info.ItemModBurnable && (fuelType == null || item.info == fuelType))
 		{
 			return true;
 		}
@@ -577,7 +604,7 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 
 	public bool IsBurnableByproduct(Item item)
 	{
-		ItemModBurnable itemModBurnable = fuelType?.GetComponent<ItemModBurnable>();
+		ItemModBurnable itemModBurnable = fuelType?.ItemModBurnable;
 		if (itemModBurnable == null)
 		{
 			return false;
@@ -587,8 +614,8 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 
 	public bool IsMaterialInput(Item item)
 	{
-		ItemModCookable component = item.info.GetComponent<ItemModCookable>();
-		if (component == null || (float)component.lowTemp > cookingTemperature || (float)component.highTemp < cookingTemperature)
+		ItemModCookable itemModCookable = item.info.ItemModCookable;
+		if (itemModCookable == null || (float)itemModCookable.lowTemp > cookingTemperature || (float)itemModCookable.highTemp < cookingTemperature)
 		{
 			return false;
 		}
@@ -631,10 +658,10 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 			_materialOutputCache[key] = hashSet;
 			foreach (ItemDefinition item in ItemManager.itemList)
 			{
-				ItemModCookable component = item.GetComponent<ItemModCookable>();
-				if (!(component == null) && component.CanBeCookedByAtTemperature(key))
+				ItemModCookable itemModCookable = item.ItemModCookable;
+				if (!(itemModCookable == null) && itemModCookable.CanBeCookedByAtTemperature(key))
 				{
-					hashSet.Add(component.becomeOnCooked);
+					hashSet.Add(itemModCookable.becomeOnCooked);
 				}
 			}
 		}
@@ -642,7 +669,7 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 
 	public override bool HasSlot(Slot slot)
 	{
-		if (canModFire && slot == Slot.FireMod)
+		if (hasFireDeploySlot && slot == Slot.FireMod)
 		{
 			return true;
 		}

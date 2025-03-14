@@ -1,0 +1,277 @@
+using System;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+using Oxide.Ext.Discord.Cache;
+using Oxide.Ext.Discord.Configuration;
+using Oxide.Ext.Discord.Constants;
+using Oxide.Ext.Discord.Entities;
+using Oxide.Ext.Discord.Interfaces;
+using Oxide.Ext.Discord.Logging;
+using Oxide.Ext.Discord.Rest;
+using Oxide.Ext.Discord.Types;
+
+public class RequestHandler : BasePoolable, IDebugLoggable
+{
+	internal BaseRequest Request;
+
+	private RequestResponse _response;
+
+	private CancellationToken _token;
+
+	private ILogger _logger;
+
+	private readonly Func<ValueTask> _runner;
+
+	public RequestHandler()
+	{
+		_runner = RunRequest;
+	}
+
+	public static RequestHandler CreateRequest(BaseRequest request)
+	{
+		RequestHandler requestHandler = request.PluginPool.Get<RequestHandler>();
+		requestHandler.Init(request, request.Client.Logger);
+		return requestHandler;
+	}
+
+	private void Init(BaseRequest request, ILogger logger)
+	{
+		Request = request;
+		_token = Request.Source.Token;
+		_logger = logger;
+	}
+
+	public void StartRequest()
+	{
+		if (Request.Status == RequestStatus.InQueue)
+		{
+			Request.Status = RequestStatus.Started;
+			Task.Run(_runner, _token);
+		}
+	}
+
+	private async ValueTask RunRequest()
+	{
+		AdjustableSemaphore semaphore = null;
+		try
+		{
+			Bucket bucket = Request.Bucket;
+			BucketId bucketId = bucket.Id;
+			semaphore = bucket.ActiveRequestsSemaphore;
+			Request.Status = RequestStatus.PendingBucket;
+			_logger.Debug("Waiting for bucket availability Bucket ID: {0} Request ID: {1}", bucket.Id, Request.Id);
+			await semaphore.WaitOneAsync().ConfigureAwait(continueOnCapturedContext: false);
+			bucket = Request.Bucket;
+			if (bucketId != bucket.Id)
+			{
+				_logger.Debug("Bucket ID Changed. Waiting for bucket availability again for ID: {0} Old Bucket ID: {1} New Bucket ID: {2}", Request.Id, bucketId, bucket.Id);
+				semaphore.Release();
+				semaphore = bucket.ActiveRequestsSemaphore;
+				await semaphore.WaitOneAsync().ConfigureAwait(continueOnCapturedContext: false);
+			}
+			_logger.Debug("Request started for Bucket ID: {0} Request ID: {1}", bucket.Id, Request.Id);
+			_response = await FireRequest().ConfigureAwait(continueOnCapturedContext: false);
+			if (_response != null)
+			{
+				Request.OnRequestCompleted(this, _response);
+			}
+			_logger.Debug("Request callback completed successfully for Bucket ID: {0} Request ID: {1}", bucket.Id, Request.Id);
+		}
+		catch (Exception ex)
+		{
+			Exception ex2 = ex;
+			_logger.Exception("Request callback threw exception for Bucket ID: {0} Request ID: {1}", Request.Id, Request.Id, ex2);
+		}
+		finally
+		{
+			semaphore?.Release();
+		}
+		Dispose();
+	}
+
+	private ValueTask<RequestResponse> FireRequest()
+	{
+		try
+		{
+			return FireRequestInternal();
+		}
+		catch (Exception ex)
+		{
+			return RequestResponse.CreateExceptionResponse(GetResponseError(RequestErrorType.Generic, DiscordLogLevel.Exception).WithException(ex), null, RequestCompletedStatus.ErrorFatal);
+		}
+	}
+
+	private async ValueTask<RequestResponse> FireRequestInternal()
+	{
+		_logger.Verbose("RequestHandler.FireRequestInternal Starting REST Request. Request ID: {0} Method: {1} Url: {2}", Request.Id, Request.Method, Request.Route);
+		RequestResponse response = null;
+		byte retries = 0;
+		while (CanSendRequest(response, retries))
+		{
+			response?.Dispose();
+			Request.Status = RequestStatus.PendingStart;
+			await Request.WaitUntilRequestCanStart(_token).ConfigureAwait(continueOnCapturedContext: false);
+			await Request.Bucket.WaitUntilBucketAvailable(this, _token).ConfigureAwait(continueOnCapturedContext: false);
+			Request.Status = RequestStatus.InProgress;
+			if (Request.IsCancelled)
+			{
+				_logger.Verbose("RequestHandler.FireRequestInternal Cancel REST Request. Request ID: {0} Method: {1} Url: {2}", Request.Id, Request.Method, Request.Route);
+				return await RequestResponse.CreateCancelledResponse().ConfigureAwait(continueOnCapturedContext: false);
+			}
+			response = await SendRequest(_token).ConfigureAwait(continueOnCapturedContext: false);
+			if (response == null)
+			{
+				return null;
+			}
+			Request.Bucket.UpdateRateLimits(this, response);
+			RequestCompletedStatus status = response.Status;
+			RequestCompletedStatus requestCompletedStatus = status;
+			RequestCompletedStatus requestCompletedStatus2 = requestCompletedStatus;
+			if (requestCompletedStatus2 <= RequestCompletedStatus.ErrorFatal || requestCompletedStatus2 == RequestCompletedStatus.Cancelled)
+			{
+				return response;
+			}
+			if (response.Code == DiscordHttpStatusCode.BadRequest)
+			{
+				return response;
+			}
+			retries++;
+		}
+		return response;
+	}
+
+	private bool CanSendRequest(RequestResponse response, byte retries)
+	{
+		if (retries >= DiscordConfig.Instance.Rest.ApiRateLimitRetries)
+		{
+			return false;
+		}
+		if (response != null && response.Code != DiscordHttpStatusCode.TooManyRequests)
+		{
+			return retries < DiscordConfig.Instance.Rest.ApiErrorRetries;
+		}
+		return true;
+	}
+
+	private async ValueTask<RequestResponse> SendRequest(CancellationToken token)
+	{
+		try
+		{
+			using HttpRequestMessage request = CreateRequest();
+			using HttpResponseMessage webResponse = await Request.HttpClient.SendAsync(request, token).ConfigureAwait(continueOnCapturedContext: false);
+			if (token.IsCancellationRequested)
+			{
+				return null;
+			}
+			if (webResponse.IsSuccessStatusCode)
+			{
+				return await RequestResponse.CreateSuccessResponse(webResponse).ConfigureAwait(continueOnCapturedContext: false);
+			}
+			return await HandleWebException(request, webResponse).ConfigureAwait(continueOnCapturedContext: false);
+		}
+		catch (OperationCanceledException)
+		{
+			return await RequestResponse.CreateCancelledResponse().ConfigureAwait(continueOnCapturedContext: false);
+		}
+		catch (JsonSerializationException ex2)
+		{
+			return await RequestResponse.CreateExceptionResponse(GetResponseError(RequestErrorType.Serialization, DiscordLogLevel.Error).WithException(ex2), null, RequestCompletedStatus.ErrorFatal).ConfigureAwait(continueOnCapturedContext: false);
+		}
+		catch (Exception ex3)
+		{
+			return await RequestResponse.CreateExceptionResponse(GetResponseError(RequestErrorType.Generic, DiscordLogLevel.Error).WithException(ex3), null, RequestCompletedStatus.ErrorFatal).ConfigureAwait(continueOnCapturedContext: false);
+		}
+	}
+
+	private async ValueTask<RequestResponse> HandleWebException(HttpRequestMessage request, HttpResponseMessage webResponse)
+	{
+		if (Request.Client.Logger.IsLogging(DiscordLogLevel.Verbose))
+		{
+			string text = ((request.Content == null) ? "No Content" : (await request.Content.ReadAsStringAsync().ConfigureAwait(continueOnCapturedContext: false)));
+			string content = text;
+			Request.Client.Logger.Verbose("Web Exception Occured. Request ID: {0} Plugin: {1} Method: {2} Route: {3} HTTP Code: {4}\nBody:\n{5}", Request.Id, Request.Client.PluginName, Request.Method, Request.Route, webResponse.StatusCode, content);
+		}
+		DiscordHttpStatusCode statusCode = (DiscordHttpStatusCode)webResponse.StatusCode;
+		RequestResponse response = ((statusCode != DiscordHttpStatusCode.TooManyRequests) ? (await RequestResponse.CreateExceptionResponse(await GetResponseError(RequestErrorType.GenericWeb, DiscordLogLevel.Error).WithRequest(request).ConfigureAwait(continueOnCapturedContext: false), webResponse, RequestCompletedStatus.ErrorFatal).ConfigureAwait(continueOnCapturedContext: false)) : (await RequestResponse.CreateExceptionResponse(await GetResponseError(RequestErrorType.RateLimit, DiscordLogLevel.Warning).WithRequest(request).ConfigureAwait(continueOnCapturedContext: false), webResponse, RequestCompletedStatus.ErrorRetry).ConfigureAwait(continueOnCapturedContext: false)));
+		Request.OnRequestErrored();
+		if (Request.Client.Logger.IsLogging(DiscordLogLevel.Verbose))
+		{
+			string text2 = ((request.Content == null) ? "No Content" : (await request.Content.ReadAsStringAsync().ConfigureAwait(continueOnCapturedContext: false)));
+			string content2 = text2;
+			Request.Client.Logger.Verbose("Web Exception Occured. Type: {0} Request ID: {1} Plugin: {2} Method: {3} Route: {4} HTTP Code: {5}\nBody:\n{6}", response.Error?.ErrorType, Request.Id, Request.Client.PluginName, Request.Method, Request.Route, response.Code, content2);
+		}
+		return response;
+	}
+
+	private HttpRequestMessage CreateRequest()
+	{
+		HttpRequestMessage httpRequestMessage = new HttpRequestMessage(DiscordHttpMethods.GetMethod(Request.Method), Request.Route);
+		CreateContent(httpRequestMessage);
+		return httpRequestMessage;
+	}
+
+	private void CreateContent(HttpRequestMessage request)
+	{
+		object data = Request.Data;
+		object obj = data;
+		object obj2 = obj;
+		if (obj2 == null)
+		{
+			return;
+		}
+		if (obj2 is IFileAttachments { FileAttachments: { } } fileAttachments && fileAttachments.FileAttachments.Count != 0)
+		{
+			MultipartFormDataContent multipartFormDataContent = new MultipartFormDataContent();
+			HttpContent jsonContent = GetJsonContent(data);
+			multipartFormDataContent.Add(jsonContent, "payload_json");
+			for (int i = 0; i < fileAttachments.FileAttachments.Count; i++)
+			{
+				MessageFileAttachment messageFileAttachment = fileAttachments.FileAttachments[i];
+				ByteArrayContent byteArrayContent = new ByteArrayContent(messageFileAttachment.Data);
+				multipartFormDataContent.Add(byteArrayContent, Singleton<FileAttachmentCache>.Instance.GetName(i), messageFileAttachment.FileName);
+				byteArrayContent.Headers.ContentType = Singleton<MediaTypeHeaderCache>.Instance.Get(messageFileAttachment.ContentType);
+			}
+			request.Content = multipartFormDataContent;
+		}
+		else
+		{
+			request.Content = GetJsonContent(data);
+		}
+	}
+
+	private StringContent GetJsonContent(object data)
+	{
+		string text = JsonConvert.SerializeObject(data, Request.Client.JsonSettings);
+		_logger.Verbose("RequestHandler.GetJsonContent Data: {0}", text);
+		StringContent stringContent = new StringContent(text);
+		stringContent.Headers.ContentType = Singleton<MediaTypeHeaderCache>.Instance.Get("application/json");
+		return stringContent;
+	}
+
+	public void Abort()
+	{
+		Request.Client.Logger.Debug("RequestHandler.Abort Abort Request Bucket ID: {0} Request ID: {1} Plugin: {2} Method: {3} Route: {4}", Request.Bucket.Id, Request.Id, Request.Client.PluginName, Request.Method, Request.Route);
+		Request.Abort();
+	}
+
+	private ResponseError GetResponseError(RequestErrorType type, DiscordLogLevel log)
+	{
+		return new ResponseError(Request, type, log);
+	}
+
+	protected override void EnterPool()
+	{
+		Request.Dispose();
+		_response?.Dispose();
+		Request = null;
+		_response = null;
+		_logger = null;
+	}
+
+	public void LogDebug(DebugLogger logger)
+	{
+		Request.LogDebug(logger);
+	}
+}

@@ -123,7 +123,7 @@ public class HelicopterTurret : MonoBehaviour
 
 	public void FireGun()
 	{
-		_heliAI.FireGun(_target.transform.position + new Vector3(0f, 0.25f, 0f), PatrolHelicopter.bulletAccuracy, left);
+		_heliAI.FireGun(_target.transform.position + new Vector3(0f, 0.25f, 0f), ConVar.PatrolHelicopter.bulletAccuracy, left);
 	}
 
 	public Vector3 GetPositionForEntity(BaseCombatEntity potentialtarget)

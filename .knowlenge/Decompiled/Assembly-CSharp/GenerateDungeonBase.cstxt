@@ -72,104 +72,109 @@ public class GenerateDungeonBase : ProceduralComponent
 		if (World.Cached)
 		{
 			TerrainMeta.Path.DungeonBaseRoot = HierarchyUtil.GetRoot("DungeonBase");
-			return;
 		}
-		if (World.Networked)
+		else if (World.Networked)
 		{
 			World.Spawn("DungeonBase");
 			TerrainMeta.Path.DungeonBaseRoot = HierarchyUtil.GetRoot("DungeonBase");
-			return;
 		}
-		Prefab<DungeonBaseLink>[] array = Prefab.Load<DungeonBaseLink>("assets/bundled/prefabs/autospawn/" + EntranceFolder);
-		if (array == null)
+		else
 		{
-			return;
-		}
-		Prefab<DungeonBaseLink>[] array2 = Prefab.Load<DungeonBaseLink>("assets/bundled/prefabs/autospawn/" + LinkFolder);
-		if (array2 == null)
-		{
-			return;
-		}
-		Prefab<DungeonBaseLink>[] array3 = Prefab.Load<DungeonBaseLink>("assets/bundled/prefabs/autospawn/" + EndFolder);
-		if (array3 == null)
-		{
-			return;
-		}
-		Prefab<DungeonBaseTransition>[] array4 = Prefab.Load<DungeonBaseTransition>("assets/bundled/prefabs/autospawn/" + TransitionFolder);
-		if (array4 == null)
-		{
-			return;
-		}
-		foreach (DungeonBaseInfo item in TerrainMeta.Path ? TerrainMeta.Path.DungeonBaseEntrances : null)
-		{
-			TerrainPathConnect[] componentsInChildren = item.GetComponentsInChildren<TerrainPathConnect>(includeInactive: true);
-			foreach (TerrainPathConnect obj in componentsInChildren)
+			if (ConnectionType == InfrastructureType.UnderwaterLab && !World.Config.UnderwaterLabs)
 			{
-				if (obj.Type != ConnectionType)
+				return;
+			}
+			Prefab<DungeonBaseLink>[] array = Prefab.Load<DungeonBaseLink>("assets/bundled/prefabs/autospawn/" + EntranceFolder, null, null, useProbabilities: true, useWorldConfig: false);
+			if (array == null)
+			{
+				return;
+			}
+			Prefab<DungeonBaseLink>[] array2 = Prefab.Load<DungeonBaseLink>("assets/bundled/prefabs/autospawn/" + LinkFolder, null, null, useProbabilities: true, useWorldConfig: false);
+			if (array2 == null)
+			{
+				return;
+			}
+			Prefab<DungeonBaseLink>[] array3 = Prefab.Load<DungeonBaseLink>("assets/bundled/prefabs/autospawn/" + EndFolder, null, null, useProbabilities: true, useWorldConfig: false);
+			if (array3 == null)
+			{
+				return;
+			}
+			Prefab<DungeonBaseTransition>[] array4 = Prefab.Load<DungeonBaseTransition>("assets/bundled/prefabs/autospawn/" + TransitionFolder, null, null, useProbabilities: true, useWorldConfig: false);
+			if (array4 == null)
+			{
+				return;
+			}
+			foreach (DungeonBaseInfo item in TerrainMeta.Path ? TerrainMeta.Path.DungeonBaseEntrances : null)
+			{
+				TerrainPathConnect[] componentsInChildren = item.GetComponentsInChildren<TerrainPathConnect>(includeInactive: true);
+				foreach (TerrainPathConnect obj in componentsInChildren)
 				{
-					continue;
-				}
-				uint seed2 = seed++;
-				List<DungeonSegment> list = new List<DungeonSegment>();
-				DungeonSegment segmentStart = new DungeonSegment();
-				int num = 0;
-				segmentStart.position = item.transform.position;
-				segmentStart.rotation = item.transform.rotation;
-				segmentStart.link = item.GetComponentInChildren<DungeonBaseLink>();
-				segmentStart.cost = 0;
-				segmentStart.floor = 0;
-				for (int j = 0; j < 25; j++)
-				{
-					List<DungeonSegment> list2 = new List<DungeonSegment>();
-					list2.Add(segmentStart);
-					PlaceSegments(ref seed2, int.MaxValue, 3, 2, attachToFemale: true, attachToMale: false, list2, array2);
-					int num2 = list2.Count((DungeonSegment x) => x.link.MaxCountLocal != -1);
-					if (num2 > num || (num2 == num && list2.Count > list.Count))
+					if (obj.Type != ConnectionType)
 					{
-						list = list2;
-						num = num2;
+						continue;
 					}
-				}
-				if (list.Count > 5)
-				{
-					list = list.OrderByDescending((DungeonSegment x) => (x.position - segmentStart.position).SqrMagnitude2D()).ToList();
-					PlaceSegments(ref seed2, 1, 4, 2, attachToFemale: true, attachToMale: false, list, array);
-				}
-				if (list.Count > 25)
-				{
-					DungeonSegment segmentEnd = list[list.Count - 1];
-					list = list.OrderByDescending((DungeonSegment x) => Mathf.Min((x.position - segmentStart.position).SqrMagnitude2D(), (x.position - segmentEnd.position).SqrMagnitude2D())).ToList();
-					PlaceSegments(ref seed2, 1, 5, 2, attachToFemale: true, attachToMale: false, list, array);
-				}
-				bool flag = true;
-				while (flag)
-				{
-					flag = false;
-					for (int k = 0; k < list.Count; k++)
+					uint seed2 = seed++;
+					List<DungeonSegment> list = new List<DungeonSegment>();
+					DungeonSegment segmentStart = new DungeonSegment();
+					int num = 0;
+					segmentStart.position = item.transform.position;
+					segmentStart.rotation = item.transform.rotation;
+					segmentStart.link = item.GetComponentInChildren<DungeonBaseLink>();
+					segmentStart.cost = 0;
+					segmentStart.floor = 0;
+					for (int j = 0; j < 25; j++)
 					{
-						DungeonSegment dungeonSegment = list[k];
-						if (dungeonSegment.link.Cost <= 0 && !IsFullyOccupied(list, dungeonSegment))
+						List<DungeonSegment> list2 = new List<DungeonSegment>();
+						list2.Add(segmentStart);
+						PlaceSegments(ref seed2, int.MaxValue, 3, 2, attachToFemale: true, attachToMale: false, list2, array2);
+						int num2 = list2.Count((DungeonSegment x) => x.link.MaxCountLocal != -1);
+						if (num2 > num || (num2 == num && list2.Count > list.Count))
 						{
-							list.RemoveAt(k--);
-							flag = true;
+							list = list2;
+							num = num2;
 						}
 					}
+					if (list.Count > 5)
+					{
+						list = list.OrderByDescending((DungeonSegment x) => (x.position - segmentStart.position).SqrMagnitude2D()).ToList();
+						PlaceSegments(ref seed2, 1, 4, 2, attachToFemale: true, attachToMale: false, list, array);
+					}
+					if (list.Count > 25)
+					{
+						DungeonSegment segmentEnd = list[list.Count - 1];
+						list = list.OrderByDescending((DungeonSegment x) => Mathf.Min((x.position - segmentStart.position).SqrMagnitude2D(), (x.position - segmentEnd.position).SqrMagnitude2D())).ToList();
+						PlaceSegments(ref seed2, 1, 5, 2, attachToFemale: true, attachToMale: false, list, array);
+					}
+					bool flag = true;
+					while (flag)
+					{
+						flag = false;
+						for (int k = 0; k < list.Count; k++)
+						{
+							DungeonSegment dungeonSegment = list[k];
+							if (dungeonSegment.link.Cost <= 0 && !IsFullyOccupied(list, dungeonSegment))
+							{
+								list.RemoveAt(k--);
+								flag = true;
+							}
+						}
+					}
+					PlaceSegments(ref seed2, int.MaxValue, int.MaxValue, 3, attachToFemale: true, attachToMale: true, list, array3);
+					PlaceTransitions(ref seed2, list, array4);
+					segmentsTotal.AddRange(list);
 				}
-				PlaceSegments(ref seed2, int.MaxValue, int.MaxValue, 3, attachToFemale: true, attachToMale: true, list, array3);
-				PlaceTransitions(ref seed2, list, array4);
-				segmentsTotal.AddRange(list);
 			}
-		}
-		foreach (DungeonSegment item2 in segmentsTotal)
-		{
-			if (item2.prefab != null)
+			foreach (DungeonSegment item2 in segmentsTotal)
 			{
-				World.AddPrefab("DungeonBase", item2.prefab, item2.position, item2.rotation, Vector3.one);
+				if (item2.prefab != null)
+				{
+					World.AddPrefab("DungeonBase", item2.prefab, item2.position, item2.rotation, Vector3.one);
+				}
 			}
-		}
-		if ((bool)TerrainMeta.Path)
-		{
-			TerrainMeta.Path.DungeonBaseRoot = HierarchyUtil.GetRoot("DungeonBase");
+			if ((bool)TerrainMeta.Path)
+			{
+				TerrainMeta.Path.DungeonBaseRoot = HierarchyUtil.GetRoot("DungeonBase");
+			}
 		}
 	}
 

@@ -8,4 +8,6 @@ public class TeamMemberMapMarker : MonoBehaviour
 	public Text nameTagText;
 
 	public Tooltip toolTip;
+
+	public Image innerImage;
 }

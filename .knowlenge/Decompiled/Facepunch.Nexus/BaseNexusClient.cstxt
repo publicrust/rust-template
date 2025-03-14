@@ -1,0 +1,143 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Facepunch.Nexus;
+using Facepunch.Nexus.Connector;
+using Facepunch.Nexus.Models;
+using Facepunch.Nexus.Time;
+
+public abstract class BaseNexusClient : NexusAnonymousClient, IDisposable
+{
+	protected readonly IClockProvider Clock;
+
+	protected readonly CancellationToken CancellationToken;
+
+	private readonly CancellationTokenSource _cts;
+
+	private readonly double _updateInterval;
+
+	private bool _disposed;
+
+	private bool _started;
+
+	protected virtual bool ShouldUpdateVariables => _started;
+
+	public event NexusVariableChangedHandler OnVariableChanged;
+
+	public event NexusErrorHandler OnError;
+
+	protected BaseNexusClient(INexusConnector connector, IClockProvider clock, double updateInterval)
+		: base(connector, clock)
+	{
+		_cts = new CancellationTokenSource();
+		_updateInterval = updateInterval;
+		Clock = clock ?? throw new ArgumentNullException("clock");
+		CancellationToken = _cts.Token;
+	}
+
+	~BaseNexusClient()
+	{
+		Dispose(disposing: false);
+	}
+
+	public void Dispose()
+	{
+		Dispose(disposing: true);
+		GC.SuppressFinalize(this);
+	}
+
+	protected virtual void Dispose(bool disposing)
+	{
+		if (_disposed)
+		{
+			throw new ObjectDisposedException(GetType().Name);
+		}
+		_disposed = true;
+		_cts.Cancel();
+	}
+
+	public async Task Start()
+	{
+		if (_started)
+		{
+			throw new InvalidOperationException("The " + GetType().Name + " was already started");
+		}
+		await Initialize(CancellationToken);
+		UpdateLoop(CancellationToken);
+		_started = true;
+	}
+
+	protected abstract ValueTask Initialize(CancellationToken ct);
+
+	protected abstract ValueTask Update(CancellationToken ct);
+
+	private async Task UpdateLoop(CancellationToken ct)
+	{
+		while (!ct.IsCancellationRequested)
+		{
+			await Clock.Delay(_updateInterval);
+			try
+			{
+				await Update(ct);
+			}
+			catch (Exception ex) when (!(ex is OperationCanceledException))
+			{
+				DispatchError(ex);
+			}
+		}
+	}
+
+	internal void UpdateVariables(VariableContainer container, Dictionary<string, VariableData> updatedData)
+	{
+		if (container == null)
+		{
+			throw new ArgumentNullException("container");
+		}
+		if (updatedData == null || updatedData.Count == 0)
+		{
+			return;
+		}
+		NexusVariableChangedHandler nexusVariableChangedHandler = this.OnVariableChanged;
+		HashSet<string> hashSet = ((ShouldUpdateVariables && nexusVariableChangedHandler != null) ? new HashSet<string>() : null);
+		container.UpdateFromModel(updatedData, hashSet);
+		if (nexusVariableChangedHandler == null || hashSet == null)
+		{
+			return;
+		}
+		foreach (string item in hashSet)
+		{
+			try
+			{
+				nexusVariableChangedHandler(this, item);
+			}
+			catch (Exception exception)
+			{
+				DispatchError(exception);
+			}
+		}
+	}
+
+	internal void DispatchVariableChanged(string key)
+	{
+		try
+		{
+			this.OnVariableChanged?.Invoke(this, key);
+		}
+		catch (Exception exception)
+		{
+			DispatchError(exception);
+		}
+	}
+
+	internal void DispatchError(Exception exception)
+	{
+		try
+		{
+			this.OnError?.Invoke(this, exception);
+		}
+		catch
+		{
+		}
+	}
+}

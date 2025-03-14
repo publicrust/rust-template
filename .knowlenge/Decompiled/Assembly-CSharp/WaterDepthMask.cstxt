@@ -1,5 +1,5 @@
 using UnityEngine;
 
-public class WaterDepthMask : MonoBehaviour
+public class WaterDepthMask : MonoBehaviour, IClientComponent
 {
 }

@@ -1,15 +1,40 @@
 using System.Collections.Generic;
+using ConVar;
+using Facepunch;
 using Network;
 using Oxide.Core;
 using UnityEngine;
 
 public class ConnectionQueue
 {
+	private class ReservedServerSlot : Facepunch.Pool.IPooled
+	{
+		public ulong UserId;
+
+		public float Expiry;
+
+		public void EnterPool()
+		{
+		}
+
+		public void LeavePool()
+		{
+			UserId = 0uL;
+			Expiry = 0f;
+		}
+	}
+
 	public List<Connection> queue = new List<Connection>();
 
 	public List<Connection> joining = new List<Connection>();
 
+	private List<ReservedServerSlot> reservedSlots = new List<ReservedServerSlot>();
+
+	private float nextCleanupReservedSlots;
+
 	public float nextMessageTime;
+
+	public int ReservedCount => reservedSlots.Count;
 
 	public int Queued => queue.Count;
 
@@ -44,7 +69,16 @@ public class ConnectionQueue
 
 	public void Cycle(int availableSlots)
 	{
-		if (Interface.CallHook("OnQueueCycle", availableSlots) == null && queue.Count != 0)
+		if (Interface.CallHook("OnQueueCycle", availableSlots) != null)
+		{
+			return;
+		}
+		if (UnityEngine.Time.realtimeSinceStartup > nextCleanupReservedSlots)
+		{
+			nextCleanupReservedSlots = UnityEngine.Time.realtimeSinceStartup + 1f;
+			CleanupExpiredReservedSlots();
+		}
+		if (queue.Count != 0)
 		{
 			if (availableSlots - Joining > 0)
 			{
@@ -56,9 +90,9 @@ public class ConnectionQueue
 
 	public void SendMessages()
 	{
-		if (!(nextMessageTime > Time.realtimeSinceStartup))
+		if (!(nextMessageTime > UnityEngine.Time.realtimeSinceStartup))
 		{
-			nextMessageTime = Time.realtimeSinceStartup + 10f;
+			nextMessageTime = UnityEngine.Time.realtimeSinceStartup + 10f;
 			for (int i = 0; i < queue.Count; i++)
 			{
 				SendMessage(queue[i], i);
@@ -72,7 +106,7 @@ public class ConnectionQueue
 		{
 			string empty = string.Empty;
 			empty = ((position <= 0) ? string.Format("YOU'RE NEXT - {1:N0} PLAYERS BEHIND YOU", position, queue.Count - position - 1) : $"{position:N0} PLAYERS AHEAD OF YOU, {queue.Count - position - 1:N0} PLAYERS BEHIND");
-			NetWrite netWrite = Net.sv.StartWrite();
+			NetWrite netWrite = Network.Net.sv.StartWrite();
 			netWrite.PacketID(Message.Type.Message);
 			netWrite.String("QUEUE");
 			netWrite.String(empty);
@@ -92,10 +126,19 @@ public class ConnectionQueue
 		}
 	}
 
+	public void TryAddReservedSlot(Connection connection)
+	{
+		if (connection.canReserveSlot && (connection.state == Connection.State.Connected || connection.state == Connection.State.Welcoming))
+		{
+			AddReservation(connection.userid);
+		}
+	}
+
 	private void JoinGame(Connection connection)
 	{
 		queue.Remove(connection);
 		connection.state = Connection.State.Welcoming;
+		RemoveReservedSlot(connection.userid);
 		nextMessageTime = 0f;
 		joining.Add(connection);
 		SingletonComponent<ServerMgr>.Instance.JoinGame(connection);
@@ -104,6 +147,63 @@ public class ConnectionQueue
 	public void JoinedGame(Connection connection)
 	{
 		RemoveConnection(connection);
+	}
+
+	private void AddReservation(ulong userId)
+	{
+		ReservedServerSlot reservedServerSlot = FindQueueSpot(userId);
+		if (reservedServerSlot == null)
+		{
+			reservedServerSlot = Facepunch.Pool.Get<ReservedServerSlot>();
+			reservedSlots.Add(reservedServerSlot);
+		}
+		reservedServerSlot.UserId = userId;
+		reservedServerSlot.Expiry = UnityEngine.Time.realtimeSinceStartup + (float)ConVar.Server.rejoin_delay;
+	}
+
+	private void CleanupExpiredReservedSlots()
+	{
+		if (reservedSlots.Count == 0)
+		{
+			return;
+		}
+		float realtimeSinceStartup = UnityEngine.Time.realtimeSinceStartup;
+		for (int i = 0; i < reservedSlots.Count; i++)
+		{
+			ReservedServerSlot obj = reservedSlots[i];
+			if (realtimeSinceStartup > obj.Expiry)
+			{
+				reservedSlots.RemoveAt(i);
+				i--;
+				Facepunch.Pool.Free(ref obj);
+			}
+		}
+	}
+
+	private ReservedServerSlot FindQueueSpot(ulong userId)
+	{
+		foreach (ReservedServerSlot reservedSlot in reservedSlots)
+		{
+			if (reservedSlot.UserId == userId)
+			{
+				return reservedSlot;
+			}
+		}
+		return null;
+	}
+
+	private void RemoveReservedSlot(ulong userId)
+	{
+		for (int i = 0; i < reservedSlots.Count; i++)
+		{
+			ReservedServerSlot obj = reservedSlots[i];
+			if (obj.UserId == userId)
+			{
+				reservedSlots.RemoveAt(i);
+				i--;
+				Facepunch.Pool.Free(ref obj);
+			}
+		}
 	}
 
 	private bool CanJumpQueue(Connection connection)
@@ -129,6 +229,13 @@ public class ConnectionQueue
 		if (user != null && user.group == ServerUsers.UserGroup.SkipQueue)
 		{
 			return true;
+		}
+		for (int i = 0; i < reservedSlots.Count; i++)
+		{
+			if (reservedSlots[i].UserId == connection.userid && reservedSlots[i].Expiry > UnityEngine.Time.realtimeSinceStartup)
+			{
+				return true;
+			}
 		}
 		return false;
 	}

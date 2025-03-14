@@ -169,7 +169,7 @@ public sealed class ByteQuadtree
 	public void UpdateValues(byte[] baseValues)
 	{
 		size = Mathf.RoundToInt(Mathf.Sqrt(baseValues.Length));
-		levels = Mathf.RoundToInt(Mathf.Log(size, 2f)) + 1;
+		levels = Mathf.RoundToInt(Mathf.Max(Mathf.Log(size, 2f), 0f)) + 1;
 		values = new ByteMap[levels];
 		values[0] = new ByteMap(size, baseValues);
 		for (int i = 1; i < levels; i++)

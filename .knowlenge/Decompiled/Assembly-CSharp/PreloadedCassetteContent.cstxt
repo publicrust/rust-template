@@ -32,30 +32,64 @@ public class PreloadedCassetteContent : ScriptableObject
 		return array[index];
 	}
 
+	public uint GetSoundContentId(SoundDefinition def)
+	{
+		uint num = 0u;
+		SoundDefinition[] shortTapeContent = ShortTapeContent;
+		for (int i = 0; i < shortTapeContent.Length; i++)
+		{
+			if (shortTapeContent[i] == def)
+			{
+				return num;
+			}
+			num++;
+		}
+		shortTapeContent = MediumTapeContent;
+		for (int i = 0; i < shortTapeContent.Length; i++)
+		{
+			if (shortTapeContent[i] == def)
+			{
+				return num;
+			}
+			num++;
+		}
+		shortTapeContent = LongTapeContent;
+		for (int i = 0; i < shortTapeContent.Length; i++)
+		{
+			if (shortTapeContent[i] == def)
+			{
+				return num;
+			}
+			num++;
+		}
+		return num;
+	}
+
 	public SoundDefinition GetSoundContent(uint id)
 	{
+		int num = 0;
 		SoundDefinition[] shortTapeContent = ShortTapeContent;
-		foreach (SoundDefinition soundDefinition in shortTapeContent)
+		foreach (SoundDefinition result in shortTapeContent)
 		{
-			if (StringPool.Get(soundDefinition.name) == id)
+			if (num++ == id)
 			{
-				return soundDefinition;
+				return result;
 			}
 		}
 		shortTapeContent = MediumTapeContent;
-		foreach (SoundDefinition soundDefinition2 in shortTapeContent)
+		foreach (SoundDefinition result2 in shortTapeContent)
 		{
-			if (StringPool.Get(soundDefinition2.name) == id)
+			if (num++ == id)
 			{
-				return soundDefinition2;
+				return result2;
 			}
 		}
 		shortTapeContent = LongTapeContent;
-		foreach (SoundDefinition soundDefinition3 in shortTapeContent)
+		foreach (SoundDefinition result3 in shortTapeContent)
 		{
-			if (StringPool.Get(soundDefinition3.name) == id)
+			if (num++ == id)
 			{
-				return soundDefinition3;
+				return result3;
 			}
 		}
 		return null;

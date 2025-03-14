@@ -19,7 +19,7 @@ public class UIMarketTerminal : UIDialog, IVendingMachineInterface
 
 	public LeanTweenType easeType = LeanTweenType.linear;
 
-	public RustText shopName;
+	public TmProEmojiRedirector shopName;
 
 	public GameObject shopOrderingPanel;
 

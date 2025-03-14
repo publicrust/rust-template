@@ -6,8 +6,6 @@ public class KeyCodeEntry : UIDialog
 {
 	public Text textDisplay;
 
-	public Action<string> onCodeEntered;
-
 	public Action onClosed;
 
 	public Text typeDisplay;

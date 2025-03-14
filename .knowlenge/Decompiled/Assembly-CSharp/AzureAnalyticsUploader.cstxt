@@ -1,0 +1,215 @@
+using System;
+using System.Collections.Concurrent;
+using System.IO;
+using System.IO.Compression;
+using System.Threading;
+using System.Threading.Tasks;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using ConVar;
+using Cysharp.Text;
+using Facepunch;
+using Facepunch.Rust;
+using UnityEngine;
+
+public class AzureAnalyticsUploader : Facepunch.Pool.IPooled
+{
+	public static bool UsePooling;
+
+	private ConcurrentQueue<EventRecord> queue = new ConcurrentQueue<EventRecord>();
+
+	private BlobClient _blobClient;
+
+	private Stream Stream;
+
+	private GZipStream ZipStream;
+
+	private Utf8ValueStringBuilder Writer;
+
+	private bool disposed;
+
+	public TimeSpan LoopDelay { get; set; }
+
+	public DateTime Expiry { get; private set; }
+
+	public bool StrictMode { get; set; }
+
+	public AnalyticsDocumentMode DocumentMode { get; private set; }
+
+	public bool UseJsonDataObject { get; set; }
+
+	public AzureAnalyticsUploader()
+	{
+		Writer = ZString.CreateUtf8StringBuilder();
+	}
+
+	public void EnterPool()
+	{
+		disposed = true;
+	}
+
+	public void LeavePool()
+	{
+		Initialize();
+	}
+
+	private void Initialize()
+	{
+		LoopDelay = TimeSpan.FromMilliseconds(250.0);
+		Expiry = DateTime.MinValue;
+		StrictMode = false;
+		UseJsonDataObject = false;
+		DocumentMode = AnalyticsDocumentMode.JSON;
+		EmptyUploadQueue();
+		_blobClient = null;
+		Stream = null;
+		ZipStream = null;
+		disposed = false;
+	}
+
+	public bool TryFlush()
+	{
+		if (Expiry < DateTime.UtcNow)
+		{
+			disposed = true;
+			return true;
+		}
+		return false;
+	}
+
+	public static AzureAnalyticsUploader Create(string table, TimeSpan timeout, AnalyticsDocumentMode mode = AnalyticsDocumentMode.JSON)
+	{
+		AzureAnalyticsUploader azureAnalyticsUploader;
+		if (UsePooling)
+		{
+			azureAnalyticsUploader = Facepunch.Pool.Get<AzureAnalyticsUploader>();
+		}
+		else
+		{
+			azureAnalyticsUploader = new AzureAnalyticsUploader();
+			azureAnalyticsUploader.Initialize();
+		}
+		azureAnalyticsUploader.Expiry = DateTime.UtcNow + timeout;
+		azureAnalyticsUploader.DocumentMode = mode;
+		if (string.IsNullOrEmpty(Analytics.BulkUploadConnectionString))
+		{
+			azureAnalyticsUploader.disposed = true;
+			return azureAnalyticsUploader;
+		}
+		string text = ((mode == AnalyticsDocumentMode.JSON) ? ".json" : ".csv");
+		string blobName = Path.Combine(table, Server.server_id, Guid.NewGuid().ToString("N") + text + ".gz");
+		BlobContainerClient blobContainerClient = new BlobContainerClient(new Uri(Analytics.BulkUploadConnectionString));
+		azureAnalyticsUploader._blobClient = blobContainerClient.GetBlobClient(blobName);
+		Task.Run((Func<Task>)azureAnalyticsUploader.UploadThread);
+		return azureAnalyticsUploader;
+	}
+
+	public void Append(EventRecord record)
+	{
+		if (disposed)
+		{
+			if (StrictMode)
+			{
+				throw new Exception("Trying to append to a disposed uploader: make sure to dispose the uploader properly!");
+			}
+			record.MarkSubmitted();
+			Facepunch.Pool.Free(ref record);
+		}
+		else
+		{
+			queue.Enqueue(record);
+		}
+	}
+
+	private async Task CreateBlobAsync()
+	{
+		CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
+		cancellationTokenSource.CancelAfter(TimeSpan.FromSeconds(10.0));
+		BlobOpenWriteOptions options = new BlobOpenWriteOptions
+		{
+			HttpHeaders = new BlobHttpHeaders
+			{
+				ContentType = ((DocumentMode == AnalyticsDocumentMode.JSON) ? "application/json" : "text/csv"),
+				ContentEncoding = "gzip"
+			}
+		};
+		Stream = await _blobClient.OpenWriteAsync(overwrite: true, options, cancellationTokenSource.Token);
+		ZipStream = new GZipStream(Stream, System.IO.Compression.CompressionLevel.Fastest);
+		Writer.Clear();
+	}
+
+	private async Task UploadThread()
+	{
+		try
+		{
+			_ = 2;
+			try
+			{
+				while (!disposed || !queue.IsEmpty)
+				{
+					EventRecord record;
+					while (queue.TryDequeue(out record))
+					{
+						if (Stream == null)
+						{
+							await CreateBlobAsync();
+						}
+						Writer.Clear();
+						if (DocumentMode == AnalyticsDocumentMode.JSON)
+						{
+							record.SerializeAsJson(ref Writer, UseJsonDataObject);
+						}
+						else if (DocumentMode == AnalyticsDocumentMode.CSV)
+						{
+							record.SerializeAsCSV(ref Writer);
+						}
+						Writer.AppendLine();
+						await Writer.WriteToAsync(ZipStream);
+						record.MarkSubmitted();
+						Facepunch.Pool.Free(ref record);
+					}
+					await Task.Delay(LoopDelay);
+				}
+			}
+			catch (Exception exception)
+			{
+				disposed = true;
+				Debug.LogException(exception);
+				EmptyUploadQueue();
+			}
+		}
+		finally
+		{
+			await DisposeStreamsAsync();
+			if (UsePooling)
+			{
+				AzureAnalyticsUploader obj = this;
+				Facepunch.Pool.Free(ref obj);
+			}
+		}
+	}
+
+	private void EmptyUploadQueue()
+	{
+		EventRecord result;
+		while (queue.TryDequeue(out result))
+		{
+			result.MarkSubmitted();
+			Facepunch.Pool.Free(ref result);
+		}
+	}
+
+	private async Task DisposeStreamsAsync()
+	{
+		if (ZipStream != null)
+		{
+			await ZipStream.DisposeAsync();
+			ZipStream = null;
+		}
+		if (Stream != null)
+		{
+			await Stream.DisposeAsync();
+			Stream = null;
+		}
+	}
+}

@@ -48,8 +48,6 @@ public class GenerateRailSiding : ProceduralComponent
 	{
 		if (World.Networked)
 		{
-			TerrainMeta.Path.Rails.Clear();
-			TerrainMeta.Path.Rails.AddRange(World.GetPaths("Rail"));
 			return;
 		}
 		int min = Mathf.RoundToInt(40f);
@@ -173,15 +171,5 @@ public class GenerateRailSiding : ProceduralComponent
 			item2.AdjustPlacementMap(20f);
 		}
 		TerrainMeta.Path.Rails.AddRange(list);
-	}
-
-	public PathFinder.Point GetPathFinderPoint(Vector3 worldPos, int res)
-	{
-		float num = TerrainMeta.NormalizeX(worldPos.x);
-		float num2 = TerrainMeta.NormalizeZ(worldPos.z);
-		PathFinder.Point result = default(PathFinder.Point);
-		result.x = Mathf.Clamp((int)(num * (float)res), 0, res - 1);
-		result.y = Mathf.Clamp((int)(num2 * (float)res), 0, res - 1);
-		return result;
 	}
 }

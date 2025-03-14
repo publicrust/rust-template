@@ -57,7 +57,7 @@ public class VehicleTerrainHandler
 	{
 		timeSinceTerrainCheck = Random.Range(-0.025f, 0.025f);
 		Transform transform = vehicle.transform;
-		if (Physics.Raycast(transform.position + transform.up * 0.5f, -transform.up, out var hitInfo, RayLength, 27328513, QueryTriggerInteraction.Ignore))
+		if (Physics.Raycast(transform.position + transform.up * 0.5f, -transform.up, out var hitInfo, RayLength, 161546241, QueryTriggerInteraction.Ignore))
 		{
 			CurGroundPhysicsMatName = AssetNameCache.GetNameLower(ColliderEx.GetMaterialAt(hitInfo.collider, hitInfo.point));
 			if (GetOnRoad(CurGroundPhysicsMatName))

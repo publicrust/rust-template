@@ -12,6 +12,8 @@ public class MixerSnapshotManager : SingletonComponent<MixerSnapshotManager>, IC
 
 	public AudioMixerSnapshot cctvSnapshot;
 
+	public AudioMixerSnapshot fadeToBlackSnapshot;
+
 	public SoundDefinition underwaterInSound;
 
 	public SoundDefinition underwaterOutSound;

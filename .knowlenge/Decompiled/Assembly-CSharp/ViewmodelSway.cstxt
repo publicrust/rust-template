@@ -9,4 +9,6 @@ public class ViewmodelSway : MonoBehaviour
 	public float rotationSwaySpeed = 1f;
 
 	public float rotationSwayAmount = 1f;
+
+	public float rotateAmountTest = 20f;
 }

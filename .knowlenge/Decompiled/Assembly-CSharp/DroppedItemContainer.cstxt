@@ -1,6 +1,7 @@
 #define UNITY_ASSERTIONS
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using ConVar;
 using Facepunch;
 using Network;
@@ -29,6 +30,10 @@ public class DroppedItemContainer : BaseCombatEntity, LootPanel.IHasLootPanel, I
 
 	public SoundDefinition closeSound;
 
+	public const Flags HasItems = Flags.Reserved1;
+
+	public const Flags HasBeenOpened = Flags.Reserved2;
+
 	public ItemContainer inventory;
 
 	public Translate.Phrase LootPanelTitle => playerName;
@@ -37,7 +42,11 @@ public class DroppedItemContainer : BaseCombatEntity, LootPanel.IHasLootPanel, I
 	{
 		get
 		{
-			return NameHelper.Get(playerSteamID, _playerName);
+			if (playerSteamID == 0L)
+			{
+				return "";
+			}
+			return NameHelper.Get(playerSteamID, _playerName, base.isClient);
 		}
 		set
 		{
@@ -56,7 +65,7 @@ public class DroppedItemContainer : BaseCombatEntity, LootPanel.IHasLootPanel, I
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_OpenLoot "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - RPC_OpenLoot ");
 				}
 				using (TimeWarning.New("RPC_OpenLoot"))
 				{
@@ -93,14 +102,16 @@ public class DroppedItemContainer : BaseCombatEntity, LootPanel.IHasLootPanel, I
 
 	public override bool OnStartBeingLooted(BasePlayer baseEntity)
 	{
-		if (baseEntity.InSafeZone() && baseEntity.userID != playerSteamID)
+		if ((baseEntity.InSafeZone() || InSafeZone()) && (ulong)baseEntity.userID != playerSteamID)
 		{
 			return false;
 		}
-		if (onlyOwnerLoot && baseEntity.userID != playerSteamID)
+		if (onlyOwnerLoot && (ulong)baseEntity.userID != playerSteamID)
 		{
 			return false;
 		}
+		SetFlag(Flags.Reserved2, b: true);
+		EvaluateBagConditions();
 		return base.OnStartBeingLooted(baseEntity);
 	}
 
@@ -120,6 +131,12 @@ public class DroppedItemContainer : BaseCombatEntity, LootPanel.IHasLootPanel, I
 		{
 			Kill();
 		}
+	}
+
+	private void EvaluateBagConditions()
+	{
+		Rigidbody component = GetComponent<Rigidbody>();
+		SetFlag(Flags.Reserved1, inventory != null && inventory.itemList.Count > 0 && inventory.itemList.Count > 3 && component != null && component.IsSleeping());
 	}
 
 	public void ResetRemovalTime(float dur)
@@ -157,8 +174,7 @@ public class DroppedItemContainer : BaseCombatEntity, LootPanel.IHasLootPanel, I
 		base.DoServerDestroy();
 		if (inventory != null)
 		{
-			inventory.Kill();
-			inventory = null;
+			Facepunch.Pool.Free(ref inventory);
 		}
 	}
 
@@ -173,12 +189,13 @@ public class DroppedItemContainer : BaseCombatEntity, LootPanel.IHasLootPanel, I
 			{
 				num += itemContainer.itemList.Count;
 			}
-			inventory = new ItemContainer();
+			inventory = Facepunch.Pool.Get<ItemContainer>();
 			inventory.ServerInitialize(null, Mathf.Min(num, maxItemCount));
 			inventory.GiveUID();
 			inventory.entityOwner = this;
 			inventory.SetFlag(ItemContainer.Flag.NoItemInput, b: true);
-			List<Item> obj = Facepunch.Pool.GetList<Item>();
+			inventory.containerVolume = source.Max((ItemContainer x) => x.containerVolume);
+			List<Item> obj = Facepunch.Pool.Get<List<Item>>();
 			array = source;
 			for (int i = 0; i < array.Length; i++)
 			{
@@ -214,13 +231,13 @@ public class DroppedItemContainer : BaseCombatEntity, LootPanel.IHasLootPanel, I
 					}
 				}
 			}
-			Facepunch.Pool.FreeList(ref obj);
+			Facepunch.Pool.Free(ref obj, freeElements: false);
 			ResetRemovalTime();
 		}
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
 	private void RPC_OpenLoot(RPCMessage rpc)
 	{
 		if (inventory != null)
@@ -231,7 +248,7 @@ public class DroppedItemContainer : BaseCombatEntity, LootPanel.IHasLootPanel, I
 				SetFlag(Flags.Open, b: true);
 				player.inventory.loot.AddContainer(inventory);
 				player.inventory.loot.SendImmediate();
-				player.ClientRPCPlayer(null, player, "RPC_OpenLootPanel", lootPanelName);
+				player.ClientRPC(RpcTarget.Player("RPC_OpenLootPanel", player), lootPanelName);
 				SendNetworkUpdate();
 			}
 		}
@@ -243,17 +260,21 @@ public class DroppedItemContainer : BaseCombatEntity, LootPanel.IHasLootPanel, I
 		if (inventory == null || inventory.itemList == null || inventory.itemList.Count == 0)
 		{
 			Kill();
-			return;
 		}
-		ResetRemovalTime();
-		SetFlag(Flags.Open, b: false);
-		SendNetworkUpdate();
+		else
+		{
+			ResetRemovalTime();
+			SetFlag(Flags.Open, b: false);
+			SendNetworkUpdate();
+		}
+		EvaluateBagConditions();
 	}
 
 	public override void PreServerLoad()
 	{
 		base.PreServerLoad();
-		inventory = new ItemContainer();
+		Debug.Assert(inventory == null, "Double init of inventory!");
+		inventory = Facepunch.Pool.Get<ItemContainer>();
 		inventory.entityOwner = this;
 		inventory.ServerInitialize(null, 0);
 		inventory.SetFlag(ItemContainer.Flag.NoItemInput, b: true);

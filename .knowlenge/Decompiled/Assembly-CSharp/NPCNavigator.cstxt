@@ -4,12 +4,41 @@ using UnityEngine.AI;
 
 public class NPCNavigator : BaseNavigator
 {
+	public int DestroyOnFailedSampleCount = 5;
+
+	private int sampleFailCount;
+
 	public BaseNpc NPC { get; private set; }
 
 	public override void Init(BaseCombatEntity entity, NavMeshAgent agent)
 	{
 		base.Init(entity, agent);
 		NPC = entity as BaseNpc;
+		sampleFailCount = 0;
+	}
+
+	public override void OnFailedToPlaceOnNavmesh()
+	{
+		base.OnFailedToPlaceOnNavmesh();
+		if (SingletonComponent<DynamicNavMesh>.Instance == null || SingletonComponent<DynamicNavMesh>.Instance.IsBuilding)
+		{
+			return;
+		}
+		sampleFailCount++;
+		if (DestroyOnFailedSampleCount > 0 && sampleFailCount >= DestroyOnFailedSampleCount)
+		{
+			Debug.LogWarning("Failed to sample navmesh " + sampleFailCount + " times in a row at: " + base.transform.position.ToString() + ". Destroying: " + base.gameObject.name);
+			if (NPC != null && !NPC.IsDestroyed)
+			{
+				NPC.Kill();
+			}
+		}
+	}
+
+	public override void OnPlacedOnNavmesh()
+	{
+		base.OnPlacedOnNavmesh();
+		sampleFailCount = 0;
 	}
 
 	protected override bool CanEnableNavMeshNavigation()

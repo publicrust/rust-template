@@ -7,5 +7,6 @@ public enum PerformanceSample
 	FixedUpdate,
 	NetworkMessage,
 	TotalCPU,
+	PhysicsUpdate,
 	Last
 }

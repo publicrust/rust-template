@@ -17,7 +17,7 @@ public class LiquidVessel : HeldEntity
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - DoEmpty "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - DoEmpty ");
 				}
 				using (TimeWarning.New("DoEmpty"))
 				{
@@ -83,8 +83,8 @@ public class LiquidVessel : HeldEntity
 		return true;
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsActiveItem]
+	[RPC_Server]
 	private void DoEmpty(RPCMessage msg)
 	{
 		if (!msg.player.CanInteract())

@@ -1,0 +1,170 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Facepunch;
+using Facepunch.Ping;
+using Newtonsoft.Json;
+using UnityEngine;
+
+public static class PingEstimater
+{
+	private static string json = "{\"addresses\":[{\"ip\":\"20.217.192.56\",\"location\":\"Isreal\",\"shortname\":\"isreal\",\"code\":\"isr\"},{\"ip\":\"168.63.102.56\",\"location\":\"Netherlands\",\"shortname\":\"eu-west\",\"code\":\"eu1\"},{\"ip\":\"20.90.192.172\",\"location\":\"London\",\"shortname\":\"uk-south\",\"code\":\"uk1\"},{\"ip\":\"20.215.67.201\",\"location\":\"Poland\",\"shortname\":\"poland\",\"code\":\"pol\"},{\"ip\":\"20.216.185.89\",\"location\":\"France\",\"shortname\":\"france\",\"code\":\"fra\"},{\"ip\":\"20.91.203.128\",\"location\":\"Sweden\",\"shortname\":\"sweden\",\"code\":\"eu2\"},{\"ip\":\"20.164.44.234\",\"location\":\"Johannesburg\",\"shortname\":\"africa-south\",\"code\":\"af\"},{\"ip\":\"20.226.112.187\",\"location\":\"Brazil\",\"shortname\":\"brazil\",\"code\":\"br\"},{\"ip\":\"4.188.243.219\",\"location\":\"Pune\",\"shortname\":\"india\",\"code\":\"ind\"},{\"ip\":\"20.63.42.137\",\"location\":\"Toronto\",\"shortname\":\"can-central\",\"code\":\"ca1\"},{\"ip\":\"172.203.56.37\",\"location\":\"Virginia\",\"shortname\":\"us-east-2\",\"code\":\"us4\"},{\"ip\":\"20.220.64.24\",\"location\":\"Quebec City\",\"shortname\":\"can-east\",\"code\":\"ca2\"},{\"ip\":\"20.18.241.207\",\"location\":\"Tokyo\",\"shortname\":\"japan-east\",\"code\":\"ja1\"},{\"ip\":\"20.112.98.85\",\"location\":\"Washington\",\"shortname\":\"us-west-2\",\"code\":\"us2\"},{\"ip\":\"20.218.98.161\",\"location\":\"Germany\",\"shortname\":\"germany\",\"code\":\"ger\"},{\"ip\":\"20.24.146.17\",\"location\":\"Singapore\",\"shortname\":\"asia-south\",\"code\":\"as1\"},{\"ip\":\"20.247.59.162\",\"location\":\"Hong Kong\",\"shortname\":\"asia-east\",\"code\":\"as2\"},{\"ip\":\"172.190.181.248\",\"location\":\"Illinois\",\"shortname\":\"us-north\",\"code\":\"us5\"},{\"ip\":\"20.37.4.183\",\"location\":\"Canberra\",\"shortname\":\"au-central\",\"code\":\"au1\"},{\"ip\":\"20.65.248.143\",\"location\":\"Texas\",\"shortname\":\"us-central\",\"code\":\"us1\"},{\"ip\":\"137.135.24.105\",\"location\":\"California\",\"shortname\":\"us-west\",\"code\":\"us3\"}]}";
+
+	private static PingManifest manifest = null;
+
+	private static uint seed = 1234u;
+
+	public static int numSamples = 5;
+
+	public static bool parallel = false;
+
+	public static int refreshIntervalMinutes = 45;
+
+	public static bool AutoRefresh = Environment.OSVersion.Platform != PlatformID.Unix;
+
+	public static bool enabled = true;
+
+	public static bool logging = false;
+
+	private static readonly IPingRegion UnknownRegion = new PingAddress
+	{
+		Code = "?",
+		Location = "Unknown",
+		Shortname = "unknown"
+	};
+
+	private static Task updateRegionTask;
+
+	private static DateTime _cachedTime;
+
+	private static IPingRegion _cachedRegion = UnknownRegion;
+
+	private static IPingEstimateResults _pingResults;
+
+	public static bool IsEnabled
+	{
+		get
+		{
+			if (enabled)
+			{
+				return refreshIntervalMinutes > 0;
+			}
+			return false;
+		}
+	}
+
+	private static List<PingAddress> DownloadRegions()
+	{
+		if (manifest == null)
+		{
+			manifest = JsonConvert.DeserializeObject<PingManifest>(json);
+		}
+		return manifest.Addresses;
+	}
+
+	private static void TryRefreshCache()
+	{
+		if (IsEnabled && (AutoRefresh || _cachedRegion == null) && DateTime.UtcNow - _cachedTime > TimeSpan.FromMinutes(refreshIntervalMinutes))
+		{
+			_cachedTime = DateTime.UtcNow;
+			ForceRefreshCache();
+		}
+	}
+
+	public static void ForceRefreshCache()
+	{
+		if (updateRegionTask == null || updateRegionTask.IsCompleted)
+		{
+			updateRegionTask = CalculateClosestRegion();
+		}
+	}
+
+	public static IPingRegion GetCachedClosestRegion()
+	{
+		TryRefreshCache();
+		return _cachedRegion;
+	}
+
+	public static int? GetCachedPingForRegion(StringView regionCode)
+	{
+		TryRefreshCache();
+		return _pingResults?.GetRegionByCode(regionCode)?.Ping ?? int.MaxValue;
+	}
+
+	public static IPingEstimateResults GetEstimateToAllRegions()
+	{
+		TryRefreshCache();
+		return _pingResults;
+	}
+
+	private static async Task CalculateClosestRegion()
+	{
+		List<PingAddress> source = DownloadRegions();
+		List<PingSample> samples = source.Select((PingAddress x) => new PingSample(x)).ToList();
+		seed = (uint)new System.Random().Next(0, int.MaxValue);
+		for (int sampleCount = 0; sampleCount < numSamples; sampleCount++)
+		{
+			if (logging)
+			{
+				Debug.Log($"[PingEstimator] Iteration {sampleCount}");
+			}
+			samples.Shuffle(ref seed);
+			foreach (PingSample sample in samples)
+			{
+				sample.PingInstance = new Ping(sample.Region.IP);
+				sample.Timestamp = DateTime.UtcNow;
+				if (!parallel)
+				{
+					while (!sample.IsDone())
+					{
+						await Task.Delay(80);
+					}
+					if (sample.PingInstance.time >= 0)
+					{
+						sample.AddSample(sample.PingInstance.time);
+					}
+					sample.PingInstance.DestroyPing();
+					if (Environment.OSVersion.Platform == PlatformID.Unix)
+					{
+						await Task.Delay(500);
+					}
+					if (logging)
+					{
+						Debug.Log($"[PingEstimator] Region {sample.Region.Shortname} took {sample.PingInstance.time}ms");
+					}
+				}
+			}
+			if (parallel)
+			{
+				bool flag = false;
+				while (!flag)
+				{
+					await Task.Delay(80);
+					flag = true;
+					foreach (PingSample item in samples)
+					{
+						if (!item.IsDone())
+						{
+							if (item.PingInstance.time >= 0)
+							{
+								item.AddSample(item.PingInstance.time);
+							}
+							item.PingInstance.DestroyPing();
+							flag = false;
+							break;
+						}
+					}
+				}
+			}
+			samples.Sort();
+			PingSample pingSample = samples[0];
+			_cachedRegion = pingSample.Region;
+			_pingResults = new PingEstimateResults(samples);
+			if (logging)
+			{
+				Debug.Log($"[PingEstimator] Closest region is {pingSample.Region.Shortname} with {pingSample.Value}ms");
+			}
+		}
+	}
+}

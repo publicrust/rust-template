@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
 using Facepunch;
+using Facepunch.Extend;
 using Facepunch.Rust;
 using Oxide.Core;
 using Rust;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 [CreateAssetMenu(menuName = "Rust/Missions/BaseMission")]
 public class BaseMission : BaseScriptableObject
@@ -12,13 +14,23 @@ public class BaseMission : BaseScriptableObject
 	[Serializable]
 	public class MissionDependancy
 	{
-		public string targetMissionShortname;
+		public BaseMission targetMission;
 
 		public MissionStatus targetMissionDesiredStatus;
 
 		public bool everAttempted;
 
-		public uint targetMissionID => targetMissionShortname.ManifestHash();
+		public uint targetMissionID
+		{
+			get
+			{
+				if (!(targetMission != null))
+				{
+					return 0u;
+				}
+				return targetMission.shortname.ManifestHash();
+			}
+		}
 	}
 
 	public enum MissionStatus
@@ -37,7 +49,23 @@ public class BaseMission : BaseScriptableObject
 		CONVERSATION,
 		KILL_ENTITY,
 		ACQUIRE_ITEM,
-		FREE_CRATE
+		FREE_CRATE,
+		MOUNT_ENTITY,
+		HURT_ENTITY,
+		PLAYER_TICK,
+		CRAFT_ITEM,
+		DEPLOY,
+		HEAL,
+		CLOTHINGCHANGED,
+		STARTOVEN,
+		CONSUME,
+		ACQUITE_ITEM_STACK,
+		OPEN_STORAGE,
+		COOK,
+		ENTER_TRIGGER,
+		UPGRADE_BUILDING_GRADE,
+		RESPAWN,
+		METAL_DETECTOR_FIND
 	}
 
 	[Serializable]
@@ -51,12 +79,29 @@ public class BaseMission : BaseScriptableObject
 
 		public bool onlyProgressIfStarted = true;
 
+		public bool isRequired = true;
+
 		public MissionObjective objective;
+
+		public string[] requiredEntities;
+
+		public ItemAmount[] bonusRewards;
 
 		public MissionObjective Get()
 		{
 			return objective;
 		}
+	}
+
+	public struct MissionEventPayload
+	{
+		public NetworkableId NetworkIdentifier;
+
+		public uint UintIdentifier;
+
+		public int IntIdentifier;
+
+		public Vector3 WorldPosition;
 	}
 
 	public class MissionInstance : Pool.IPooled
@@ -70,9 +115,11 @@ public class BaseMission : BaseScriptableObject
 
 			public bool failed;
 
-			public int genericInt1;
+			public float progressTarget;
 
-			public float genericFloat1;
+			public float progressCurrent;
+
+			public RealTimeSince sinceLastThink;
 		}
 
 		public enum ObjectiveType
@@ -91,8 +138,6 @@ public class BaseMission : BaseScriptableObject
 
 		public MissionStatus status;
 
-		public float completionScale;
-
 		public float startTime;
 
 		public float endTime;
@@ -103,11 +148,11 @@ public class BaseMission : BaseScriptableObject
 
 		public Dictionary<string, Vector3> missionPoints = new Dictionary<string, Vector3>();
 
+		public Dictionary<string, MissionEntity> missionEntities = new Dictionary<string, MissionEntity>();
+
+		private int playerInputCounter;
+
 		public ObjectiveStatus[] objectiveStatuses;
-
-		public List<MissionEntity> createdEntities;
-
-		public ItemAmount[] rewards;
 
 		public BaseEntity ProviderEntity()
 		{
@@ -141,14 +186,33 @@ public class BaseMission : BaseScriptableObject
 			return ShouldShowOnMap();
 		}
 
-		public virtual void ProcessMissionEvent(BasePlayer playerFor, MissionEventType type, string identifier, float amount)
+		public bool NeedsPlayerInput()
+		{
+			return playerInputCounter > 0;
+		}
+
+		public void EnablePlayerInput()
+		{
+			playerInputCounter++;
+		}
+
+		public void DisablePlayerInput()
+		{
+			playerInputCounter--;
+			if (playerInputCounter < 0)
+			{
+				playerInputCounter = 0;
+			}
+		}
+
+		public virtual void ProcessMissionEvent(BasePlayer playerFor, MissionEventType type, MissionEventPayload payload, float amount)
 		{
 			if (status == MissionStatus.Active)
 			{
 				BaseMission mission = GetMission();
 				for (int i = 0; i < mission.objectives.Length; i++)
 				{
-					mission.objectives[i].objective.ProcessMissionEvent(playerFor, this, i, type, identifier, amount);
+					mission.objectives[i].objective.ProcessMissionEvent(playerFor, this, i, type, payload, amount);
 				}
 			}
 		}
@@ -167,59 +231,139 @@ public class BaseMission : BaseScriptableObject
 			}
 		}
 
-		public Vector3 GetMissionPoint(string identifier, BasePlayer playerFor)
+		public Vector3 GetMissionPoint(string identifier, BasePlayer playerFor, int depth = 0)
 		{
-			if (missionPoints.ContainsKey(identifier))
+			if (identifier == null)
 			{
-				return missionPoints[identifier];
+				identifier = "";
 			}
-			if ((bool)playerFor)
+			if (missionPoints.TryGetValue(identifier, out var value))
 			{
-				GetMission().SetupPositions(this, playerFor);
-				Debug.Log("Mission point not found, regenerating");
-				if (missionPoints.ContainsKey(identifier))
-				{
-					return missionPoints[identifier];
-				}
+				return value;
+			}
+			BaseMission mission = GetMission();
+			if (playerFor == null)
+			{
+				Debug.LogError("Massive mission failure to get point, correct mission definition of: " + mission.shortname + " (player is null)");
 				return Vector3.zero;
 			}
-			Debug.Log("Massive mission failure to get point, correct mission definition of : " + GetMission().shortname);
-			return Vector3.zero;
+			PositionGenerator positionGenerator = ((IReadOnlyCollection<PositionGenerator>)(object)mission.positionGenerators).FindWith((PositionGenerator p) => p.identifier, identifier);
+			if (positionGenerator == null)
+			{
+				Debug.LogError("Massive mission failure to get point, correct mission definition of: " + mission.shortname + " (cannot find position '" + identifier + "')");
+				return Vector3.zero;
+			}
+			Vector3 position = positionGenerator.GetPosition(this, playerFor, depth);
+			missionPoints.Add(identifier, position);
+			AddBlocker(position);
+			return position;
 		}
 
-		public void EnterPool()
+		public MissionEntity GetMissionEntity(string identifier, BasePlayer playerFor)
+		{
+			if (identifier == null)
+			{
+				identifier = "";
+			}
+			if (missionEntities.TryGetValue(identifier, out var value))
+			{
+				return value;
+			}
+			MissionEntityEntry missionEntityEntry = ((IReadOnlyCollection<MissionEntityEntry>)(object)GetMission().missionEntities).FindWith((MissionEntityEntry e) => e.identifier, identifier);
+			if (missionEntityEntry == null)
+			{
+				Debug.LogError($"Cannot spawn mission entity, identifier '{identifier}' not found in mission ID {missionID}");
+				value = null;
+			}
+			else if (!missionEntityEntry.entityRef.isValid)
+			{
+				Debug.LogError($"Cannot spawn mission entity, identifier '{identifier}' has no entity set in mission ID {missionID}");
+				value = null;
+			}
+			else
+			{
+				Vector3 missionPoint = GetMissionPoint(missionEntityEntry.spawnPositionToUse, playerFor);
+				BaseEntity baseEntity = GameManager.server.CreateEntity(missionEntityEntry.entityRef.resourcePath, missionPoint, Quaternion.identity);
+				MissionEntity component;
+				MissionEntity obj = (baseEntity.gameObject.TryGetComponent<MissionEntity>(out component) ? component : baseEntity.gameObject.AddComponent<MissionEntity>());
+				obj.Setup(playerFor, this, identifier, missionEntityEntry.cleanupOnMissionSuccess, missionEntityEntry.cleanupOnMissionFailed);
+				baseEntity.Spawn();
+				value = obj;
+			}
+			missionEntities.Add(identifier, value);
+			if (value != null)
+			{
+				value.MissionStarted(playerFor, this);
+			}
+			return value;
+		}
+
+		public void PostServerLoad(BasePlayer player)
+		{
+			BaseMission mission = GetMission();
+			for (int i = 0; i < mission.objectives.Length; i++)
+			{
+				if (i >= 0 && i < objectiveStatuses.Length)
+				{
+					mission.objectives[i].objective.PostServerLoad(player, objectiveStatuses[i]);
+				}
+			}
+		}
+
+		public int GetTotalRequiredRewardItemSlots()
+		{
+			BaseMission mission = GetMission();
+			int num = 0;
+			for (int i = 0; i < mission.objectives.Length; i++)
+			{
+				if (!mission.objectives[i].isRequired && objectiveStatuses[i].completed)
+				{
+					num += mission.objectives[i].bonusRewards.Length;
+				}
+			}
+			return mission.baseRewards.Length + num;
+		}
+
+		public void Reset()
 		{
 			providerID = default(NetworkableId);
 			missionID = 0u;
 			status = MissionStatus.Default;
-			completionScale = 0f;
 			startTime = -1f;
 			endTime = -1f;
 			missionLocation = Vector3.zero;
 			_cachedMission = null;
 			timePassed = 0f;
-			rewards = null;
 			missionPoints.Clear();
-			if (createdEntities != null)
-			{
-				Pool.FreeList(ref createdEntities);
-			}
+			missionEntities.Clear();
+		}
+
+		public void EnterPool()
+		{
+			Reset();
 		}
 
 		public void LeavePool()
 		{
-			createdEntities = Pool.GetList<MissionEntity>();
 		}
 	}
 
 	[Serializable]
 	public class PositionGenerator
 	{
+		public enum RelativeType
+		{
+			Player,
+			Provider,
+			Position
+		}
+
 		public enum PositionType
 		{
 			MissionPoint,
 			WorldPositionGenerator,
-			DungeonPoint
+			DungeonPoint,
+			Radius
 		}
 
 		public string identifier;
@@ -228,22 +372,20 @@ public class BaseMission : BaseScriptableObject
 
 		public float maxDistForMovePoint = 25f;
 
-		public bool centerOnProvider;
+		public bool allowDoubleDistanceIfNoOptionsAreFound;
 
-		public bool centerOnPlayer;
-
-		public string centerOnPositionIdentifier = "";
+		public RelativeType relativeTo;
 
 		public PositionType positionType;
 
-		[Header("MissionPoint")]
+		public string centerOnPositionIdentifier = "";
+
 		[InspectorFlags]
 		public MissionPoint.MissionPointEnum Flags = (MissionPoint.MissionPointEnum)(-1);
 
 		[InspectorFlags]
 		public MissionPoint.MissionPointEnum ExclusionFlags;
 
-		[Header("WorldPositionGenerator")]
 		public WorldPositionGenerator worldPositionGenerator;
 
 		public bool IsDependant()
@@ -251,19 +393,19 @@ public class BaseMission : BaseScriptableObject
 			return !string.IsNullOrEmpty(centerOnPositionIdentifier);
 		}
 
-		public string GetIdentifier()
-		{
-			return identifier;
-		}
-
 		public bool Validate(BasePlayer assignee, BaseMission missionDef)
 		{
 			Vector3 position;
 			if (positionType == PositionType.MissionPoint)
 			{
-				List<MissionPoint> points = Pool.GetList<MissionPoint>();
+				List<MissionPoint> points = Pool.Get<List<MissionPoint>>();
 				bool missionPoints = MissionPoint.GetMissionPoints(ref points, assignee.transform.position, minDistForMovePoint, maxDistForMovePoint, (int)Flags, (int)ExclusionFlags);
-				Pool.FreeList(ref points);
+				if (!missionPoints && allowDoubleDistanceIfNoOptionsAreFound)
+				{
+					points.Clear();
+					missionPoints = MissionPoint.GetMissionPoints(ref points, assignee.transform.position, minDistForMovePoint, maxDistForMovePoint * 2f, (int)Flags, (int)ExclusionFlags);
+				}
+				Pool.FreeUnmanaged(ref points);
 				if (!missionPoints)
 				{
 					Debug.Log("FAILED TO FIND MISSION POINTS");
@@ -278,69 +420,142 @@ public class BaseMission : BaseScriptableObject
 			return true;
 		}
 
-		public Vector3 GetPosition(BasePlayer assignee)
+		public Vector3 GetPosition(MissionInstance instance, BasePlayer assignee, int depth = 0)
 		{
-			Vector3 position;
+			if (depth > 10)
+			{
+				Debug.LogError($"Exceeded max depth while calculating position! missionID={instance.missionID} identifier={identifier}");
+				return assignee.transform.position;
+			}
+			Vector3 relativeToPosition = GetRelativeToPosition(instance, assignee, depth);
+			Vector3 result;
 			if (positionType == PositionType.MissionPoint)
 			{
-				List<MissionPoint> points = Pool.GetList<MissionPoint>();
-				if (MissionPoint.GetMissionPoints(ref points, assignee.transform.position, minDistForMovePoint, maxDistForMovePoint, (int)Flags, (int)ExclusionFlags))
+				List<MissionPoint> points = Pool.Get<List<MissionPoint>>();
+				bool missionPoints = MissionPoint.GetMissionPoints(ref points, relativeToPosition, minDistForMovePoint, maxDistForMovePoint, (int)Flags, (int)ExclusionFlags);
+				if (!missionPoints && allowDoubleDistanceIfNoOptionsAreFound)
 				{
-					position = points[UnityEngine.Random.Range(0, points.Count)].GetPosition();
+					points.Clear();
+					missionPoints = MissionPoint.GetMissionPoints(ref points, relativeToPosition, minDistForMovePoint, maxDistForMovePoint * 2f, (int)Flags, (int)ExclusionFlags);
+				}
+				if (missionPoints)
+				{
+					result = points[UnityEngine.Random.Range(0, points.Count)].GetPosition();
 				}
 				else
 				{
 					Debug.LogError("UNABLE TO FIND MISSIONPOINT FOR MISSION!");
-					position = assignee.transform.position;
+					result = relativeToPosition;
 				}
-				Pool.FreeList(ref points);
+				Pool.FreeUnmanaged(ref points);
 			}
 			else if (positionType == PositionType.WorldPositionGenerator && worldPositionGenerator != null)
 			{
-				if (!worldPositionGenerator.TrySample(assignee.transform.position, minDistForMovePoint, maxDistForMovePoint, out position, blockedPoints))
+				int num = 0;
+				while (true)
 				{
-					Debug.LogError("UNABLE TO FIND WORLD POINT FOR MISSION!");
-					position = assignee.transform.position;
+					if (worldPositionGenerator.TrySample(relativeToPosition, minDistForMovePoint, maxDistForMovePoint, out var position, blockedPoints) && TryAlignToGround(position, out var correctedPosition))
+					{
+						result = correctedPosition;
+						break;
+					}
+					if (num >= 10)
+					{
+						Debug.LogError("UNABLE TO FIND WORLD POINT FOR MISSION!");
+						result = relativeToPosition;
+						break;
+					}
+					num++;
 				}
 			}
 			else if (positionType == PositionType.DungeonPoint)
 			{
-				position = DynamicDungeon.GetNextDungeonPoint();
+				result = DynamicDungeon.GetNextDungeonPoint();
 			}
 			else
 			{
-				Vector3 onUnitSphere = UnityEngine.Random.onUnitSphere;
-				onUnitSphere.y = 0f;
-				onUnitSphere.Normalize();
-				position = (centerOnPlayer ? assignee.transform.position : assignee.transform.position) + onUnitSphere * UnityEngine.Random.Range(minDistForMovePoint, maxDistForMovePoint);
-				float b = position.y;
-				float a = position.y;
-				if (TerrainMeta.WaterMap != null)
+				int num2 = 0;
+				while (true)
 				{
-					a = TerrainMeta.WaterMap.GetHeight(position);
+					Vector3 onUnitSphere = UnityEngine.Random.onUnitSphere;
+					onUnitSphere.y = 0f;
+					onUnitSphere.Normalize();
+					Vector3 vector = relativeToPosition + onUnitSphere * UnityEngine.Random.Range(minDistForMovePoint, maxDistForMovePoint);
+					vector.y = WaterLevel.GetWaterOrTerrainSurface(vector, waves: false, volumes: false);
+					if (TryAlignToGround(vector, out var correctedPosition2))
+					{
+						result = correctedPosition2;
+						break;
+					}
+					if (num2 >= 10)
+					{
+						Debug.LogError("UNABLE TO FIND WORLD POINT FOR MISSION!");
+						result = relativeToPosition;
+						break;
+					}
+					num2++;
 				}
-				if (TerrainMeta.HeightMap != null)
-				{
-					b = TerrainMeta.HeightMap.GetHeight(position);
-				}
-				position.y = Mathf.Max(a, b);
 			}
-			return position;
+			return result;
+		}
+
+		private Vector3 GetRelativeToPosition(MissionInstance instance, BasePlayer assignee, int depth)
+		{
+			switch (relativeTo)
+			{
+			case RelativeType.Position:
+				return instance.GetMissionPoint(centerOnPositionIdentifier, assignee, depth + 1);
+			case RelativeType.Provider:
+			{
+				BaseEntity baseEntity = instance.ProviderEntity();
+				if (baseEntity != null)
+				{
+					return baseEntity.transform.position;
+				}
+				break;
+			}
+			}
+			if (assignee != null)
+			{
+				return assignee.transform.position;
+			}
+			Debug.LogError($"Cannot get mission point origin - assigne playere is null! missionID={instance.missionID} relativeTo={relativeTo}");
+			return Vector3.zero;
+		}
+
+		private static bool TryAlignToGround(Vector3 wishPosition, out Vector3 correctedPosition)
+		{
+			Vector3 origin = wishPosition.WithY(wishPosition.y + 50f);
+			if (!Physics.Raycast(new Ray(origin, Vector3.down), out var hitInfo, 50f, 1218652417, QueryTriggerInteraction.Ignore))
+			{
+				correctedPosition = wishPosition;
+				return true;
+			}
+			if (RaycastHitEx.GetEntity(hitInfo) != null)
+			{
+				correctedPosition = wishPosition;
+				return false;
+			}
+			correctedPosition = hitInfo.point;
+			return true;
 		}
 	}
 
 	[Serializable]
 	public class MissionEntityEntry
 	{
+		[FormerlySerializedAs("entityIdentifier")]
+		public string identifier;
+
 		public GameObjectRef entityRef;
 
 		public string spawnPositionToUse;
 
+		public bool spawnOnMissionStart = true;
+
 		public bool cleanupOnMissionFailed;
 
 		public bool cleanupOnMissionSuccess;
-
-		public string entityIdentifier;
 	}
 
 	public enum MissionFailReason
@@ -348,7 +563,8 @@ public class BaseMission : BaseScriptableObject
 		TimeOut,
 		Disconnect,
 		ResetPlayerState,
-		Abandon
+		Abandon,
+		ObjectiveFailed
 	}
 
 	[ServerVar]
@@ -359,6 +575,14 @@ public class BaseMission : BaseScriptableObject
 	public Translate.Phrase missionName;
 
 	public Translate.Phrase missionDesc;
+
+	public bool canBeAbandoned = true;
+
+	public bool completeSilently;
+
+	public bool blockMissionStat;
+
+	public TutorialMissionHelpSet showHelpInfo;
 
 	public MissionObjectiveEntry[] objectives;
 
@@ -372,6 +596,10 @@ public class BaseMission : BaseScriptableObject
 
 	public GameObjectRef victoryEffect;
 
+	public BasePlayer.TutorialItemAllowance AllowedTutorialItems;
+
+	public BaseMission followupMission;
+
 	public int repeatDelaySecondsSuccess = -1;
 
 	public int repeatDelaySecondsFailed = -1;
@@ -382,9 +610,9 @@ public class BaseMission : BaseScriptableObject
 
 	public Sprite providerIcon;
 
-	public MissionDependancy[] acceptDependancies;
+	public bool hideStagesNotStarted;
 
-	public MissionDependancy[] completionDependancies;
+	public MissionDependancy[] acceptDependancies;
 
 	public MissionEntityEntry[] missionEntities;
 
@@ -398,9 +626,9 @@ public class BaseMission : BaseScriptableObject
 	{
 		get
 		{
-			if (repeatDelaySecondsSuccess == -1)
+			if (repeatDelaySecondsSuccess < 0)
 			{
-				return repeatDelaySecondsFailed != -1;
+				return repeatDelaySecondsFailed >= 0;
 			}
 			return true;
 		}
@@ -433,57 +661,19 @@ public class BaseMission : BaseScriptableObject
 		return icon;
 	}
 
-	public virtual void SetupPositions(MissionInstance instance, BasePlayer assignee)
+	public static void AddBlocker(Vector3 point)
 	{
-		PositionGenerator[] array = positionGenerators;
-		foreach (PositionGenerator positionGenerator in array)
+		if (point != Vector3.zero && !blockedPoints.Contains(point))
 		{
-			if (!positionGenerator.IsDependant())
-			{
-				instance.missionPoints.Add(positionGenerator.GetIdentifier(), positionGenerator.GetPosition(assignee));
-			}
-		}
-		array = positionGenerators;
-		foreach (PositionGenerator positionGenerator2 in array)
-		{
-			if (positionGenerator2.IsDependant())
-			{
-				instance.missionPoints.Add(positionGenerator2.GetIdentifier(), positionGenerator2.GetPosition(assignee));
-			}
+			blockedPoints.Add(point);
 		}
 	}
 
-	public void AddBlockers(MissionInstance instance)
+	public static void RemoveBlockers(MissionInstance instance)
 	{
 		foreach (KeyValuePair<string, Vector3> missionPoint in instance.missionPoints)
 		{
-			if (!blockedPoints.Contains(missionPoint.Value))
-			{
-				blockedPoints.Add(missionPoint.Value);
-			}
-		}
-	}
-
-	public void RemoveBlockers(MissionInstance instance)
-	{
-		foreach (KeyValuePair<string, Vector3> missionPoint in instance.missionPoints)
-		{
-			if (blockedPoints.Contains(missionPoint.Value))
-			{
-				blockedPoints.Remove(missionPoint.Value);
-			}
-		}
-	}
-
-	public virtual void SetupRewards(MissionInstance instance, BasePlayer assignee)
-	{
-		if (baseRewards.Length != 0)
-		{
-			instance.rewards = new ItemAmount[baseRewards.Length];
-			for (int i = 0; i < baseRewards.Length; i++)
-			{
-				instance.rewards[i] = new ItemAmount(baseRewards[i].itemDef, baseRewards[i].amount);
-			}
+			blockedPoints.Remove(missionPoint.Value);
 		}
 	}
 
@@ -501,12 +691,9 @@ public class BaseMission : BaseScriptableObject
 		{
 			return;
 		}
-		SetupRewards(instance, assignee);
-		SetupPositions(instance, assignee);
-		AddBlockers(instance);
 		for (int i = 0; i < objectives.Length; i++)
 		{
-			objectives[i].Get().MissionStarted(i, instance);
+			objectives[i].Get().MissionStarted(i, instance, assignee);
 		}
 		if (acceptEffect.isValid)
 		{
@@ -515,19 +702,14 @@ public class BaseMission : BaseScriptableObject
 		MissionEntityEntry[] array = missionEntities;
 		foreach (MissionEntityEntry missionEntityEntry in array)
 		{
-			if (missionEntityEntry.entityRef.isValid)
+			if (missionEntityEntry.spawnOnMissionStart)
 			{
-				Vector3 missionPoint = instance.GetMissionPoint(missionEntityEntry.spawnPositionToUse, assignee);
-				BaseEntity baseEntity = GameManager.server.CreateEntity(missionEntityEntry.entityRef.resourcePath, missionPoint, Quaternion.identity);
-				MissionEntity missionEntity = baseEntity.gameObject.AddComponent<MissionEntity>();
-				missionEntity.Setup(assignee, instance, missionEntityEntry.cleanupOnMissionSuccess, missionEntityEntry.cleanupOnMissionFailed);
-				instance.createdEntities.Add(missionEntity);
-				baseEntity.Spawn();
+				instance.GetMissionEntity(missionEntityEntry.identifier, assignee);
 			}
 		}
-		foreach (MissionEntity createdEntity in instance.createdEntities)
+		if (AllowedTutorialItems != 0)
 		{
-			createdEntity.MissionStarted(assignee, instance);
+			assignee.SetTutorialAllowance(AllowedTutorialItems);
 		}
 		Interface.CallHook("OnMissionStarted", this, instance, assignee);
 	}
@@ -535,16 +717,28 @@ public class BaseMission : BaseScriptableObject
 	public void CheckObjectives(MissionInstance instance, BasePlayer assignee)
 	{
 		bool flag = true;
+		bool flag2 = false;
 		for (int i = 0; i < objectives.Length; i++)
 		{
-			if (!instance.objectiveStatuses[i].completed || instance.objectiveStatuses[i].failed)
+			if (objectives[i].isRequired && (!instance.objectiveStatuses[i].completed || instance.objectiveStatuses[i].failed))
 			{
 				flag = false;
 			}
+			if (instance.objectiveStatuses[i].failed && objectives[i].isRequired)
+			{
+				flag2 = true;
+			}
 		}
-		if (flag && instance.status == MissionStatus.Active)
+		if (instance.status == MissionStatus.Active)
 		{
-			MissionSuccess(instance, assignee);
+			if (flag2)
+			{
+				MissionFailed(instance, assignee, MissionFailReason.ObjectiveFailed);
+			}
+			else if (flag)
+			{
+				MissionSuccess(instance, assignee);
+			}
 		}
 	}
 
@@ -560,20 +754,31 @@ public class BaseMission : BaseScriptableObject
 	public virtual void MissionComplete(MissionInstance instance, BasePlayer assignee)
 	{
 		DoMissionEffect(victoryEffect.resourcePath, assignee);
-		assignee.ChatMessage("You have completed the mission : " + missionName.english);
-		if (instance.rewards != null && instance.rewards.Length != 0)
+		if (!instance.GetMission().completeSilently)
 		{
-			ItemAmount[] rewards = instance.rewards;
-			foreach (ItemAmount itemAmount in rewards)
+			assignee.ChatMessage("You have completed the mission : " + missionName.english);
+		}
+		BaseMission mission = instance.GetMission();
+		if (mission != null)
+		{
+			if (mission.baseRewards != null)
 			{
-				if (itemAmount.itemDef == null || itemAmount.amount == 0f)
+				ItemAmount[] array = mission.baseRewards;
+				foreach (ItemAmount reward2 in array)
 				{
-					Debug.LogError("BIG REWARD SCREWUP, NULL ITEM DEF");
+					GiveReward(assignee, reward2);
 				}
-				Item item = ItemManager.Create(itemAmount.itemDef, Mathf.CeilToInt(itemAmount.amount), 0uL);
-				if (item != null)
+			}
+			for (int j = 0; j < mission.objectives.Length; j++)
+			{
+				MissionObjectiveEntry missionObjectiveEntry = mission.objectives[j];
+				if (!missionObjectiveEntry.isRequired && missionObjectiveEntry.bonusRewards != null && instance.objectiveStatuses[j].completed && !instance.objectiveStatuses[j].failed)
 				{
-					assignee.GiveItem(item, BaseEntity.GiveItemReason.PickedUp);
+					ItemAmount[] array = missionObjectiveEntry.bonusRewards;
+					foreach (ItemAmount reward3 in array)
+					{
+						GiveReward(assignee, reward3);
+					}
 				}
 			}
 		}
@@ -582,10 +787,41 @@ public class BaseMission : BaseScriptableObject
 		instance.status = MissionStatus.Completed;
 		assignee.SetActiveMission(-1);
 		assignee.MissionDirty();
-		if (Rust.GameInfo.HasAchievements)
+		if (followupMission != null)
+		{
+			assignee.RegisterFollowupMission(followupMission, instance.ProviderEntity() as IMissionProvider);
+		}
+		if (Rust.GameInfo.HasAchievements && mission != null && !mission.blockMissionStat)
 		{
 			assignee.stats.Add("missions_completed", 1, Stats.All);
 			assignee.stats.Save(forceSteamSave: true);
+		}
+		if (assignee.IsInTutorial)
+		{
+			TutorialIsland currentTutorialIsland = assignee.GetCurrentTutorialIsland();
+			if (currentTutorialIsland != null && currentTutorialIsland.FinalMission == this)
+			{
+				currentTutorialIsland.StartEndingCinematic(assignee);
+			}
+		}
+		static void GiveReward(BasePlayer player, ItemAmount reward)
+		{
+			if (reward.itemDef == null || reward.amount == 0f)
+			{
+				Debug.LogError("BIG REWARD SCREWUP, NULL ITEM DEF");
+			}
+			else
+			{
+				Item item = (reward.isBP ? ItemManager.Create(ItemManager.blueprintBaseDef, Mathf.CeilToInt(reward.amount), 0uL) : ItemManager.Create(reward.itemDef, Mathf.CeilToInt(reward.amount), 0uL));
+				if (reward.isBP)
+				{
+					item.blueprintTarget = reward.itemDef.itemid;
+				}
+				if (item != null)
+				{
+					player.GiveItem(item, BaseEntity.GiveItemReason.PickedUp);
+				}
+			}
 		}
 	}
 
@@ -599,7 +835,10 @@ public class BaseMission : BaseScriptableObject
 
 	public virtual void MissionFailed(MissionInstance instance, BasePlayer assignee, MissionFailReason failReason)
 	{
-		assignee.ChatMessage("You have failed the mission : " + missionName.english);
+		if (!instance.GetMission().completeSilently)
+		{
+			assignee.ChatMessage("You have failed the mission : " + missionName.english);
+		}
 		DoMissionEffect(failedEffect.resourcePath, assignee);
 		Facepunch.Rust.Analytics.Server.MissionFailed(this, failReason);
 		Facepunch.Rust.Analytics.Azure.OnMissionComplete(assignee, this, failReason);
@@ -610,16 +849,21 @@ public class BaseMission : BaseScriptableObject
 
 	public virtual void MissionEnded(MissionInstance instance, BasePlayer assignee)
 	{
-		if (instance.createdEntities != null)
+		if (instance.missionEntities != null)
 		{
-			for (int num = instance.createdEntities.Count - 1; num >= 0; num--)
+			List<MissionEntity> obj = Pool.Get<List<MissionEntity>>();
+			foreach (MissionEntity value in instance.missionEntities.Values)
 			{
-				MissionEntity missionEntity = instance.createdEntities[num];
-				if (!(missionEntity == null))
+				obj.Add(value);
+			}
+			foreach (MissionEntity item in obj)
+			{
+				if (!(item == null))
 				{
-					missionEntity.MissionEnded(assignee, instance);
+					item.MissionEnded(assignee, instance);
 				}
 			}
+			Pool.FreeUnmanaged(ref obj);
 		}
 		RemoveBlockers(instance);
 		instance.endTime = Time.time;
@@ -645,6 +889,11 @@ public class BaseMission : BaseScriptableObject
 		CheckObjectives(instance, playerFor);
 	}
 
+	public void OnObjectiveFailed(int objectiveIndex, MissionInstance instance, BasePlayer playerFor)
+	{
+		CheckObjectives(instance, playerFor);
+	}
+
 	public static bool AssignMission(BasePlayer assignee, IMissionProvider provider, BaseMission mission)
 	{
 		if (!missionsenabled)
@@ -660,20 +909,32 @@ public class BaseMission : BaseScriptableObject
 		{
 			return (bool)obj;
 		}
-		MissionInstance missionInstance = Pool.Get<MissionInstance>();
+		int num = assignee.missions.FindIndexWith((MissionInstance i) => i.missionID, mission.id);
+		MissionInstance missionInstance;
+		int activeMission;
+		if (num >= 0)
+		{
+			missionInstance = assignee.missions[num];
+			activeMission = num;
+			missionInstance.Reset();
+		}
+		else
+		{
+			missionInstance = Pool.Get<MissionInstance>();
+			activeMission = assignee.missions.Count;
+			assignee.missions.Add(missionInstance);
+		}
 		missionInstance.missionID = mission.id;
 		missionInstance.startTime = Time.time;
 		missionInstance.providerID = provider.ProviderID();
 		missionInstance.status = MissionStatus.Active;
-		missionInstance.createdEntities = Pool.GetList<MissionEntity>();
 		missionInstance.objectiveStatuses = new MissionInstance.ObjectiveStatus[mission.objectives.Length];
-		for (int i = 0; i < mission.objectives.Length; i++)
+		for (int j = 0; j < mission.objectives.Length; j++)
 		{
-			missionInstance.objectiveStatuses[i] = new MissionInstance.ObjectiveStatus();
+			missionInstance.objectiveStatuses[j] = new MissionInstance.ObjectiveStatus();
 		}
-		assignee.AddMission(missionInstance);
 		mission.MissionStart(missionInstance, assignee);
-		assignee.SetActiveMission(assignee.missions.Count - 1);
+		assignee.SetActiveMission(activeMission);
 		assignee.MissionDirty();
 		Interface.CallHook("OnMissionAssigned", mission, provider, assignee);
 		return true;

@@ -16,8 +16,6 @@ public class TeamMemberElement : MonoBehaviour
 
 	public Color woundedColor;
 
-	public GameObject hoverOverlay;
-
 	public RawImage memberIcon;
 
 	public RawImage leaderIcon;
@@ -27,4 +25,6 @@ public class TeamMemberElement : MonoBehaviour
 	public RawImage woundedIcon;
 
 	public int teamIndex;
+
+	public CanvasGroup EditButton;
 }

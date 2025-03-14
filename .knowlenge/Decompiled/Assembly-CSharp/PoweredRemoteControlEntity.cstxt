@@ -60,7 +60,7 @@ public class PoweredRemoteControlEntity : IOEntity, IRemoteControllable
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - Server_SetID "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - Server_SetID ");
 				}
 				using (TimeWarning.New("Server_SetID"))
 				{

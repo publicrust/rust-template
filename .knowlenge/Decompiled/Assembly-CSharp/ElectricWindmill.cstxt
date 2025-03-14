@@ -120,6 +120,6 @@ public class ElectricWindmill : IOEntity
 	{
 		float num = time / 3600f * 360f;
 		int num2 = 10;
-		return new Vector3(Mathf.Sin(num * ((float)Math.PI / 180f)) * (float)num2, 0f, Mathf.Cos(num * ((float)Math.PI / 180f)) * (float)num2).normalized;
+		return new Vector3(Mathf.Sin(num * (MathF.PI / 180f)) * (float)num2, 0f, Mathf.Cos(num * (MathF.PI / 180f)) * (float)num2).normalized;
 	}
 }

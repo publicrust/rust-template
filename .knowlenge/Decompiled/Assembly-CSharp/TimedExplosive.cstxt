@@ -4,11 +4,17 @@ using Facepunch;
 using Facepunch.Rust;
 using Oxide.Core;
 using Rust;
-using Rust.Ai;
 using UnityEngine;
 
 public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 {
+	public enum ExplosionEffectOffsetMode
+	{
+		Local,
+		World
+	}
+
+	[Header("General")]
 	public float timerAmountMin = 10f;
 
 	public float timerAmountMax = 20f;
@@ -23,33 +29,84 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 
 	public bool onlyDamageParent;
 
+	[Header("AI")]
+	public bool IgnoreAI;
+
 	public bool BlindAI;
 
 	public float aiBlindDuration = 2.5f;
 
 	public float aiBlindRange = 4f;
 
+	[Header("Offsets")]
+	public ExplosionEffectOffsetMode explosionOffsetMode;
+
+	public Vector3 explosionEffectOffset = Vector3.zero;
+
+	[Header("Normals")]
+	public bool explosionMatchesNormal;
+
+	public bool explosionUsesForward;
+
+	public bool explosionMatchesOrientation;
+
+	[Header("Effects")]
 	public GameObjectRef explosionEffect;
 
-	[Tooltip("Optional: Will fall back to explosionEffect if not assigned.")]
+	[Tooltip("Optional: Will fall back to watersurfaceExplosionEffect or explosionEffect if not assigned.")]
 	public GameObjectRef underwaterExplosionEffect;
 
 	public GameObjectRef stickEffect;
 
 	public GameObjectRef bounceEffect;
 
-	public bool explosionUsesForward;
+	public GameObjectRef watersurfaceExplosionEffect;
+
+	[Min(0f)]
+	[Header("Water")]
+	public float underwaterExplosionDepth = 1f;
+
+	[Tooltip("Optional: Will fall back to underwaterExplosionEffect or explosionEffect if not assigned.")]
+	[MinMax(0f, 100f)]
+	public MinMax watersurfaceExplosionDepth = new MinMax(0.5f, 10f);
 
 	public bool waterCausesExplosion;
+
+	[Header("Other")]
+	public int vibrationLevel = 3;
 
 	public List<DamageTypeEntry> damageTypes = new List<DamageTypeEntry>();
 
 	[NonSerialized]
 	private float lastBounceTime;
 
-	private CollisionDetectionMode? initialCollisionDetectionMode;
+	private bool hadRB;
+
+	private float rbMass;
+
+	private float rbDrag;
+
+	private float rbAngularDrag;
+
+	private CollisionDetectionMode rbCollisionMode;
+
+	private const int parentOnlySplashDamage = 166144;
+
+	private const int fullSplashDamage = 1210222849;
+
+	private Vector3? hitNormal;
 
 	private static BaseEntity[] queryResults = new BaseEntity[64];
+
+	private Vector3 lastPosition = Vector3.zero;
+
+	public override bool PositionTickFixedTime
+	{
+		protected get
+		{
+			return true;
+		}
+	}
 
 	protected virtual bool AlwaysRunWaterCheck => false;
 
@@ -71,7 +128,10 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 		lastBounceTime = Time.time;
 		base.ServerInit();
 		SetFuse(GetRandomTimerTime());
-		ReceiveCollisionMessages(b: true);
+		if (ComponentEx.HasComponent<Collider>(base.transform))
+		{
+			ReceiveCollisionMessages(b: true);
+		}
 		if (waterCausesExplosion || AlwaysRunWaterCheck)
 		{
 			InvokeRepeating(WaterCheck, 0f, 0.5f);
@@ -107,12 +167,50 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 
 	public virtual void ProjectileImpact(RaycastHit info, Vector3 rayOrigin)
 	{
+		hitNormal = info.normal;
+		Explode();
+	}
+
+	public void ForceExplode()
+	{
+		if (this is DudTimedExplosive dudTimedExplosive)
+		{
+			dudTimedExplosive.dudChance = 0f;
+		}
+		if (this is RFTimedExplosive rFTimedExplosive)
+		{
+			rFTimedExplosive.DisarmRF();
+		}
 		Explode();
 	}
 
 	public virtual void Explode()
 	{
 		Explode(PivotPoint());
+	}
+
+	private Vector3 GetExplosionNormal()
+	{
+		Vector3 result;
+		if (explosionUsesForward)
+		{
+			result = base.transform.forward;
+		}
+		else if (explosionMatchesOrientation)
+		{
+			Quaternion rotation = base.transform.rotation;
+			Vector3 forward = Vector3.forward;
+			result = rotation * forward;
+		}
+		else
+		{
+			result = Vector3.up;
+		}
+		if (explosionMatchesNormal && hitNormal.HasValue)
+		{
+			result = hitNormal.Value;
+		}
+		return result;
 	}
 
 	public virtual void Explode(Vector3 explosionFxPos)
@@ -123,25 +221,39 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 		{
 			component.enabled = false;
 		}
-		bool flag = false;
-		if (underwaterExplosionEffect.isValid)
+		WaterLevel.WaterInfo waterInfo = WaterLevel.GetWaterInfo(explosionFxPos - new Vector3(0f, 0.25f, 0f), waves: true, volumes: true);
+		if (underwaterExplosionEffect.isValid && waterInfo.isValid && waterInfo.currentDepth >= underwaterExplosionDepth)
 		{
-			flag = WaterLevel.GetWaterDepth(base.transform.position) > 1f;
-		}
-		if (flag)
-		{
-			Effect.server.Run(underwaterExplosionEffect.resourcePath, explosionFxPos, explosionUsesForward ? base.transform.forward : Vector3.up, null, broadcast: true);
+			Effect.server.Run(underwaterExplosionEffect.resourcePath, explosionFxPos, GetExplosionNormal(), null, broadcast: true);
 		}
 		else if (explosionEffect.isValid)
 		{
-			Effect.server.Run(explosionEffect.resourcePath, explosionFxPos, explosionUsesForward ? base.transform.forward : Vector3.up, null, broadcast: true);
+			Vector3 posWorld = explosionFxPos;
+			if (explosionOffsetMode == ExplosionEffectOffsetMode.Local)
+			{
+				Vector3 vector = base.transform.TransformPoint(explosionEffectOffset) - base.transform.position;
+				posWorld += vector;
+			}
+			if (explosionOffsetMode == ExplosionEffectOffsetMode.World)
+			{
+				posWorld += explosionEffectOffset;
+			}
+			Effect.server.Run(explosionEffect.resourcePath, posWorld, GetExplosionNormal(), null, broadcast: true);
+		}
+		if (watersurfaceExplosionEffect.isValid && waterInfo.isValid && waterInfo.overallDepth >= watersurfaceExplosionDepth.x && waterInfo.currentDepth <= watersurfaceExplosionDepth.y)
+		{
+			Effect.server.Run(watersurfaceExplosionEffect.resourcePath, explosionFxPos.WithY(waterInfo.surfaceLevel), GetExplosionNormal(), null, broadcast: true);
 		}
 		if (damageTypes.Count > 0)
 		{
+			if (Interface.CallHook("OnTimedExplosiveExplode", this, explosionFxPos) != null)
+			{
+				return;
+			}
+			Vector3 vector2 = ExplosionCenter();
 			if (onlyDamageParent)
 			{
-				Vector3 vector = CenterPoint();
-				DamageUtil.RadiusDamage(creatorEntity, LookupPrefab(), vector, minExplosionRadius, explosionRadius, damageTypes, 166144, useLineOfSight: true);
+				DamageUtil.RadiusDamage(creatorEntity, LookupPrefab(), vector2, minExplosionRadius, explosionRadius, damageTypes, 166144, useLineOfSight: true, IgnoreAI);
 				BaseEntity baseEntity = GetParentEntity();
 				BaseCombatEntity baseCombatEntity = baseEntity as BaseCombatEntity;
 				while (baseCombatEntity == null && baseEntity != null && baseEntity.HasParent())
@@ -151,16 +263,16 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 				}
 				if (baseEntity == null || !GameObjectEx.IsOnLayer(baseEntity.gameObject, Layer.Construction))
 				{
-					List<BuildingBlock> obj = Pool.GetList<BuildingBlock>();
-					Vis.Entities(vector, explosionRadius, obj, 2097152, QueryTriggerInteraction.Ignore);
+					List<BuildingBlock> obj = Pool.Get<List<BuildingBlock>>();
+					Vis.Entities(vector2, explosionRadius, obj, 2097152, QueryTriggerInteraction.Ignore);
 					BuildingBlock buildingBlock = null;
 					float num = float.PositiveInfinity;
 					foreach (BuildingBlock item in obj)
 					{
 						if (!item.isClient && !item.IsDestroyed && !(item.healthFraction <= 0f))
 						{
-							float num2 = Vector3.Distance(item.ClosestPoint(vector), vector);
-							if (num2 < num && item.IsVisible(vector, explosionRadius))
+							float num2 = Vector3.Distance(item.ClosestPoint(vector2), vector2);
+							if (num2 < num && item.IsVisible(vector2, explosionRadius))
 							{
 								buildingBlock = item;
 								num = num2;
@@ -173,13 +285,13 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 						hitInfo.Initiator = creatorEntity;
 						hitInfo.WeaponPrefab = LookupPrefab();
 						hitInfo.damageTypes.Add(damageTypes);
-						hitInfo.PointStart = vector;
+						hitInfo.PointStart = vector2;
 						hitInfo.PointEnd = buildingBlock.transform.position;
 						float amount = 1f - Mathf.Clamp01((num - minExplosionRadius) / (explosionRadius - minExplosionRadius));
 						hitInfo.damageTypes.ScaleAll(amount);
 						buildingBlock.Hurt(hitInfo);
 					}
-					Pool.FreeList(ref obj);
+					Pool.FreeUnmanaged(ref obj);
 				}
 				if ((bool)baseCombatEntity)
 				{
@@ -195,47 +307,16 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 					hitInfo3.Initiator = creatorEntity;
 					hitInfo3.WeaponPrefab = LookupPrefab();
 					hitInfo3.damageTypes.Add(damageTypes);
-					hitInfo3.PointStart = vector;
+					hitInfo3.PointStart = vector2;
 					hitInfo3.PointEnd = baseEntity.transform.position;
 					baseEntity.OnAttacked(hitInfo3);
-				}
-				if (creatorEntity != null && damageTypes != null)
-				{
-					float num3 = 0f;
-					foreach (DamageTypeEntry damageType in damageTypes)
-					{
-						num3 += damageType.amount;
-					}
-					Sensation sensation = default(Sensation);
-					sensation.Type = SensationType.Explosion;
-					sensation.Position = creatorEntity.transform.position;
-					sensation.Radius = explosionRadius * 17f;
-					sensation.DamagePotential = num3;
-					sensation.InitiatorPlayer = creatorEntity as BasePlayer;
-					sensation.Initiator = creatorEntity;
-					Sense.Stimulate(sensation);
 				}
 			}
 			else
 			{
-				DamageUtil.RadiusDamage(creatorEntity, LookupPrefab(), CenterPoint(), minExplosionRadius, explosionRadius, damageTypes, 1076005121, useLineOfSight: true);
-				if (creatorEntity != null && damageTypes != null)
-				{
-					float num4 = 0f;
-					foreach (DamageTypeEntry damageType2 in damageTypes)
-					{
-						num4 += damageType2.amount;
-					}
-					Sensation sensation = default(Sensation);
-					sensation.Type = SensationType.Explosion;
-					sensation.Position = creatorEntity.transform.position;
-					sensation.Radius = explosionRadius * 17f;
-					sensation.DamagePotential = num4;
-					sensation.InitiatorPlayer = creatorEntity as BasePlayer;
-					sensation.Initiator = creatorEntity;
-					Sense.Stimulate(sensation);
-				}
+				DamageUtil.RadiusDamage(creatorEntity, LookupPrefab(), vector2, minExplosionRadius, explosionRadius, damageTypes, 1210222849, useLineOfSight: true, IgnoreAI);
 			}
+			SeismicSensor.Notify(vector2, vibrationLevel);
 			BlindAnyAI();
 		}
 		if (!base.IsDestroyed && !HasFlag(Flags.Broken))
@@ -244,14 +325,24 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 		}
 	}
 
+	private Vector3 ExplosionCenter()
+	{
+		if (IsStuck() && parentEntity.Get(base.isServer) is BaseVehicle)
+		{
+			OBB oBB = WorldSpaceBounds();
+			return CenterPoint() - oBB.forward * (oBB.extents.z + 0.1f);
+		}
+		return CenterPoint();
+	}
+
 	private void BlindAnyAI()
 	{
 		if (!BlindAI)
 		{
 			return;
 		}
-		int brainsInSphere = Query.Server.GetBrainsInSphere(base.transform.position, 10f, queryResults);
-		for (int i = 0; i < brainsInSphere; i++)
+		int brainsInSphereFast = Query.Server.GetBrainsInSphereFast(base.transform.position, 10f, queryResults);
+		for (int i = 0; i < brainsInSphereFast; i++)
 		{
 			BaseEntity baseEntity = queryResults[i];
 			if (Vector3.Distance(base.transform.position, baseEntity.transform.position) > aiBlindRange)
@@ -268,6 +359,44 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 					component.SetBlinded(blinded);
 					queryResults[i] = null;
 				}
+			}
+		}
+	}
+
+	public void FixedUpdate()
+	{
+		CheckClippingThroughWalls();
+	}
+
+	private void CheckClippingThroughWalls()
+	{
+		if (!canStick)
+		{
+			return;
+		}
+		if (lastPosition == default(Vector3) || !parentEntity.IsValid(serverside: true))
+		{
+			lastPosition = CenterPoint();
+			return;
+		}
+		Vector3 vector = lastPosition;
+		Vector3 vector2 = CenterPoint();
+		Vector3 vector3 = vector2 - vector;
+		lastPosition = vector2;
+		if (vector == vector2 || !IsStuck(bypassColliderCheck: true))
+		{
+			return;
+		}
+		Ray ray = new Ray(vector, vector2 - vector);
+		List<RaycastHit> list = Pool.Get<List<RaycastHit>>();
+		GamePhysics.TraceAll(ray, 0f, list, Vector3.Distance(vector2, vector), 2097152);
+		foreach (RaycastHit item in list)
+		{
+			if (RaycastHitEx.GetEntity(item) as BuildingBlock != null)
+			{
+				base.transform.position -= vector3;
+				ForceExplode();
+				break;
 			}
 		}
 	}
@@ -321,6 +450,10 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 		{
 			return false;
 		}
+		if (entity is TravellingVendor)
+		{
+			return false;
+		}
 		return true;
 	}
 
@@ -350,36 +483,44 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 	public virtual void SetMotionEnabled(bool wantsMotion)
 	{
 		Rigidbody component = GetComponent<Rigidbody>();
-		if ((bool)component)
+		if (wantsMotion)
 		{
-			if (!initialCollisionDetectionMode.HasValue)
+			if (component == null && hadRB)
 			{
-				initialCollisionDetectionMode = component.collisionDetectionMode;
+				component = base.gameObject.AddComponent<Rigidbody>();
+				component.mass = rbMass;
+				component.drag = rbDrag;
+				component.angularDrag = rbAngularDrag;
+				component.collisionDetectionMode = rbCollisionMode;
+				component.useGravity = true;
+				component.isKinematic = false;
 			}
-			component.useGravity = wantsMotion;
-			if (!wantsMotion)
-			{
-				component.collisionDetectionMode = CollisionDetectionMode.Discrete;
-			}
-			component.isKinematic = !wantsMotion;
-			if (wantsMotion)
-			{
-				component.collisionDetectionMode = initialCollisionDetectionMode.Value;
-			}
+		}
+		else if (component != null)
+		{
+			hadRB = true;
+			rbMass = component.mass;
+			rbDrag = component.drag;
+			rbAngularDrag = component.angularDrag;
+			rbCollisionMode = component.collisionDetectionMode;
+			UnityEngine.Object.Destroy(component);
 		}
 	}
 
-	public bool IsStuck()
+	public bool IsStuck(bool bypassColliderCheck = false)
 	{
 		Rigidbody component = GetComponent<Rigidbody>();
 		if ((bool)component && !component.isKinematic)
 		{
 			return false;
 		}
-		Collider component2 = GetComponent<Collider>();
-		if ((bool)component2 && component2.enabled)
+		if (!bypassColliderCheck)
 		{
-			return false;
+			Collider component2 = GetComponent<Collider>();
+			if ((bool)component2 && component2.enabled)
+			{
+				return false;
+			}
 		}
 		return parentEntity.IsValid(serverside: true);
 	}
@@ -400,7 +541,6 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 			ent = ent.parentEntity.Get(serverside: true);
 		}
 		SetMotionEnabled(wantsMotion: false);
-		SetCollisionEnabled(wantsCollision: false);
 		if (!HasChild(ent))
 		{
 			base.transform.position = position;
@@ -412,6 +552,10 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 			else
 			{
 				SetParent(ent, StringPool.closest, worldPositionStays: true);
+			}
+			if (ent is BaseCombatEntity baseCombatEntity)
+			{
+				baseCombatEntity.SetJustAttacked();
 			}
 			if (stickEffect.isValid)
 			{
@@ -427,8 +571,10 @@ public class TimedExplosive : BaseEntity, ServerProjectile.IProjectileImpact
 		{
 			SetParent(null, worldPositionStays: true, sendImmediate: true);
 			SetMotionEnabled(wantsMotion: true);
-			SetCollisionEnabled(wantsCollision: true);
-			ReceiveCollisionMessages(b: true);
+			if (ComponentEx.HasComponent<Collider>(base.transform))
+			{
+				ReceiveCollisionMessages(b: true);
+			}
 		}
 	}
 

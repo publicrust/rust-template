@@ -1,0 +1,733 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using Facepunch;
+using Facepunch.Extend;
+using Facepunch.Sqlite;
+using Oxide.Core;
+using UnityEngine;
+
+public class LocalClan : IClan
+{
+	[StructLayout(LayoutKind.Auto)]
+	[CompilerGenerated]
+	private struct <Disband>d__72 : IAsyncStateMachine
+	{
+		public int <>1__state;
+
+		public AsyncValueTaskMethodBuilder<ClanResult> <>t__builder;
+
+		public LocalClan <>4__this;
+
+		public ulong bySteamId;
+
+		private void MoveNext()
+		{
+			int num = <>1__state;
+			LocalClan localClan = <>4__this;
+			ClanResult result;
+			try
+			{
+				if (!localClan.TryGetRank(bySteamId, out var rank) || rank != 1)
+				{
+					result = ClanResult.NoPermission;
+				}
+				else if (localClan._backend.Database.DeleteClan(localClan.ClanId))
+				{
+					localClan._backend.ClanDisbanded(localClan.ClanId);
+					List<ClanMember>.Enumerator enumerator = localClan._members.GetEnumerator();
+					try
+					{
+						while (enumerator.MoveNext())
+						{
+							ClanMember current = enumerator.Current;
+							localClan._backend.MembershipChanged(current.SteamId, null);
+						}
+					}
+					finally
+					{
+						if (num < 0)
+						{
+							((IDisposable)enumerator/*cast due to .constrained prefix*/).Dispose();
+						}
+					}
+					result = ClanResult.Success;
+				}
+				else
+				{
+					result = ClanResult.Fail;
+				}
+			}
+			catch (Exception exception)
+			{
+				<>1__state = -2;
+				<>t__builder.SetException(exception);
+				return;
+			}
+			Interface.CallHook("OnClanDisbanded", localClan, bySteamId);
+			<>1__state = -2;
+			<>t__builder.SetResult(result);
+		}
+
+		void IAsyncStateMachine.MoveNext()
+		{
+			//ILSpy generated this explicit interface implementation from .override directive in MoveNext
+			this.MoveNext();
+		}
+
+		[DebuggerHidden]
+		private void SetStateMachine(IAsyncStateMachine stateMachine)
+		{
+			<>t__builder.SetStateMachine(stateMachine);
+		}
+
+		void IAsyncStateMachine.SetStateMachine(IAsyncStateMachine stateMachine)
+		{
+			//ILSpy generated this explicit interface implementation from .override directive in SetStateMachine
+			this.SetStateMachine(stateMachine);
+		}
+	}
+
+	private const int MaxChatScrollback = 20;
+
+	private readonly LocalClanBackend _backend;
+
+	private readonly List<ClanRole> _roles;
+
+	private readonly List<ClanMember> _members;
+
+	private readonly List<ClanInvite> _invites;
+
+	private readonly List<ClanChatEntry> _chatHistory;
+
+	private RealTimeSince _sinceLastRefresh;
+
+	public long ClanId { get; }
+
+	public string Name { get; private set; }
+
+	public long Created { get; private set; }
+
+	public ulong Creator { get; private set; }
+
+	public string Motd { get; private set; }
+
+	public long MotdTimestamp { get; private set; }
+
+	public ulong MotdAuthor { get; private set; }
+
+	public byte[] Logo { get; private set; }
+
+	public Color32 Color { get; private set; }
+
+	public long Score { get; private set; }
+
+	public IReadOnlyList<ClanRole> Roles => _roles;
+
+	public IReadOnlyList<ClanMember> Members => _members;
+
+	public int MaxMemberCount => _backend.MaxMemberCount;
+
+	public IReadOnlyList<ClanInvite> Invites => _invites;
+
+	public LocalClan(LocalClanBackend backend, long clanId)
+	{
+		_backend = backend ?? throw new ArgumentNullException("backend");
+		ClanId = clanId;
+		_roles = new List<ClanRole>();
+		_members = new List<ClanMember>();
+		_invites = new List<ClanInvite>();
+		_chatHistory = new List<ClanChatEntry>(20);
+		_sinceLastRefresh = 0f;
+	}
+
+	public bool Refresh(ClanDataSource sources = ClanDataSource.All)
+	{
+		if (sources.HasFlag(ClanDataSource.Basic) || sources.HasFlag(ClanDataSource.Motd) || sources.HasFlag(ClanDataSource.Logo))
+		{
+			ClanData? clanData = _backend.Database.ReadClan(ClanId);
+			if (!clanData.HasValue)
+			{
+				return false;
+			}
+			ClanData value = clanData.Value;
+			Name = value.Name;
+			Created = value.Created;
+			Creator = value.Creator;
+			Motd = value.Motd;
+			MotdTimestamp = value.MotdTimestamp;
+			MotdAuthor = value.MotdAuthor;
+			Logo = value.Logo;
+			Color = value.Color;
+			Score = value.Score;
+		}
+		if (sources.HasFlag(ClanDataSource.Roles))
+		{
+			List<ClanRole> obj = _backend.Database.ListRoles(ClanId);
+			if (obj.Count == 0)
+			{
+				Pool.FreeUnmanaged(ref obj);
+				return false;
+			}
+			_roles.Clear();
+			_roles.AddRange(obj);
+			Pool.FreeUnmanaged(ref obj);
+		}
+		if (sources.HasFlag(ClanDataSource.Members))
+		{
+			List<ClanMember> obj2 = _backend.Database.ListMembers(ClanId);
+			if (obj2.Count == 0)
+			{
+				Pool.FreeUnmanaged(ref obj2);
+				return false;
+			}
+			_members.Clear();
+			_members.AddRange(obj2);
+			Pool.FreeUnmanaged(ref obj2);
+		}
+		if (sources.HasFlag(ClanDataSource.Invites))
+		{
+			List<ClanInvite> obj3 = _backend.Database.ListInvites(ClanId);
+			_invites.Clear();
+			_invites.AddRange(obj3);
+			Pool.FreeUnmanaged(ref obj3);
+		}
+		return true;
+	}
+
+	public async ValueTask RefreshIfStale()
+	{
+		if ((float)_sinceLastRefresh > 30f)
+		{
+			_sinceLastRefresh = 0f;
+			Refresh();
+		}
+	}
+
+	public async ValueTask<ClanValueResult<ClanLogs>> GetLogs(int limit, ulong bySteamId)
+	{
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanAccessLogs))
+		{
+			return ClanResult.NoPermission;
+		}
+		List<ClanLogEntry> entries = _backend.Database.ReadLogs(ClanId, limit);
+		ClanLogs value = default(ClanLogs);
+		value.ClanId = ClanId;
+		value.Entries = entries;
+		return new ClanValueResult<ClanLogs>(value);
+	}
+
+	public async ValueTask<ClanResult> UpdateLastSeen(ulong steamId)
+	{
+		return _backend.Database.UpdateMemberLastSeen(ClanId, steamId) ? ClanResult.Success : ClanResult.NotFound;
+	}
+
+	public async ValueTask<ClanResult> SetMotd(string newMotd, ulong bySteamId)
+	{
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanSetMotd))
+		{
+			return ClanResult.NoPermission;
+		}
+		if (newMotd == Motd)
+		{
+			return ClanResult.Success;
+		}
+		if (_backend.Database.UpdateClanMotd(ClanId, newMotd, bySteamId))
+		{
+			_backend.Database.AppendLog(ClanId, "set_motd", bySteamId, newMotd);
+			Changed(ClanDataSource.Motd);
+			return ClanResult.Success;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> SetLogo(byte[] newLogo, ulong bySteamId)
+	{
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanSetLogo))
+		{
+			return ClanResult.NoPermission;
+		}
+		if (Logo != null && Logo.Length == newLogo.Length && Logo.SequenceEqual(newLogo))
+		{
+			return ClanResult.Success;
+		}
+		if (_backend.Database.UpdateClanLogo(ClanId, newLogo))
+		{
+			_backend.Database.AppendLog(ClanId, "set_logo", bySteamId);
+			Changed(ClanDataSource.Logo);
+			Interface.CallHook("OnClanLogoChanged", this, newLogo, bySteamId);
+			return ClanResult.Success;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> SetColor(Color32 newColor, ulong bySteamId)
+	{
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanSetLogo))
+		{
+			return ClanResult.NoPermission;
+		}
+		if (Color.ToInt32() == newColor.ToInt32())
+		{
+			return ClanResult.Success;
+		}
+		if (_backend.Database.UpdateClanColor(ClanId, newColor))
+		{
+			_backend.Database.AppendLog(ClanId, "set_color", bySteamId, newColor.ToHex());
+			Changed(ClanDataSource.Basic);
+			Interface.CallHook("OnClanColorChanged", this, newColor, bySteamId);
+			return ClanResult.Success;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> Invite(ulong steamId, ulong bySteamId)
+	{
+		if (_backend.MaxMemberCount > 0 && _members.Count >= _backend.MaxMemberCount)
+		{
+			return ClanResult.ClanIsFull;
+		}
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanInvite))
+		{
+			return ClanResult.NoPermission;
+		}
+		if (_backend.Database.CreateInvite(ClanId, steamId, bySteamId))
+		{
+			_backend.Database.AppendLog(ClanId, "invite", bySteamId, steamId);
+			Changed(ClanDataSource.Invites);
+			_backend.InvitationCreated(steamId, ClanId);
+			return ClanResult.Success;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> CancelInvite(ulong steamId, ulong bySteamId)
+	{
+		if (steamId != bySteamId && !CheckRole(bySteamId, (ClanRole r) => r.CanInvite))
+		{
+			return ClanResult.NoPermission;
+		}
+		if (_backend.Database.DeleteInvite(ClanId, steamId))
+		{
+			if (steamId == bySteamId)
+			{
+				_backend.Database.AppendLog(ClanId, "decline_invite", bySteamId);
+			}
+			else
+			{
+				_backend.Database.AppendLog(ClanId, "cancel_invite", bySteamId, steamId);
+			}
+			Changed(ClanDataSource.Invites);
+			return ClanResult.Success;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> AcceptInvite(ulong steamId)
+	{
+		if (_backend.MaxMemberCount > 0 && _members.Count >= _backend.MaxMemberCount)
+		{
+			return ClanResult.ClanIsFull;
+		}
+		try
+		{
+			if (_backend.Database.AcceptInvite(ClanId, steamId))
+			{
+				_backend.Database.AppendLog(ClanId, "accept_invite", steamId);
+				Changed(ClanDataSource.Members | ClanDataSource.Invites);
+				_backend.MembershipChanged(steamId, ClanId);
+				return ClanResult.Success;
+			}
+		}
+		catch (SqliteException ex) when (ex.Result == 2067)
+		{
+			return ClanResult.AlreadyInAClan;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> Kick(ulong steamId, ulong bySteamId)
+	{
+		if (!TryGetRank(steamId, out var rank))
+		{
+			return ClanResult.NotFound;
+		}
+		bool flag = steamId == bySteamId;
+		if (!flag)
+		{
+			if (!CheckRole(bySteamId, (ClanRole r) => r.CanKick))
+			{
+				return ClanResult.NoPermission;
+			}
+			if (!TryGetRank(bySteamId, out var rank2))
+			{
+				return ClanResult.NotFound;
+			}
+			if (rank <= rank2 && rank2 != 1)
+			{
+				return ClanResult.NoPermission;
+			}
+		}
+		else
+		{
+			if (_members.Count == 1)
+			{
+				return await Disband(bySteamId);
+			}
+			if (rank == 1 && OtherLeaderCount(steamId) == 0)
+			{
+				return ClanResult.CannotKickLeader;
+			}
+		}
+		if (_backend.Database.DeleteMember(ClanId, steamId))
+		{
+			if (flag)
+			{
+				Interface.CallHook("OnClanMemberLeft", this, steamId);
+				_backend.Database.AppendLog(ClanId, "leave", steamId);
+			}
+			else
+			{
+				Interface.CallHook("OnClanMemberKicked", this, steamId, bySteamId);
+				_backend.Database.AppendLog(ClanId, "kick", bySteamId, steamId);
+			}
+			Changed(ClanDataSource.Members);
+			_backend.MembershipChanged(steamId, null);
+			return ClanResult.Success;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> SetPlayerRole(ulong steamId, int newRoleId, ulong bySteamId)
+	{
+		ClanMember? clanMember = _members.TryFindWith((ClanMember m) => m.SteamId, steamId);
+		if (!clanMember.HasValue)
+		{
+			return ClanResult.NotFound;
+		}
+		ClanRole? clanRole = _roles.TryFindWith((ClanRole r) => r.RoleId, clanMember.Value.RoleId);
+		if (!clanRole.HasValue)
+		{
+			return ClanResult.Fail;
+		}
+		ClanRole? clanRole2 = _roles.TryFindWith((ClanRole r) => r.RoleId, newRoleId);
+		if (!clanRole2.HasValue)
+		{
+			return ClanResult.NotFound;
+		}
+		if (!TryGetRank(bySteamId, out var rank))
+		{
+			return ClanResult.NotFound;
+		}
+		if (clanRole.Value.Rank <= rank && rank != 1)
+		{
+			return ClanResult.NoPermission;
+		}
+		if (clanRole2.Value.Rank <= rank && rank != 1)
+		{
+			return ClanResult.NoPermission;
+		}
+		if (!((clanRole2.Value.Rank < clanRole.Value.Rank) ? CheckRole(bySteamId, (ClanRole r) => r.CanPromote) : CheckRole(bySteamId, (ClanRole r) => r.CanDemote)))
+		{
+			return ClanResult.NoPermission;
+		}
+		if (clanMember.Value.RoleId == newRoleId)
+		{
+			return ClanResult.Success;
+		}
+		if (rank == 1 && steamId == bySteamId && OtherLeaderCount(steamId) == 0)
+		{
+			return ClanResult.CannotDemoteLeader;
+		}
+		if (_backend.Database.UpdateMemberRole(ClanId, steamId, newRoleId))
+		{
+			_backend.Database.AppendLog(ClanId, "change_role", bySteamId, steamId, clanRole.Value.Name, clanRole2.Value.Name);
+			Changed(ClanDataSource.Members);
+			return ClanResult.Success;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> SetPlayerNotes(ulong steamId, string newNotes, ulong bySteamId)
+	{
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanSetPlayerNotes))
+		{
+			return ClanResult.NoPermission;
+		}
+		ClanMember? clanMember = _members.TryFindWith((ClanMember m) => m.SteamId, steamId);
+		if (!clanMember.HasValue)
+		{
+			return ClanResult.NotFound;
+		}
+		if (clanMember.Value.Notes == newNotes)
+		{
+			return ClanResult.Success;
+		}
+		if (_backend.Database.UpdateMemberNotes(ClanId, steamId, newNotes))
+		{
+			_backend.Database.AppendLog(ClanId, "set_notes", bySteamId, steamId, newNotes);
+			Changed(ClanDataSource.Members);
+			return ClanResult.Success;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> CreateRole(ClanRole role, ulong bySteamId)
+	{
+		if (string.IsNullOrWhiteSpace(role.Name))
+		{
+			return ClanResult.InvalidText;
+		}
+		if (!TryGetRank(bySteamId, out var rank) || rank != 1)
+		{
+			return ClanResult.NoPermission;
+		}
+		try
+		{
+			if (_backend.Database.CreateRole(ClanId, role).HasValue)
+			{
+				_backend.Database.AppendLog(ClanId, "create_role", bySteamId, role.Name);
+				Changed(ClanDataSource.Roles);
+				return ClanResult.Success;
+			}
+		}
+		catch (SqliteException ex) when (ex.Result == 2067)
+		{
+			return ClanResult.DuplicateName;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> UpdateRole(ClanRole role, ulong bySteamId)
+	{
+		if (string.IsNullOrWhiteSpace(role.Name))
+		{
+			return ClanResult.InvalidText;
+		}
+		if (!TryGetRank(bySteamId, out var rank) || rank != 1)
+		{
+			return ClanResult.NoPermission;
+		}
+		ClanRole? clanRole = _roles.TryFindWith((ClanRole r) => r.RoleId, role.RoleId);
+		if (!clanRole.HasValue)
+		{
+			return ClanResult.NotFound;
+		}
+		try
+		{
+			if ((clanRole.Value.Rank == 1) ? _backend.Database.UpdateRoleName(ClanId, role.RoleId, role.Name) : _backend.Database.UpdateRole(ClanId, role))
+			{
+				if (role.Name != clanRole.Value.Name)
+				{
+					_backend.Database.AppendLog(ClanId, "update_role_renamed", bySteamId, clanRole.Value.Name, role.Name);
+				}
+				else
+				{
+					_backend.Database.AppendLog(ClanId, "update_role", bySteamId, role.Name);
+				}
+				Changed(ClanDataSource.Roles);
+				return ClanResult.Success;
+			}
+		}
+		catch (SqliteException ex) when (ex.Result == 2067)
+		{
+			return ClanResult.DuplicateName;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> SwapRoleRanks(int roleIdA, int roleIdB, ulong bySteamId)
+	{
+		if (!TryGetRank(bySteamId, out var rank) || rank != 1)
+		{
+			return ClanResult.NoPermission;
+		}
+		ClanRole? clanRole = _roles.TryFindWith((ClanRole r) => r.RoleId, roleIdA);
+		if (!clanRole.HasValue)
+		{
+			return ClanResult.NotFound;
+		}
+		ClanRole? clanRole2 = _roles.TryFindWith((ClanRole r) => r.RoleId, roleIdB);
+		if (!clanRole2.HasValue)
+		{
+			return ClanResult.NotFound;
+		}
+		if (clanRole.Value.Rank == 1 || clanRole2.Value.Rank == 1)
+		{
+			return ClanResult.CannotSwapLeader;
+		}
+		if (_backend.Database.SwapRoleRanks(ClanId, roleIdA, roleIdB))
+		{
+			_backend.Database.AppendLog(ClanId, "swap_roles", bySteamId, clanRole.Value.Name, clanRole2.Value.Name);
+			Changed(ClanDataSource.Roles);
+			return ClanResult.Success;
+		}
+		return ClanResult.Fail;
+	}
+
+	public async ValueTask<ClanResult> DeleteRole(int roleId, ulong bySteamId)
+	{
+		if (!TryGetRank(bySteamId, out var rank) || rank != 1)
+		{
+			return ClanResult.NoPermission;
+		}
+		ClanRole? clanRole = _roles.TryFindWith((ClanRole r) => r.RoleId, roleId);
+		if (!clanRole.HasValue)
+		{
+			return ClanResult.NotFound;
+		}
+		if (clanRole.Value.Rank == 1)
+		{
+			return ClanResult.CannotDeleteLeader;
+		}
+		bool flag;
+		try
+		{
+			flag = _backend.Database.DeleteRole(ClanId, roleId);
+		}
+		catch (SqliteException ex) when (ex.Result == 787 || ex.Result == 1811)
+		{
+			return ClanResult.RoleNotEmpty;
+		}
+		if (flag)
+		{
+			_backend.Database.AppendLog(ClanId, "delete_role", bySteamId, clanRole.Value.Name);
+			Changed(ClanDataSource.Roles);
+			return ClanResult.Success;
+		}
+		return ClanResult.Fail;
+	}
+
+	[AsyncStateMachine(typeof(<Disband>d__72))]
+	public ValueTask<ClanResult> Disband(ulong bySteamId)
+	{
+		<Disband>d__72 stateMachine = default(<Disband>d__72);
+		stateMachine.<>t__builder = AsyncValueTaskMethodBuilder<ClanResult>.Create();
+		stateMachine.<>4__this = this;
+		stateMachine.bySteamId = bySteamId;
+		stateMachine.<>1__state = -1;
+		stateMachine.<>t__builder.Start(ref stateMachine);
+		return stateMachine.<>t__builder.Task;
+	}
+
+	public async ValueTask<ClanValueResult<ClanScoreEvents>> GetScoreEvents(int limit, ulong bySteamId)
+	{
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanAccessScoreEvents))
+		{
+			return ClanResult.NoPermission;
+		}
+		List<ClanScoreEvent> scoreEvents = _backend.Database.ReadScoreEvents(ClanId, limit);
+		ClanScoreEvents value = default(ClanScoreEvents);
+		value.ClanId = ClanId;
+		value.ScoreEvents = scoreEvents;
+		return new ClanValueResult<ClanScoreEvents>(value);
+	}
+
+	public async ValueTask<ClanResult> AddScoreEvent(ClanScoreEvent scoreEvent)
+	{
+		if (scoreEvent.Score == 0)
+		{
+			throw new ArgumentException("Score cannot be zero.", "scoreEvent");
+		}
+		if (scoreEvent.Multiplier == 0)
+		{
+			throw new ArgumentException("Multiplier cannot be zero.", "scoreEvent");
+		}
+		_backend.Database.AppendScoreEvent(ClanId, scoreEvent);
+		Changed(ClanDataSource.Score);
+		return ClanResult.Success;
+	}
+
+	public async ValueTask<ClanValueResult<ClanChatScrollback>> GetChatScrollback()
+	{
+		ClanChatScrollback value = default(ClanChatScrollback);
+		value.ClanId = ClanId;
+		value.Entries = _chatHistory.ToList();
+		return new ClanValueResult<ClanChatScrollback>(value);
+	}
+
+	public async ValueTask<ClanResult> SendChatMessage(string name, string message, ulong bySteamId)
+	{
+		if (!TryGetRank(bySteamId, out var _))
+		{
+			return ClanResult.Fail;
+		}
+		if (!ClanValidator.ValidateChatMessage(message, out var validated))
+		{
+			return ClanResult.InvalidText;
+		}
+		ClanChatEntry clanChatEntry = default(ClanChatEntry);
+		clanChatEntry.SteamId = bySteamId;
+		clanChatEntry.Name = name;
+		clanChatEntry.Message = validated;
+		clanChatEntry.Time = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+		ClanChatEntry clanChatEntry2 = clanChatEntry;
+		if (_chatHistory.Count >= 20)
+		{
+			_chatHistory.RemoveAt(0);
+		}
+		_chatHistory.Add(clanChatEntry2);
+		_backend.ClanChatMessage(ClanId, clanChatEntry2);
+		return ClanResult.Success;
+	}
+
+	private int OtherLeaderCount(ulong excludeSteamId)
+	{
+		int num = 0;
+		foreach (ClanMember member in _members)
+		{
+			if (member.SteamId != excludeSteamId && TryGetRank(member.SteamId, out var rank) && rank == 1)
+			{
+				num++;
+			}
+		}
+		return num;
+	}
+
+	private bool CheckRole(ulong steamId, Func<ClanRole, bool> roleTest)
+	{
+		ClanMember? clanMember = _members.TryFindWith((ClanMember m) => m.SteamId, steamId);
+		if (!clanMember.HasValue)
+		{
+			return false;
+		}
+		ClanRole? clanRole = _roles.TryFindWith((ClanRole r) => r.RoleId, clanMember.Value.RoleId);
+		if (!clanRole.HasValue)
+		{
+			return false;
+		}
+		if (clanRole.Value.Rank != 1)
+		{
+			return roleTest(clanRole.Value);
+		}
+		return true;
+	}
+
+	private bool TryGetRank(ulong steamId, out int rank)
+	{
+		ClanMember? clanMember = _members.TryFindWith((ClanMember m) => m.SteamId, steamId);
+		if (!clanMember.HasValue)
+		{
+			rank = int.MaxValue;
+			return false;
+		}
+		ClanRole? clanRole = _roles.TryFindWith((ClanRole r) => r.RoleId, clanMember.Value.RoleId);
+		if (!clanRole.HasValue)
+		{
+			rank = int.MaxValue;
+			return false;
+		}
+		rank = clanRole.Value.Rank;
+		return true;
+	}
+
+	private void Changed(ClanDataSource dataSources)
+	{
+		_backend.ClanChanged(ClanId, dataSources);
+		Refresh(dataSources);
+	}
+}

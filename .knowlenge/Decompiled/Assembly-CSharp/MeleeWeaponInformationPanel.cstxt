@@ -1,3 +1,5 @@
+using UnityEngine;
+
 public class MeleeWeaponInformationPanel : ItemInformationPanel
 {
 	public ItemStatValue damageDisplay;
@@ -13,4 +15,6 @@ public class MeleeWeaponInformationPanel : ItemInformationPanel
 	public ItemStatValue treeGatherDisplay;
 
 	public ItemStatValue fleshGatherDisplay;
+
+	public GameObject untieCrateDisplay;
 }

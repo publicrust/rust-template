@@ -36,9 +36,11 @@ public class ContainerIOEntity : IOEntity, IItemContainerEntity, IIdealSlotEntit
 
 	public SoundDefinition closeSound;
 
+	private ItemContainer _inventory;
+
 	public Translate.Phrase LootPanelTitle => panelTitle;
 
-	public ItemContainer inventory { get; private set; }
+	public ItemContainer inventory => _inventory;
 
 	public Transform Transform => base.transform;
 
@@ -59,7 +61,7 @@ public class ContainerIOEntity : IOEntity, IItemContainerEntity, IIdealSlotEntit
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_OpenLoot "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - RPC_OpenLoot ");
 				}
 				using (TimeWarning.New("RPC_OpenLoot"))
 				{
@@ -96,7 +98,7 @@ public class ContainerIOEntity : IOEntity, IItemContainerEntity, IIdealSlotEntit
 
 	public override bool CanPickup(BasePlayer player)
 	{
-		if (!pickup.requireEmptyInv || inventory == null || inventory.itemList.Count == 0)
+		if (!pickup.requireEmptyInv || _inventory == null || _inventory.itemList.Count == 0)
 		{
 			return base.CanPickup(player);
 		}
@@ -105,12 +107,18 @@ public class ContainerIOEntity : IOEntity, IItemContainerEntity, IIdealSlotEntit
 
 	public override void ServerInit()
 	{
-		if (inventory == null)
+		if (_inventory == null)
 		{
 			CreateInventory(giveUID: true);
-			OnInventoryFirstCreated(inventory);
+			OnInventoryFirstCreated(_inventory);
 		}
 		base.ServerInit();
+	}
+
+	internal override void DoServerDestroy()
+	{
+		base.DoServerDestroy();
+		Facepunch.Pool.Free(ref _inventory);
 	}
 
 	public override void PreServerLoad()
@@ -122,27 +130,28 @@ public class ContainerIOEntity : IOEntity, IItemContainerEntity, IIdealSlotEntit
 	public override void PostServerLoad()
 	{
 		base.PostServerLoad();
-		if (inventory != null && !inventory.uid.IsValid)
+		if (_inventory != null && !_inventory.uid.IsValid)
 		{
-			inventory.GiveUID();
+			_inventory.GiveUID();
 		}
 		SetFlag(Flags.Open, b: false);
 	}
 
 	public void CreateInventory(bool giveUID)
 	{
-		inventory = new ItemContainer();
-		inventory.entityOwner = this;
-		inventory.allowedContents = ((allowedContents == (ItemContainer.ContentsType)0) ? ItemContainer.ContentsType.Generic : allowedContents);
-		inventory.SetOnlyAllowedItem(onlyAllowedItem);
-		inventory.maxStackSize = maxStackSize;
-		inventory.ServerInitialize(null, numSlots);
+		Debug.Assert(_inventory == null, "Double init of inventory!");
+		_inventory = Facepunch.Pool.Get<ItemContainer>();
+		_inventory.entityOwner = this;
+		_inventory.allowedContents = ((allowedContents == (ItemContainer.ContentsType)0) ? ItemContainer.ContentsType.Generic : allowedContents);
+		_inventory.SetOnlyAllowedItem(onlyAllowedItem);
+		_inventory.maxStackSize = maxStackSize;
+		_inventory.ServerInitialize(null, numSlots);
 		if (giveUID)
 		{
-			inventory.GiveUID();
+			_inventory.GiveUID();
 		}
-		inventory.onItemAddedRemoved = OnItemAddedOrRemoved;
-		inventory.onDirty += OnInventoryDirty;
+		_inventory.onItemAddedRemoved = OnItemAddedOrRemoved;
+		_inventory.onDirty += OnInventoryDirty;
 	}
 
 	public override void Save(SaveInfo info)
@@ -150,10 +159,10 @@ public class ContainerIOEntity : IOEntity, IItemContainerEntity, IIdealSlotEntit
 		base.Save(info);
 		if (info.forDisk)
 		{
-			if (inventory != null)
+			if (_inventory != null)
 			{
 				info.msg.storageBox = Facepunch.Pool.Get<StorageBox>();
-				info.msg.storageBox.contents = inventory.Save();
+				info.msg.storageBox.contents = _inventory.Save();
 			}
 			else
 			{
@@ -185,11 +194,11 @@ public class ContainerIOEntity : IOEntity, IItemContainerEntity, IIdealSlotEntit
 		StorageContainer.DropItems(this, initiator);
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
 	private void RPC_OpenLoot(RPCMessage rpc)
 	{
-		if (inventory != null)
+		if (_inventory != null)
 		{
 			BasePlayer player = rpc.player;
 			if ((bool)player && player.CanInteract())
@@ -209,9 +218,9 @@ public class ContainerIOEntity : IOEntity, IItemContainerEntity, IIdealSlotEntit
 		{
 			return false;
 		}
-		if (onlyOneUser && IsOpen())
+		if ((onlyOneUser && IsOpen()) || IsTransferring())
 		{
-			player.ChatMessage("Already in use");
+			player.ShowToast(GameTip.Styles.Red_Normal, StorageContainer.LockedMessage, false);
 			return false;
 		}
 		if (panelToOpen == "")
@@ -221,9 +230,9 @@ public class ContainerIOEntity : IOEntity, IItemContainerEntity, IIdealSlotEntit
 		if (player.inventory.loot.StartLootingEntity(this, doPositionChecks))
 		{
 			SetFlag(Flags.Open, b: true);
-			player.inventory.loot.AddContainer(inventory);
+			player.inventory.loot.AddContainer(_inventory);
 			player.inventory.loot.SendImmediate();
-			player.ClientRPCPlayer(null, player, "RPC_OpenLootPanel", lootPanelName);
+			player.ClientRPC(RpcTarget.Player("RPC_OpenLootPanel", player), lootPanelName);
 			SendNetworkUpdate();
 			return true;
 		}
@@ -242,12 +251,12 @@ public class ContainerIOEntity : IOEntity, IItemContainerEntity, IIdealSlotEntit
 		return false;
 	}
 
-	public virtual int GetIdealSlot(BasePlayer player, Item item)
+	public virtual int GetIdealSlot(BasePlayer player, ItemContainer container, Item item)
 	{
 		return -1;
 	}
 
-	public virtual ItemContainerId GetIdealContainer(BasePlayer player, Item item, bool altMove)
+	public virtual ItemContainerId GetIdealContainer(BasePlayer player, Item item, ItemMoveModifier modifier)
 	{
 		return default(ItemContainerId);
 	}
@@ -274,10 +283,10 @@ public class ContainerIOEntity : IOEntity, IItemContainerEntity, IIdealSlotEntit
 		base.Load(info);
 		if (info.fromDisk && info.msg.storageBox != null)
 		{
-			if (inventory != null)
+			if (_inventory != null)
 			{
-				inventory.Load(info.msg.storageBox.contents);
-				inventory.capacity = numSlots;
+				_inventory.Load(info.msg.storageBox.contents);
+				_inventory.capacity = numSlots;
 			}
 			else
 			{

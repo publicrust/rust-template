@@ -298,7 +298,7 @@ public class m2bradleyAnimator : MonoBehaviour
 	{
 		Vector3 vector = objectTransform.InverseTransformDirection(vecEnd - vecStart);
 		float x = Mathf.Sqrt(vector.x * vector.x + vector.z * vector.z);
-		pitch = (0f - Mathf.Atan2(vector.y, x)) * (180f / (float)Math.PI);
+		pitch = (0f - Mathf.Atan2(vector.y, x)) * (180f / MathF.PI);
 		vector = (vecEnd - vecStart).normalized;
 		Vector3 forward = objectTransform.forward;
 		forward.y = 0f;
@@ -307,7 +307,7 @@ public class m2bradleyAnimator : MonoBehaviour
 		float num2 = Vector3.Dot(vector, objectTransform.right);
 		float y = 360f * num2;
 		float x2 = 360f * (0f - num);
-		yaw = (Mathf.Atan2(y, x2) + (float)Math.PI) * (180f / (float)Math.PI);
+		yaw = (Mathf.Atan2(y, x2) + MathF.PI) * (180f / MathF.PI);
 	}
 
 	public float NormalizeYaw(float flYaw)

@@ -5,11 +5,6 @@ using UnityEngine;
 
 public class InstrumentKeyController : MonoBehaviour
 {
-	[StructLayout(LayoutKind.Sequential, Size = 1)]
-	public struct NoteBinding
-	{
-	}
-
 	public enum IKType
 	{
 		LeftHand,
@@ -69,6 +64,11 @@ public class InstrumentKeyController : MonoBehaviour
 		public IKType TargetType;
 
 		public int IkIndex;
+	}
+
+	[StructLayout(LayoutKind.Sequential, Size = 1)]
+	public struct NoteBinding
+	{
 	}
 
 	public const float DEFAULT_NOTE_VELOCITY = 1f;

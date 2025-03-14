@@ -1,0 +1,203 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Oxide.Ext.Discord.Clients;
+using Oxide.Ext.Discord.Entities;
+using Oxide.Ext.Discord.Extensions;
+using Oxide.Ext.Discord.Interfaces;
+using Oxide.Ext.Discord.Logging;
+using Oxide.Ext.Discord.Types;
+using Oxide.Ext.Discord.WebSockets;
+
+public class WebSocketCommandHandler
+{
+	private readonly BotClient _client;
+
+	private readonly DiscordWebSocket _webSocket;
+
+	private readonly ILogger _logger;
+
+	private readonly ConcurrentQueue<WebSocketCommand> _pendingCommands = new ConcurrentQueue<WebSocketCommand>();
+
+	private readonly WebsocketRateLimit _rateLimit;
+
+	private readonly AutoResetEvent _online = new AutoResetEvent(initialState: false);
+
+	private readonly AutoResetEvent _commands = new AutoResetEvent(initialState: false);
+
+	private readonly CancellationTokenSource _source;
+
+	private readonly CancellationToken _token;
+
+	private bool _isSocketReady;
+
+	private bool _isDisposed;
+
+	public WebSocketCommandHandler(BotClient client, DiscordWebSocket webSocket, ILogger logger)
+	{
+		_client = client;
+		_webSocket = webSocket;
+		_logger = logger;
+		_rateLimit = new WebsocketRateLimit(_logger);
+		_source = new CancellationTokenSource();
+		_token = _source.Token;
+		Task.Factory.StartNew(RunInternal, _token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+	}
+
+	private async void RunInternal()
+	{
+		try
+		{
+			await SendCommandsInternal().ConfigureAwait(continueOnCapturedContext: false);
+		}
+		catch (OperationCanceledException)
+		{
+		}
+		catch (Exception ex2)
+		{
+			Exception ex3 = ex2;
+			_logger.Exception("Unhandled exception in WebSocketCommandHandler.RunInternal", ex3);
+		}
+	}
+
+	private async ValueTask SendCommandsInternal()
+	{
+		while (true)
+		{
+			CancellationTokenSource source = _source;
+			if (source == null || source.IsCancellationRequested)
+			{
+				break;
+			}
+			WebSocketCommand command = null;
+			try
+			{
+				try
+				{
+					_online.WaitOne();
+					_commands.WaitOne();
+					if (_rateLimit.HasReachedRateLimit)
+					{
+						DateTimeOffset reset = _rateLimit.NextReset();
+						if (reset > DateTimeOffset.UtcNow)
+						{
+							await reset.DelayUntil(_token).ConfigureAwait(continueOnCapturedContext: false);
+						}
+						goto end_IL_004e;
+					}
+					command = GetNextCommand();
+					if (command == null)
+					{
+						goto end_IL_004e;
+					}
+					if (command.Client.Bot == null)
+					{
+						RemoveCommand(command);
+						goto end_IL_004e;
+					}
+					if (!_rateLimit.CanFireRequest(command))
+					{
+						_logger.Warning("WebSocketCommandHandler.SendCommandsInternal Skipping websocket command for plugin {0} Exceeded Rate Limit of {1} Requests in {2} Seconds! Report this error to the plugin author.", command.Client.PluginName, 60, 60L);
+						RemoveCommand(command);
+						goto end_IL_004e;
+					}
+					_logger.Debug("WebSocketCommandHandler.SendCommandsInternal {0} Sending Command {1}", command.Client.PluginName, command.Payload.OpCode);
+					_rateLimit.FiredRequest(command);
+					await _webSocket.SendAsync(command.Payload).ConfigureAwait(continueOnCapturedContext: false);
+					RemoveCommand(command);
+					goto end_IL_0031;
+					end_IL_004e:;
+				}
+				catch (OperationCanceledException)
+				{
+					goto end_IL_0031;
+				}
+				catch (Exception exception)
+				{
+					_logger.Exception("An error occured sending commands", exception);
+					if (command != null)
+					{
+						RemoveCommand(command);
+					}
+					await Task.Delay(1000, _token).ConfigureAwait(continueOnCapturedContext: false);
+					goto end_IL_0031;
+				}
+				end_IL_0031:;
+			}
+			finally
+			{
+				if (_isSocketReady)
+				{
+					_online.Set();
+				}
+				if (!_pendingCommands.IsEmpty)
+				{
+					_commands.Set();
+				}
+			}
+		}
+	}
+
+	private WebSocketCommand GetNextCommand()
+	{
+		if (_isSocketReady && _pendingCommands.TryPeek(out var result))
+		{
+			return result;
+		}
+		return null;
+	}
+
+	private void RemoveCommand(WebSocketCommand command)
+	{
+		_pendingCommands.TryDequeue(out var _);
+		command.Dispose();
+	}
+
+	public void Enqueue(WebSocketCommand command)
+	{
+		_logger.Debug("WebSocketCommandHandler.Enqueue {0} Queuing command {1}", command.Client.PluginName, command.Payload.OpCode);
+		_pendingCommands.Enqueue(command);
+		_commands.Set();
+	}
+
+	internal void OnWebSocketReady()
+	{
+		_logger.Debug("WebSocketCommandHandler.OnWebSocketReady Socket Connected. Sending queued commands.");
+		_isSocketReady = true;
+		_online.Set();
+	}
+
+	internal void OnSocketDisconnected()
+	{
+		if (!_isDisposed)
+		{
+			_logger.Debug("WebSocketCommandHandler.OnSocketDisconnected Socket Disconnected. Queuing Commands.");
+			_online.Reset();
+			while (!_pendingCommands.IsEmpty)
+			{
+				_pendingCommands.TryDequeue(out var _);
+			}
+			_isSocketReady = false;
+		}
+	}
+
+	internal void OnSocketShutdown()
+	{
+		if (!_isDisposed)
+		{
+			_isDisposed = true;
+			_online.Reset();
+			_commands.Reset();
+			_online?.Dispose();
+			_commands?.Dispose();
+			_source?.Cancel();
+		}
+	}
+
+	internal IReadOnlyCollection<WebSocketCommand> GetPendingCommands()
+	{
+		return _pendingCommands;
+	}
+}

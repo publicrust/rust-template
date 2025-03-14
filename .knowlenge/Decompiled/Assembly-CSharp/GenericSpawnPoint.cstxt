@@ -22,8 +22,8 @@ public class GenericSpawnPoint : BaseSpawnPoint
 		{
 			return Quaternion.identity;
 		}
-		int max = Mathf.FloorToInt(360f / randomRotSnapDegrees);
-		int num = Random.Range(0, max);
+		int maxExclusive = Mathf.FloorToInt(360f / randomRotSnapDegrees);
+		int num = Random.Range(0, maxExclusive);
 		return Quaternion.Euler(0f, (float)num * randomRotSnapDegrees, 0f);
 	}
 

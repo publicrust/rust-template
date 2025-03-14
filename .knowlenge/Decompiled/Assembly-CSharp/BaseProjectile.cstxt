@@ -2,13 +2,14 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
 using Rust;
-using Rust.Ai;
 using UnityEngine;
 using UnityEngine.Assertions;
 
@@ -23,8 +24,8 @@ public class BaseProjectile : AttackEntity
 			[Tooltip("Set to 0 to not use inbuilt mag")]
 			public int builtInSize;
 
-			[Tooltip("If using inbuilt mag, will accept these types of ammo")]
 			[InspectorFlags]
+			[Tooltip("If using inbuilt mag, will accept these types of ammo")]
 			public AmmoTypes ammoTypes;
 		}
 
@@ -36,6 +37,10 @@ public class BaseProjectile : AttackEntity
 
 		[ItemSelector(ItemCategory.All)]
 		public ItemDefinition ammoType;
+
+		public bool allowPlayerReloading = true;
+
+		public bool allowAmmoSwitching = true;
 
 		public void ServerInit()
 		{
@@ -70,99 +75,57 @@ public class BaseProjectile : AttackEntity
 			ammoType = ItemManager.FindItemDefinition(mag.ammoType);
 		}
 
-		public bool CanReload(BasePlayer owner)
+		public bool CanReload(IAmmoContainer ammoSource)
 		{
 			if (contents >= capacity)
 			{
 				return false;
 			}
-			return owner.inventory.HasAmmo(definition.ammoTypes);
-		}
-
-		public bool CanAiReload(BasePlayer owner)
-		{
-			if (contents >= capacity)
-			{
-				return false;
-			}
-			return true;
-		}
-
-		public void SwitchAmmoTypesIfNeeded(BasePlayer owner)
-		{
-			List<Item> list = owner.inventory.FindItemIDs(ammoType.itemid).ToList();
-			if (list.Count != 0)
-			{
-				return;
-			}
-			List<Item> list2 = new List<Item>();
-			owner.inventory.FindAmmo(list2, definition.ammoTypes);
-			if (list2.Count == 0)
-			{
-				return;
-			}
-			list = owner.inventory.FindItemIDs(list2[0].info.itemid).ToList();
-			if (list != null && list.Count != 0)
-			{
-				if (contents > 0)
-				{
-					owner.GiveItem(ItemManager.CreateByItemID(ammoType.itemid, contents, 0uL));
-					contents = 0;
-				}
-				ammoType = list[0].info;
-			}
-		}
-
-		public bool Reload(BasePlayer owner, int desiredAmount = -1, bool canRefundAmmo = true)
-		{
-			List<Item> list = owner.inventory.FindItemIDs(ammoType.itemid).ToList();
-			if (list.Count == 0)
-			{
-				List<Item> list2 = new List<Item>();
-				owner.inventory.FindAmmo(list2, definition.ammoTypes);
-				if (list2.Count == 0)
-				{
-					return false;
-				}
-				list = owner.inventory.FindItemIDs(list2[0].info.itemid).ToList();
-				if (list == null || list.Count == 0)
-				{
-					return false;
-				}
-				if (contents > 0)
-				{
-					if (canRefundAmmo)
-					{
-						owner.GiveItem(ItemManager.CreateByItemID(ammoType.itemid, contents, 0uL));
-					}
-					contents = 0;
-				}
-				ammoType = list[0].info;
-			}
-			int num = desiredAmount;
-			if (num == -1)
-			{
-				num = capacity - contents;
-			}
-			foreach (Item item in list)
-			{
-				_ = item.amount;
-				int num2 = Mathf.Min(num, item.amount);
-				item.UseItem(num2);
-				contents += num2;
-				num -= num2;
-				if (num <= 0)
-				{
-					break;
-				}
-			}
-			return false;
+			return ammoSource.HasAmmo(definition.ammoTypes);
 		}
 	}
 
 	public static class BaseProjectileFlags
 	{
 		public const Flags BurstToggle = Flags.Reserved6;
+	}
+
+	public struct EncryptedValue<TInner> where TInner : unmanaged
+	{
+		private TInner _value;
+
+		private int _padding;
+
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		public TInner Get()
+		{
+			return _value;
+		}
+
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		public void Set(TInner value)
+		{
+			_value = value;
+		}
+
+		public override string ToString()
+		{
+			return Get().ToString();
+		}
+
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		public static implicit operator EncryptedValue<TInner>(TInner value)
+		{
+			EncryptedValue<TInner> result = default(EncryptedValue<TInner>);
+			result.Set(value);
+			return result;
+		}
+
+		[MethodImpl(MethodImplOptions.AggressiveInlining)]
+		public static implicit operator TInner(EncryptedValue<TInner> encrypted)
+		{
+			return encrypted.Get();
+		}
 	}
 
 	[Header("NPC Info")]
@@ -189,6 +152,8 @@ public class BaseProjectile : AttackEntity
 
 	public GameObjectRef muzzleBrakeAttack;
 
+	public SoundDefinition fireModeSound;
+
 	public Transform MuzzlePoint;
 
 	[Header("Reloading")]
@@ -205,6 +170,8 @@ public class BaseProjectile : AttackEntity
 	public float reloadFractionDuration;
 
 	public float reloadEndDuration;
+
+	public float alternateDryFireRate;
 
 	[Header("Recoil")]
 	public float aimSway = 3f;
@@ -246,9 +213,6 @@ public class BaseProjectile : AttackEntity
 	[NonSerialized]
 	public bool aiming;
 
-	[Header("ViewModel")]
-	public bool useEmptyAmmoState;
-
 	[Header("Burst Information")]
 	public bool isBurstWeapon;
 
@@ -262,19 +226,17 @@ public class BaseProjectile : AttackEntity
 
 	public float internalBurstAimConeScale = 0.8f;
 
-	public Translate.Phrase Toast_BurstDisabled = new Translate.Phrase("burst_disabled", "Burst Disabled");
-
-	public Translate.Phrase Toast_BurstEnabled = new Translate.Phrase("burst enabled", "Burst Enabled");
-
 	public float resetDuration = 0.3f;
 
 	public int numShotsFired;
 
-	[NonSerialized]
-	private float nextReloadTime = float.NegativeInfinity;
+	public const float maxDistance = 300f;
 
 	[NonSerialized]
-	private float startReloadTime = float.NegativeInfinity;
+	private EncryptedValue<float> nextReloadTime = float.NegativeInfinity;
+
+	[NonSerialized]
+	private EncryptedValue<float> startReloadTime = float.NegativeInfinity;
 
 	private float lastReloadTime = -10f;
 
@@ -316,15 +278,13 @@ public class BaseProjectile : AttackEntity
 
 	public bool isSemiAuto => !automatic;
 
-	public override bool IsUsableByTurret => usableByTurret;
-
 	public override Transform MuzzleTransform => MuzzlePoint;
+
+	public override bool IsUsableByTurret => usableByTurret;
 
 	protected virtual bool CanRefundAmmo => true;
 
 	protected virtual ItemDefinition PrimaryMagazineAmmo => primaryMagazine.ammoType;
-
-	private bool UsingInfiniteAmmoCheat => false;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -335,7 +295,7 @@ public class BaseProjectile : AttackEntity
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - CLProject "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - CLProject ");
 				}
 				using (TimeWarning.New("CLProject"))
 				{
@@ -375,7 +335,7 @@ public class BaseProjectile : AttackEntity
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - Reload "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - Reload ");
 				}
 				using (TimeWarning.New("Reload"))
 				{
@@ -411,7 +371,7 @@ public class BaseProjectile : AttackEntity
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - ServerFractionalReloadInsert "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - ServerFractionalReloadInsert ");
 				}
 				using (TimeWarning.New("ServerFractionalReloadInsert"))
 				{
@@ -447,7 +407,7 @@ public class BaseProjectile : AttackEntity
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - StartReload "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - StartReload ");
 				}
 				using (TimeWarning.New("StartReload"))
 				{
@@ -483,7 +443,7 @@ public class BaseProjectile : AttackEntity
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - SwitchAmmoTo "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SwitchAmmoTo ");
 				}
 				using (TimeWarning.New("SwitchAmmoTo"))
 				{
@@ -519,7 +479,7 @@ public class BaseProjectile : AttackEntity
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - ToggleFireMode "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - ToggleFireMode ");
 				}
 				using (TimeWarning.New("ToggleFireMode"))
 				{
@@ -558,6 +518,110 @@ public class BaseProjectile : AttackEntity
 		return base.OnRpcMessage(player, rpc, msg);
 	}
 
+	protected bool TryReload(IAmmoContainer ammoSource, int desiredAmount, bool canRefundAmmo = true)
+	{
+		List<Item> list = ammoSource.FindItemsByItemID(primaryMagazine.ammoType.itemid);
+		if (list.Count == 0 && !primaryMagazine.allowAmmoSwitching)
+		{
+			return false;
+		}
+		if (list.Count == 0)
+		{
+			Item item = ammoSource.FindAmmo(primaryMagazine.definition.ammoTypes);
+			if (item == null)
+			{
+				return false;
+			}
+			list = ammoSource.FindItemsByItemID(item.info.itemid);
+			if (list == null || list.Count == 0)
+			{
+				return false;
+			}
+			if (primaryMagazine.contents > 0)
+			{
+				if (canRefundAmmo)
+				{
+					ammoSource.GiveItem(ItemManager.CreateByItemID(primaryMagazine.ammoType.itemid, primaryMagazine.contents, 0uL));
+				}
+				SetAmmoCount(0);
+			}
+			primaryMagazine.ammoType = list[0].info;
+		}
+		int num = desiredAmount;
+		if (num == -1)
+		{
+			num = primaryMagazine.capacity - primaryMagazine.contents;
+		}
+		foreach (Item item2 in list)
+		{
+			_ = item2.amount;
+			int num2 = Mathf.Min(num, item2.amount);
+			item2.UseItem(num2);
+			ModifyAmmoCount(num2);
+			num -= num2;
+			if (num <= 0)
+			{
+				break;
+			}
+		}
+		return true;
+	}
+
+	public void SwitchAmmoTypesIfNeeded(IAmmoContainer ammoSource)
+	{
+		Item item = ammoSource.FindItemByItemID(primaryMagazine.ammoType.itemid);
+		if (item != null)
+		{
+			return;
+		}
+		Item item2 = ammoSource.FindAmmo(primaryMagazine.definition.ammoTypes);
+		if (item2 == null)
+		{
+			return;
+		}
+		item = ammoSource.FindItemByItemID(item2.info.itemid);
+		if (item != null)
+		{
+			if (primaryMagazine.contents > 0)
+			{
+				ammoSource.GiveItem(ItemManager.CreateByItemID(primaryMagazine.ammoType.itemid, primaryMagazine.contents, 0uL));
+				SetAmmoCount(0);
+			}
+			primaryMagazine.ammoType = item.info;
+		}
+	}
+
+	public static void StripAmmoToType(ref List<Item> ammos, ItemDefinition onlyAllowed)
+	{
+		if (!(onlyAllowed != null))
+		{
+			return;
+		}
+		for (int num = ammos.Count - 1; num >= 0; num--)
+		{
+			if (ammos[num].info != onlyAllowed)
+			{
+				ammos.RemoveAt(num);
+			}
+		}
+	}
+
+	public void SetAmmoCount(int newCount)
+	{
+		primaryMagazine.contents = newCount;
+		Item item = GetItem();
+		if (item != null)
+		{
+			item.ammoCount = newCount;
+			item.MarkDirty();
+		}
+	}
+
+	public void ModifyAmmoCount(int amount)
+	{
+		SetAmmoCount(primaryMagazine.contents + amount);
+	}
+
 	public override Vector3 GetInheritedVelocity(BasePlayer player, Vector3 direction)
 	{
 		return player.GetInheritedProjectileVelocity(direction);
@@ -578,10 +642,19 @@ public class BaseProjectile : AttackEntity
 		return projectileVelocityScale;
 	}
 
+	public virtual float GetOverrideProjectileThickness(Projectile projectile)
+	{
+		if (projectile == null)
+		{
+			return 0f;
+		}
+		return projectile.thickness;
+	}
+
 	protected void StartReloadCooldown(float cooldown)
 	{
 		nextReloadTime = CalculateCooldownTime(nextReloadTime, cooldown, catchup: false);
-		startReloadTime = nextReloadTime - cooldown;
+		startReloadTime = (float)nextReloadTime - cooldown;
 	}
 
 	protected void ResetReloadCooldown()
@@ -591,17 +664,17 @@ public class BaseProjectile : AttackEntity
 
 	protected bool HasReloadCooldown()
 	{
-		return UnityEngine.Time.time < nextReloadTime;
+		return UnityEngine.Time.time < (float)nextReloadTime;
 	}
 
 	protected float GetReloadCooldown()
 	{
-		return Mathf.Max(nextReloadTime - UnityEngine.Time.time, 0f);
+		return Mathf.Max((float)nextReloadTime - UnityEngine.Time.time, 0f);
 	}
 
 	protected float GetReloadIdle()
 	{
-		return Mathf.Max(UnityEngine.Time.time - nextReloadTime, 0f);
+		return Mathf.Max(UnityEngine.Time.time - (float)nextReloadTime, 0f);
 	}
 
 	private void OnDrawGizmos()
@@ -624,6 +697,11 @@ public class BaseProjectile : AttackEntity
 		return recoilProperties;
 	}
 
+	public override float AmmoFraction()
+	{
+		return (float)primaryMagazine.contents / (float)primaryMagazine.capacity;
+	}
+
 	public virtual void DidAttackServerside()
 	{
 	}
@@ -638,14 +716,9 @@ public class BaseProjectile : AttackEntity
 		return primaryMagazine.contents < primaryMagazine.capacity;
 	}
 
-	public override float AmmoFraction()
-	{
-		return (float)primaryMagazine.contents / (float)primaryMagazine.capacity;
-	}
-
 	public override void TopUpAmmo()
 	{
-		primaryMagazine.contents = primaryMagazine.capacity;
+		SetAmmoCount(primaryMagazine.capacity);
 	}
 
 	public override void ServerReload()
@@ -654,9 +727,33 @@ public class BaseProjectile : AttackEntity
 		{
 			lastReloadTime = UnityEngine.Time.time;
 			StartAttackCooldown(reloadTime);
-			GetOwnerPlayer().SignalBroadcast(Signal.Reload);
-			primaryMagazine.contents = primaryMagazine.capacity;
+			BasePlayer ownerPlayer = GetOwnerPlayer();
+			if (ownerPlayer != null)
+			{
+				ownerPlayer.SignalBroadcast(Signal.Reload);
+			}
+			SetAmmoCount(primaryMagazine.capacity);
 		}
+	}
+
+	public override bool ServerTryReload(IAmmoContainer ammoSource)
+	{
+		if (ServerIsReloading())
+		{
+			return false;
+		}
+		if (TryReloadMagazine(ammoSource))
+		{
+			BasePlayer ownerPlayer = GetOwnerPlayer();
+			if (ownerPlayer != null)
+			{
+				ownerPlayer.SignalBroadcast(Signal.Reload);
+			}
+			lastReloadTime = UnityEngine.Time.time;
+			StartAttackCooldown(reloadTime);
+			return true;
+		}
+		return false;
 	}
 
 	public override Vector3 ModifyAIAim(Vector3 eulerInput, float swayModifier = 1f)
@@ -686,7 +783,7 @@ public class BaseProjectile : AttackEntity
 		ServerUse(1f);
 	}
 
-	public override void ServerUse(float damageModifier, Transform originOverride = null)
+	public override void ServerUse(float damageModifier, Transform originOverride = null, bool useBulletThickness = true)
 	{
 		if (base.isClient || HasAttackCooldown())
 		{
@@ -700,10 +797,10 @@ public class BaseProjectile : AttackEntity
 			StartAttackCooldownRaw(1f);
 			return;
 		}
-		primaryMagazine.contents--;
+		ModifyAmmoCount(-1);
 		if (primaryMagazine.contents < 0)
 		{
-			primaryMagazine.contents = 0;
+			SetAmmoCount(0);
 		}
 		bool flag2 = flag && ownerPlayer.IsNpc;
 		if (flag2 && (ownerPlayer.isMounted || ownerPlayer.GetParentEntity() != null))
@@ -723,8 +820,9 @@ public class BaseProjectile : AttackEntity
 			inputVec = originOverride.forward;
 		}
 		ItemModProjectile component = primaryMagazine.ammoType.GetComponent<ItemModProjectile>();
-		SignalBroadcast(Signal.Attack, string.Empty);
+		SignalBroadcast(Signal.Attack, string.Empty, null, GetAttackEffect());
 		Projectile component2 = component.projectileObject.Get().GetComponent<Projectile>();
+		bool flag3 = GetParentEntity() is BasePlayer;
 		BaseEntity baseEntity = null;
 		if (flag)
 		{
@@ -732,14 +830,26 @@ public class BaseProjectile : AttackEntity
 		}
 		for (int i = 0; i < component.numProjectiles; i++)
 		{
-			Vector3 modifiedAimConeDirection = AimConeUtil.GetModifiedAimConeDirection(component.projectileSpread + GetAimCone() + GetAIAimcone() * 1f, inputVec);
-			List<RaycastHit> obj = Facepunch.Pool.GetList<RaycastHit>();
-			GamePhysics.TraceAll(new Ray(vector, modifiedAimConeDirection), 0f, obj, 300f, 1219701505);
+			Vector3 vector2 = ((!flag2) ? AimConeUtil.GetModifiedAimConeDirection(component.projectileSpread + GetAimCone(), inputVec) : AimConeUtil.GetModifiedAimConeDirection(component.projectileSpread + GetAimCone() + GetAIAimcone(), inputVec));
+			float radius = (useBulletThickness ? GetOverrideProjectileThickness(component2) : 0f);
+			List<RaycastHit> obj = Facepunch.Pool.Get<List<RaycastHit>>();
+			GamePhysics.TraceAll(new Ray(vector, vector2), radius, obj, 300f, 1220225793, QueryTriggerInteraction.Ignore, ownerPlayer);
 			for (int j = 0; j < obj.Count; j++)
 			{
 				RaycastHit hit = obj[j];
 				BaseEntity entity = RaycastHitEx.GetEntity(hit);
-				if ((entity != null && (entity == this || entity.EqualNetID(this))) || (entity != null && entity.isClient))
+				if (flag3)
+				{
+					if (entity != null && (entity == this || entity.EqualNetID(this)))
+					{
+						continue;
+					}
+				}
+				else if (entity != null && this.HasEntityInParents(entity))
+				{
+					continue;
+				}
+				if (entity != null && entity.isClient)
 				{
 					continue;
 				}
@@ -749,7 +859,7 @@ public class BaseProjectile : AttackEntity
 					continue;
 				}
 				BaseCombatEntity baseCombatEntity = entity as BaseCombatEntity;
-				if ((!(entity != null && entity.IsNpc && flag2) || baseCombatEntity.GetFaction() == BaseCombatEntity.Faction.Horror || entity is BasePet) && baseCombatEntity != null && (baseEntity == null || entity == baseEntity || entity.EqualNetID(baseEntity)))
+				if ((!(entity != null && entity.IsNpc && flag2) || baseCombatEntity.GetFaction() == BaseCombatEntity.Faction.Horror || entity is BasePet) && baseCombatEntity != null && (baseEntity == null || entity == baseEntity || entity.EqualNetID(baseEntity)) && baseCombatEntity.IsVisible(vector, hit.point, 300f))
 				{
 					HitInfo hitInfo = new HitInfo();
 					AssignInitiator(hitInfo);
@@ -758,7 +868,7 @@ public class BaseProjectile : AttackEntity
 					hitInfo.IsPredicting = false;
 					hitInfo.DoHitEffects = component2.doDefaultHitEffects;
 					hitInfo.DidHit = true;
-					hitInfo.ProjectileVelocity = modifiedAimConeDirection * 300f;
+					hitInfo.ProjectileVelocity = vector2 * 300f;
 					hitInfo.PointStart = MuzzlePoint.position;
 					hitInfo.PointEnd = hit.point;
 					hitInfo.HitPositionWorld = hit.point;
@@ -776,15 +886,15 @@ public class BaseProjectile : AttackEntity
 						hitInfo.HitMaterial = StringPool.Get("Flesh");
 						Effect.server.ImpactEffect(hitInfo);
 					}
-				}
-				if (!(entity != null) || entity.ShouldBlockProjectiles())
-				{
-					break;
+					if (!(entity != null) || entity.ShouldBlockProjectiles())
+					{
+						break;
+					}
 				}
 			}
-			Facepunch.Pool.FreeList(ref obj);
-			Vector3 vector2 = ((flag && ownerPlayer.isMounted) ? (modifiedAimConeDirection * 6f) : Vector3.zero);
-			CreateProjectileEffectClientside(component.projectileObject.resourcePath, vector + vector2, modifiedAimConeDirection * component.projectileVelocity, UnityEngine.Random.Range(1, 100), null, IsSilenced(), forceClientsideEffects: true);
+			Facepunch.Pool.FreeUnmanaged(ref obj);
+			Vector3 vector3 = ((flag && ownerPlayer.isMounted) ? (vector2 * 6f) : Vector3.zero);
+			CreateProjectileEffectClientside(component.projectileObject.resourcePath, vector + vector3, vector2 * component.projectileVelocity, UnityEngine.Random.Range(1, 100), null, IsSilenced(), forceClientsideEffects: true);
 		}
 	}
 
@@ -869,7 +979,7 @@ public class BaseProjectile : AttackEntity
 			{
 				itemContainer = GetCachedItem().parent;
 			}
-			primaryMagazine.contents = 0;
+			SetAmmoCount(0);
 			if (itemContainer != null)
 			{
 				Item item = ItemManager.Create(primaryMagazine.ammoType, contents, 0uL);
@@ -903,16 +1013,29 @@ public class BaseProjectile : AttackEntity
 		{
 			return;
 		}
-		int contents = component.primaryMagazine.contents;
-		if (contents > 0)
+		int num = component.primaryMagazine.contents;
+		if (num <= 0)
 		{
-			component.primaryMagazine.contents = 0;
-			SendNetworkUpdateImmediate();
-			Item item2 = ItemManager.Create(component.primaryMagazine.ammoType, contents, 0uL);
-			if (!item2.MoveToContainer(player.inventory.containerMain))
+			return;
+		}
+		component.SetAmmoCount(0);
+		item.MarkDirty();
+		SendNetworkUpdateImmediate();
+		int stackable = component.primaryMagazine.ammoType.stackable;
+		if (num > stackable)
+		{
+			int num2 = Mathf.FloorToInt(num / component.primaryMagazine.ammoType.stackable);
+			num %= stackable;
+			for (int i = 0; i < num2; i++)
 			{
-				item2.Drop(player.GetDropPosition(), player.GetDropVelocity());
+				Item item2 = ItemManager.Create(component.primaryMagazine.ammoType, stackable, 0uL);
+				player.GiveItem(item2);
 			}
+		}
+		if (num > 0)
+		{
+			Item item3 = ItemManager.Create(component.primaryMagazine.ammoType, num, 0uL);
+			player.GiveItem(item3);
 		}
 	}
 
@@ -931,7 +1054,7 @@ public class BaseProjectile : AttackEntity
 			BaseProjectile component = item.GetHeldEntity().GetComponent<BaseProjectile>();
 			if ((bool)component)
 			{
-				component.primaryMagazine.contents = 0;
+				component.SetAmmoCount(0);
 			}
 		}
 	}
@@ -950,11 +1073,13 @@ public class BaseProjectile : AttackEntity
 		{
 			return;
 		}
-		foreach (ProjectileWeaponMod item in from ProjectileWeaponMod x in children
-			where x != null && x.isLight
-			select x)
+		foreach (BaseEntity child in children)
 		{
-			item.SetFlag(Flags.On, b);
+			ProjectileWeaponMod projectileWeaponMod = child as ProjectileWeaponMod;
+			if (projectileWeaponMod != null && projectileWeaponMod.isLight)
+			{
+				projectileWeaponMod.SetFlag(Flags.On, b);
+			}
 		}
 	}
 
@@ -1019,7 +1144,7 @@ public class BaseProjectile : AttackEntity
 
 	public float ScaleRepeatDelay(float delay)
 	{
-		float num = ProjectileWeaponMod.Average(this, (ProjectileWeaponMod x) => x.repeatDelay, (ProjectileWeaponMod.Modifier y) => y.scalar, 1f);
+		float num = ProjectileWeaponMod.Mult(this, (ProjectileWeaponMod x) => x.repeatDelay, (ProjectileWeaponMod.Modifier y) => y.scalar, 1f);
 		float num2 = ProjectileWeaponMod.Sum(this, (ProjectileWeaponMod x) => x.repeatDelay, (ProjectileWeaponMod.Modifier y) => y.offset, 0f);
 		float num3 = (UsingInternalBurstMode() ? internalBurstFireRateScale : 1f);
 		return delay * num * num3 + num2;
@@ -1029,9 +1154,9 @@ public class BaseProjectile : AttackEntity
 	{
 		Projectile.Modifier result = default(Projectile.Modifier);
 		result.damageOffset = ProjectileWeaponMod.Sum(this, (ProjectileWeaponMod x) => x.projectileDamage, (ProjectileWeaponMod.Modifier y) => y.offset, 0f);
-		result.damageScale = ProjectileWeaponMod.Average(this, (ProjectileWeaponMod x) => x.projectileDamage, (ProjectileWeaponMod.Modifier y) => y.scalar, 1f) * GetDamageScale();
+		result.damageScale = ProjectileWeaponMod.Mult(this, (ProjectileWeaponMod x) => x.projectileDamage, (ProjectileWeaponMod.Modifier y) => y.scalar, 1f) * GetDamageScale();
 		result.distanceOffset = ProjectileWeaponMod.Sum(this, (ProjectileWeaponMod x) => x.projectileDistance, (ProjectileWeaponMod.Modifier y) => y.offset, 0f);
-		result.distanceScale = ProjectileWeaponMod.Average(this, (ProjectileWeaponMod x) => x.projectileDistance, (ProjectileWeaponMod.Modifier y) => y.scalar, 1f) * GetDistanceScale();
+		result.distanceScale = ProjectileWeaponMod.Mult(this, (ProjectileWeaponMod x) => x.projectileDistance, (ProjectileWeaponMod.Modifier y) => y.scalar, 1f) * GetDistanceScale();
 		return result;
 	}
 
@@ -1041,17 +1166,7 @@ public class BaseProjectile : AttackEntity
 		{
 			return false;
 		}
-		if (!isBurstWeapon)
-		{
-			if (children != null)
-			{
-				return (from ProjectileWeaponMod x in children
-					where x != null && x.burstCount > 0
-					select x).FirstOrDefault() != null;
-			}
-			return false;
-		}
-		return true;
+		return IsBurstEligable();
 	}
 
 	public bool UsingInternalBurstMode()
@@ -1065,22 +1180,36 @@ public class BaseProjectile : AttackEntity
 
 	public bool IsBurstEligable()
 	{
-		if (!isBurstWeapon)
+		if (isBurstWeapon)
 		{
-			if (children != null)
-			{
-				return (from ProjectileWeaponMod x in children
-					where x != null && x.burstCount > 0
-					select x).FirstOrDefault() != null;
-			}
-			return false;
+			return true;
 		}
-		return true;
+		if (children != null)
+		{
+			foreach (BaseEntity child in children)
+			{
+				ProjectileWeaponMod projectileWeaponMod = child as ProjectileWeaponMod;
+				if (projectileWeaponMod != null && projectileWeaponMod.burstCount > 0)
+				{
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	public float TimeBetweenBursts()
 	{
-		return repeatDelay * 3f;
+		return repeatDelay * 2f;
+	}
+
+	public virtual bool CanAttack()
+	{
+		if (ProjectileWeaponMod.HasBrokenWeaponMod(this))
+		{
+			return false;
+		}
+		return true;
 	}
 
 	public float GetReloadDuration()
@@ -1098,9 +1227,9 @@ public class BaseProjectile : AttackEntity
 		BasePlayer ownerPlayer = GetOwnerPlayer();
 		if (ownerPlayer == null)
 		{
-			return primaryMagazine.capacity;
+			return primaryMagazine.contents;
 		}
-		List<Item> obj = Facepunch.Pool.GetList<Item>();
+		List<Item> obj = Facepunch.Pool.Get<List<Item>>();
 		ownerPlayer.inventory.FindAmmo(obj, primaryMagazine.definition.ammoTypes);
 		int num = 0;
 		if (obj.Count != 0)
@@ -1114,7 +1243,7 @@ public class BaseProjectile : AttackEntity
 				}
 			}
 		}
-		Facepunch.Pool.FreeList(ref obj);
+		Facepunch.Pool.Free(ref obj, freeElements: false);
 		return num;
 	}
 
@@ -1123,8 +1252,8 @@ public class BaseProjectile : AttackEntity
 		return HasFlag(Flags.Reserved6) == defaultOn;
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsActiveItem]
+	[RPC_Server]
 	[RPC_Server.CallsPerSecond(2uL)]
 	private void ToggleFireMode(RPCMessage msg)
 	{
@@ -1132,24 +1261,29 @@ public class BaseProjectile : AttackEntity
 		{
 			SetFlag(Flags.Reserved6, !HasFlag(Flags.Reserved6));
 			SendNetworkUpdate_Flags();
-			BasePlayer ownerPlayer = GetOwnerPlayer();
-			if (!ownerPlayer.IsNpc && ownerPlayer.IsConnected)
-			{
-				ownerPlayer.ShowToast(GameTip.Styles.Blue_Short, IsBurstDisabled() ? Toast_BurstDisabled : Toast_BurstEnabled);
-			}
+			Facepunch.Rust.Analytics.Azure.OnBurstModeToggled(msg.player, this, HasFlag(Flags.Reserved6));
 		}
 	}
 
-	protected virtual void ReloadMagazine(int desiredAmount = -1)
+	public virtual bool TryReloadMagazine(IAmmoContainer ammoSource, int desiredAmount = -1)
 	{
-		BasePlayer ownerPlayer = GetOwnerPlayer();
-		if ((bool)ownerPlayer && Interface.CallHook("OnMagazineReload", this, desiredAmount, ownerPlayer) == null)
+		object obj = Interface.CallHook("OnMagazineReload", this, ammoSource, GetOwnerPlayer());
+		if (obj is bool)
 		{
-			primaryMagazine.Reload(ownerPlayer, desiredAmount);
-			SendNetworkUpdateImmediate();
-			ItemManager.DoRemoves();
+			return (bool)obj;
+		}
+		if (!TryReload(ammoSource, desiredAmount))
+		{
+			return false;
+		}
+		SendNetworkUpdateImmediate();
+		ItemManager.DoRemoves();
+		BasePlayer ownerPlayer = GetOwnerPlayer();
+		if (ownerPlayer != null)
+		{
 			ownerPlayer.inventory.ServerUpdate(0f);
 		}
+		return true;
 	}
 
 	[RPC_Server]
@@ -1177,7 +1311,7 @@ public class BaseProjectile : AttackEntity
 			if (primaryMagazine.contents > 0)
 			{
 				ownerPlayer.GiveItem(ItemManager.CreateByItemID(primaryMagazine.ammoType.itemid, primaryMagazine.contents, 0uL));
-				primaryMagazine.contents = 0;
+				SetAmmoCount(0);
 			}
 			primaryMagazine.ammoType = itemDefinition;
 			SendNetworkUpdateImmediate();
@@ -1213,10 +1347,15 @@ public class BaseProjectile : AttackEntity
 			fractionalInsertCounter = 0;
 			if (CanRefundAmmo)
 			{
-				primaryMagazine.SwitchAmmoTypesIfNeeded(player);
+				SwitchAmmoTypesIfNeeded(player.inventory);
 			}
+			OnReloadStarted();
 			StartReloadCooldown(GetReloadDuration());
 		}
+	}
+
+	protected virtual void OnReloadStarted()
+	{
 	}
 
 	[RPC_Server]
@@ -1253,14 +1392,14 @@ public class BaseProjectile : AttackEntity
 			reloadFinished = false;
 			return;
 		}
-		if (UnityEngine.Time.time < startReloadTime + reloadStartDuration)
+		if (UnityEngine.Time.time < (float)startReloadTime + reloadStartDuration)
 		{
 			AntiHack.Log(player, AntiHackType.ReloadHack, "Fractional reload too early (" + base.ShortPrefabName + ")");
 			player.stats.combat.LogInvalid(player, this, "reload_fraction_too_early");
 			reloadStarted = false;
 			reloadFinished = false;
 		}
-		if (UnityEngine.Time.time < startReloadTime + reloadStartDuration + (float)fractionalInsertCounter * reloadFractionDuration)
+		if (UnityEngine.Time.time < (float)startReloadTime + reloadStartDuration + (float)fractionalInsertCounter * reloadFractionDuration)
 		{
 			AntiHack.Log(player, AntiHackType.ReloadHack, "Fractional reload rate too high (" + base.ShortPrefabName + ")");
 			player.stats.combat.LogInvalid(player, this, "reload_fraction_rate");
@@ -1272,7 +1411,7 @@ public class BaseProjectile : AttackEntity
 			fractionalInsertCounter++;
 			if (primaryMagazine.contents < primaryMagazine.capacity)
 			{
-				ReloadMagazine(1);
+				TryReloadMagazine(player.inventory, 1);
 			}
 		}
 	}
@@ -1324,13 +1463,13 @@ public class BaseProjectile : AttackEntity
 		reloadFinished = true;
 		if (!fractionalReload)
 		{
-			ReloadMagazine();
+			TryReloadMagazine(player.inventory);
 		}
 	}
 
-	[RPC_Server.IsActiveItem]
 	[RPC_Server]
 	[RPC_Server.FromOwner]
+	[RPC_Server.IsActiveItem]
 	private void CLProject(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
@@ -1347,7 +1486,7 @@ public class BaseProjectile : AttackEntity
 		}
 		reloadStarted = false;
 		reloadFinished = false;
-		if (primaryMagazine.contents <= 0 && !UsingInfiniteAmmoCheat)
+		if (primaryMagazine.contents <= 0 && !base.UsingInfiniteAmmoCheat)
 		{
 			AntiHack.Log(player, AntiHackType.ProjectileHack, "Magazine empty (" + base.ShortPrefabName + ")");
 			player.stats.combat.LogInvalid(player, this, "ammo_missing");
@@ -1361,9 +1500,9 @@ public class BaseProjectile : AttackEntity
 			player.stats.combat.LogInvalid(player, this, "ammo_mismatch");
 			return;
 		}
-		if (!UsingInfiniteAmmoCheat)
+		if (!base.UsingInfiniteAmmoCheat)
 		{
-			primaryMagazine.contents--;
+			ModifyAmmoCount(-1);
 		}
 		ItemModProjectile component = primaryMagazineAmmo.GetComponent<ItemModProjectile>();
 		if (component == null)
@@ -1383,7 +1522,7 @@ public class BaseProjectile : AttackEntity
 		{
 			return;
 		}
-		SignalBroadcast(Signal.Attack, string.Empty, msg.connection);
+		SignalBroadcast(Signal.Attack, string.Empty, msg.connection, GetAttackEffect());
 		player.CleanupExpiredProjectiles();
 		Guid projectileGroupId = Guid.NewGuid();
 		foreach (ProjectileShoot.Projectile projectile in projectileShoot.projectiles)
@@ -1392,56 +1531,46 @@ public class BaseProjectile : AttackEntity
 			{
 				AntiHack.Log(player, AntiHackType.ProjectileHack, "Duplicate ID (" + projectile.projectileID + ")");
 				player.stats.combat.LogInvalid(player, this, "duplicate_id");
+				continue;
 			}
-			else if (ValidateEyePos(player, projectile.startPos))
+			Vector3 positionOffset = Vector3.zero;
+			if (ConVar.AntiHack.projectile_positionoffset && (player.isMounted || player.HasParent()))
 			{
-				player.NoteFiredProjectile(projectile.projectileID, projectile.startPos, projectile.startVel, this, primaryMagazineAmmo, projectileGroupId);
-				if (!player.limitNetworking)
+				if (!ValidateEyePos(player, projectile.startPos, checkLineOfSight: false))
 				{
-					CreateProjectileEffectClientside(component.projectileObject.resourcePath, projectile.startPos, projectile.startVel, projectile.seed, msg.connection, IsSilenced());
+					continue;
 				}
+				Vector3 position = player.eyes.position;
+				positionOffset = position - projectile.startPos;
+				projectile.startPos = position;
+			}
+			else if (!ValidateEyePos(player, projectile.startPos))
+			{
+				continue;
+			}
+			player.NoteFiredProjectile(projectile.projectileID, projectile.startPos, projectile.startVel, this, primaryMagazineAmmo, projectileGroupId, positionOffset);
+			if (!player.limitNetworking)
+			{
+				CreateProjectileEffectClientside(component.projectileObject.resourcePath, projectile.startPos, projectile.startVel, projectile.seed, msg.connection, IsSilenced());
 			}
 		}
 		player.MakeNoise(player.transform.position, BaseCombatEntity.ActionVolume.Loud);
+		SingletonComponent<NpcNoiseManager>.Instance.OnWeaponShot(player, this);
 		player.stats.Add(component.category + "_fired", projectileShoot.projectiles.Count(), (Stats)5);
 		player.LifeStoryShotFired(this);
 		StartAttackCooldown(ScaleRepeatDelay(repeatDelay) + animationDelay);
 		player.MarkHostileFor();
 		UpdateItemCondition();
 		DidAttackServerside();
-		float num = 0f;
-		if (component.projectileObject != null)
+		BaseMountable mounted = player.GetMounted();
+		if (mounted != null)
 		{
-			GameObject gameObject = component.projectileObject.Get();
-			if (gameObject != null)
-			{
-				Projectile component2 = gameObject.GetComponent<Projectile>();
-				if (component2 != null)
-				{
-					foreach (DamageTypeEntry damageType in component2.damageTypes)
-					{
-						num += damageType.amount;
-					}
-				}
-			}
+			mounted.OnWeaponFired(this);
 		}
-		float num2 = NoiseRadius;
-		if (IsSilenced())
-		{
-			num2 *= AI.npc_gun_noise_silencer_modifier;
-		}
-		Sensation sensation = default(Sensation);
-		sensation.Type = SensationType.Gunshot;
-		sensation.Position = player.transform.position;
-		sensation.Radius = num2;
-		sensation.DamagePotential = num;
-		sensation.InitiatorPlayer = player;
-		sensation.Initiator = player;
-		Sense.Stimulate(sensation);
 		EACServer.LogPlayerUseWeapon(player, this);
 	}
 
-	public void CreateProjectileEffectClientside(string prefabName, Vector3 pos, Vector3 velocity, int seed, Connection sourceConnection, bool silenced = false, bool forceClientsideEffects = false)
+	public void CreateProjectileEffectClientside(string prefabName, Vector3 pos, Vector3 velocity, int seed, Connection sourceConnection, bool silenced = false, bool forceClientsideEffects = false, List<Connection> targets = null)
 	{
 		if (Interface.CallHook("OnClientProjectileEffectCreate", sourceConnection, this, prefabName) == null)
 		{
@@ -1455,6 +1584,7 @@ public class BaseProjectile : AttackEntity
 			}
 			effect.pooledString = prefabName;
 			effect.number = seed;
+			effect.targets = targets;
 			EffectNetwork.Send(effect);
 		}
 	}
@@ -1468,12 +1598,21 @@ public class BaseProjectile : AttackEntity
 		}
 		float barrelConditionLoss = primaryMagazine.ammoType.GetComponent<ItemModProjectile>().barrelConditionLoss;
 		float num = 0.25f;
-		ownerItem.LoseCondition(num + barrelConditionLoss);
-		if (ownerItem.contents != null && ownerItem.contents.itemList != null)
+		bool usingInfiniteAmmoCheat = base.UsingInfiniteAmmoCheat;
+		if (!usingInfiniteAmmoCheat)
 		{
-			for (int num2 = ownerItem.contents.itemList.Count - 1; num2 >= 0; num2--)
+			ownerItem.LoseCondition(num + barrelConditionLoss);
+		}
+		if (ownerItem.contents == null || ownerItem.contents.itemList == null)
+		{
+			return;
+		}
+		for (int num2 = ownerItem.contents.itemList.Count - 1; num2 >= 0; num2--)
+		{
+			Item item = ownerItem.contents.itemList[num2];
+			if (item != null && !usingInfiniteAmmoCheat)
 			{
-				ownerItem.contents.itemList[num2]?.LoseCondition(num + barrelConditionLoss);
+				item.LoseCondition(num + barrelConditionLoss);
 			}
 		}
 	}
@@ -1494,14 +1633,83 @@ public class BaseProjectile : AttackEntity
 		return false;
 	}
 
+	public string GetAttackEffectAdditive()
+	{
+		string result = "";
+		if (children != null)
+		{
+			foreach (BaseEntity child in children)
+			{
+				ProjectileWeaponMod projectileWeaponMod = child as ProjectileWeaponMod;
+				if (!(projectileWeaponMod == null) && projectileWeaponMod.additiveEffect.isValid)
+				{
+					result = projectileWeaponMod.additiveEffect.resourcePath;
+					break;
+				}
+			}
+		}
+		return result;
+	}
+
+	protected string GetAttackEffect()
+	{
+		string resourcePath = attackFX.resourcePath;
+		if (primaryMagazine.ammoType != null)
+		{
+			ItemModProjectile component = primaryMagazine.ammoType.GetComponent<ItemModProjectile>();
+			if (component.attackEffectOverride.isValid)
+			{
+				resourcePath = component.attackEffectOverride.resourcePath;
+			}
+		}
+		if (children != null)
+		{
+			foreach (BaseEntity child in children)
+			{
+				ProjectileWeaponMod projectileWeaponMod = child as ProjectileWeaponMod;
+				if (projectileWeaponMod == null)
+				{
+					continue;
+				}
+				if (projectileWeaponMod.isSilencer)
+				{
+					resourcePath = projectileWeaponMod.defaultSilencerEffect.resourcePath;
+					if (silencedAttack.isValid)
+					{
+						resourcePath = silencedAttack.resourcePath;
+					}
+					break;
+				}
+				if (projectileWeaponMod.isMuzzleBrake)
+				{
+					if (muzzleBrakeAttack.isValid)
+					{
+						resourcePath = muzzleBrakeAttack.resourcePath;
+					}
+					break;
+				}
+			}
+		}
+		return resourcePath;
+	}
+
 	public override bool CanUseNetworkCache(Connection sendingTo)
 	{
-		Connection ownerConnection = GetOwnerConnection();
-		if (sendingTo == null || ownerConnection == null)
+		BasePlayer ownerPlayer = GetOwnerPlayer();
+		if (ownerPlayer == null || ownerPlayer.net == null)
 		{
 			return true;
 		}
-		return sendingTo != ownerConnection;
+		if (ownerPlayer.IsBeingSpectated)
+		{
+			return false;
+		}
+		Connection connection = ownerPlayer.net.connection;
+		if (sendingTo == null || connection == null)
+		{
+			return true;
+		}
+		return sendingTo != connection;
 	}
 
 	public override void Save(SaveInfo info)

@@ -21,6 +21,18 @@ public class DepthOfFieldEffect : PostProcessEffectSettings
 		value = 11.5f
 	};
 
+	[Range(0f, 3f)]
+	public FloatParameter anamorphicSqueeze = new FloatParameter
+	{
+		value = 0f
+	};
+
+	[Range(0f, 1f)]
+	public FloatParameter anamorphicBarrel = new FloatParameter
+	{
+		value = 0f
+	};
+
 	public FloatParameter maxBlurSize = new FloatParameter
 	{
 		value = 2f

@@ -26,5 +26,7 @@ public enum AIState
 	Cooldown,
 	MoveToPoint,
 	MoveToVector3,
-	Blinded
+	Blinded,
+	KillSelf,
+	MountAPC
 }

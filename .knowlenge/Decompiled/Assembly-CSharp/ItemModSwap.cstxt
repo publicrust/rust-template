@@ -32,7 +32,7 @@ public class ItemModSwap : ItemMod
 				}
 				if (sendPlayerPickupNotification)
 				{
-					player.Command("note.inv", item2.info.itemid, item2.amount);
+					player.Command("note.inv", item2.info.itemid, itemAmount.amount);
 				}
 			}
 		}

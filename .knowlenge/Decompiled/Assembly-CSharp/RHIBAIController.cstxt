@@ -10,7 +10,7 @@ public class RHIBAIController : FacepunchBehaviour
 	public void SetupPatrolPath()
 	{
 		float x = TerrainMeta.Size.x;
-		float num = x * 2f * (float)Math.PI;
+		float num = x * 2f * MathF.PI;
 		float num2 = 30f;
 		int num3 = Mathf.CeilToInt(num / num2);
 		nodes = new List<Vector3>();
@@ -19,7 +19,7 @@ public class RHIBAIController : FacepunchBehaviour
 		for (int i = 0; i < num3; i++)
 		{
 			float num5 = (float)i / (float)num3 * 360f;
-			nodes.Add(new Vector3(Mathf.Sin(num5 * ((float)Math.PI / 180f)) * num4, y, Mathf.Cos(num5 * ((float)Math.PI / 180f)) * num4));
+			nodes.Add(new Vector3(Mathf.Sin(num5 * (MathF.PI / 180f)) * num4, y, Mathf.Cos(num5 * (MathF.PI / 180f)) * num4));
 		}
 		float num6 = 2f;
 		float num7 = 200f;

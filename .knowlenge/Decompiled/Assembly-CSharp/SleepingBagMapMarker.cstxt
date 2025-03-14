@@ -1,3 +1,4 @@
+using Rust.UI;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
@@ -27,4 +28,8 @@ public class SleepingBagMapMarker : MonoBehaviour
 	public Image CircleRim;
 
 	public Image CircleFill;
+
+	public RustButton DeleteButton;
+
+	public Image ConfirmSlider;
 }

@@ -1,8 +1,8 @@
 using ConVar;
 using UnityEngine;
 
-[RequireComponent(typeof(Light))]
 [ExecuteInEditMode]
+[RequireComponent(typeof(Light))]
 public class NGSS_Directional : MonoBehaviour
 {
 	public enum SAMPLER_COUNT

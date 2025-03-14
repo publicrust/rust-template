@@ -48,7 +48,7 @@ public class CompoundBowWeapon : BowWeapon
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_StringHoldStatus "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - RPC_StringHoldStatus ");
 				}
 				using (TimeWarning.New("RPC_StringHoldStatus"))
 				{

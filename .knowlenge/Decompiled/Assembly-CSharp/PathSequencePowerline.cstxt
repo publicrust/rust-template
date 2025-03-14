@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using UnityEngine;
 
 public class PathSequencePowerline : PathSequence
 {
@@ -12,7 +13,7 @@ public class PathSequencePowerline : PathSequence
 
 	private const int RegularPowerlineSpacing = 2;
 
-	public override void ApplySequenceReplacement(List<Prefab> sequence, ref Prefab replacement, Prefab[] possibleReplacements, int pathLength, int pathIndex)
+	public override void ApplySequenceReplacement(List<Prefab> sequence, ref Prefab replacement, Prefab[] possibleReplacements, int pathLength, int pathIndex, Vector3 position)
 	{
 		bool flag = false;
 		if (Rule == SequenceRule.Powerline)

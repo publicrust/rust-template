@@ -18,7 +18,7 @@ public class ProceduralDungeonCell : BaseMonoBehaviour
 
 	public SpawnGroup[] spawnGroups;
 
-	public MeshRenderer[] mapRenderers;
+	public RendererLOD[] mapRendererLods;
 
 	public void Awake()
 	{

@@ -2,7 +2,9 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using ConVar;
 using Facepunch;
 using Facepunch.Extend;
@@ -10,7 +12,6 @@ using Network;
 using Oxide.Core;
 using ProtoBuf;
 using Rust;
-using Rust.Ai;
 using Rust.Workshop;
 using Spatial;
 using UnityEngine;
@@ -121,6 +122,14 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		public float drag;
 	}
 
+	public enum GiveItemReason
+	{
+		Generic,
+		ResourceHarvested,
+		PickedUp,
+		Crafted
+	}
+
 	[Flags]
 	public enum Flags
 	{
@@ -144,7 +153,12 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		Reserved9 = 0x20000,
 		Reserved10 = 0x40000,
 		Reserved11 = 0x80000,
-		InUse = 0x100000
+		InUse = 0x100000,
+		Reserved12 = 0x200000,
+		Reserved13 = 0x400000,
+		Unused23 = 0x800000,
+		Protected = 0x1000000,
+		Transferring = 0x2000000
 	}
 
 	private readonly struct QueuedFileRequest : IEquatable<QueuedFileRequest>
@@ -242,6 +256,13 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 	public static class Query
 	{
+		public enum DistanceCheckType
+		{
+			None,
+			OnlyCenter,
+			Bounds
+		}
+
 		public class EntityTree
 		{
 			public Grid<BaseEntity> Grid;
@@ -328,19 +349,129 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				BrainGrid.Move(entity, position.x, position.z);
 			}
 
+			public void GetInSphere<T>(Vector3 position, float distance, List<T> results, DistanceCheckType distanceCheckType = DistanceCheckType.OnlyCenter) where T : BaseEntity
+			{
+				using (TimeWarning.New("GetInSphereList"))
+				{
+					Grid.Query(position.x, position.z, distance, results);
+					if (distanceCheckType != 0)
+					{
+						NarrowPhaseReduce(position, distance, results, distanceCheckType == DistanceCheckType.OnlyCenter);
+					}
+				}
+			}
+
 			public int GetInSphere(Vector3 position, float distance, BaseEntity[] results, Func<BaseEntity, bool> filter = null)
+			{
+				int broadCount = Grid.Query(position.x, position.z, distance, results, filter);
+				return NarrowPhaseReduce(position, distance, results, broadCount);
+			}
+
+			public int GetInSphereFast(Vector3 position, float distance, BaseEntity[] results, Func<BaseEntity, bool> filter = null)
 			{
 				return Grid.Query(position.x, position.z, distance, results, filter);
 			}
 
+			public void GetPlayersInSphere(Vector3 position, float distance, List<BasePlayer> results, DistanceCheckType distanceCheckType = DistanceCheckType.OnlyCenter)
+			{
+				using (TimeWarning.New("GetPlayersInSphereList"))
+				{
+					PlayerGrid.Query(position.x, position.z, distance, results);
+					if (distanceCheckType != 0)
+					{
+						NarrowPhaseReduce(position, distance, results, distanceCheckType == DistanceCheckType.OnlyCenter);
+					}
+				}
+			}
+
 			public int GetPlayersInSphere(Vector3 position, float distance, BasePlayer[] results, Func<BasePlayer, bool> filter = null)
+			{
+				int broadCount = PlayerGrid.Query(position.x, position.z, distance, results, filter);
+				return NarrowPhaseReduce(position, distance, results, broadCount);
+			}
+
+			public int GetPlayersInSphereFast(Vector3 position, float distance, BasePlayer[] results, Func<BasePlayer, bool> filter = null)
 			{
 				return PlayerGrid.Query(position.x, position.z, distance, results, filter);
 			}
 
+			public void GetBrainsInSphere<T>(Vector3 position, float distance, List<T> results, bool filterPastDistance = true) where T : BaseEntity
+			{
+				using (TimeWarning.New("GetBrainsInSphereList"))
+				{
+					BrainGrid.Query(position.x, position.z, distance, results);
+					if (filterPastDistance)
+					{
+						NarrowPhaseReduce(position, distance, results);
+					}
+				}
+			}
+
 			public int GetBrainsInSphere(Vector3 position, float distance, BaseEntity[] results, Func<BaseEntity, bool> filter = null)
 			{
+				int broadCount = BrainGrid.Query(position.x, position.z, distance, results, filter);
+				return NarrowPhaseReduce(position, distance, results, broadCount);
+			}
+
+			public int GetBrainsInSphereFast(Vector3 position, float distance, BaseEntity[] results, Func<BaseEntity, bool> filter = null)
+			{
 				return BrainGrid.Query(position.x, position.z, distance, results, filter);
+			}
+
+			public void GetPlayersAndBrainsInSphere(Vector3 position, float distance, List<BaseEntity> results, DistanceCheckType distanceCheckType = DistanceCheckType.OnlyCenter)
+			{
+				using (TimeWarning.New("GetPlayersAndBrainsInSphereList"))
+				{
+					PlayerGrid.Query(position.x, position.z, distance, results);
+					BrainGrid.Query(position.x, position.z, distance, results);
+					if (distanceCheckType != 0)
+					{
+						NarrowPhaseReduce(position, distance, results, distanceCheckType == DistanceCheckType.OnlyCenter);
+					}
+				}
+			}
+
+			private int NarrowPhaseReduce<T>(Vector3 position, float radius, T[] results, int broadCount) where T : BaseEntity
+			{
+				using (TimeWarning.New("NarrowPhaseReduce"))
+				{
+					int num = broadCount;
+					float num2 = radius * radius;
+					for (int i = 0; i < num; i++)
+					{
+						if ((results[i].WorldSpaceBounds().ClosestPoint(position) - position).sqrMagnitude > num2)
+						{
+							results[i] = results[num - 1];
+							num--;
+							i--;
+						}
+					}
+					return num;
+				}
+			}
+
+			private static void NarrowPhaseReduce<T>(Vector3 position, float radius, List<T> results, bool onlyConsiderCenter = true) where T : BaseEntity
+			{
+				using (TimeWarning.New("NarrowPhaseReduceList"))
+				{
+					float num = radius * radius;
+					for (int num2 = results.Count - 1; num2 >= 0; num2--)
+					{
+						T val = results[num2];
+						if (((onlyConsiderCenter ? val.transform.position : val.WorldSpaceBounds().ClosestPoint(position)) - position).sqrMagnitude > num)
+						{
+							results.RemoveAt(num2);
+						}
+					}
+				}
+			}
+
+			private static bool IsEntityInRadius<T>(Vector3 position, float radiusSq, T entity) where T : BaseEntity
+			{
+				using (TimeWarning.New("IsEntityInRadius"))
+				{
+					return (entity.WorldSpaceBounds().ClosestPoint(position) - position).sqrMagnitude < radiusSq;
+				}
 			}
 		}
 
@@ -374,6 +505,8 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		{
 			private float maximumDistance;
 
+			public bool CheckParent { get; set; }
+
 			public MaxDistance(float maxDist)
 			{
 				maximumDistance = maxDist;
@@ -381,21 +514,27 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 			public override string GetArgs()
 			{
-				return maximumDistance.ToString("0.00f");
+				return maximumDistance.ToString("0.00f") + (CheckParent ? ", true" : "");
 			}
 
-			public static bool Test(uint id, string debugName, BaseEntity ent, BasePlayer player, float maximumDistance)
+			public static bool Test(uint id, string debugName, BaseEntity ent, BasePlayer player, float maximumDistance, bool checkParent = false)
 			{
 				if (ent == null || player == null)
 				{
 					return false;
 				}
-				object obj = Interface.CallHook("OnEntityDistanceCheck", ent, player, id, debugName, maximumDistance);
+				object obj = Interface.CallHook("OnEntityDistanceCheck", ent, player, id, debugName, maximumDistance, checkParent);
 				if (obj is bool)
 				{
 					return (bool)obj;
 				}
-				return ent.Distance(player.eyes.position) <= maximumDistance;
+				bool flag = ent.Distance(player.eyes.position) <= maximumDistance;
+				if (checkParent && !flag)
+				{
+					BaseEntity parentEntity = ent.GetParentEntity();
+					flag = parentEntity != null && parentEntity.Distance(player.eyes.position) <= maximumDistance;
+				}
+				return flag;
 			}
 		}
 
@@ -424,7 +563,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				{
 					return (bool)obj;
 				}
-				if (GamePhysics.LineOfSight(player.eyes.center, player.eyes.position, 2162688))
+				if (GamePhysics.LineOfSight(player.eyes.center, player.eyes.position, 1218519041))
 				{
 					if (!ent.IsVisible(player.eyes.HeadRay(), 1218519041, maximumDistance))
 					{
@@ -685,13 +824,36 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
-	public enum GiveItemReason
-	{
-		Generic,
-		ResourceHarvested,
-		PickedUp,
-		Crafted
-	}
+	[Header("BaseEntity")]
+	public Bounds bounds;
+
+	public GameObjectRef impactEffect;
+
+	public bool enableSaving = true;
+
+	public bool syncPosition;
+
+	public Model model;
+
+	public Flags flags;
+
+	[NonSerialized]
+	public uint parentBone;
+
+	[NonSerialized]
+	public ulong skinID;
+
+	private List<EntityComponentBase> _components;
+
+	[HideInInspector]
+	public bool HasBrain;
+
+	private float nextHeightCheckTime;
+
+	private bool cachedUnderground;
+
+	[NonSerialized]
+	public string _name;
 
 	private static Queue<BaseEntity> globalBroadcastQueue = new Queue<BaseEntity>();
 
@@ -703,12 +865,22 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 	private bool linkedToNeighbours;
 
+	private TimeUntil _transferProtectionRemaining;
+
+	private Action _disableTransferProtectionAction;
+
+	public const string RpcClientDeprecationNotice = "Use ClientRPC( RpcTarget ) overloads";
+
+	public Spawnable _spawnable;
+
+	public static HashSet<BaseEntity> saveList = new HashSet<BaseEntity>();
+
 	[NonSerialized]
 	public BaseEntity creatorEntity;
 
-	public int ticksSinceStopped;
+	private bool couldSaveOriginally;
 
-	private int doneMovingWithoutARigidBodyCheck = 1;
+	public int ticksSinceStopped;
 
 	public bool isCallingUpdateNetworkGroup;
 
@@ -724,39 +896,66 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 	protected OccludeeSphere localOccludee = new OccludeeSphere(-1);
 
-	[Header("BaseEntity")]
-	public Bounds bounds;
-
-	public GameObjectRef impactEffect;
-
-	public bool enableSaving = true;
-
-	public bool syncPosition;
-
-	public Model model;
-
-	[InspectorFlags]
-	public Flags flags;
-
-	[NonSerialized]
-	public uint parentBone;
-
-	[NonSerialized]
-	public ulong skinID;
-
-	private EntityComponentBase[] _components;
-
-	[HideInInspector]
-	public bool HasBrain;
-
-	[NonSerialized]
-	public string _name;
-
-	public Spawnable _spawnable;
-
-	public static HashSet<BaseEntity> saveList = new HashSet<BaseEntity>();
-
 	public virtual float RealisticMass => 100f;
+
+	public List<EntityComponentBase> Components
+	{
+		get
+		{
+			if (_components == null)
+			{
+				_components = new List<EntityComponentBase>();
+				GetComponentsInChildren(includeInactive: true, _components);
+			}
+			return _components;
+		}
+	}
+
+	public virtual bool IsNpc => false;
+
+	public ulong OwnerID { get; set; }
+
+	protected float TransferProtectionRemaining => _transferProtectionRemaining;
+
+	protected Action DisableTransferProtectionAction => _disableTransferProtectionAction ?? (_disableTransferProtectionAction = DisableTransferProtection);
+
+	public virtual bool ShouldTransferAssociatedFiles => false;
+
+	public virtual float PositionTickRate => 0.1f;
+
+	public virtual bool PositionTickFixedTime => false;
+
+	public virtual Vector3 ServerPosition
+	{
+		get
+		{
+			return base.transform.localPosition;
+		}
+		set
+		{
+			if (!(base.transform.localPosition == value))
+			{
+				base.transform.localPosition = value;
+				base.transform.hasChanged = true;
+			}
+		}
+	}
+
+	public virtual Quaternion ServerRotation
+	{
+		get
+		{
+			return base.transform.localRotation;
+		}
+		set
+		{
+			if (!(base.transform.localRotation == value))
+			{
+				base.transform.localRotation = value;
+				base.transform.hasChanged = true;
+			}
+		}
+	}
 
 	public float radiationLevel
 	{
@@ -799,7 +998,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				TriggerTemperature triggerTemperature = triggers[i] as TriggerTemperature;
 				if (!(triggerTemperature == null))
 				{
-					num = triggerTemperature.WorkoutTemperature(GetNetworkPosition(), num);
+					num = triggerTemperature.WorkoutTemperature(base.transform.position, num);
 				}
 			}
 			return num;
@@ -827,51 +1026,9 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
-	public virtual float PositionTickRate => 0.1f;
-
-	public virtual bool PositionTickFixedTime => false;
-
-	public virtual Vector3 ServerPosition
-	{
-		get
-		{
-			return base.transform.localPosition;
-		}
-		set
-		{
-			if (!(base.transform.localPosition == value))
-			{
-				base.transform.localPosition = value;
-				base.transform.hasChanged = true;
-			}
-		}
-	}
-
-	public virtual Quaternion ServerRotation
-	{
-		get
-		{
-			return base.transform.localRotation;
-		}
-		set
-		{
-			if (!(base.transform.localRotation == value))
-			{
-				base.transform.localRotation = value;
-				base.transform.hasChanged = true;
-			}
-		}
-	}
-
 	public virtual TraitFlag Traits => TraitFlag.None;
 
 	public float Weight { get; protected set; }
-
-	public EntityComponentBase[] Components => _components ?? (_components = GetComponentsInChildren<EntityComponentBase>(includeInactive: true));
-
-	public virtual bool IsNpc => false;
-
-	public ulong OwnerID { get; set; }
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -882,7 +1039,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - BroadcastSignalFromClient "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - BroadcastSignalFromClient ");
 				}
 				using (TimeWarning.New("BroadcastSignalFromClient"))
 				{
@@ -918,7 +1075,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - SV_RequestFile "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SV_RequestFile ");
 				}
 				using (TimeWarning.New("SV_RequestFile"))
 				{
@@ -961,6 +1118,666 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		{
 			UnityEngine.TransformEx.RemoveComponent<EntityCollisionMessage>(base.gameObject.transform);
 		}
+	}
+
+	public virtual BasePlayer ToPlayer()
+	{
+		return null;
+	}
+
+	public override void InitShared()
+	{
+		base.InitShared();
+		InitEntityLinks();
+		if (Components == null)
+		{
+			return;
+		}
+		for (int i = 0; i < Components.Count; i++)
+		{
+			if (!(Components[i] == null))
+			{
+				Components[i].InitShared();
+			}
+		}
+	}
+
+	public override void DestroyShared()
+	{
+		base.DestroyShared();
+		FreeEntityLinks();
+		if (Components == null)
+		{
+			return;
+		}
+		for (int i = 0; i < Components.Count; i++)
+		{
+			if (!(Components[i] == null))
+			{
+				Components[i].DestroyShared();
+			}
+		}
+	}
+
+	public override void ResetState()
+	{
+		base.ResetState();
+		parentBone = 0u;
+		OwnerID = 0uL;
+		flags = (Flags)0;
+		parentEntity = default(EntityRef);
+		if (base.isServer)
+		{
+			_spawnable = null;
+		}
+		if (Components == null)
+		{
+			return;
+		}
+		for (int i = 0; i < Components.Count; i++)
+		{
+			if (!(Components[i] == null))
+			{
+				Components[i].ResetState();
+			}
+		}
+	}
+
+	public virtual float InheritedVelocityScale()
+	{
+		return 0f;
+	}
+
+	public virtual bool InheritedVelocityDirection()
+	{
+		return true;
+	}
+
+	public virtual Vector3 GetInheritedProjectileVelocity(Vector3 direction)
+	{
+		BaseEntity baseEntity = parentEntity.Get(base.isServer);
+		if (baseEntity == null)
+		{
+			return Vector3.zero;
+		}
+		if (baseEntity.InheritedVelocityDirection())
+		{
+			return GetParentVelocity() * baseEntity.InheritedVelocityScale();
+		}
+		return Mathf.Max(Vector3.Dot(GetParentVelocity() * baseEntity.InheritedVelocityScale(), direction), 0f) * direction;
+	}
+
+	public virtual Vector3 GetInheritedThrowVelocity(Vector3 direction)
+	{
+		return GetParentVelocity();
+	}
+
+	public virtual Vector3 GetInheritedDropVelocity()
+	{
+		BaseEntity baseEntity = parentEntity.Get(base.isServer);
+		if (!(baseEntity != null))
+		{
+			return Vector3.zero;
+		}
+		return baseEntity.GetWorldVelocity();
+	}
+
+	public Vector3 GetParentVelocity()
+	{
+		BaseEntity baseEntity = parentEntity.Get(base.isServer);
+		if (!(baseEntity != null))
+		{
+			return Vector3.zero;
+		}
+		return baseEntity.GetWorldVelocity() + (baseEntity.GetAngularVelocity() * base.transform.localPosition - base.transform.localPosition);
+	}
+
+	public Vector3 GetWorldVelocity()
+	{
+		BaseEntity baseEntity = parentEntity.Get(base.isServer);
+		if (!(baseEntity != null))
+		{
+			return GetLocalVelocity();
+		}
+		return baseEntity.GetWorldVelocity() + (baseEntity.GetAngularVelocity() * base.transform.localPosition - base.transform.localPosition) + baseEntity.transform.TransformDirection(GetLocalVelocity());
+	}
+
+	public Vector3 GetLocalVelocity()
+	{
+		if (base.isServer)
+		{
+			return GetLocalVelocityServer();
+		}
+		return Vector3.zero;
+	}
+
+	public Quaternion GetAngularVelocity()
+	{
+		if (base.isServer)
+		{
+			return GetAngularVelocityServer();
+		}
+		return Quaternion.identity;
+	}
+
+	public virtual OBB WorldSpaceBounds()
+	{
+		return new OBB(base.transform.position, base.transform.lossyScale, base.transform.rotation, bounds);
+	}
+
+	public Vector3 PivotPoint()
+	{
+		return base.transform.position;
+	}
+
+	public Vector3 CenterPoint()
+	{
+		return WorldSpaceBounds().position;
+	}
+
+	public Vector3 ClosestPoint(Vector3 position)
+	{
+		return WorldSpaceBounds().ClosestPoint(position);
+	}
+
+	public virtual Vector3 TriggerPoint()
+	{
+		return CenterPoint();
+	}
+
+	public float Distance(Vector3 position)
+	{
+		return (ClosestPoint(position) - position).magnitude;
+	}
+
+	public float SqrDistance(Vector3 position)
+	{
+		return (ClosestPoint(position) - position).sqrMagnitude;
+	}
+
+	public float Distance(BaseEntity other)
+	{
+		return Distance(other.transform.position);
+	}
+
+	public float SqrDistance(BaseEntity other)
+	{
+		return SqrDistance(other.transform.position);
+	}
+
+	public float Distance2D(Vector3 position)
+	{
+		return (ClosestPoint(position) - position).Magnitude2D();
+	}
+
+	public float SqrDistance2D(Vector3 position)
+	{
+		return (ClosestPoint(position) - position).SqrMagnitude2D();
+	}
+
+	public float Distance2D(BaseEntity other)
+	{
+		return Distance(other.transform.position);
+	}
+
+	public float SqrDistance2D(BaseEntity other)
+	{
+		return SqrDistance(other.transform.position);
+	}
+
+	public bool IsVisible(Ray ray, int layerMask, float maxDistance)
+	{
+		if (ray.origin.IsNaNOrInfinity())
+		{
+			return false;
+		}
+		if (ray.direction.IsNaNOrInfinity())
+		{
+			return false;
+		}
+		if (ray.direction == Vector3.zero)
+		{
+			return false;
+		}
+		if (!WorldSpaceBounds().Trace(ray, out var hit, maxDistance))
+		{
+			return false;
+		}
+		if (GamePhysics.Trace(ray, 0f, out var hitInfo, maxDistance, layerMask))
+		{
+			BaseEntity entity = RaycastHitEx.GetEntity(hitInfo);
+			if (entity == this)
+			{
+				return true;
+			}
+			if (entity != null && (bool)GetParentEntity() && GetParentEntity().EqualNetID(entity) && RaycastHitEx.IsOnLayer(hitInfo, Rust.Layer.Vehicle_Detailed))
+			{
+				return true;
+			}
+			if (hitInfo.distance <= hit.distance)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	public bool IsVisibleSpecificLayers(Vector3 position, Vector3 target, int layerMask, float maxDistance = float.PositiveInfinity)
+	{
+		Vector3 vector = target - position;
+		float magnitude = vector.magnitude;
+		if (magnitude < Mathf.Epsilon)
+		{
+			return true;
+		}
+		Vector3 vector2 = vector / magnitude;
+		Vector3 vector3 = vector2 * Mathf.Min(magnitude, 0.01f);
+		return IsVisible(new Ray(position + vector3, vector2), layerMask, maxDistance);
+	}
+
+	public bool IsVisible(Vector3 position, Vector3 target, float maxDistance = float.PositiveInfinity)
+	{
+		Vector3 vector = target - position;
+		float magnitude = vector.magnitude;
+		if (magnitude < Mathf.Epsilon)
+		{
+			return true;
+		}
+		Vector3 vector2 = vector / magnitude;
+		Vector3 vector3 = vector2 * Mathf.Min(magnitude, 0.01f);
+		maxDistance = Mathf.Min(maxDistance, magnitude + 0.2f);
+		return IsVisible(new Ray(position + vector3, vector2), 1218519041, maxDistance);
+	}
+
+	public bool IsVisible(Vector3 position, float maxDistance = float.PositiveInfinity)
+	{
+		Vector3 target = CenterPoint();
+		if (IsVisible(position, target, maxDistance))
+		{
+			return true;
+		}
+		Vector3 target2 = ClosestPoint(position);
+		if (IsVisible(position, target2, maxDistance))
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public bool IsVisibleAndCanSee(Vector3 position)
+	{
+		Vector3 vector = CenterPoint();
+		if (IsVisible(position, vector) && CanSee(vector, position))
+		{
+			return true;
+		}
+		Vector3 vector2 = ClosestPoint(position);
+		if (IsVisible(position, vector2) && CanSee(vector2, position))
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public bool IsVisibleAndCanSeeLegacy(Vector3 position, float maxDistance = float.PositiveInfinity)
+	{
+		Vector3 vector = CenterPoint();
+		if (IsVisible(position, vector, maxDistance) && IsVisible(vector, position, maxDistance))
+		{
+			return true;
+		}
+		Vector3 vector2 = ClosestPoint(position);
+		if (IsVisible(position, vector2, maxDistance) && IsVisible(vector2, position, maxDistance))
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public bool CanSee(Vector3 fromPos, Vector3 targetPos)
+	{
+		return GamePhysics.LineOfSight(fromPos, targetPos, 1218519041, this);
+	}
+
+	public bool IsOlderThan(BaseEntity other)
+	{
+		if (other == null)
+		{
+			return true;
+		}
+		NetworkableId obj = net?.ID ?? default(NetworkableId);
+		NetworkableId networkableId = other.net?.ID ?? default(NetworkableId);
+		return obj.Value < networkableId.Value;
+	}
+
+	public virtual bool IsOutside()
+	{
+		return IsOutside(WorldSpaceBounds().position);
+	}
+
+	public bool IsOutside(Vector3 position)
+	{
+		bool result = true;
+		Vector3 vector = position + Vector3.up * 100f;
+		vector.y = Mathf.Max(vector.y, TerrainMeta.HeightMap.GetHeight(vector) + 1f);
+		if (UnityEngine.Physics.Linecast(vector, position, out var hitInfo, 161546513, QueryTriggerInteraction.Ignore))
+		{
+			BaseEntity baseEntity = GameObjectEx.ToBaseEntity(hitInfo.collider);
+			if (baseEntity == null || !baseEntity.HasEntityInParents(this))
+			{
+				result = false;
+			}
+		}
+		return result;
+	}
+
+	public bool IsUnderground(bool cached = true)
+	{
+		if (!cached || UnityEngine.Time.realtimeSinceStartup > nextHeightCheckTime)
+		{
+			cachedUnderground = EnvironmentManager.Check(base.transform.position, EnvironmentType.Underground);
+			nextHeightCheckTime = UnityEngine.Time.realtimeSinceStartup + 5f;
+		}
+		return cachedUnderground;
+	}
+
+	public virtual float WaterFactor()
+	{
+		return WaterLevel.Factor(WorldSpaceBounds().ToBounds(), waves: true, volumes: true, this);
+	}
+
+	public virtual float AirFactor()
+	{
+		if (!(WaterFactor() > 0.85f))
+		{
+			return 1f;
+		}
+		return 0f;
+	}
+
+	public bool WaterTestFromVolumes(Vector3 pos, out WaterLevel.WaterInfo info)
+	{
+		if (triggers == null)
+		{
+			info = default(WaterLevel.WaterInfo);
+			return false;
+		}
+		for (int i = 0; i < triggers.Count; i++)
+		{
+			if (triggers[i] is WaterVolume waterVolume && waterVolume.Test(pos, out info))
+			{
+				return true;
+			}
+		}
+		info = default(WaterLevel.WaterInfo);
+		return false;
+	}
+
+	public bool IsInWaterVolume(Vector3 pos, out bool natural)
+	{
+		natural = false;
+		if (triggers == null)
+		{
+			return false;
+		}
+		for (int i = 0; i < triggers.Count; i++)
+		{
+			if (triggers[i] is WaterVolume waterVolume && waterVolume.Test(pos, out var _))
+			{
+				natural = waterVolume.naturalSource;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public bool WaterTestFromVolumes(Bounds bounds, out WaterLevel.WaterInfo info)
+	{
+		if (triggers == null)
+		{
+			info = default(WaterLevel.WaterInfo);
+			return false;
+		}
+		for (int i = 0; i < triggers.Count; i++)
+		{
+			if (triggers[i] is WaterVolume waterVolume && waterVolume.Test(bounds, out info))
+			{
+				return true;
+			}
+		}
+		info = default(WaterLevel.WaterInfo);
+		return false;
+	}
+
+	public bool WaterTestFromVolumes(Vector3 start, Vector3 end, float radius, out WaterLevel.WaterInfo info)
+	{
+		if (triggers == null)
+		{
+			info = default(WaterLevel.WaterInfo);
+			return false;
+		}
+		for (int i = 0; i < triggers.Count; i++)
+		{
+			if (triggers[i] is WaterVolume waterVolume && waterVolume.Test(start, end, radius, out info))
+			{
+				return true;
+			}
+		}
+		info = default(WaterLevel.WaterInfo);
+		return false;
+	}
+
+	public virtual bool BlocksWaterFor(BasePlayer player)
+	{
+		return false;
+	}
+
+	public virtual float Health()
+	{
+		return 0f;
+	}
+
+	public virtual float MaxHealth()
+	{
+		return 0f;
+	}
+
+	public virtual float MaxVelocity()
+	{
+		return 0f;
+	}
+
+	public virtual float BoundsPadding()
+	{
+		return 0.1f;
+	}
+
+	public virtual float PenetrationResistance(HitInfo info)
+	{
+		return 100f;
+	}
+
+	public virtual GameObjectRef GetImpactEffect(HitInfo info)
+	{
+		return impactEffect;
+	}
+
+	public virtual void OnAttacked(HitInfo info)
+	{
+	}
+
+	public virtual Item GetItem()
+	{
+		return null;
+	}
+
+	public virtual Item GetItem(ItemId itemId)
+	{
+		return null;
+	}
+
+	public virtual void GiveItem(Item item, GiveItemReason reason = GiveItemReason.Generic)
+	{
+		item.Remove();
+	}
+
+	public virtual bool CanBeLooted(BasePlayer player)
+	{
+		return !IsTransferring();
+	}
+
+	public virtual BaseEntity GetEntity()
+	{
+		return this;
+	}
+
+	public override string ToString()
+	{
+		if (_name == null)
+		{
+			if (base.isServer)
+			{
+				if (net == null)
+				{
+					return base.ShortPrefabName;
+				}
+				_name = $"{base.ShortPrefabName}[{net.ID}]";
+			}
+			else
+			{
+				_name = base.ShortPrefabName;
+			}
+		}
+		return _name;
+	}
+
+	public virtual string Categorize()
+	{
+		return "entity";
+	}
+
+	public void Log(string str)
+	{
+		if (base.isClient)
+		{
+			Debug.Log("<color=#ffa>[" + ToString() + "] " + str + "</color>", base.gameObject);
+		}
+		else
+		{
+			Debug.Log("<color=#aff>[" + ToString() + "] " + str + "</color>", base.gameObject);
+		}
+	}
+
+	public void SetModel(Model mdl)
+	{
+		if (!(model == mdl))
+		{
+			model = mdl;
+		}
+	}
+
+	public Model GetModel()
+	{
+		return model;
+	}
+
+	public virtual Transform[] GetBones()
+	{
+		if ((bool)model)
+		{
+			return model.GetBones();
+		}
+		return null;
+	}
+
+	public virtual Transform FindBone(string strName)
+	{
+		if ((bool)model)
+		{
+			return model.FindBone(strName);
+		}
+		return base.transform;
+	}
+
+	public virtual uint FindBoneID(Transform boneTransform)
+	{
+		if ((bool)model)
+		{
+			return model.FindBoneID(boneTransform);
+		}
+		return StringPool.closest;
+	}
+
+	public virtual Transform FindClosestBone(Vector3 worldPos)
+	{
+		if ((bool)model)
+		{
+			return model.FindClosestBone(worldPos);
+		}
+		return base.transform;
+	}
+
+	public virtual bool ShouldBlockProjectiles()
+	{
+		return true;
+	}
+
+	public virtual bool ShouldInheritNetworkGroup()
+	{
+		return true;
+	}
+
+	public virtual bool SupportsChildDeployables()
+	{
+		return false;
+	}
+
+	public virtual bool ForceDeployableSetParent()
+	{
+		return false;
+	}
+
+	public bool IsOnMovingObject()
+	{
+		if (syncPosition)
+		{
+			return true;
+		}
+		BaseEntity baseEntity = GetParentEntity();
+		if (!(baseEntity != null))
+		{
+			return false;
+		}
+		return baseEntity.IsOnMovingObject();
+	}
+
+	public void BroadcastEntityMessage(string msg, float radius = 20f, int layerMask = 1218652417)
+	{
+		if (base.isClient)
+		{
+			return;
+		}
+		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
+		Vis.Entities(base.transform.position, radius, obj, layerMask);
+		foreach (BaseEntity item in obj)
+		{
+			if (item.isServer)
+			{
+				item.OnEntityMessage(this, msg);
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	public virtual void OnEntityMessage(BaseEntity from, string msg)
+	{
+	}
+
+	public T AddComponent<T>() where T : EntityComponentBase
+	{
+		T val = base.gameObject.AddComponent<T>();
+		_components.Add(val);
+		return val;
 	}
 
 	public virtual void DebugServer(int rep, float time)
@@ -1013,14 +1830,14 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 	public void SetFlag(Flags f, bool b, bool recursive = false, bool networkupdate = true)
 	{
-		Flags old = flags;
+		Flags flags = this.flags;
 		if (b)
 		{
 			if (HasFlag(f))
 			{
 				return;
 			}
-			flags |= f;
+			this.flags |= f;
 		}
 		else
 		{
@@ -1028,12 +1845,16 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 			{
 				return;
 			}
-			flags &= ~f;
+			this.flags &= ~f;
 		}
-		OnFlagsChanged(old, flags);
+		OnFlagsChanged(flags, this.flags);
 		if (networkupdate)
 		{
 			SendNetworkUpdate();
+			if (flags != this.flags)
+			{
+				GlobalNetworkHandler.server?.TrySendNetworkUpdate(this);
+			}
 		}
 		else
 		{
@@ -1092,6 +1913,16 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		return HasFlag(Flags.Busy);
 	}
 
+	public bool IsTransferProtected()
+	{
+		return HasFlag(Flags.Protected);
+	}
+
+	public bool IsTransferring()
+	{
+		return HasFlag(Flags.Transferring);
+	}
+
 	public override string GetLogColor()
 	{
 		if (base.isServer)
@@ -1107,6 +1938,17 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		{
 			OnDebugStart();
 		}
+		if (base.isServer)
+		{
+			if (next.HasFlag(Flags.OnFire) && !old.HasFlag(Flags.OnFire))
+			{
+				SingletonComponent<NpcFireManager>.Instance.Add(this);
+			}
+			else if (!next.HasFlag(Flags.OnFire) && old.HasFlag(Flags.OnFire))
+			{
+				SingletonComponent<NpcFireManager>.Instance.Remove(this);
+			}
+		}
 	}
 
 	public void SendNetworkUpdate_Flags()
@@ -1117,7 +1959,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 		using (TimeWarning.New("SendNetworkUpdate_Flags"))
 		{
-			LogEntry(LogEntryType.Network, 2, "SendNetworkUpdate_Flags");
+			LogEntry(RustLog.EntryType.Network, 3, "SendNetworkUpdate_Flags");
 			if (Interface.CallHook("OnEntityFlagsNetworkUpdate", this) == null)
 			{
 				List<Connection> subscribers = GetSubscribers();
@@ -1135,7 +1977,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
-	public bool IsOccupied(Socket_Base socket)
+	public virtual bool IsOccupied(Socket_Base socket)
 	{
 		return FindLink(socket)?.IsOccupied() ?? false;
 	}
@@ -1374,7 +2216,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		linkedToNeighbours = true;
 		using (TimeWarning.New("LinkToNeighbours"))
 		{
-			List<BaseEntity> obj = Facepunch.Pool.GetList<BaseEntity>();
+			List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
 			OBB oBB = WorldSpaceBounds();
 			Vis.Entities(oBB.position, oBB.extents.magnitude + 1f, obj);
 			for (int i = 0; i < obj.Count; i++)
@@ -1385,7 +2227,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 					LinkToEntity(baseEntity);
 				}
 			}
-			Facepunch.Pool.FreeList(ref obj);
+			Facepunch.Pool.FreeUnmanaged(ref obj);
 		}
 	}
 
@@ -1439,7 +2281,60 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		sendInfo.channel = 2;
 		sendInfo.method = SendMethod.Reliable;
 		SendInfo sendInfo2 = sendInfo;
-		ClientRPCEx(sendInfo2, null, funcName, num, (uint)array.Length, array, num2, (byte)type);
+		ClientRPC(RpcTarget.SendInfo(funcName, sendInfo2), num, (uint)array.Length, array, num2, (byte)type);
+	}
+
+	public virtual void EnableTransferProtection()
+	{
+		if (!IsTransferProtected())
+		{
+			SetFlag(Flags.Protected, b: true);
+			List<Connection> subscribers = GetSubscribers();
+			if (subscribers != null)
+			{
+				List<Connection> obj = Facepunch.Pool.Get<List<Connection>>();
+				foreach (Connection item in subscribers)
+				{
+					if (!ShouldNetworkTo(item.player as BasePlayer))
+					{
+						obj.Add(item);
+					}
+				}
+				OnNetworkSubscribersLeave(obj);
+				Facepunch.Pool.FreeUnmanaged(ref obj);
+			}
+			float protectionDuration = Nexus.protectionDuration;
+			_transferProtectionRemaining = protectionDuration;
+			Invoke(DisableTransferProtectionAction, protectionDuration);
+		}
+		foreach (BaseEntity child in children)
+		{
+			child.EnableTransferProtection();
+		}
+	}
+
+	public virtual void DisableTransferProtection()
+	{
+		BaseEntity baseEntity = GetParentEntity();
+		if (baseEntity != null && baseEntity.IsTransferProtected())
+		{
+			baseEntity.DisableTransferProtection();
+		}
+		if (IsTransferProtected())
+		{
+			SetFlag(Flags.Protected, b: false);
+			List<Connection> subscribers = GetSubscribers();
+			if (subscribers != null)
+			{
+				OnNetworkSubscribersEnter(subscribers);
+			}
+			_transferProtectionRemaining = 0f;
+			CancelInvoke(DisableTransferProtectionAction);
+		}
+		foreach (BaseEntity child in children)
+		{
+			child.DisableTransferProtection();
+		}
 	}
 
 	public void SetParent(BaseEntity entity, bool worldPositionStays = false, bool sendImmediate = false)
@@ -1481,7 +2376,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				return;
 			}
 		}
-		LogEntry(LogEntryType.Hierarchy, 2, "SetParent {0} {1}", entity, boneID);
+		LogEntry(RustLog.EntryType.Hierarchy, 2, "SetParent {0} {1}", entity, boneID);
 		BaseEntity baseEntity = GetParentEntity();
 		if ((bool)baseEntity)
 		{
@@ -1558,7 +2453,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 			netWrite.EntityID(net.ID);
 			netWrite.UInt8(0);
 			netWrite.Send(new SendInfo(connection));
-			LogEntry(LogEntryType.Network, 2, "EntityDestroy");
+			LogEntry(RustLog.EntryType.Network, 2, "EntityDestroy");
 		}
 	}
 
@@ -1596,20 +2491,39 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 	public virtual void OnParentChanging(BaseEntity oldParent, BaseEntity newParent)
 	{
 		Rigidbody component = GetComponent<Rigidbody>();
-		if ((bool)component)
+		if (!component || component.isKinematic)
 		{
-			if (oldParent != null && oldParent.GetComponent<Rigidbody>() == null)
+			return;
+		}
+		if (oldParent != null)
+		{
+			Rigidbody component2 = oldParent.GetComponent<Rigidbody>();
+			if (component2 == null || component2.isKinematic)
 			{
 				component.velocity += oldParent.GetWorldVelocity();
 			}
-			if (newParent != null && newParent.GetComponent<Rigidbody>() == null)
+		}
+		if (newParent != null)
+		{
+			Rigidbody component3 = newParent.GetComponent<Rigidbody>();
+			if (component3 == null || component3.isKinematic)
 			{
 				component.velocity -= newParent.GetWorldVelocity();
 			}
 		}
 	}
 
+	public virtual EntityPrivilege GetEntityBuildingPrivilege()
+	{
+		return null;
+	}
+
 	public virtual BuildingPrivlidge GetBuildingPrivilege()
+	{
+		return GetNearestBuildingPrivledge();
+	}
+
+	public BuildingPrivlidge GetNearestBuildingPrivledge()
 	{
 		return GetBuildingPrivilege(WorldSpaceBounds());
 	}
@@ -1623,7 +2537,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 		BuildingBlock other = null;
 		BuildingPrivlidge result = null;
-		List<BuildingBlock> obj2 = Facepunch.Pool.GetList<BuildingBlock>();
+		List<BuildingBlock> obj2 = Facepunch.Pool.Get<List<BuildingBlock>>();
 		Vis.Entities(obb.position, 16f + obb.extents.magnitude, obj2, 2097152);
 		for (int i = 0; i < obj2.Count; i++)
 		{
@@ -1643,7 +2557,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				}
 			}
 		}
-		Facepunch.Pool.FreeList(ref obj2);
+		Facepunch.Pool.FreeUnmanaged(ref obj2);
 		return result;
 	}
 
@@ -1658,21 +2572,29 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				Debug.Log("SV_RPCMessage: From invalid player " + basePlayer);
 			}
 		}
-		else if (basePlayer.isStalled)
+		else if (ConVar.AntiHack.rpcstallmode > 0 && basePlayer.isStalled)
 		{
 			if (ConVar.Global.developer > 0)
 			{
 				Debug.Log("SV_RPCMessage: player is stalled " + basePlayer);
 			}
 		}
+		else if (ConVar.AntiHack.rpcstallmode > 1 && basePlayer.wasStalled)
+		{
+			if (ConVar.Global.developer > 0)
+			{
+				Debug.Log("SV_RPCMessage: player was stalled " + basePlayer);
+			}
+		}
 		else if (!OnRpcMessage(basePlayer, nameID, message))
 		{
-			for (int i = 0; i < Components.Length && !Components[i].OnRpcMessage(basePlayer, nameID, message); i++)
+			for (int i = 0; i < Components.Count && !Components[i].OnRpcMessage(basePlayer, nameID, message); i++)
 			{
 			}
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPCPlayer<T1, T2, T3, T4, T5>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
@@ -1681,6 +2603,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPCPlayer<T1, T2, T3, T4>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
@@ -1689,6 +2612,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPCPlayer<T1, T2, T3>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1, T2 arg2, T3 arg3)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
@@ -1697,6 +2621,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPCPlayer<T1, T2>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1, T2 arg2)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
@@ -1705,6 +2630,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPCPlayer<T1>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
@@ -1713,6 +2639,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPCPlayer(Connection sourceConnection, BasePlayer player, string funcName)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
@@ -1721,6 +2648,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPC<T1, T2, T3, T4, T5>(Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
@@ -1729,6 +2657,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPC<T1, T2, T3, T4>(Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
@@ -1737,6 +2666,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPC<T1, T2, T3>(Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
@@ -1745,6 +2675,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPC<T1, T2>(Connection sourceConnection, string funcName, T1 arg1, T2 arg2)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
@@ -1753,6 +2684,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPC<T1>(Connection sourceConnection, string funcName, T1 arg1)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
@@ -1761,6 +2693,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPC(Connection sourceConnection, string funcName)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
@@ -1769,162 +2702,197 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
-	public void ClientRPCEx<T1, T2, T3, T4, T5>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
+	public void ClientRPC(RpcTarget target)
 	{
 		if (Network.Net.sv.IsConnected() && net != null)
 		{
-			NetWrite write = ClientRPCStart(sourceConnection, funcName);
+			GetRpcTargetNetworkGroup(ref target);
+			NetWrite write = ClientRPCStart(target.Function);
+			ClientRPCSend(write, target.Connections);
+			FreeRPCTarget(target);
+		}
+	}
+
+	public void ClientRPC<T1>(RpcTarget target, T1 arg1)
+	{
+		if (Network.Net.sv.IsConnected() && net != null)
+		{
+			GetRpcTargetNetworkGroup(ref target);
+			NetWrite write = ClientRPCStart(target.Function);
+			ClientRPCWrite(write, arg1);
+			ClientRPCSend(write, target.Connections);
+			FreeRPCTarget(target);
+		}
+	}
+
+	public void ClientRPC<T1, T2>(RpcTarget target, T1 arg1, T2 arg2)
+	{
+		if (Network.Net.sv.IsConnected() && net != null)
+		{
+			GetRpcTargetNetworkGroup(ref target);
+			NetWrite write = ClientRPCStart(target.Function);
+			ClientRPCWrite(write, arg1);
+			ClientRPCWrite(write, arg2);
+			ClientRPCSend(write, target.Connections);
+			FreeRPCTarget(target);
+		}
+	}
+
+	public void ClientRPC<T1, T2, T3>(RpcTarget target, T1 arg1, T2 arg2, T3 arg3)
+	{
+		if (Network.Net.sv.IsConnected() && net != null)
+		{
+			GetRpcTargetNetworkGroup(ref target);
+			NetWrite write = ClientRPCStart(target.Function);
+			ClientRPCWrite(write, arg1);
+			ClientRPCWrite(write, arg2);
+			ClientRPCWrite(write, arg3);
+			ClientRPCSend(write, target.Connections);
+			FreeRPCTarget(target);
+		}
+	}
+
+	public void ClientRPC<T1, T2, T3, T4>(RpcTarget target, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
+	{
+		if (Network.Net.sv.IsConnected() && net != null)
+		{
+			GetRpcTargetNetworkGroup(ref target);
+			NetWrite write = ClientRPCStart(target.Function);
+			ClientRPCWrite(write, arg1);
+			ClientRPCWrite(write, arg2);
+			ClientRPCWrite(write, arg3);
+			ClientRPCWrite(write, arg4);
+			ClientRPCSend(write, target.Connections);
+			FreeRPCTarget(target);
+		}
+	}
+
+	public void ClientRPC<T1, T2, T3, T4, T5>(RpcTarget target, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
+	{
+		if (Network.Net.sv.IsConnected() && net != null)
+		{
+			GetRpcTargetNetworkGroup(ref target);
+			NetWrite write = ClientRPCStart(target.Function);
 			ClientRPCWrite(write, arg1);
 			ClientRPCWrite(write, arg2);
 			ClientRPCWrite(write, arg3);
 			ClientRPCWrite(write, arg4);
 			ClientRPCWrite(write, arg5);
-			ClientRPCSend(write, sendInfo);
+			ClientRPCSend(write, target.Connections);
+			FreeRPCTarget(target);
 		}
 	}
 
-	public void ClientRPCEx<T1, T2, T3, T4>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
+	public void ClientRPC<T1, T2, T3, T4, T5, T6>(RpcTarget target, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6)
 	{
 		if (Network.Net.sv.IsConnected() && net != null)
 		{
-			NetWrite write = ClientRPCStart(sourceConnection, funcName);
+			GetRpcTargetNetworkGroup(ref target);
+			NetWrite write = ClientRPCStart(target.Function);
 			ClientRPCWrite(write, arg1);
 			ClientRPCWrite(write, arg2);
 			ClientRPCWrite(write, arg3);
 			ClientRPCWrite(write, arg4);
-			ClientRPCSend(write, sendInfo);
+			ClientRPCWrite(write, arg5);
+			ClientRPCWrite(write, arg6);
+			ClientRPCSend(write, target.Connections);
+			FreeRPCTarget(target);
 		}
 	}
 
-	public void ClientRPCEx<T1, T2, T3>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3)
+	public void ClientRPC<T1, T2, T3, T4, T5, T6, T7>(RpcTarget target, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5, T6 arg6, T7 arg7)
 	{
 		if (Network.Net.sv.IsConnected() && net != null)
 		{
-			NetWrite write = ClientRPCStart(sourceConnection, funcName);
+			GetRpcTargetNetworkGroup(ref target);
+			NetWrite write = ClientRPCStart(target.Function);
 			ClientRPCWrite(write, arg1);
 			ClientRPCWrite(write, arg2);
 			ClientRPCWrite(write, arg3);
-			ClientRPCSend(write, sendInfo);
+			ClientRPCWrite(write, arg4);
+			ClientRPCWrite(write, arg5);
+			ClientRPCWrite(write, arg6);
+			ClientRPCWrite(write, arg7);
+			ClientRPCSend(write, target.Connections);
+			FreeRPCTarget(target);
 		}
 	}
 
+	public void ClientRPC(RpcTarget target, MemoryStream stream)
+	{
+		if (Network.Net.sv.IsConnected() && net != null)
+		{
+			GetRpcTargetNetworkGroup(ref target);
+			NetWrite netWrite = ClientRPCStart(target.Function);
+			using (TimeWarning.New("Copy Buffer"))
+			{
+				netWrite.Write(stream.GetBuffer(), 0, (int)stream.Length);
+			}
+			ClientRPCSend(netWrite, target.Connections);
+			FreeRPCTarget(target);
+		}
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private void GetRpcTargetNetworkGroup(ref RpcTarget target)
+	{
+		if (target.ToNetworkGroup)
+		{
+			target.Connections = new SendInfo(net.group.subscribers);
+		}
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private void FreeRPCTarget(RpcTarget target)
+	{
+		if (target.UsingPooledConnections)
+		{
+			Facepunch.Pool.FreeUnmanaged(ref target.Connections.connections);
+		}
+	}
+
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
+	public void ClientRPCEx<T1, T2, T3, T4, T5>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
+	{
+		ClientRPC(RpcTarget.SendInfo(funcName, sendInfo), arg1, arg2, arg3, arg4, arg5);
+	}
+
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
+	public void ClientRPCEx<T1, T2, T3, T4>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
+	{
+		ClientRPC(RpcTarget.SendInfo(funcName, sendInfo), arg1, arg2, arg3, arg4);
+	}
+
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
+	public void ClientRPCEx<T1, T2, T3>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3)
+	{
+		ClientRPC(RpcTarget.SendInfo(funcName, sendInfo), arg1, arg2, arg3);
+	}
+
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPCEx<T1, T2>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1, T2 arg2)
 	{
-		if (Network.Net.sv.IsConnected() && net != null)
-		{
-			NetWrite write = ClientRPCStart(sourceConnection, funcName);
-			ClientRPCWrite(write, arg1);
-			ClientRPCWrite(write, arg2);
-			ClientRPCSend(write, sendInfo);
-		}
+		ClientRPC(RpcTarget.SendInfo(funcName, sendInfo), arg1, arg2);
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPCEx<T1>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1)
 	{
-		if (Network.Net.sv.IsConnected() && net != null)
-		{
-			NetWrite write = ClientRPCStart(sourceConnection, funcName);
-			ClientRPCWrite(write, arg1);
-			ClientRPCSend(write, sendInfo);
-		}
+		ClientRPC(RpcTarget.SendInfo(funcName, sendInfo), arg1);
 	}
 
+	[Obsolete("Use ClientRPC( RpcTarget ) overloads")]
 	public void ClientRPCEx(SendInfo sendInfo, Connection sourceConnection, string funcName)
 	{
-		if (Network.Net.sv.IsConnected() && net != null)
-		{
-			NetWrite write = ClientRPCStart(sourceConnection, funcName);
-			ClientRPCSend(write, sendInfo);
-		}
+		ClientRPC(RpcTarget.SendInfo(funcName, sendInfo));
 	}
 
-	public void ClientRPCPlayerAndSpectators(Connection sourceConnection, BasePlayer player, string funcName)
-	{
-		if (!Network.Net.sv.IsConnected() || player.net == null || player.net.connection == null)
-		{
-			return;
-		}
-		ClientRPCEx(new SendInfo(player.net.connection), sourceConnection, funcName);
-		if (!player.IsBeingSpectated || player.children == null)
-		{
-			return;
-		}
-		foreach (BaseEntity child in player.children)
-		{
-			if (child is BasePlayer player2)
-			{
-				ClientRPCPlayer(sourceConnection, player2, funcName);
-			}
-		}
-	}
-
-	public void ClientRPCPlayerAndSpectators<T1>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1)
-	{
-		if (!Network.Net.sv.IsConnected() || player.net == null || player.net.connection == null)
-		{
-			return;
-		}
-		ClientRPCEx(new SendInfo(player.net.connection), sourceConnection, funcName, arg1);
-		if (!player.IsBeingSpectated || player.children == null)
-		{
-			return;
-		}
-		foreach (BaseEntity child in player.children)
-		{
-			if (child is BasePlayer player2)
-			{
-				ClientRPCPlayer(sourceConnection, player2, funcName, arg1);
-			}
-		}
-	}
-
-	public void ClientRPCPlayerAndSpectators<T1, T2>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1, T2 arg2)
-	{
-		if (!Network.Net.sv.IsConnected() || player.net == null || player.net.connection == null)
-		{
-			return;
-		}
-		ClientRPCPlayer(sourceConnection, player, funcName, arg1, arg2);
-		if (!player.IsBeingSpectated || player.children == null)
-		{
-			return;
-		}
-		foreach (BaseEntity child in children)
-		{
-			if (child is BasePlayer player2)
-			{
-				ClientRPCPlayer(sourceConnection, player2, funcName, arg1, arg2);
-			}
-		}
-	}
-
-	public void ClientRPCPlayerAndSpectators<T1, T2, T3>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1, T2 arg2, T3 arg3)
-	{
-		if (!Network.Net.sv.IsConnected() || player.net == null || player.net.connection == null)
-		{
-			return;
-		}
-		ClientRPCPlayer(sourceConnection, player, funcName, arg1, arg2, arg3);
-		if (!player.IsBeingSpectated || player.children == null)
-		{
-			return;
-		}
-		foreach (BaseEntity child in player.children)
-		{
-			if (child is BasePlayer player2)
-			{
-				ClientRPCPlayer(sourceConnection, player2, funcName, arg1, arg2, arg3);
-			}
-		}
-	}
-
-	private NetWrite ClientRPCStart(Connection sourceConnection, string funcName)
+	protected NetWrite ClientRPCStart(string funcName)
 	{
 		NetWrite netWrite = Network.Net.sv.StartWrite();
 		netWrite.PacketID(Message.Type.RPCMessage);
 		netWrite.EntityID(net.ID);
 		netWrite.UInt32(StringPool.Get(funcName));
-		netWrite.UInt64(sourceConnection?.userid ?? 0);
 		return netWrite;
 	}
 
@@ -1933,19 +2901,213 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		NetworkWriteEx.WriteObject(write, arg);
 	}
 
-	private void ClientRPCSend(NetWrite write, SendInfo sendInfo)
+	protected void ClientRPCSend(NetWrite write, SendInfo sendInfo)
 	{
 		write.Send(sendInfo);
 	}
 
-	public virtual float RadiationProtection()
+	public void ClientRPCPlayerList<T1>(Connection sourceConnection, BasePlayer player, string funcName, List<T1> list)
 	{
-		return 0f;
+		if (!Network.Net.sv.IsConnected() || net == null || player.net.connection == null)
+		{
+			return;
+		}
+		NetWrite write = ClientRPCStart(funcName);
+		ClientRPCWrite(write, list.Count);
+		foreach (T1 item in list)
+		{
+			ClientRPCWrite(write, item);
+		}
+		ClientRPCSend(write, new SendInfo(player.net.connection)
+		{
+			priority = Priority.Immediate
+		});
 	}
 
-	public virtual float RadiationExposureFraction()
+	public override void Save(SaveInfo info)
 	{
-		return 1f;
+		base.Save(info);
+		BaseEntity baseEntity = parentEntity.Get(base.isServer);
+		info.msg.baseEntity = Facepunch.Pool.Get<ProtoBuf.BaseEntity>();
+		if (info.forDisk)
+		{
+			if (this is BasePlayer)
+			{
+				if (baseEntity == null || baseEntity.enableSaving)
+				{
+					info.msg.baseEntity.pos = base.transform.localPosition;
+					info.msg.baseEntity.rot = base.transform.localRotation.eulerAngles;
+				}
+				else
+				{
+					info.msg.baseEntity.pos = base.transform.position;
+					info.msg.baseEntity.rot = base.transform.rotation.eulerAngles;
+				}
+			}
+			else
+			{
+				info.msg.baseEntity.pos = base.transform.localPosition;
+				info.msg.baseEntity.rot = base.transform.localRotation.eulerAngles;
+			}
+		}
+		else
+		{
+			info.msg.baseEntity.pos = GetNetworkPosition();
+			info.msg.baseEntity.rot = GetNetworkRotation().eulerAngles;
+			info.msg.baseEntity.time = GetNetworkTime();
+		}
+		info.msg.baseEntity.flags = (int)flags;
+		info.msg.baseEntity.skinid = skinID;
+		if (info.forDisk && this is BasePlayer)
+		{
+			if (baseEntity != null && baseEntity.enableSaving)
+			{
+				info.msg.parent = Facepunch.Pool.Get<ParentInfo>();
+				info.msg.parent.uid = parentEntity.uid;
+				info.msg.parent.bone = parentBone;
+			}
+		}
+		else if (baseEntity != null)
+		{
+			info.msg.parent = Facepunch.Pool.Get<ParentInfo>();
+			info.msg.parent.uid = parentEntity.uid;
+			info.msg.parent.bone = parentBone;
+		}
+		if (HasAnySlot())
+		{
+			info.msg.entitySlots = Facepunch.Pool.Get<EntitySlots>();
+			info.msg.entitySlots.slotLock = entitySlots[0].uid;
+			info.msg.entitySlots.slotFireMod = entitySlots[1].uid;
+			info.msg.entitySlots.slotUpperModification = entitySlots[2].uid;
+			info.msg.entitySlots.centerDecoration = entitySlots[5].uid;
+			info.msg.entitySlots.lowerCenterDecoration = entitySlots[6].uid;
+			info.msg.entitySlots.storageMonitor = entitySlots[7].uid;
+		}
+		if (info.forDisk && (bool)_spawnable)
+		{
+			_spawnable.Save(info);
+		}
+		if (OwnerID != 0L && (info.forDisk || ShouldNetworkOwnerInfo()))
+		{
+			info.msg.ownerInfo = Facepunch.Pool.Get<OwnerInfo>();
+			if (info.forDisk)
+			{
+				info.msg.ownerInfo.steamid = OwnerID;
+			}
+			else
+			{
+				info.msg.ownerInfo.steamid = ((OwnerID == info.forConnection.userid) ? info.forConnection.userid : 0);
+			}
+		}
+		if (Components != null)
+		{
+			for (int i = 0; i < Components.Count; i++)
+			{
+				if (!(Components[i] == null))
+				{
+					Components[i].SaveComponent(info);
+				}
+			}
+		}
+		if (info.forTransfer && ShouldTransferAssociatedFiles)
+		{
+			info.msg.associatedFiles = Facepunch.Pool.Get<AssociatedFiles>();
+			info.msg.associatedFiles.files = Facepunch.Pool.Get<List<AssociatedFiles.AssociatedFile>>();
+			info.msg.associatedFiles.files.AddRange(FileStorage.server.QueryAllByEntity(net.ID));
+		}
+	}
+
+	public virtual bool ShouldNetworkOwnerInfo()
+	{
+		return false;
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (info.msg.baseEntity != null)
+		{
+			ProtoBuf.BaseEntity baseEntity = info.msg.baseEntity;
+			Flags old = flags;
+			if (base.isServer)
+			{
+				baseEntity.flags &= -33554433;
+			}
+			flags = (Flags)baseEntity.flags;
+			OnFlagsChanged(old, flags);
+			OnSkinChanged(skinID, info.msg.baseEntity.skinid);
+			if (info.fromDisk)
+			{
+				if (baseEntity.pos.IsNaNOrInfinity())
+				{
+					string text = ToString();
+					Vector3 pos = baseEntity.pos;
+					Debug.LogWarning(text + " has broken position - " + pos.ToString());
+					baseEntity.pos = Vector3.zero;
+				}
+				base.transform.localPosition = baseEntity.pos;
+				base.transform.localRotation = Quaternion.Euler(baseEntity.rot);
+			}
+		}
+		if (info.msg.entitySlots != null)
+		{
+			entitySlots[0].uid = info.msg.entitySlots.slotLock;
+			entitySlots[1].uid = info.msg.entitySlots.slotFireMod;
+			entitySlots[2].uid = info.msg.entitySlots.slotUpperModification;
+			entitySlots[5].uid = info.msg.entitySlots.centerDecoration;
+			entitySlots[6].uid = info.msg.entitySlots.lowerCenterDecoration;
+			entitySlots[7].uid = info.msg.entitySlots.storageMonitor;
+		}
+		if (info.msg.parent != null)
+		{
+			if (base.isServer)
+			{
+				BaseEntity entity = BaseNetworkable.serverEntities.Find(info.msg.parent.uid) as BaseEntity;
+				SetParent(entity, info.msg.parent.bone);
+			}
+			parentEntity.uid = info.msg.parent.uid;
+			parentBone = info.msg.parent.bone;
+		}
+		else
+		{
+			parentEntity.uid = default(NetworkableId);
+			parentBone = 0u;
+		}
+		if (info.msg.ownerInfo != null)
+		{
+			OwnerID = info.msg.ownerInfo.steamid;
+		}
+		if ((bool)_spawnable)
+		{
+			_spawnable.Load(info);
+		}
+		if (info.fromTransfer && ShouldTransferAssociatedFiles && info.msg.associatedFiles != null && info.msg.associatedFiles.files != null)
+		{
+			foreach (AssociatedFiles.AssociatedFile file in info.msg.associatedFiles.files)
+			{
+				if (FileStorage.server.Store(file.data, (FileStorage.Type)file.type, net.ID, file.numID) != file.crc)
+				{
+					Debug.LogWarning("Associated file has a different CRC after transfer!");
+				}
+			}
+		}
+		if (info.fromDisk && info.msg.baseEntity != null && IsTransferProtected())
+		{
+			float num = ((info.msg.baseEntity.protection > 0f) ? info.msg.baseEntity.protection : Nexus.protectionDuration);
+			_transferProtectionRemaining = num;
+			Invoke(DisableTransferProtectionAction, num);
+		}
+		if (Components == null)
+		{
+			return;
+		}
+		for (int i = 0; i < Components.Count; i++)
+		{
+			if (!(Components[i] == null))
+			{
+				Components[i].LoadComponent(info);
+			}
+		}
 	}
 
 	public virtual void SetCreatorEntity(BaseEntity newCreatorEntity)
@@ -1974,29 +3136,35 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 	public void EnableSaving(bool wants)
 	{
-		if (enableSaving == wants)
+		if (enableSaving != wants)
 		{
-			return;
-		}
-		enableSaving = wants;
-		if (enableSaving)
-		{
-			if (!saveList.Contains(this))
+			enableSaving = wants;
+			if (enableSaving)
 			{
 				saveList.Add(this);
 			}
+			else
+			{
+				saveList.Remove(this);
+			}
 		}
-		else
-		{
-			saveList.Remove(this);
-		}
+	}
+
+	public void RestoreCanSave()
+	{
+		EnableSaving(couldSaveOriginally);
 	}
 
 	public override void ServerInit()
 	{
 		_spawnable = GetComponent<Spawnable>();
 		base.ServerInit();
-		if (enableSaving && !saveList.Contains(this))
+		if (!base.isServer)
+		{
+			return;
+		}
+		couldSaveOriginally = enableSaving;
+		if (enableSaving)
 		{
 			saveList.Add(this);
 		}
@@ -2016,10 +3184,24 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 			}
 		}
 		Query.Server.Add(this);
+		if (this is SamSite.ISamSiteTarget item)
+		{
+			SamSite.ISamSiteTarget.serverList.Add(item);
+		}
 	}
 
-	public virtual void OnSensation(Sensation sensation)
+	public virtual void OnPlaced(BasePlayer player)
 	{
+	}
+
+	protected virtual bool ShouldUpdateNetworkGroup()
+	{
+		return syncPosition;
+	}
+
+	protected virtual bool ShouldUpdateNetworkPosition()
+	{
+		return syncPosition;
 	}
 
 	public void NetworkPositionTick()
@@ -2046,22 +3228,25 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		{
 			Query.Server.Move(this);
 		}
+		SingletonComponent<NpcFoodManager>.Instance.Move(this);
+		SingletonComponent<NpcFireManager>.Instance.Move(this);
 		if (net == null)
 		{
 			return;
 		}
 		InvalidateNetworkCache();
-		if (!globalBroadcast && !ValidBounds.Test(base.transform.position))
+		if (!globalBroadcast && !ValidBounds.Test(this, base.transform.position))
 		{
 			OnInvalidPosition();
+			return;
 		}
-		else if (syncPosition)
+		if (ShouldUpdateNetworkGroup() && !isCallingUpdateNetworkGroup)
 		{
-			if (!isCallingUpdateNetworkGroup)
-			{
-				Invoke(UpdateNetworkGroup, 5f);
-				isCallingUpdateNetworkGroup = true;
-			}
+			Invoke(UpdateNetworkGroup, 5f);
+			isCallingUpdateNetworkGroup = true;
+		}
+		if (ShouldUpdateNetworkPosition())
+		{
 			SendNetworkUpdate_Position();
 			OnPositionalNetworkUpdate();
 		}
@@ -2069,18 +3254,6 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 	public virtual void OnPositionalNetworkUpdate()
 	{
-	}
-
-	public void DoMovingWithoutARigidBodyCheck()
-	{
-		if (doneMovingWithoutARigidBodyCheck <= 10)
-		{
-			doneMovingWithoutARigidBodyCheck++;
-			if (doneMovingWithoutARigidBodyCheck >= 10 && !(GetComponent<Collider>() == null) && GetComponent<Rigidbody>() == null)
-			{
-				Debug.LogWarning(string.Concat("Entity moving without a rigid body! (", base.gameObject, ")"), this);
-			}
-		}
 	}
 
 	public override void Spawn()
@@ -2105,7 +3278,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 		if (GameManager.server.preProcessed.NeedsProcessing(base.gameObject))
 		{
-			GameManager.server.preProcessed.ProcessObject(null, base.gameObject, resetLocalTransform: false);
+			GameManager.server.preProcessed.ProcessObject(null, base.gameObject, PreProcessPrefabOptions.Default_NoResetPosition);
 		}
 		BaseEntity baseEntity = ((base.transform.parent != null) ? base.transform.parent.GetComponentInParent<BaseEntity>() : null);
 		Spawn();
@@ -2121,7 +3294,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		{
 			if (GameManager.server.preProcessed.NeedsProcessing(base.gameObject))
 			{
-				GameManager.server.preProcessed.ProcessObject(null, base.gameObject, resetLocalTransform: false);
+				GameManager.server.preProcessed.ProcessObject(null, base.gameObject, PreProcessPrefabOptions.Default_NoResetPosition);
 			}
 			base.transform.parent = null;
 			SceneManager.MoveGameObjectToScene(base.gameObject, Rust.Server.EntityScene);
@@ -2137,7 +3310,11 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 	internal override void DoServerDestroy()
 	{
 		CancelInvoke(NetworkPositionTick);
-		saveList.Remove(this);
+		if (enableSaving)
+		{
+			saveList.Remove(this);
+		}
+		enableSaving = couldSaveOriginally;
 		RemoveFromTriggers();
 		if (children != null)
 		{
@@ -2149,6 +3326,11 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 		SetParent(null, worldPositionStays: true);
 		Query.Server.Remove(this);
+		SingletonComponent<NpcFireManager>.Instance.Remove(this);
+		if (this is SamSite.ISamSiteTarget item)
+		{
+			SamSite.ISamSiteTarget.serverList.Remove(item);
+		}
 		base.DoServerDestroy();
 	}
 
@@ -2159,11 +3341,16 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 	public virtual void OnInvalidPosition()
 	{
-		Debug.Log(string.Concat("Invalid Position: ", this, " ", base.transform.position, " (destroying)"));
+		Debug.Log("Invalid Position: " + this?.ToString() + " " + base.transform.position.ToString() + " (destroying)");
 		Kill();
 	}
 
-	public BaseCorpse DropCorpse(string strCorpsePrefab)
+	public BaseCorpse DropCorpse(string strCorpsePrefab, BasePlayer.PlayerFlags playerFlagsOnDeath = (BasePlayer.PlayerFlags)0, ModelState modelState = null)
+	{
+		return DropCorpse(strCorpsePrefab, base.transform.position, base.transform.rotation, playerFlagsOnDeath, modelState);
+	}
+
+	public BaseCorpse DropCorpse(string strCorpsePrefab, Vector3 posOnDeath, Quaternion rotOnDeath, BasePlayer.PlayerFlags playerFlagsOnDeath = (BasePlayer.PlayerFlags)0, ModelState modelState = null)
 	{
 		Assert.IsTrue(base.isServer, "DropCorpse called on client!");
 		if (!ConVar.Server.corpses)
@@ -2177,10 +3364,10 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		BaseCorpse baseCorpse = GameManager.server.CreateEntity(strCorpsePrefab) as BaseCorpse;
 		if (baseCorpse == null)
 		{
-			Debug.LogWarning(string.Concat("Error creating corpse: ", base.gameObject, " - ", strCorpsePrefab));
+			Debug.LogWarning("Error creating corpse: " + base.gameObject?.ToString() + " - " + strCorpsePrefab);
 			return null;
 		}
-		baseCorpse.InitCorpse(this);
+		baseCorpse.ServerInitCorpse(this, posOnDeath, rotOnDeath, playerFlagsOnDeath, modelState);
 		return baseCorpse;
 	}
 
@@ -2208,7 +3395,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				{
 					if (!Rust.Application.isLoadingSave)
 					{
-						Debug.LogWarning("UpdateNetworkGroup: Missing parent entity " + parentEntity.uid);
+						Debug.LogWarning("UpdateNetworkGroup: Missing parent entity " + parentEntity.uid.ToString());
 						Invoke(UpdateNetworkGroup, 2f);
 						isCallingUpdateNetworkGroup = true;
 					}
@@ -2222,7 +3409,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				}
 				else
 				{
-					Debug.LogWarning(string.Concat(base.gameObject, ": has parent id - but couldn't find parent! ", parentEntity));
+					Debug.LogWarning(base.gameObject?.ToString() + ": has parent id - but couldn't find parent! " + parentEntity);
 				}
 			}
 			else if (base.limitNetworking && !(this is BasePlayer))
@@ -2254,6 +3441,10 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		{
 			return true;
 		}
+		if (IsTransferProtected())
+		{
+			return false;
+		}
 		BaseEntity baseEntity = GetParentEntity();
 		if (base.limitNetworking)
 		{
@@ -2266,13 +3457,8 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				return false;
 			}
 		}
-		if (baseEntity != null)
+		if (ShouldInheritNetworkGroup() && baseEntity != null)
 		{
-			object obj = Interface.CallHook("CanNetworkTo", this, player);
-			if (obj is bool)
-			{
-				return (bool)obj;
-			}
 			return baseEntity.ShouldNetworkTo(player);
 		}
 		return base.ShouldNetworkTo(player);
@@ -2339,8 +3525,28 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		return $"Owner ID: {OwnerID}";
 	}
 
-	[RPC_Server]
+	public virtual bool BuoyancyWake()
+	{
+		return false;
+	}
+
+	public virtual bool BuoyancySleep(bool inWater)
+	{
+		return false;
+	}
+
+	public virtual float RadiationProtection()
+	{
+		return 0f;
+	}
+
+	public virtual float RadiationExposureFraction()
+	{
+		return 1f;
+	}
+
 	[RPC_Server.FromOwner]
+	[RPC_Server]
 	private void BroadcastSignalFromClient(RPCMessage msg)
 	{
 		uint num = StringPool.Get("BroadcastSignalFromClient");
@@ -2352,19 +3558,21 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				Signal signal = (Signal)msg.read.Int32();
 				string arg = msg.read.String();
 				SignalBroadcast(signal, arg, msg.connection);
+				OnReceivedSignalServer(signal, arg);
 			}
 		}
 	}
 
+	protected virtual void OnReceivedSignalServer(Signal signal, string arg)
+	{
+		SingletonComponent<NpcFireManager>.Instance.OnReceivedSignalServer(this, signal, arg);
+	}
+
 	public void SignalBroadcast(Signal signal, string arg, Connection sourceConnection = null)
 	{
-		if (net != null && net.group != null && !base.limitNetworking && Interface.CallHook("OnSignalBroadcast", this) == null)
+		if (net != null && net.group != null && !base.limitNetworking && Interface.CallHook("OnSignalBroadcast", this, sourceConnection) == null)
 		{
-			ClientRPCEx(new SendInfo(net.group.subscribers)
-			{
-				method = SendMethod.Unreliable,
-				priority = Priority.Immediate
-			}, sourceConnection, "SignalFromServerEx", (int)signal, arg);
+			ClientRPC(RpcTarget.NetworkGroup("SignalFromServerEx", this, SendMethod.Unreliable, Priority.Immediate), (int)signal, arg, sourceConnection?.userid ?? 0);
 		}
 	}
 
@@ -2372,11 +3580,49 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 	{
 		if (net != null && net.group != null && !base.limitNetworking && Interface.CallHook("OnSignalBroadcast", this) == null)
 		{
-			ClientRPCEx(new SendInfo(net.group.subscribers)
+			ClientRPC(RpcTarget.NetworkGroup("SignalFromServer", this, SendMethod.Unreliable, Priority.Immediate), (int)signal, sourceConnection?.userid ?? 0);
+		}
+	}
+
+	public void SignalBroadcast(Signal signal, string arg, Connection sourceConnection, string fallbackEffect)
+	{
+		if (!ServerOcclusion.OcclusionEnabled)
+		{
+			SignalBroadcast(signal, arg, sourceConnection);
+		}
+		else
+		{
+			if (net == null || net.group == null)
 			{
-				method = SendMethod.Unreliable,
-				priority = Priority.Immediate
-			}, sourceConnection, "SignalFromServer", (int)signal);
+				return;
+			}
+			List<Connection> obj = Facepunch.Pool.Get<List<Connection>>();
+			List<Connection> obj2 = Facepunch.Pool.Get<List<Connection>>();
+			foreach (Connection subscriber in net.group.subscribers)
+			{
+				BasePlayer basePlayer = subscriber.player as BasePlayer;
+				if (!(basePlayer == null))
+				{
+					if (ShouldNetworkTo(basePlayer))
+					{
+						obj.Add(subscriber);
+					}
+					else
+					{
+						obj2.Add(subscriber);
+					}
+				}
+			}
+			if (obj.Count > 0)
+			{
+				ClientRPC(RpcTarget.Players("SignalFromServerEx", obj, SendMethod.Unreliable, Priority.Immediate), (int)signal, arg, sourceConnection?.userid ?? 0);
+			}
+			if (obj2.Count > 0)
+			{
+				Effect.server.Run(fallbackEffect, base.transform.position, base.transform.up, sourceConnection, broadcast: false, obj2);
+			}
+			Facepunch.Pool.FreeUnmanaged(ref obj);
+			Facepunch.Pool.FreeUnmanaged(ref obj2);
 		}
 	}
 
@@ -2472,7 +3718,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 			triggers.Remove(trigger);
 			if (triggers.Count == 0)
 			{
-				Facepunch.Pool.FreeList(ref triggers);
+				Facepunch.Pool.FreeUnmanaged(ref triggers);
 			}
 		}
 	}
@@ -2485,17 +3731,18 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 		using (TimeWarning.New("RemoveFromTriggers"))
 		{
-			TriggerBase[] array = triggers.ToArray();
-			foreach (TriggerBase triggerBase in array)
+			List<TriggerBase> obj = triggers.ShallowClonePooled();
+			foreach (TriggerBase item in obj)
 			{
-				if ((bool)triggerBase)
+				if ((bool)item)
 				{
-					triggerBase.RemoveEntity(this);
+					item.RemoveEntity(this);
 				}
 			}
+			Facepunch.Pool.FreeUnmanaged(ref obj);
 			if (triggers != null && triggers.Count == 0)
 			{
-				Facepunch.Pool.FreeList(ref triggers);
+				Facepunch.Pool.FreeUnmanaged(ref triggers);
 			}
 		}
 	}
@@ -2532,8 +3779,8 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 	public void ForceUpdateTriggers(bool enter = true, bool exit = true, bool invoke = true)
 	{
-		List<TriggerBase> obj = Facepunch.Pool.GetList<TriggerBase>();
-		List<TriggerBase> obj2 = Facepunch.Pool.GetList<TriggerBase>();
+		List<TriggerBase> obj = Facepunch.Pool.Get<List<TriggerBase>>();
+		List<TriggerBase> obj2 = Facepunch.Pool.Get<List<TriggerBase>>();
 		if (triggers != null)
 		{
 			obj.AddRange(triggers);
@@ -2580,12 +3827,39 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				}
 			}
 		}
-		Facepunch.Pool.FreeList(ref obj);
-		Facepunch.Pool.FreeList(ref obj2);
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+		Facepunch.Pool.FreeUnmanaged(ref obj2);
 		if (invoke)
 		{
 			Invoke(ForceUpdateTriggersAction, UnityEngine.Time.time - UnityEngine.Time.fixedTime + UnityEngine.Time.fixedDeltaTime * 1.5f);
 		}
+	}
+
+	public virtual bool InSafeZone()
+	{
+		BaseGameMode activeGameMode = BaseGameMode.GetActiveGameMode(serverside: true);
+		if (activeGameMode != null && !activeGameMode.safeZone)
+		{
+			return false;
+		}
+		float num = 0f;
+		Vector3 position = base.transform.position;
+		if (triggers != null)
+		{
+			for (int i = 0; i < triggers.Count; i++)
+			{
+				TriggerSafeZone triggerSafeZone = triggers[i] as TriggerSafeZone;
+				if (!(triggerSafeZone == null))
+				{
+					float safeLevel = triggerSafeZone.GetSafeLevel(position);
+					if (safeLevel > num)
+					{
+						num = safeLevel;
+					}
+				}
+			}
+		}
+		return num > 0f;
 	}
 
 	public TriggerParent FindSuitableParent()
@@ -2602,739 +3876,5 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 			}
 		}
 		return null;
-	}
-
-	public virtual BasePlayer ToPlayer()
-	{
-		return null;
-	}
-
-	public override void InitShared()
-	{
-		base.InitShared();
-		InitEntityLinks();
-	}
-
-	public override void DestroyShared()
-	{
-		base.DestroyShared();
-		FreeEntityLinks();
-	}
-
-	public override void ResetState()
-	{
-		base.ResetState();
-		parentBone = 0u;
-		OwnerID = 0uL;
-		flags = (Flags)0;
-		parentEntity = default(EntityRef);
-		if (base.isServer)
-		{
-			_spawnable = null;
-		}
-	}
-
-	public virtual float InheritedVelocityScale()
-	{
-		return 0f;
-	}
-
-	public virtual bool InheritedVelocityDirection()
-	{
-		return true;
-	}
-
-	public virtual Vector3 GetInheritedProjectileVelocity(Vector3 direction)
-	{
-		BaseEntity baseEntity = parentEntity.Get(base.isServer);
-		if (baseEntity == null)
-		{
-			return Vector3.zero;
-		}
-		if (baseEntity.InheritedVelocityDirection())
-		{
-			return GetParentVelocity() * baseEntity.InheritedVelocityScale();
-		}
-		return Mathf.Max(Vector3.Dot(GetParentVelocity() * baseEntity.InheritedVelocityScale(), direction), 0f) * direction;
-	}
-
-	public virtual Vector3 GetInheritedThrowVelocity(Vector3 direction)
-	{
-		return GetParentVelocity();
-	}
-
-	public virtual Vector3 GetInheritedDropVelocity()
-	{
-		BaseEntity baseEntity = parentEntity.Get(base.isServer);
-		if (!(baseEntity != null))
-		{
-			return Vector3.zero;
-		}
-		return baseEntity.GetWorldVelocity();
-	}
-
-	public Vector3 GetParentVelocity()
-	{
-		BaseEntity baseEntity = parentEntity.Get(base.isServer);
-		if (!(baseEntity != null))
-		{
-			return Vector3.zero;
-		}
-		return baseEntity.GetWorldVelocity() + (baseEntity.GetAngularVelocity() * base.transform.localPosition - base.transform.localPosition);
-	}
-
-	public Vector3 GetWorldVelocity()
-	{
-		BaseEntity baseEntity = parentEntity.Get(base.isServer);
-		if (!(baseEntity != null))
-		{
-			return GetLocalVelocity();
-		}
-		return baseEntity.GetWorldVelocity() + (baseEntity.GetAngularVelocity() * base.transform.localPosition - base.transform.localPosition) + baseEntity.transform.TransformDirection(GetLocalVelocity());
-	}
-
-	public Vector3 GetLocalVelocity()
-	{
-		if (base.isServer)
-		{
-			return GetLocalVelocityServer();
-		}
-		return Vector3.zero;
-	}
-
-	public Quaternion GetAngularVelocity()
-	{
-		if (base.isServer)
-		{
-			return GetAngularVelocityServer();
-		}
-		return Quaternion.identity;
-	}
-
-	public virtual OBB WorldSpaceBounds()
-	{
-		return new OBB(base.transform.position, base.transform.lossyScale, base.transform.rotation, bounds);
-	}
-
-	public Vector3 PivotPoint()
-	{
-		return base.transform.position;
-	}
-
-	public Vector3 CenterPoint()
-	{
-		return WorldSpaceBounds().position;
-	}
-
-	public Vector3 ClosestPoint(Vector3 position)
-	{
-		return WorldSpaceBounds().ClosestPoint(position);
-	}
-
-	public virtual Vector3 TriggerPoint()
-	{
-		return CenterPoint();
-	}
-
-	public float Distance(Vector3 position)
-	{
-		return (ClosestPoint(position) - position).magnitude;
-	}
-
-	public float SqrDistance(Vector3 position)
-	{
-		return (ClosestPoint(position) - position).sqrMagnitude;
-	}
-
-	public float Distance(BaseEntity other)
-	{
-		return Distance(other.transform.position);
-	}
-
-	public float SqrDistance(BaseEntity other)
-	{
-		return SqrDistance(other.transform.position);
-	}
-
-	public float Distance2D(Vector3 position)
-	{
-		return (ClosestPoint(position) - position).Magnitude2D();
-	}
-
-	public float SqrDistance2D(Vector3 position)
-	{
-		return (ClosestPoint(position) - position).SqrMagnitude2D();
-	}
-
-	public float Distance2D(BaseEntity other)
-	{
-		return Distance(other.transform.position);
-	}
-
-	public float SqrDistance2D(BaseEntity other)
-	{
-		return SqrDistance(other.transform.position);
-	}
-
-	public bool IsVisible(Ray ray, int layerMask, float maxDistance)
-	{
-		if (ray.origin.IsNaNOrInfinity())
-		{
-			return false;
-		}
-		if (ray.direction.IsNaNOrInfinity())
-		{
-			return false;
-		}
-		if (ray.direction == Vector3.zero)
-		{
-			return false;
-		}
-		if (!WorldSpaceBounds().Trace(ray, out var hit, maxDistance))
-		{
-			return false;
-		}
-		if (GamePhysics.Trace(ray, 0f, out var hitInfo, maxDistance, layerMask))
-		{
-			BaseEntity entity = RaycastHitEx.GetEntity(hitInfo);
-			if (entity == this)
-			{
-				return true;
-			}
-			if (entity != null && (bool)GetParentEntity() && GetParentEntity().EqualNetID(entity) && RaycastHitEx.IsOnLayer(hitInfo, Rust.Layer.Vehicle_Detailed))
-			{
-				return true;
-			}
-			if (hitInfo.distance <= hit.distance)
-			{
-				return false;
-			}
-		}
-		return true;
-	}
-
-	public bool IsVisibleSpecificLayers(Vector3 position, Vector3 target, int layerMask, float maxDistance = float.PositiveInfinity)
-	{
-		Vector3 vector = target - position;
-		float magnitude = vector.magnitude;
-		if (magnitude < Mathf.Epsilon)
-		{
-			return true;
-		}
-		Vector3 vector2 = vector / magnitude;
-		Vector3 vector3 = vector2 * Mathf.Min(magnitude, 0.01f);
-		return IsVisible(new Ray(position + vector3, vector2), layerMask, maxDistance);
-	}
-
-	public bool IsVisible(Vector3 position, Vector3 target, float maxDistance = float.PositiveInfinity)
-	{
-		Vector3 vector = target - position;
-		float magnitude = vector.magnitude;
-		if (magnitude < Mathf.Epsilon)
-		{
-			return true;
-		}
-		Vector3 vector2 = vector / magnitude;
-		Vector3 vector3 = vector2 * Mathf.Min(magnitude, 0.01f);
-		return IsVisible(new Ray(position + vector3, vector2), 1218519041, maxDistance);
-	}
-
-	public bool IsVisible(Vector3 position, float maxDistance = float.PositiveInfinity)
-	{
-		Vector3 target = CenterPoint();
-		if (IsVisible(position, target, maxDistance))
-		{
-			return true;
-		}
-		Vector3 target2 = ClosestPoint(position);
-		if (IsVisible(position, target2, maxDistance))
-		{
-			return true;
-		}
-		return false;
-	}
-
-	public bool IsVisibleAndCanSee(Vector3 position, float maxDistance = float.PositiveInfinity)
-	{
-		Vector3 vector = CenterPoint();
-		if (IsVisible(position, vector, maxDistance) && IsVisible(vector, position, maxDistance))
-		{
-			return true;
-		}
-		Vector3 vector2 = ClosestPoint(position);
-		if (IsVisible(position, vector2, maxDistance) && IsVisible(vector2, position, maxDistance))
-		{
-			return true;
-		}
-		return false;
-	}
-
-	public bool IsOlderThan(BaseEntity other)
-	{
-		if (other == null)
-		{
-			return true;
-		}
-		NetworkableId obj = net?.ID ?? default(NetworkableId);
-		NetworkableId networkableId = other.net?.ID ?? default(NetworkableId);
-		return obj.Value < networkableId.Value;
-	}
-
-	public virtual bool IsOutside()
-	{
-		return IsOutside(WorldSpaceBounds().position);
-	}
-
-	public bool IsOutside(Vector3 position)
-	{
-		bool result = true;
-		bool flag;
-		do
-		{
-			flag = false;
-			if (!UnityEngine.Physics.Raycast(position, Vector3.up, out var hitInfo, 100f, 161546513))
-			{
-				continue;
-			}
-			BaseEntity baseEntity = GameObjectEx.ToBaseEntity(hitInfo.collider);
-			if (baseEntity != null && baseEntity.HasEntityInParents(this))
-			{
-				if (hitInfo.point.y > position.y + 0.2f)
-				{
-					position = hitInfo.point + Vector3.up * 0.05f;
-				}
-				else
-				{
-					position.y += 0.2f;
-				}
-				flag = true;
-			}
-			else
-			{
-				result = false;
-			}
-		}
-		while (flag);
-		return result;
-	}
-
-	public virtual float WaterFactor()
-	{
-		return WaterLevel.Factor(WorldSpaceBounds().ToBounds(), this);
-	}
-
-	public virtual float AirFactor()
-	{
-		if (!(WaterFactor() > 0.85f))
-		{
-			return 1f;
-		}
-		return 0f;
-	}
-
-	public bool WaterTestFromVolumes(Vector3 pos, out WaterLevel.WaterInfo info)
-	{
-		if (triggers == null)
-		{
-			info = default(WaterLevel.WaterInfo);
-			return false;
-		}
-		for (int i = 0; i < triggers.Count; i++)
-		{
-			if (triggers[i] is WaterVolume waterVolume && waterVolume.Test(pos, out info))
-			{
-				return true;
-			}
-		}
-		info = default(WaterLevel.WaterInfo);
-		return false;
-	}
-
-	public bool IsInWaterVolume(Vector3 pos)
-	{
-		if (triggers == null)
-		{
-			return false;
-		}
-		WaterLevel.WaterInfo info = default(WaterLevel.WaterInfo);
-		for (int i = 0; i < triggers.Count; i++)
-		{
-			if (triggers[i] is WaterVolume waterVolume && waterVolume.Test(pos, out info))
-			{
-				return true;
-			}
-		}
-		return false;
-	}
-
-	public bool WaterTestFromVolumes(Bounds bounds, out WaterLevel.WaterInfo info)
-	{
-		if (triggers == null)
-		{
-			info = default(WaterLevel.WaterInfo);
-			return false;
-		}
-		for (int i = 0; i < triggers.Count; i++)
-		{
-			if (triggers[i] is WaterVolume waterVolume && waterVolume.Test(bounds, out info))
-			{
-				return true;
-			}
-		}
-		info = default(WaterLevel.WaterInfo);
-		return false;
-	}
-
-	public bool WaterTestFromVolumes(Vector3 start, Vector3 end, float radius, out WaterLevel.WaterInfo info)
-	{
-		if (triggers == null)
-		{
-			info = default(WaterLevel.WaterInfo);
-			return false;
-		}
-		for (int i = 0; i < triggers.Count; i++)
-		{
-			if (triggers[i] is WaterVolume waterVolume && waterVolume.Test(start, end, radius, out info))
-			{
-				return true;
-			}
-		}
-		info = default(WaterLevel.WaterInfo);
-		return false;
-	}
-
-	public virtual bool BlocksWaterFor(BasePlayer player)
-	{
-		return false;
-	}
-
-	public virtual float Health()
-	{
-		return 0f;
-	}
-
-	public virtual float MaxHealth()
-	{
-		return 0f;
-	}
-
-	public virtual float MaxVelocity()
-	{
-		return 0f;
-	}
-
-	public virtual float BoundsPadding()
-	{
-		return 0.1f;
-	}
-
-	public virtual float PenetrationResistance(HitInfo info)
-	{
-		return 100f;
-	}
-
-	public virtual GameObjectRef GetImpactEffect(HitInfo info)
-	{
-		return impactEffect;
-	}
-
-	public virtual void OnAttacked(HitInfo info)
-	{
-	}
-
-	public virtual Item GetItem()
-	{
-		return null;
-	}
-
-	public virtual Item GetItem(ItemId itemId)
-	{
-		return null;
-	}
-
-	public virtual void GiveItem(Item item, GiveItemReason reason = GiveItemReason.Generic)
-	{
-		item.Remove();
-	}
-
-	public virtual bool CanBeLooted(BasePlayer player)
-	{
-		return true;
-	}
-
-	public virtual BaseEntity GetEntity()
-	{
-		return this;
-	}
-
-	public override string ToString()
-	{
-		if (_name == null)
-		{
-			if (base.isServer)
-			{
-				_name = string.Format("{1}[{0}]", net?.ID ?? default(NetworkableId), base.ShortPrefabName);
-			}
-			else
-			{
-				_name = base.ShortPrefabName;
-			}
-		}
-		return _name;
-	}
-
-	public virtual string Categorize()
-	{
-		return "entity";
-	}
-
-	public void Log(string str)
-	{
-		if (base.isClient)
-		{
-			Debug.Log("<color=#ffa>[" + ToString() + "] " + str + "</color>", base.gameObject);
-		}
-		else
-		{
-			Debug.Log("<color=#aff>[" + ToString() + "] " + str + "</color>", base.gameObject);
-		}
-	}
-
-	public void SetModel(Model mdl)
-	{
-		if (!(model == mdl))
-		{
-			model = mdl;
-		}
-	}
-
-	public Model GetModel()
-	{
-		return model;
-	}
-
-	public virtual Transform[] GetBones()
-	{
-		if ((bool)model)
-		{
-			return model.GetBones();
-		}
-		return null;
-	}
-
-	public virtual Transform FindBone(string strName)
-	{
-		if ((bool)model)
-		{
-			return model.FindBone(strName);
-		}
-		return base.transform;
-	}
-
-	public virtual uint FindBoneID(Transform boneTransform)
-	{
-		if ((bool)model)
-		{
-			return model.FindBoneID(boneTransform);
-		}
-		return StringPool.closest;
-	}
-
-	public virtual Transform FindClosestBone(Vector3 worldPos)
-	{
-		if ((bool)model)
-		{
-			return model.FindClosestBone(worldPos);
-		}
-		return base.transform;
-	}
-
-	public virtual bool ShouldBlockProjectiles()
-	{
-		return true;
-	}
-
-	public virtual bool ShouldInheritNetworkGroup()
-	{
-		return true;
-	}
-
-	public virtual bool SupportsChildDeployables()
-	{
-		return false;
-	}
-
-	public void BroadcastEntityMessage(string msg, float radius = 20f, int layerMask = 1218652417)
-	{
-		if (base.isClient)
-		{
-			return;
-		}
-		List<BaseEntity> obj = Facepunch.Pool.GetList<BaseEntity>();
-		Vis.Entities(base.transform.position, radius, obj, layerMask);
-		foreach (BaseEntity item in obj)
-		{
-			if (item.isServer)
-			{
-				item.OnEntityMessage(this, msg);
-			}
-		}
-		Facepunch.Pool.FreeList(ref obj);
-	}
-
-	public virtual void OnEntityMessage(BaseEntity from, string msg)
-	{
-	}
-
-	public override void Save(SaveInfo info)
-	{
-		base.Save(info);
-		BaseEntity baseEntity = parentEntity.Get(base.isServer);
-		info.msg.baseEntity = Facepunch.Pool.Get<ProtoBuf.BaseEntity>();
-		if (info.forDisk)
-		{
-			if (this is BasePlayer)
-			{
-				if (baseEntity == null || baseEntity.enableSaving)
-				{
-					info.msg.baseEntity.pos = base.transform.localPosition;
-					info.msg.baseEntity.rot = base.transform.localRotation.eulerAngles;
-				}
-				else
-				{
-					info.msg.baseEntity.pos = base.transform.position;
-					info.msg.baseEntity.rot = base.transform.rotation.eulerAngles;
-				}
-			}
-			else
-			{
-				info.msg.baseEntity.pos = base.transform.localPosition;
-				info.msg.baseEntity.rot = base.transform.localRotation.eulerAngles;
-			}
-		}
-		else
-		{
-			info.msg.baseEntity.pos = GetNetworkPosition();
-			info.msg.baseEntity.rot = GetNetworkRotation().eulerAngles;
-			info.msg.baseEntity.time = GetNetworkTime();
-		}
-		info.msg.baseEntity.flags = (int)flags;
-		info.msg.baseEntity.skinid = skinID;
-		if (info.forDisk && this is BasePlayer)
-		{
-			if (baseEntity != null && baseEntity.enableSaving)
-			{
-				info.msg.parent = Facepunch.Pool.Get<ParentInfo>();
-				info.msg.parent.uid = parentEntity.uid;
-				info.msg.parent.bone = parentBone;
-			}
-		}
-		else if (baseEntity != null)
-		{
-			info.msg.parent = Facepunch.Pool.Get<ParentInfo>();
-			info.msg.parent.uid = parentEntity.uid;
-			info.msg.parent.bone = parentBone;
-		}
-		if (HasAnySlot())
-		{
-			info.msg.entitySlots = Facepunch.Pool.Get<EntitySlots>();
-			info.msg.entitySlots.slotLock = entitySlots[0].uid;
-			info.msg.entitySlots.slotFireMod = entitySlots[1].uid;
-			info.msg.entitySlots.slotUpperModification = entitySlots[2].uid;
-			info.msg.entitySlots.centerDecoration = entitySlots[5].uid;
-			info.msg.entitySlots.lowerCenterDecoration = entitySlots[6].uid;
-			info.msg.entitySlots.storageMonitor = entitySlots[7].uid;
-		}
-		if (info.forDisk && (bool)_spawnable)
-		{
-			_spawnable.Save(info);
-		}
-		if (OwnerID != 0L && (info.forDisk || ShouldNetworkOwnerInfo()))
-		{
-			info.msg.ownerInfo = Facepunch.Pool.Get<OwnerInfo>();
-			info.msg.ownerInfo.steamid = OwnerID;
-		}
-		if (Components == null)
-		{
-			return;
-		}
-		for (int i = 0; i < Components.Length; i++)
-		{
-			if (!(Components[i] == null))
-			{
-				Components[i].SaveComponent(info);
-			}
-		}
-	}
-
-	public virtual bool ShouldNetworkOwnerInfo()
-	{
-		return false;
-	}
-
-	public override void Load(LoadInfo info)
-	{
-		base.Load(info);
-		if (info.msg.baseEntity != null)
-		{
-			ProtoBuf.BaseEntity baseEntity = info.msg.baseEntity;
-			Flags old = flags;
-			flags = (Flags)baseEntity.flags;
-			OnFlagsChanged(old, flags);
-			OnSkinChanged(skinID, info.msg.baseEntity.skinid);
-			if (info.fromDisk)
-			{
-				if (baseEntity.pos.IsNaNOrInfinity())
-				{
-					Debug.LogWarning(ToString() + " has broken position - " + baseEntity.pos);
-					baseEntity.pos = Vector3.zero;
-				}
-				base.transform.localPosition = baseEntity.pos;
-				base.transform.localRotation = Quaternion.Euler(baseEntity.rot);
-			}
-		}
-		if (info.msg.entitySlots != null)
-		{
-			entitySlots[0].uid = info.msg.entitySlots.slotLock;
-			entitySlots[1].uid = info.msg.entitySlots.slotFireMod;
-			entitySlots[2].uid = info.msg.entitySlots.slotUpperModification;
-			entitySlots[5].uid = info.msg.entitySlots.centerDecoration;
-			entitySlots[6].uid = info.msg.entitySlots.lowerCenterDecoration;
-			entitySlots[7].uid = info.msg.entitySlots.storageMonitor;
-		}
-		if (info.msg.parent != null)
-		{
-			if (base.isServer)
-			{
-				BaseEntity entity = BaseNetworkable.serverEntities.Find(info.msg.parent.uid) as BaseEntity;
-				SetParent(entity, info.msg.parent.bone);
-			}
-			parentEntity.uid = info.msg.parent.uid;
-			parentBone = info.msg.parent.bone;
-		}
-		else
-		{
-			parentEntity.uid = default(NetworkableId);
-			parentBone = 0u;
-		}
-		if (info.msg.ownerInfo != null)
-		{
-			OwnerID = info.msg.ownerInfo.steamid;
-		}
-		if ((bool)_spawnable)
-		{
-			_spawnable.Load(info);
-		}
-		if (Components == null)
-		{
-			return;
-		}
-		for (int i = 0; i < Components.Length; i++)
-		{
-			if (!(Components[i] == null))
-			{
-				Components[i].LoadComponent(info);
-			}
-		}
 	}
 }

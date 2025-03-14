@@ -86,6 +86,8 @@ public class Gibbable : PrefabAttribute, IClientComponent
 
 	public List<OverrideMesh> MeshOverrides = new List<OverrideMesh>();
 
+	public bool UsePerGibWaterCheck;
+
 	protected override Type GetIndexedType()
 	{
 		return typeof(Gibbable);

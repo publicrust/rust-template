@@ -1,8 +1,6 @@
-using UnityEngine;
-
 public class UIUnderlay : SingletonComponent<UIUnderlay>
 {
-	public GameObject damageDirectional;
+	public GameObjectRef damageDirectional;
 
-	public GameObject waterDirectional;
+	public GameObjectRef waterDirectional;
 }

@@ -34,19 +34,13 @@ public class Elevator : IOEntity, IFlagNotify
 	[ColorUsage(true, true)]
 	public Color UnpoweredLightColour;
 
-	public SkinnedMeshRenderer[] CableRenderers;
-
-	public LODGroup CableLod;
-
-	public Transform CableRoot;
-
 	public float LiftMoveDelay;
 
 	protected const Flags TopFloorFlag = Flags.Reserved1;
 
 	public const Flags ElevatorPowered = Flags.Reserved2;
 
-	public ElevatorLift liftEntity;
+	public EntityRef<ElevatorLift> liftEntity;
 
 	public IOEntity ioEntity;
 
@@ -66,6 +60,7 @@ public class Elevator : IOEntity, IFlagNotify
 		if (info.msg.elevator != null)
 		{
 			Floor = info.msg.elevator.floor;
+			liftEntity.uid = info.msg.elevator.spawnedLift;
 		}
 		if (FloorBlockerVolume != null)
 		{
@@ -83,6 +78,8 @@ public class Elevator : IOEntity, IFlagNotify
 			Floor = elevatorInDirection.Floor + 1;
 		}
 		SetFlag(Flags.Reserved1, b: true);
+		UpdateChildEntities(isTop: true);
+		SendNetworkUpdate();
 	}
 
 	public virtual void CallElevator()
@@ -142,35 +139,42 @@ public class Elevator : IOEntity, IFlagNotify
 		{
 			return false;
 		}
-		if (!liftEntity.CanMove())
-		{
-			return false;
-		}
 		int num = LiftPositionToFloor();
 		if (num == targetFloor)
 		{
-			OpenLiftDoors();
 			OpenDoorsAtFloor(num);
-			fromElevator.OpenLiftDoors();
+			return false;
+		}
+		if (!liftEntity.IsValid(base.isServer))
+		{
+			return false;
+		}
+		ElevatorLift elevatorLift = liftEntity.Get(base.isServer);
+		if (!elevatorLift.CanMove())
+		{
 			return false;
 		}
 		Vector3 worldSpaceFloorPosition = GetWorldSpaceFloorPosition(targetFloor);
-		if (!GamePhysics.LineOfSight(liftEntity.transform.position, worldSpaceFloorPosition, 2097152))
+		if (!GamePhysics.LineOfSight(elevatorLift.transform.position, worldSpaceFloorPosition, 2097152))
 		{
 			return false;
 		}
 		OnMoveBegin();
-		Vector3 vector = base.transform.InverseTransformPoint(worldSpaceFloorPosition);
-		timeToTravel = TimeToTravelDistance(Mathf.Abs(liftEntity.transform.localPosition.y - vector.y));
-		LeanTween.moveLocalY(liftEntity.gameObject, vector.y, timeToTravel).delay = LiftMoveDelay;
+		timeToTravel = TimeToTravelDistance(Mathf.Abs(elevatorLift.transform.position.y - worldSpaceFloorPosition.y));
+		LeanTween.moveY(elevatorLift.gameObject, worldSpaceFloorPosition.y, timeToTravel).delay = LiftMoveDelay;
 		timeToTravel += LiftMoveDelay;
 		SetFlag(Flags.Busy, b: true);
 		if (targetFloor < Floor)
 		{
-			liftEntity.ToggleHurtTrigger(state: true);
+			elevatorLift.ToggleHurtTrigger(state: true);
 		}
+		elevatorLift.SetFlag(Flags.Busy, b: true);
 		Invoke(ClearBusy, timeToTravel + 1f);
-		liftEntity.NotifyNewFloor(targetFloor, Floor);
+		elevatorLift.NotifyNewFloor(targetFloor, Floor);
+		EntityLinkBroadcast(delegate(Elevator elevatorEnt)
+		{
+			elevatorEnt.SetFlag(Flags.Busy, b: true);
+		}, (ConstructionSocket socket) => socket.socketType == ConstructionSocket.Type.Elevator);
 		if (ioEntity != null)
 		{
 			ioEntity.SetFlag(Flags.Busy, b: true);
@@ -204,15 +208,20 @@ public class Elevator : IOEntity, IFlagNotify
 	public virtual void ClearBusy()
 	{
 		SetFlag(Flags.Busy, b: false);
-		if (liftEntity != null)
+		if (liftEntity.IsValid(base.isServer))
 		{
-			liftEntity.ToggleHurtTrigger(state: false);
+			liftEntity.Get(base.isServer).ToggleHurtTrigger(state: false);
+			liftEntity.Get(base.isServer).SetFlag(Flags.Busy, b: false);
 		}
 		if (ioEntity != null)
 		{
 			ioEntity.SetFlag(Flags.Busy, b: false);
 			ioEntity.SendChangedToRoot(forceUpdate: true);
 		}
+		EntityLinkBroadcast(delegate(Elevator elevatorEnt)
+		{
+			elevatorEnt.SetFlag(Flags.Busy, b: false);
+		}, (ConstructionSocket socket) => socket.socketType == ConstructionSocket.Type.Elevator);
 	}
 
 	public virtual bool IsValidFloor(int targetFloor)
@@ -242,15 +251,25 @@ public class Elevator : IOEntity, IFlagNotify
 	{
 		if (isTop)
 		{
-			if (liftEntity == null)
+			if (!liftEntity.IsValid(base.isServer))
 			{
 				FindExistingLiftChild();
 			}
-			if (liftEntity == null)
+			if (!liftEntity.IsValid(base.isServer))
 			{
-				liftEntity = GameManager.server.CreateEntity(LiftEntityPrefab.resourcePath, GetWorldSpaceFloorPosition(Floor), LiftRoot.rotation) as ElevatorLift;
-				liftEntity.SetParent(this, worldPositionStays: true);
-				liftEntity.Spawn();
+				ElevatorLift elevatorLift = GameManager.server.CreateEntity(LiftEntityPrefab.resourcePath, GetWorldSpaceFloorPosition(Floor), LiftRoot.rotation) as ElevatorLift;
+				elevatorLift.SetOwnerElevator(this);
+				elevatorLift.Spawn();
+				liftEntity.Set(elevatorLift);
+			}
+			if (liftEntity.IsValid(base.isServer))
+			{
+				if (liftEntity.Get(base.isServer).GetParentEntity() == this)
+				{
+					liftEntity.Get(base.isServer).SetParent(null, worldPositionStays: true);
+				}
+				liftEntity.Get(base.isServer).SetOwnerElevator(this);
+				liftEntity.Get(base.isServer).SetFlag(Flags.Reserved5, HasFlag(Flags.Reserved2) || IsStatic);
 			}
 			if (ioEntity == null)
 			{
@@ -265,9 +284,10 @@ public class Elevator : IOEntity, IFlagNotify
 		}
 		else
 		{
-			if (liftEntity != null)
+			if (liftEntity.IsValid(base.isServer))
 			{
-				liftEntity.Kill();
+				liftEntity.Get(base.isServer).Kill();
+				liftEntity.Set(null);
 			}
 			if (ioEntity != null)
 			{
@@ -296,11 +316,16 @@ public class Elevator : IOEntity, IFlagNotify
 			info.msg.elevator = Pool.Get<ProtoBuf.Elevator>();
 		}
 		info.msg.elevator.floor = Floor;
+		info.msg.elevator.spawnedLift = liftEntity.uid;
 	}
 
 	public int LiftPositionToFloor()
 	{
-		Vector3 position = liftEntity.transform.position;
+		if (!liftEntity.IsValid(base.isServer))
+		{
+			return 0;
+		}
+		Vector3 position = liftEntity.Get(base.isServer).transform.position;
 		int result = -1;
 		float num = float.MaxValue;
 		for (int i = 0; i <= Floor; i++)
@@ -376,11 +401,11 @@ public class Elevator : IOEntity, IFlagNotify
 
 	public void NotifyLiftEntityDoorsOpen(bool state)
 	{
-		if (!(liftEntity != null))
+		if (!liftEntity.IsValid(base.isServer))
 		{
 			return;
 		}
-		foreach (BaseEntity child in liftEntity.children)
+		foreach (BaseEntity child in liftEntity.Get(base.isServer).children)
 		{
 			if (child is Door door)
 			{
@@ -393,22 +418,38 @@ public class Elevator : IOEntity, IFlagNotify
 	{
 	}
 
+	internal override void DoServerDestroy()
+	{
+		base.DoServerDestroy();
+		if (liftEntity.Get(base.isServer) != null)
+		{
+			liftEntity.Get(base.isServer).Kill();
+		}
+	}
+
+	public override void OnKilled(HitInfo info)
+	{
+		base.OnKilled(info);
+		if (liftEntity.Get(base.isServer) != null)
+		{
+			liftEntity.Get(base.isServer).Kill(DestroyMode.Gib);
+		}
+	}
+
 	public override void OnFlagsChanged(Flags old, Flags next)
 	{
 		base.OnFlagsChanged(old, next);
 		if (!Rust.Application.isLoading && base.isServer && old.HasFlag(Flags.Reserved1) != next.HasFlag(Flags.Reserved1))
 		{
 			UpdateChildEntities(next.HasFlag(Flags.Reserved1));
+			SendNetworkUpdate();
 		}
-		if (old.HasFlag(Flags.Busy) != next.HasFlag(Flags.Busy))
+		if (base.isServer)
 		{
-			if (liftEntity == null)
+			ElevatorLift elevatorLift = liftEntity.Get(base.isServer);
+			if (elevatorLift != null)
 			{
-				FindExistingLiftChild();
-			}
-			if (liftEntity != null)
-			{
-				liftEntity.ToggleMovementCollider(!next.HasFlag(Flags.Busy));
+				elevatorLift.SetFlag(Flags.Reserved5, HasFlag(Flags.Reserved2) || IsStatic);
 			}
 		}
 		if (old.HasFlag(Flags.Reserved1) != next.HasFlag(Flags.Reserved1) && FloorBlockerVolume != null)
@@ -421,9 +462,9 @@ public class Elevator : IOEntity, IFlagNotify
 	{
 		foreach (BaseEntity child in children)
 		{
-			if (child is ElevatorLift elevatorLift)
+			if (child is ElevatorLift entity)
 			{
-				liftEntity = elevatorLift;
+				liftEntity.Set(entity);
 				break;
 			}
 		}
@@ -434,6 +475,11 @@ public class Elevator : IOEntity, IFlagNotify
 		if (base.isServer)
 		{
 			SetFlag(Flags.Reserved2, state);
+			ElevatorLift elevatorLift = liftEntity.Get(base.isServer);
+			if (elevatorLift != null)
+			{
+				elevatorLift.SetFlag(Flags.Reserved5, HasFlag(Flags.Reserved2) || IsStatic);
+			}
 		}
 	}
 }

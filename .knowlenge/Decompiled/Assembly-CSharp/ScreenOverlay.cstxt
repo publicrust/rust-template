@@ -24,4 +24,9 @@ public class ScreenOverlay : PostProcessEffectSettings
 	{
 		value = null
 	};
+
+	public BoolParameter respectUseLightingConvar = new BoolParameter
+	{
+		value = false
+	};
 }

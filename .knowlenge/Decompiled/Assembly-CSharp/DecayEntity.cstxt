@@ -9,10 +9,26 @@ using UnityEngine;
 
 public class DecayEntity : BaseCombatEntity
 {
+	[Serializable]
+	public struct DebrisPosition
+	{
+		public Vector3 Position;
+
+		public Vector3 Rotation;
+
+		public bool dropToTerrain;
+	}
+
 	public GameObjectRef debrisPrefab;
+
+	public Vector3 debrisRotationOffset = Vector3.zero;
+
+	public DebrisPosition[] DebrisPositions;
 
 	[NonSerialized]
 	public uint buildingID;
+
+	public float timePlaced;
 
 	public float decayTimer;
 
@@ -28,38 +44,11 @@ public class DecayEntity : BaseCombatEntity
 
 	public float decayVariance = 1f;
 
+	public Upkeep Upkeep => upkeep;
+
 	public virtual bool BypassInsideDecayMultiplier => false;
 
-	public override void Save(SaveInfo info)
-	{
-		base.Save(info);
-		info.msg.decayEntity = Facepunch.Pool.Get<ProtoBuf.DecayEntity>();
-		info.msg.decayEntity.buildingID = buildingID;
-		if (info.forDisk)
-		{
-			info.msg.decayEntity.decayTimer = decayTimer;
-			info.msg.decayEntity.upkeepTimer = upkeepTimer;
-		}
-	}
-
-	public override void Load(LoadInfo info)
-	{
-		base.Load(info);
-		if (info.msg.decayEntity == null)
-		{
-			return;
-		}
-		decayTimer = info.msg.decayEntity.decayTimer;
-		upkeepTimer = info.msg.decayEntity.upkeepTimer;
-		if (buildingID != info.msg.decayEntity.buildingID)
-		{
-			AttachToBuilding(info.msg.decayEntity.buildingID);
-			if (info.fromDisk)
-			{
-				BuildingManager.server.LoadBuildingID(buildingID);
-			}
-		}
-	}
+	public virtual bool AllowOnCargoShip => false;
 
 	public override void ResetState()
 	{
@@ -96,9 +85,18 @@ public class DecayEntity : BaseCombatEntity
 		BuildingManager.Building building = GetBuilding();
 		if (building != null)
 		{
-			return building.GetDominatingBuildingPrivilege();
+			BuildingPrivlidge dominatingBuildingPrivilege = building.GetDominatingBuildingPrivilege();
+			if (dominatingBuildingPrivilege != null || CanReturnEmptyBuildingPrivilege())
+			{
+				return dominatingBuildingPrivilege;
+			}
 		}
 		return base.GetBuildingPrivilege();
+	}
+
+	public virtual bool CanReturnEmptyBuildingPrivilege()
+	{
+		return false;
 	}
 
 	public void CalculateUpkeepCostAmounts(List<ItemAmount> itemAmounts, float multiplier)
@@ -183,7 +181,7 @@ public class DecayEntity : BaseCombatEntity
 		float num = float.MaxValue;
 		BuildingBlock result = null;
 		Vector3 position = PivotPoint();
-		List<BuildingBlock> obj = Facepunch.Pool.GetList<BuildingBlock>();
+		List<BuildingBlock> obj = Facepunch.Pool.Get<List<BuildingBlock>>();
 		Vis.Entities(position, 1.5f, obj, 2097152);
 		for (int i = 0; i < obj.Count; i++)
 		{
@@ -202,7 +200,7 @@ public class DecayEntity : BaseCombatEntity
 				}
 			}
 		}
-		Facepunch.Pool.FreeList(ref obj);
+		Facepunch.Pool.FreeUnmanaged(ref obj);
 		return result;
 	}
 
@@ -226,26 +224,49 @@ public class DecayEntity : BaseCombatEntity
 		return Mathf.Max(0f, 0f - upkeepTimer);
 	}
 
+	public virtual float GetEntityDecayDuration()
+	{
+		return decay.GetDecayDuration(this);
+	}
+
+	public virtual float GetEntityHealScale()
+	{
+		return decay.GetHealScale(this);
+	}
+
+	public virtual float GetEntityDecayDelay()
+	{
+		return decay.GetDecayDelay(this);
+	}
+
 	public virtual void DecayTick()
 	{
-		if (decay == null)
+		if (!(decay == null))
 		{
-			return;
+			float num = decay.GetDecayTickOverride();
+			if (num == 0f)
+			{
+				num = ConVar.Decay.tick;
+			}
+			float num2 = UnityEngine.Time.time - lastDecayTick;
+			if (!(num2 < num))
+			{
+				OnDecay(decay, num2);
+			}
 		}
-		float num = UnityEngine.Time.time - lastDecayTick;
-		if (num < ConVar.Decay.tick)
-		{
-			return;
-		}
+	}
+
+	public virtual void OnDecay(Decay decay, float decayDeltaTime)
+	{
 		lastDecayTick = UnityEngine.Time.time;
-		if (!decay.ShouldDecay(this))
+		if (HasParent() || !decay.ShouldDecay(this))
 		{
 			return;
 		}
-		float num2 = num * ConVar.Decay.scale;
+		float num = decayDeltaTime * ConVar.Decay.scale;
 		if (ConVar.Decay.upkeep)
 		{
-			upkeepTimer += num2;
+			upkeepTimer += num;
 			if (upkeepTimer > 0f)
 			{
 				BuildingPrivlidge buildingPrivilege = GetBuildingPrivilege();
@@ -256,28 +277,28 @@ public class DecayEntity : BaseCombatEntity
 			}
 			if (upkeepTimer < 1f)
 			{
-				if (base.healthFraction < 1f && ConVar.Decay.upkeep_heal_scale > 0f && base.SecondsSinceAttacked > 600f && Interface.CallHook("OnDecayHeal", this) == null)
+				if (base.healthFraction < 1f && GetEntityHealScale() > 0f && base.SecondsSinceAttacked > 600f && Interface.CallHook("OnDecayHeal", this) == null)
 				{
-					float num3 = num / decay.GetDecayDuration(this) * ConVar.Decay.upkeep_heal_scale;
-					Heal(MaxHealth() * num3);
+					float num2 = decayDeltaTime / GetEntityDecayDuration() * GetEntityHealScale();
+					Heal(MaxHealth() * num2);
 				}
 				return;
 			}
 			upkeepTimer = 1f;
 		}
-		decayTimer += num2;
-		if (decayTimer < decay.GetDecayDelay(this))
+		decayTimer += num;
+		if (decayTimer < GetEntityDecayDelay())
 		{
 			return;
 		}
 		using (TimeWarning.New("DecayTick"))
 		{
-			float num4 = 1f;
+			float num3 = 1f;
 			if (ConVar.Decay.upkeep)
 			{
 				if (!BypassInsideDecayMultiplier && !IsOutside())
 				{
-					num4 *= ConVar.Decay.upkeep_inside_decay_scale;
+					num3 *= ConVar.Decay.upkeep_inside_decay_scale;
 				}
 			}
 			else
@@ -287,14 +308,14 @@ public class DecayEntity : BaseCombatEntity
 					DecayPoint decayPoint = decayPoints[i];
 					if (decayPoint.IsOccupied(this))
 					{
-						num4 -= decayPoint.protection;
+						num3 -= decayPoint.protection;
 					}
 				}
 			}
-			if (num4 > 0f && Interface.CallHook("OnDecayDamage", this) == null)
+			if (Interface.CallHook("OnDecayDamage", this) == null && num3 > 0f)
 			{
-				float num5 = num2 / decay.GetDecayDuration(this) * MaxHealth();
-				Hurt(num5 * num4 * decayVariance, DamageType.Decay);
+				float num4 = num / GetEntityDecayDuration() * MaxHealth();
+				Hurt(num4 * num3 * decayVariance, DamageType.Decay);
 			}
 		}
 	}
@@ -309,12 +330,100 @@ public class DecayEntity : BaseCombatEntity
 	{
 		if (debrisPrefab.isValid)
 		{
-			BaseEntity baseEntity = GameManager.server.CreateEntity(debrisPrefab.resourcePath, base.transform.position, base.transform.rotation);
-			if ((bool)baseEntity)
+			if (DebrisPositions != null && DebrisPositions.Length != 0)
 			{
-				baseEntity.Spawn();
+				DebrisPosition[] debrisPositions = DebrisPositions;
+				for (int i = 0; i < debrisPositions.Length; i++)
+				{
+					DebrisPosition debrisPosition = debrisPositions[i];
+					SpawnDebris(debrisPosition.Position, Quaternion.Euler(debrisPosition.Rotation), debrisPosition.dropToTerrain);
+				}
+			}
+			else
+			{
+				SpawnDebris(Vector3.zero, Quaternion.Euler(debrisRotationOffset), dropToTerrain: false);
 			}
 		}
 		base.OnKilled(info);
+	}
+
+	private void SpawnDebris(Vector3 localPos, Quaternion rot, bool dropToTerrain)
+	{
+		if (Interface.CallHook("OnDebrisSpawn", this, localPos, rot, dropToTerrain) != null)
+		{
+			return;
+		}
+		Vector3 vector = base.transform.TransformPoint(localPos);
+		if (dropToTerrain && UnityEngine.Physics.Raycast(vector, Vector3.down, out var hitInfo, 6f, 8388608))
+		{
+			float num = vector.y - hitInfo.point.y;
+			vector.y = hitInfo.point.y;
+			localPos.y -= num;
+		}
+		List<DebrisEntity> obj = Facepunch.Pool.Get<List<DebrisEntity>>();
+		Vis.Entities(vector, 0.1f, obj, 256);
+		if (obj.Count > 0)
+		{
+			Facepunch.Pool.FreeUnmanaged(ref obj);
+			return;
+		}
+		BaseEntity baseEntity = GameManager.server.CreateEntity(debrisPrefab.resourcePath, base.transform.TransformPoint(localPos), base.transform.rotation * rot);
+		if ((bool)baseEntity)
+		{
+			baseEntity.SetParent(parentEntity.Get(serverside: true), worldPositionStays: true);
+			baseEntity.Spawn();
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	public override bool SupportsChildDeployables()
+	{
+		BaseEntity baseEntity = GetParentEntity();
+		if (!(baseEntity != null))
+		{
+			return false;
+		}
+		return baseEntity.ForceDeployableSetParent();
+	}
+
+	public override bool ForceDeployableSetParent()
+	{
+		BaseEntity baseEntity = GetParentEntity();
+		if (!(baseEntity != null))
+		{
+			return false;
+		}
+		return baseEntity.ForceDeployableSetParent();
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		info.msg.decayEntity = Facepunch.Pool.Get<ProtoBuf.DecayEntity>();
+		info.msg.decayEntity.buildingID = buildingID;
+		if (info.forDisk)
+		{
+			info.msg.decayEntity.decayTimer = decayTimer;
+			info.msg.decayEntity.upkeepTimer = upkeepTimer;
+		}
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (info.msg.decayEntity == null)
+		{
+			return;
+		}
+		decayTimer = info.msg.decayEntity.decayTimer;
+		upkeepTimer = info.msg.decayEntity.upkeepTimer;
+		if (buildingID != info.msg.decayEntity.buildingID)
+		{
+			AttachToBuilding(info.msg.decayEntity.buildingID);
+			if (info.fromDisk)
+			{
+				BuildingManager.server.LoadBuildingID(buildingID);
+			}
+		}
 	}
 }

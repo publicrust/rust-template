@@ -9,6 +9,8 @@ public class ConditionalModel : PrefabAttribute
 
 	public bool onServer = true;
 
+	public bool IsImportant;
+
 	[NonSerialized]
 	public ModelConditionTest[] conditions;
 
@@ -23,6 +25,18 @@ public class ConditionalModel : PrefabAttribute
 		for (int i = 0; i < conditions.Length; i++)
 		{
 			if (!conditions[i].DoTest(parent))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	public bool RunTestsExceptFoundationSide(BaseEntity parent)
+	{
+		for (int i = 0; i < conditions.Length; i++)
+		{
+			if (!(conditions[i] is ModelConditionTest_FoundationSide) && !conditions[i].DoTest(parent))
 			{
 				return false;
 			}

@@ -1,5 +1,9 @@
+using UnityEngine;
+
 public class MapMarkerMLRSRocket : MapMarker
 {
+	public RectTransform uiMarkerTransform;
+
 	public override void ServerInit()
 	{
 		base.ServerInit();
@@ -8,6 +12,6 @@ public class MapMarkerMLRSRocket : MapMarker
 
 	public override bool ShouldNetworkTo(BasePlayer player)
 	{
-		return player.userID == base.OwnerID;
+		return (ulong)player.userID == base.OwnerID;
 	}
 }

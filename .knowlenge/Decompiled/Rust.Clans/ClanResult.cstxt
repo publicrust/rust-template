@@ -1,0 +1,21 @@
+public enum ClanResult
+{
+	Fail,
+	Success,
+	Timeout,
+	NoClan,
+	NotFound,
+	NoPermission,
+	InvalidText,
+	InvalidLogo,
+	InvalidColor,
+	DuplicateName,
+	RoleNotEmpty,
+	CannotSwapLeader,
+	CannotDeleteLeader,
+	CannotKickLeader,
+	CannotDemoteLeader,
+	AlreadyInAClan,
+	CantModifyClanHere,
+	ClanIsFull
+}

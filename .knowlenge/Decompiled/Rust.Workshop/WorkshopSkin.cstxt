@@ -37,7 +37,9 @@ public class WorkshopSkin : MonoBehaviour
 
 	private ulong AppliedWorkshopID;
 
-	private Action OnRefresh;
+	private Action<Skin> OnRefresh;
+
+	private Action OnRefreshFail;
 
 	private Skin AppliedSkin;
 
@@ -118,17 +120,19 @@ public class WorkshopSkin : MonoBehaviour
 		return ItemCache[workshopId];
 	}
 
-	public static void Apply(GameObject gameobj, ulong workshopId, Action callback = null)
+	public static void Apply(GameObject gameobj, ulong workshopId, Action<Skin> callback = null, Action failureCallback = null)
 	{
-		if (PlatformService.Instance.IsValid)
+		if (!PlatformService.Instance.IsValid)
 		{
-			WorkshopSkin workshopSkin = gameobj.GetComponent<WorkshopSkin>();
-			if (workshopSkin == null)
-			{
-				workshopSkin = gameobj.AddComponent<WorkshopSkin>();
-			}
-			workshopSkin.Apply(workshopId, callback);
+			failureCallback?.Invoke();
+			return;
 		}
+		WorkshopSkin workshopSkin = gameobj.GetComponent<WorkshopSkin>();
+		if (workshopSkin == null)
+		{
+			workshopSkin = gameobj.AddComponent<WorkshopSkin>();
+		}
+		workshopSkin.Apply(workshopId, callback, failureCallback);
 	}
 
 	public static void Reset(GameObject gameobj)
@@ -157,13 +161,13 @@ public class WorkshopSkin : MonoBehaviour
 		}
 	}
 
-	private void Apply(ulong workshopId, Action callback = null)
+	private void Apply(ulong workshopId, Action<Skin> callback = null, Action failureCallback = null)
 	{
 		DequeueSkinRefresh(RequestedWorkshopID);
 		RequestedWorkshopID = workshopId;
 		OnRefresh = callback;
-		Skin val = null;
-		if (SkinCache.TryGetValue(workshopId, out val) && val.AssetsRequested && val.AssetsLoaded)
+		OnRefreshFail = failureCallback;
+		if (SkinCache.TryGetValue(workshopId, out var val) && val.AssetsRequested && val.AssetsLoaded)
 		{
 			ApplySkin(val, workshopId);
 		}
@@ -175,19 +179,21 @@ public class WorkshopSkin : MonoBehaviour
 
 	private void EnqueueSkinRefresh(ulong workshopId)
 	{
-		if (workshopId != 0L)
+		if (workshopId == 0L)
 		{
-			ListHashSet<WorkshopSkin> val = null;
-			if (!RefreshQueue.TryGetValue(workshopId, out val))
-			{
-				RefreshQueue.Add(workshopId, val = new ListHashSet<WorkshopSkin>());
-			}
-			val.Add(this);
-			LoadFromWorkshop(workshopId);
+			DoRefreshFailureCallback();
+			return;
 		}
+		ListHashSet<WorkshopSkin> val = null;
+		if (!RefreshQueue.TryGetValue(workshopId, out val))
+		{
+			RefreshQueue.Add(workshopId, val = new ListHashSet<WorkshopSkin>());
+		}
+		val.Add(this);
+		LoadFromWorkshop(workshopId, OnRefreshFail);
 	}
 
-	private static void LoadFromWorkshop(ulong workshopId)
+	private static void LoadFromWorkshop(ulong workshopId, Action failureCallback = null)
 	{
 	}
 
@@ -208,24 +214,24 @@ public class WorkshopSkin : MonoBehaviour
 		}
 	}
 
-	private static void LoadOrUnloadSkinAssets(ulong workshopId)
+	private static void LoadOrUnloadSkinAssets(ulong workshopId, Action failureCallback)
 	{
 		if (workshopId != 0L)
 		{
 			ItemQueue.Enqueue(workshopId);
 			if (ItemQueue.Count == 1)
 			{
-				Global.Runner.StartCoroutine(ItemQueueCoroutine());
+				Global.Runner.StartCoroutine(ItemQueueCoroutine(failureCallback));
 			}
 		}
 	}
 
-	private static IEnumerator ItemQueueCoroutine()
+	private static IEnumerator ItemQueueCoroutine(Action failureCallback)
 	{
 		while (ItemQueue.Count > 0)
 		{
 			ulong workshopId = ItemQueue.Peek();
-			yield return Global.Runner.StartCoroutine(LoadItem(workshopId));
+			yield return Global.Runner.StartCoroutine(LoadItem(workshopId, failureCallback));
 			ItemQueue.Dequeue();
 		}
 	}
@@ -240,7 +246,7 @@ public class WorkshopSkin : MonoBehaviour
 		}
 	}
 
-	private static IEnumerator LoadItem(ulong workshopId)
+	private static IEnumerator LoadItem(ulong workshopId, Action failureCallback)
 	{
 		int index = GetBundleIndex(workshopId);
 		AssetBundle assetBundle = bundles[index];
@@ -275,10 +281,12 @@ public class WorkshopSkin : MonoBehaviour
 			if (!itemInstallStarted)
 			{
 				UnityEngine.Debug.LogWarning("Skin download failed: " + workshopId);
+				failureCallback?.Invoke();
 			}
 			else if (!flag)
 			{
 				UnityEngine.Debug.LogWarning("Skin download timed out: " + workshopId);
+				failureCallback?.Invoke();
 			}
 		}
 		if (flag)
@@ -330,17 +338,39 @@ public class WorkshopSkin : MonoBehaviour
 
 	private void ApplySkin(Skin skin, ulong workshopId)
 	{
-		if ((bool)this && (bool)base.gameObject)
+		if (!this)
 		{
-			if (AllowApply)
-			{
-				skin.Apply(base.gameObject);
-				UpdateSkinReference(skin, workshopId);
-			}
-			if (OnRefresh != null)
-			{
-				OnRefresh();
-			}
+			DoRefreshFailureCallback();
+			return;
+		}
+		if (!base.gameObject)
+		{
+			DoRefreshFailureCallback();
+			return;
+		}
+		if (AllowApply)
+		{
+			skin.Apply(base.gameObject);
+			UpdateSkinReference(skin, workshopId);
+		}
+		DoRefreshSuccessCallback(skin);
+	}
+
+	private void DoRefreshSuccessCallback(Skin skin)
+	{
+		if (OnRefresh != null)
+		{
+			OnRefresh(skin);
+			OnRefresh = null;
+		}
+	}
+
+	private void DoRefreshFailureCallback()
+	{
+		if (OnRefreshFail != null)
+		{
+			OnRefreshFail();
+			OnRefreshFail = null;
 		}
 	}
 
@@ -360,7 +390,7 @@ public class WorkshopSkin : MonoBehaviour
 			else if (AppliedSkin.references == 0 && !RefreshQueue.Contains(AppliedWorkshopID) && AllowUnload && AppliedSkin.AssetsRequested)
 			{
 				AppliedSkin.AssetsRequested = false;
-				LoadOrUnloadSkinAssets(AppliedWorkshopID);
+				LoadOrUnloadSkinAssets(AppliedWorkshopID, OnRefreshFail);
 			}
 		}
 		AppliedSkin = skin;

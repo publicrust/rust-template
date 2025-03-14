@@ -26,6 +26,8 @@ public class SelectedBlueprint : SingletonComponent<SelectedBlueprint>, IInvento
 
 	public RustText CraftingAmount;
 
+	public GameObject TutorialCraftButtonHighlight;
+
 	public Sprite FavouriteOnSprite;
 
 	public Sprite FavouriteOffSprite;

@@ -1,0 +1,544 @@
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Threading.Tasks;
+using Facepunch.Nexus;
+using Facepunch.Nexus.Connector;
+using Facepunch.Nexus.Logging;
+using Facepunch.Nexus.Models;
+using Facepunch.Nexus.Time;
+
+public class NexusClan
+{
+	private const double RefreshInterval = 300.0;
+
+	private readonly NexusZoneClient _client;
+
+	private readonly INexusZoneConnector _zoneConnector;
+
+	private readonly IClockProvider _clockProvider;
+
+	private readonly INexusLogger _logger;
+
+	private readonly VariableContainer _variables;
+
+	private double _lastRefreshed;
+
+	public long ClanId { get; }
+
+	public string Name { get; private set; }
+
+	public long Created { get; private set; }
+
+	public string Creator { get; private set; }
+
+	public long Score { get; private set; }
+
+	public List<NexusClanRole> Roles { get; }
+
+	public List<NexusClanMember> Members { get; }
+
+	public int MaxMemberCount { get; private set; }
+
+	public List<ClanInvite> Invites { get; }
+
+	public IEnumerable<KeyValuePair<string, Variable>> Variables => _variables;
+
+	internal NexusClan(NexusZoneClient client, INexusZoneConnector zoneConnector, IClockProvider clockProvider, INexusLogger logger, long clanId)
+	{
+		ClanId = clanId;
+		Roles = new List<NexusClanRole>();
+		Members = new List<NexusClanMember>();
+		Invites = new List<ClanInvite>();
+		_client = client ?? throw new ArgumentNullException("client");
+		_zoneConnector = zoneConnector ?? throw new ArgumentNullException("zoneConnector");
+		_clockProvider = clockProvider ?? throw new ArgumentNullException("clockProvider");
+		_logger = logger ?? throw new ArgumentNullException("logger");
+		_variables = new VariableContainer();
+	}
+
+	internal bool UpdateFromModel(in ClanDetails details)
+	{
+		if (details.ClanId != ClanId)
+		{
+			throw new InvalidOperationException("Cannot update NexusClan with details from a different clan ID!");
+		}
+		lock (this)
+		{
+			bool changed = false;
+			Name = Util.Update<string>(Name, details.Name, ref changed);
+			Created = Util.Update<long>(Created, details.Created, ref changed);
+			Creator = Util.Update<string>(Creator, details.Creator, ref changed);
+			Score = Util.Update<long>(Score, details.Score, ref changed);
+			MaxMemberCount = Util.Update<int>(MaxMemberCount, details.MaxMemberCount, ref changed);
+			changed |= _variables.UpdateFromModel(details.Variables);
+			changed |= Roles.Resize(details.Roles.Count);
+			for (int i = 0; i < Roles.Count; i++)
+			{
+				NexusClanRole nexusClanRole = Roles[i];
+				if (nexusClanRole != null)
+				{
+					changed |= nexusClanRole.UpdateFromModel(details.Roles[i]);
+					continue;
+				}
+				Roles[i] = new NexusClanRole(details.Roles[i]);
+				changed = true;
+			}
+			changed |= Members.Resize(details.Members.Count);
+			for (int j = 0; j < Members.Count; j++)
+			{
+				NexusClanMember nexusClanMember = Members[j];
+				if (nexusClanMember != null)
+				{
+					changed |= nexusClanMember.UpdateFromModel(details.Members[j]);
+					continue;
+				}
+				Members[j] = new NexusClanMember(details.Members[j]);
+				changed = true;
+			}
+			changed |= Invites.Resize(details.Invites.Count);
+			for (int k = 0; k < Invites.Count; k++)
+			{
+				bool changed2 = false;
+				ClanInvite value = Invites[k];
+				ClanInvite clanInvite = details.Invites[k];
+				value.PlayerId = Util.Update<string>(value.PlayerId, clanInvite.PlayerId, ref changed2);
+				value.RecruiterPlayerId = Util.Update<string>(value.RecruiterPlayerId, clanInvite.RecruiterPlayerId, ref changed2);
+				value.Created = Util.Update<long>(value.Created, clanInvite.Created, ref changed2);
+				if (changed2)
+				{
+					Invites[k] = value;
+					changed = true;
+				}
+			}
+			_lastRefreshed = _clockProvider.Timestamp;
+			return changed;
+		}
+	}
+
+	internal void RefreshIfNeeded()
+	{
+		if (_clockProvider.Timestamp - _lastRefreshed > 300.0)
+		{
+			RefreshInBackground();
+		}
+	}
+
+	internal async void RefreshInBackground()
+	{
+		try
+		{
+			await Refresh();
+		}
+		catch (Exception exception)
+		{
+			_logger.LogError($"Failed to refresh clan ID {ClanId}", exception);
+		}
+	}
+
+	public async Task Refresh()
+	{
+		_lastRefreshed = _clockProvider.Timestamp;
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.GetClan(ClanId);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			_logger.LogWarn($"Clan ID {ClanId} was not found during a refresh, removing from cache");
+			_client.RemoveClan(ClanId);
+		}
+		else
+		{
+			apiResult.EnsureSuccessfulWithResponse();
+			ClanDetails details = apiResult.Response;
+			_client.UpsertClan(in details);
+		}
+	}
+
+	public bool TryGetVariable(string key, out Variable variable)
+	{
+		return _variables.TryGet(key, out variable);
+	}
+
+	public async Task<NexusClanResultCode> UpdateVariables(ClanVariablesUpdate update)
+	{
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.UpdateClanVariables(ClanId, update).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		if (apiResult.TryGetResponse(out var response))
+		{
+			_client.UpsertClan(in response);
+		}
+		return NexusClanResultCode.Success;
+	}
+
+	public async Task<NexusClanResultCode> UpdatePlayerVariables(string playerId, ClanVariablesUpdate update)
+	{
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.UpdatePlayerClanVariables(ClanId, playerId, update).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		if (apiResult.TryGetResponse(out var response))
+		{
+			_client.UpsertClan(in response);
+		}
+		return NexusClanResultCode.Success;
+	}
+
+	public async Task<NexusClanResult<List<ClanLogEntry>>> GetLogs(string byPlayerId, int limit = 100)
+	{
+		ApiResult<List<ClanLogEntry>> apiResult = await _zoneConnector.GetClanLogs(ClanId, byPlayerId, limit).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return new NexusClanResult<List<ClanLogEntry>>(NexusClanResultCode.NotFound);
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return new NexusClanResult<List<ClanLogEntry>>(NexusClanResultCode.NoPermission);
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return new NexusClanResult<List<ClanLogEntry>>(NexusClanResultCode.Fail);
+		}
+		apiResult.EnsureSuccessfulWithResponse();
+		return new NexusClanResult<List<ClanLogEntry>>(apiResult.Response);
+	}
+
+	public async Task<NexusClanResultCode> AddLog(string eventKey, string arg1 = null, string arg2 = null, string arg3 = null, string arg4 = null)
+	{
+		ApiResult apiResult = await _zoneConnector.AddClanLog(ClanId, eventKey, arg1, arg2, arg3, arg4).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		return apiResult.IsSuccess ? NexusClanResultCode.Success : NexusClanResultCode.Fail;
+	}
+
+	public async Task<NexusClanResult<List<ClanScoreEventEntry>>> GetScoreEvents(string byPlayerId, int limit = 100)
+	{
+		ApiResult<List<ClanScoreEventEntry>> apiResult = await _zoneConnector.GetClanScoreEvents(ClanId, byPlayerId, limit).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return new NexusClanResult<List<ClanScoreEventEntry>>(NexusClanResultCode.NotFound);
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return new NexusClanResult<List<ClanScoreEventEntry>>(NexusClanResultCode.NoPermission);
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return new NexusClanResult<List<ClanScoreEventEntry>>(NexusClanResultCode.Fail);
+		}
+		apiResult.EnsureSuccessfulWithResponse();
+		return new NexusClanResult<List<ClanScoreEventEntry>>(apiResult.Response);
+	}
+
+	public void AddScoreEvent(NewClanScoreEventEntry entry)
+	{
+		NexusZoneClient client = _client;
+		NewClanScoreEventBatchEntry entry2 = new NewClanScoreEventBatchEntry
+		{
+			ClanId = ClanId,
+			Type = entry.Type,
+			Score = entry.Score,
+			Multiplier = entry.Multiplier,
+			PlayerId = entry.PlayerId,
+			OtherClanId = entry.OtherClanId,
+			OtherPlayerId = entry.OtherPlayerId,
+			Arg1 = entry.Arg1,
+			Arg2 = entry.Arg2
+		};
+		client.EnqueueClanScoreEvent(in entry2);
+	}
+
+	public async Task<NexusClanResultCode> UpdateLastSeen(string playerId)
+	{
+		ApiResult apiResult = await _zoneConnector.UpdateLastSeen(ClanId, playerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		return apiResult.IsSuccess ? NexusClanResultCode.Success : NexusClanResultCode.Fail;
+	}
+
+	public async Task<NexusClanResultCode> Invite(string playerId, string byPlayerId)
+	{
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.CreateInvite(ClanId, playerId, byPlayerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return NexusClanResultCode.NoPermission;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Conflict)
+		{
+			return NexusClanResultCode.AlreadyInAClan;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.ExpectationFailed)
+		{
+			return NexusClanResultCode.ClanIsFull;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		if (apiResult.TryGetResponse(out var response))
+		{
+			_client.UpsertClan(in response);
+		}
+		return NexusClanResultCode.Success;
+	}
+
+	public async Task<NexusClanResultCode> CancelInvite(string playerId, string byPlayerId)
+	{
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.CancelInvite(ClanId, playerId, byPlayerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return NexusClanResultCode.NoPermission;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		if (apiResult.TryGetResponse(out var response))
+		{
+			_client.UpsertClan(in response);
+		}
+		return NexusClanResultCode.Success;
+	}
+
+	public async Task<NexusClanResultCode> AcceptInvite(string playerId)
+	{
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.AcceptInvite(ClanId, playerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return NexusClanResultCode.NoPermission;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Conflict)
+		{
+			return NexusClanResultCode.AlreadyInAClan;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.ExpectationFailed)
+		{
+			return NexusClanResultCode.ClanIsFull;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		if (apiResult.TryGetResponse(out var response))
+		{
+			_client.UpsertClan(in response);
+		}
+		return NexusClanResultCode.Success;
+	}
+
+	public async Task<NexusClanResultCode> Kick(string playerId, string byPlayerId)
+	{
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.Kick(ClanId, playerId, byPlayerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return NexusClanResultCode.NoPermission;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Conflict)
+		{
+			return NexusClanResultCode.CannotKickLeader;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		if (apiResult.TryGetResponse(out var response))
+		{
+			_client.UpsertClan(in response);
+		}
+		return NexusClanResultCode.Success;
+	}
+
+	public async Task<NexusClanResultCode> SetPlayerRole(string playerId, int newRoleId, string byPlayerId)
+	{
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.SetPlayerRole(ClanId, playerId, newRoleId, byPlayerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return NexusClanResultCode.NoPermission;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.ExpectationFailed)
+		{
+			return NexusClanResultCode.CannotDemoteLeader;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		if (apiResult.TryGetResponse(out var response))
+		{
+			_client.UpsertClan(in response);
+		}
+		return NexusClanResultCode.Success;
+	}
+
+	public async Task<NexusClanResultCode> CreateRole(ClanRoleParameters parameters, string byPlayerId)
+	{
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.CreateRole(ClanId, parameters, byPlayerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return NexusClanResultCode.NoPermission;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Conflict)
+		{
+			return NexusClanResultCode.DuplicateName;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		if (apiResult.TryGetResponse(out var response))
+		{
+			_client.UpsertClan(in response);
+		}
+		return NexusClanResultCode.Success;
+	}
+
+	public async Task<NexusClanResultCode> UpdateRole(int roleId, ClanRoleParameters parameters, string byPlayerId)
+	{
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.UpdateRole(ClanId, roleId, parameters, byPlayerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return NexusClanResultCode.NoPermission;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Conflict)
+		{
+			return NexusClanResultCode.DuplicateName;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		if (apiResult.TryGetResponse(out var response))
+		{
+			_client.UpsertClan(in response);
+		}
+		return NexusClanResultCode.Success;
+	}
+
+	public async Task<NexusClanResultCode> DeleteRole(int roleId, string byPlayerId)
+	{
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.DeleteRole(ClanId, roleId, byPlayerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return NexusClanResultCode.NoPermission;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Conflict)
+		{
+			return NexusClanResultCode.CannotDeleteLeader;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.ExpectationFailed)
+		{
+			return NexusClanResultCode.RoleNotEmpty;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		if (apiResult.TryGetResponse(out var response))
+		{
+			_client.UpsertClan(in response);
+		}
+		return NexusClanResultCode.Success;
+	}
+
+	public async Task<NexusClanResultCode> SwapRoleRanks(int roleIdA, int roleIdB, string byPlayerId)
+	{
+		ApiResult<ClanDetails> apiResult = await _zoneConnector.SwapRoleRanks(ClanId, roleIdA, roleIdB, byPlayerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return NexusClanResultCode.NoPermission;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.ExpectationFailed)
+		{
+			return NexusClanResultCode.CannotSwapLeader;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		if (apiResult.TryGetResponse(out var response))
+		{
+			_client.UpsertClan(in response);
+		}
+		return NexusClanResultCode.Success;
+	}
+
+	public async Task<NexusClanResultCode> Disband(string byPlayerId)
+	{
+		ApiResult apiResult = await _zoneConnector.DisbandClan(ClanId, byPlayerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return NexusClanResultCode.NotFound;
+		}
+		if (apiResult.StatusCode == HttpStatusCode.Forbidden)
+		{
+			return NexusClanResultCode.NoPermission;
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return NexusClanResultCode.Fail;
+		}
+		apiResult.EnsureSuccessful();
+		return NexusClanResultCode.Success;
+	}
+}

@@ -5,22 +5,24 @@ public class MissionObjective_FreeCrate : MissionObjective
 {
 	public int targetAmount;
 
-	public override void ObjectiveStarted(BasePlayer playerFor, int index, BaseMission.MissionInstance instance)
+	public override void MissionStarted(int index, BaseMission.MissionInstance instance, BasePlayer forPlayer)
 	{
-		base.ObjectiveStarted(playerFor, index, instance);
+		base.MissionStarted(index, instance, forPlayer);
+		instance.objectiveStatuses[index].progressCurrent = 0f;
+		instance.objectiveStatuses[index].progressTarget = targetAmount;
 	}
 
-	public override void ProcessMissionEvent(BasePlayer playerFor, BaseMission.MissionInstance instance, int index, BaseMission.MissionEventType type, string identifier, float amount)
+	public override void ProcessMissionEvent(BasePlayer playerFor, BaseMission.MissionInstance instance, int index, BaseMission.MissionEventType type, BaseMission.MissionEventPayload payload, float amount)
 	{
-		base.ProcessMissionEvent(playerFor, instance, index, type, identifier, amount);
-		if (!IsCompleted(index, instance) && CanProgress(index, instance) && type == BaseMission.MissionEventType.FREE_CRATE)
+		base.ProcessMissionEvent(playerFor, instance, index, type, payload, amount);
+		if (type == BaseMission.MissionEventType.FREE_CRATE && !IsCompleted(index, instance) && CanProgress(index, instance))
 		{
-			instance.objectiveStatuses[index].genericInt1 += (int)amount;
-			if (instance.objectiveStatuses[index].genericInt1 >= targetAmount)
+			instance.objectiveStatuses[index].progressCurrent += (int)amount;
+			if (instance.objectiveStatuses[index].progressCurrent >= (float)targetAmount)
 			{
 				CompleteObjective(index, instance, playerFor);
-				playerFor.MissionDirty();
 			}
+			playerFor.MissionDirty();
 		}
 	}
 

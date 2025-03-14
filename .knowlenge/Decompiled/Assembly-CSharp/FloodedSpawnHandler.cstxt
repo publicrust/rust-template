@@ -44,7 +44,7 @@ public static class FloodedSpawnHandler
 		float magnitude = vector.magnitude;
 		float distance = magnitude / 50f;
 		float num = RandomAngle();
-		float num2 = num + (float)Math.PI;
+		float num2 = num + MathF.PI;
 		Vector3 vector2 = TerrainMeta.Position + vector + Step(num, magnitude);
 		for (int i = 0; i < 50; i++)
 		{
@@ -81,6 +81,6 @@ public static class FloodedSpawnHandler
 
 	private static float RandomAngle()
 	{
-		return UnityEngine.Random.value * ((float)Math.PI * 2f);
+		return UnityEngine.Random.value * (MathF.PI * 2f);
 	}
 }

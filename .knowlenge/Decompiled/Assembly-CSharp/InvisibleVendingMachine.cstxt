@@ -1,5 +1,6 @@
-using System.Collections.Generic;
+using ConVar;
 using Facepunch;
+using ProtoBuf;
 using UnityEngine;
 
 public class InvisibleVendingMachine : NPCVendingMachine
@@ -8,22 +9,33 @@ public class InvisibleVendingMachine : NPCVendingMachine
 
 	public NPCVendingOrderManifest vmoManifest;
 
-	public NPCShopKeeper GetNPCShopKeeper()
+	public bool canRefreshOrders;
+
+	public EntityRef<NPCShopKeeper> cachedShopKeeper;
+
+	public const Flags HasAttachedShopkeeper = Flags.Reserved7;
+
+	private static ListHashSet<InvisibleVendingMachine> allMachines = new ListHashSet<InvisibleVendingMachine>();
+
+	public TimeUntil nextOrderRefresh;
+
+	protected override bool BlockOrderRefreshOnLoad => canRefreshOrders;
+
+	public static InvisibleVendingMachine GetMachineAtPosition(float tolerance, Vector3 position)
 	{
-		List<NPCShopKeeper> obj = Pool.GetList<NPCShopKeeper>();
-		Vis.Entities(base.transform.position, 2f, obj, 131072);
-		NPCShopKeeper result = null;
-		if (obj.Count > 0)
+		foreach (InvisibleVendingMachine allMachine in allMachines)
 		{
-			result = obj[0];
+			if (allMachine != null && allMachine.Distance(position) < tolerance)
+			{
+				return allMachine;
+			}
 		}
-		Pool.FreeList(ref obj);
-		return result;
+		return null;
 	}
 
 	public void KeeperLookAt(Vector3 pos)
 	{
-		NPCShopKeeper nPCShopKeeper = GetNPCShopKeeper();
+		NPCShopKeeper nPCShopKeeper = cachedShopKeeper.Get(base.isServer);
 		if (!(nPCShopKeeper == null))
 		{
 			nPCShopKeeper.SetAimDirection(Vector3Ex.Direction2D(pos, nPCShopKeeper.transform.position));
@@ -43,7 +55,7 @@ public class InvisibleVendingMachine : NPCVendingMachine
 	public override void CompletePendingOrder()
 	{
 		Effect.server.Run(buyEffect.resourcePath, base.transform.position, Vector3.up);
-		NPCShopKeeper nPCShopKeeper = GetNPCShopKeeper();
+		NPCShopKeeper nPCShopKeeper = cachedShopKeeper.Get(base.isServer);
 		if ((bool)nPCShopKeeper)
 		{
 			nPCShopKeeper.SignalBroadcast(Signal.Gesture, "victory");
@@ -68,6 +80,9 @@ public class InvisibleVendingMachine : NPCVendingMachine
 		{
 			info.msg.vendingMachine.vmoIndex = vmoManifest.GetIndex(vendingOrders);
 		}
+		info.msg.npcVendingMachine = Facepunch.Pool.Get<ProtoBuf.NPCVendingMachine>();
+		info.msg.npcVendingMachine.attachedNpc = cachedShopKeeper.uid;
+		info.msg.npcVendingMachine.nextRefresh = nextOrderRefresh;
 	}
 
 	public override void ServerInit()
@@ -77,26 +92,69 @@ public class InvisibleVendingMachine : NPCVendingMachine
 		{
 			Debug.LogError("VENDING ORDERS NOT FOUND! Did you forget to add these orders to the VMOManifest?");
 		}
+		if (canRefreshOrders)
+		{
+			nextOrderRefresh = Server.waterWellNpcSalesRefreshFrequency * 60f * 60f;
+			InvokeRepeating(CheckSellOrderRefresh, 30f, 30f);
+		}
+		allMachines.TryAdd(this);
+	}
+
+	internal override void DoServerDestroy()
+	{
+		base.DoServerDestroy();
+		allMachines.Remove(this);
+	}
+
+	public void CheckSellOrderRefresh()
+	{
+		if ((float)nextOrderRefresh < 0f)
+		{
+			nextOrderRefresh = Server.waterWellNpcSalesRefreshFrequency * 60f * 60f;
+			InstallFromVendingOrders();
+		}
+	}
+
+	public void SetAttachedNPC(NPCShopKeeper shopkeeper)
+	{
+		cachedShopKeeper.Set(shopkeeper);
+		SetFlag(Flags.Reserved7, shopkeeper != null);
+		SendNetworkUpdate();
+	}
+
+	public override bool CanBeLooted(BasePlayer player)
+	{
+		if (cachedShopKeeper.Get(base.isServer) == null)
+		{
+			return false;
+		}
+		return base.CanBeLooted(player);
+	}
+
+	protected override bool CanShop(BasePlayer bp)
+	{
+		if (base.CanShop(bp))
+		{
+			return cachedShopKeeper.Get(base.isServer) != null;
+		}
+		return false;
 	}
 
 	public override void Load(LoadInfo info)
 	{
 		base.Load(info);
-		if (!info.fromDisk || !(vmoManifest != null) || info.msg.vendingMachine == null)
+		if (info.fromDisk && vmoManifest != null && info.msg.vendingMachine != null)
 		{
-			return;
+			NPCVendingOrder fromIndex = vmoManifest.GetFromIndex(info.msg.vendingMachine.vmoIndex);
+			vendingOrders = fromIndex;
 		}
-		if (info.msg.vendingMachine.vmoIndex == -1 && TerrainMeta.Path.Monuments != null)
+		if (info.msg.npcVendingMachine != null)
 		{
-			foreach (MonumentInfo monument in TerrainMeta.Path.Monuments)
+			cachedShopKeeper.uid = info.msg.npcVendingMachine.attachedNpc;
+			if (base.isServer)
 			{
-				if (monument.displayPhrase.token.Contains("fish") && Vector3.Distance(monument.transform.position, base.transform.position) < 100f)
-				{
-					info.msg.vendingMachine.vmoIndex = 17;
-				}
+				nextOrderRefresh = info.msg.npcVendingMachine.nextRefresh;
 			}
 		}
-		NPCVendingOrder fromIndex = vmoManifest.GetFromIndex(info.msg.vendingMachine.vmoIndex);
-		vendingOrders = fromIndex;
 	}
 }

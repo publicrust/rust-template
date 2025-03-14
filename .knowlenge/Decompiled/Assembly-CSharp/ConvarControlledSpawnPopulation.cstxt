@@ -3,7 +3,7 @@ using UnityEngine;
 using UnityEngine.Assertions;
 
 [CreateAssetMenu(menuName = "Rust/Convar Controlled Spawn Population")]
-public class ConvarControlledSpawnPopulation : SpawnPopulation
+public class ConvarControlledSpawnPopulation : DensitySpawnPopulation
 {
 	[Header("Convars")]
 	public string PopulationConvar;

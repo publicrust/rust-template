@@ -1,49 +1,63 @@
 using Rust;
 using UnityEngine;
 
-public class ScrapTransportHelicopter : MiniCopter, TriggerHurtNotChild.IHurtTriggerUser
+public class ScrapTransportHelicopter : PlayerHelicopter, TriggerHurtNotChild.IHurtTriggerUser
 {
-	public Transform searchlightEye;
+	[SerializeField]
+	private Transform searchlightEye;
 
-	public BoxCollider parentTriggerCollider;
+	[SerializeField]
+	private BoxCollider parentTriggerCollider;
 
 	[Header("Damage Effects")]
-	public ParticleSystemContainer tailDamageLight;
+	[SerializeField]
+	private ParticleSystemContainer tailDamageLight;
 
-	public ParticleSystemContainer tailDamageHeavy;
+	[SerializeField]
+	private ParticleSystemContainer tailDamageHeavy;
 
-	public ParticleSystemContainer mainEngineDamageLight;
+	[SerializeField]
+	private ParticleSystemContainer mainEngineDamageLight;
 
-	public ParticleSystemContainer mainEngineDamageHeavy;
+	[SerializeField]
+	private ParticleSystemContainer mainEngineDamageHeavy;
 
-	public ParticleSystemContainer cockpitSparks;
+	[SerializeField]
+	private ParticleSystemContainer cockpitSparks;
 
-	public Transform tailDamageLightEffects;
+	[SerializeField]
+	private Transform tailDamageLightEffects;
 
-	public Transform mainEngineDamageLightEffects;
+	[SerializeField]
+	private Transform mainEngineDamageLightEffects;
 
-	public SoundDefinition damagedFireSoundDef;
+	[SerializeField]
+	private SoundDefinition damagedFireSoundDef;
 
-	public SoundDefinition damagedFireTailSoundDef;
+	[SerializeField]
+	private SoundDefinition damagedFireTailSoundDef;
 
-	public SoundDefinition damagedSparksSoundDef;
+	[SerializeField]
+	private SoundDefinition damagedSparksSoundDef;
 
-	private Sound damagedFireSound;
+	[SerializeField]
+	private float pilotRotorScale = 1.5f;
 
-	private Sound damagedFireTailSound;
-
-	private Sound damagedSparksSound;
-
-	public float pilotRotorScale = 1.5f;
-
-	public float compassOffset;
+	[SerializeField]
+	private float compassOffset;
 
 	[ServerVar(Help = "Population active on the server", ShowInAdminUI = true)]
-	public new static float population;
+	public static float population;
 
 	public const string PASSENGER_ACHIEVEMENT = "RUST_AIR";
 
 	public const int PASSENGER_ACHIEVEMENT_REQ_COUNT = 5;
+
+	public override void ServerInit()
+	{
+		base.ServerInit();
+		rigidBody.inertiaTensor = new Vector3(19082f, 14356f, 7940f);
+	}
 
 	public override void OnHealthChanged(float oldvalue, float newvalue)
 	{
@@ -56,11 +70,6 @@ public class ScrapTransportHelicopter : MiniCopter, TriggerHurtNotChild.IHurtTri
 	public void DelayedNetworking()
 	{
 		SendNetworkUpdate();
-	}
-
-	public override void OnAttacked(HitInfo info)
-	{
-		base.OnAttacked(info);
 	}
 
 	public override void OnFlagsChanged(Flags old, Flags next)
@@ -86,11 +95,6 @@ public class ScrapTransportHelicopter : MiniCopter, TriggerHurtNotChild.IHurtTri
 		{
 			GetDriver().GiveAchievement("RUST_AIR");
 		}
-	}
-
-	public override int StartingFuelUnits()
-	{
-		return 100;
 	}
 
 	public float GetDamageMultiplier(BaseEntity ent)

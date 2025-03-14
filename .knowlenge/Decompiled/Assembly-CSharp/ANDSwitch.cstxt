@@ -6,6 +6,25 @@ public class ANDSwitch : IOEntity
 
 	private int input2Amount;
 
+	public override int ConsumptionAmount()
+	{
+		return 0;
+	}
+
+	public override bool WantsPower(int inputIndex)
+	{
+		if (input1Amount == 0 || input2Amount == 0)
+		{
+			return false;
+		}
+		if (input1Amount == input2Amount)
+		{
+			return inputIndex == 0;
+		}
+		int num = ((input1Amount <= input2Amount) ? 1 : 0);
+		return inputIndex == num;
+	}
+
 	public override int GetPassthroughAmount(int outputSlot = 0)
 	{
 		if (input1Amount <= 0 || input2Amount <= 0)

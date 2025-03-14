@@ -1,6 +1,6 @@
 using UnityEngine;
 
-public class BucketVMFluidSim : MonoBehaviour
+public class BucketVMFluidSim : MonoBehaviour, IClientComponent
 {
 	public Animator waterbucketAnim;
 
@@ -15,20 +15,4 @@ public class BucketVMFluidSim : MonoBehaviour
 	public float targetWaterLevel;
 
 	public AudioSource waterSpill;
-
-	private float PlayerEyePitch;
-
-	private float turb_forward;
-
-	private float turb_side;
-
-	private Vector3 lastPosition;
-
-	protected Vector3 groundSpeedLast;
-
-	private Vector3 lastAngle;
-
-	protected Vector3 vecAngleSpeedLast;
-
-	private Vector3 initialPosition;
 }

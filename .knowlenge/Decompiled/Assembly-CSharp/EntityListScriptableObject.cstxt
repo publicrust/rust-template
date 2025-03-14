@@ -6,8 +6,7 @@ public class EntityListScriptableObject : ScriptableObject
 	[SerializeField]
 	public BaseEntity[] entities;
 
-	[SerializeField]
-	public bool whitelist;
+	public bool blockIfAny;
 
 	public bool IsInList(uint prefabId)
 	{

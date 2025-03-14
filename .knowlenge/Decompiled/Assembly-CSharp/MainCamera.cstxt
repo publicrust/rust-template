@@ -1,3 +1,4 @@
+using System;
 using UnityEngine;
 
 [ExecuteInEditMode]
@@ -6,6 +7,8 @@ public class MainCamera : RustCamera<MainCamera>
 	public static Camera mainCamera;
 
 	public static Transform mainCameraTransform;
+
+	public static Action PreCullCallback;
 
 	public static bool isValid
 	{

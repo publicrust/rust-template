@@ -15,10 +15,15 @@ public class ElectricalCombiner : IOEntity
 		return true;
 	}
 
+	public override int ConsumptionAmount()
+	{
+		return 0;
+	}
+
 	public override int GetPassthroughAmount(int outputSlot = 0)
 	{
 		int num = input1Amount + input2Amount + input3Amount;
-		Mathf.Clamp(num - 1, 0, num);
+		Mathf.Clamp(num, 0, num);
 		return num;
 	}
 

@@ -1,6 +1,6 @@
 public interface IIdealSlotEntity
 {
-	int GetIdealSlot(BasePlayer player, Item item);
+	int GetIdealSlot(BasePlayer player, ItemContainer container, Item item);
 
-	ItemContainerId GetIdealContainer(BasePlayer player, Item item, bool altMove);
+	ItemContainerId GetIdealContainer(BasePlayer player, Item item, ItemMoveModifier modifiers);
 }

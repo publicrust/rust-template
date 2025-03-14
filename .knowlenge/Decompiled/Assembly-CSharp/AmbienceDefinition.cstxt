@@ -46,4 +46,7 @@ public class AmbienceDefinition : ScriptableObject
 
 	[Horizontal(2, -1)]
 	public ValueRange snow = new ValueRange(0f, 1f);
+
+	[Horizontal(2, -1)]
+	public ValueRange waves = new ValueRange(0f, 10f);
 }

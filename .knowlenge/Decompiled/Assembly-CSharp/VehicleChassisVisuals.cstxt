@@ -1,6 +1,6 @@
 using UnityEngine;
 
-public abstract class VehicleChassisVisuals<T> : MonoBehaviour where T : BaseVehicle, VehicleChassisVisuals<T>.IClientWheelUser
+public abstract class VehicleChassisVisuals<T> : MonoBehaviour where T : BaseEntity, VehicleChassisVisuals<T>.IClientWheelUser
 {
 	public interface IClientWheelUser
 	{

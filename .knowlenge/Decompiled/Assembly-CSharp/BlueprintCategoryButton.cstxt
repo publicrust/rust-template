@@ -16,4 +16,6 @@ public class BlueprintCategoryButton : MonoBehaviour, IInventoryChanged
 	public SoundDefinition clickSound;
 
 	public SoundDefinition hoverSound;
+
+	public PingWidget tutorialHighlight;
 }

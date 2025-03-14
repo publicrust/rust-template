@@ -7,6 +7,8 @@ public class HorseBreed : ScriptableObject
 
 	public Translate.Phrase breedDesc;
 
+	public Sprite trophyHeadSprite;
+
 	public Material[] materialOverrides;
 
 	public float maxHealth = 1f;

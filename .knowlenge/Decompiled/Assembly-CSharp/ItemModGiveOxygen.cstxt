@@ -57,7 +57,7 @@ public class ItemModGiveOxygen : ItemMod, IAirSupply
 		{
 			Effect.server.Run((!inhaled) ? inhaleEffect.resourcePath : exhaleEffect.resourcePath, player, StringPool.Get("jaw"), Vector3.zero, Vector3.forward);
 			inhaled = !inhaled;
-			if (!inhaled && WaterLevel.GetWaterDepth(player.eyes.position, player) > 3f)
+			if (!inhaled && WaterLevel.GetWaterDepth(player.eyes.position, waves: true, volumes: true, player) > 3f)
 			{
 				Effect.server.Run(bubblesEffect.resourcePath, player, StringPool.Get("jaw"), Vector3.zero, Vector3.forward);
 			}

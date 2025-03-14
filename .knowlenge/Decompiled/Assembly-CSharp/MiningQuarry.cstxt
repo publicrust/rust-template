@@ -42,6 +42,10 @@ public class MiningQuarry : BaseResourceExtractor
 
 	public int scrollMatIndex = 3;
 
+	public float animatorSpeedChange = 1f;
+
+	public float beltScrollSpeedMultiplier = 1f;
+
 	public SoundPlayer[] onSounds;
 
 	public float processRate = 5f;
@@ -228,7 +232,7 @@ public class MiningQuarry : BaseResourceExtractor
 		{
 			return true;
 		}
-		Item item = fuelStoragePrefab.instance.GetComponent<StorageContainer>().inventory.FindItemsByItemName("diesel_barrel");
+		Item item = fuelStoragePrefab.instance.GetComponent<StorageContainer>().inventory.FindItemByItemName("diesel_barrel");
 		object obj = Interface.CallHook("OnQuarryConsumeFuel", this, item);
 		if (obj is Item)
 		{
@@ -276,9 +280,5 @@ public class MiningQuarry : BaseResourceExtractor
 			hopperPrefab.instance.GetComponent<StorageContainer>().inventory.Load(info.msg.miningQuarry.extractor.outputContents);
 			staticType = (QuarryType)info.msg.miningQuarry.staticType;
 		}
-	}
-
-	public void Update()
-	{
 	}
 }

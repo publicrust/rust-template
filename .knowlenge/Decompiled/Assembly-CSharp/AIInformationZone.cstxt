@@ -1,11 +1,14 @@
 using System;
 using System.Collections.Generic;
 using ConVar;
+using Unity.AI.Navigation;
 using UnityEngine;
 using UnityEngine.AI;
 
 public class AIInformationZone : BaseMonoBehaviour, IServerComponent
 {
+	public bool RenderBounds;
+
 	public bool ShouldSleepAI;
 
 	public bool Virtual;
@@ -28,7 +31,12 @@ public class AIInformationZone : BaseMonoBehaviour, IServerComponent
 
 	public Bounds bounds;
 
+	public bool SetMovePointTerrainYOnEnable;
+
 	private AIInformationGrid grid;
+
+	[ServerVar]
+	public static bool UseSimpleLOSCheck = false;
 
 	private List<IAISleepable> sleepables = new List<IAISleepable>();
 
@@ -129,18 +137,56 @@ public class AIInformationZone : BaseMonoBehaviour, IServerComponent
 		Init();
 	}
 
+	private void OnEnable()
+	{
+		Init();
+		if (SetMovePointTerrainYOnEnable)
+		{
+			SetMovePointsY(8454144, 4f, 8f, 0f);
+		}
+	}
+
+	private void OnDisable()
+	{
+		if (zones != null)
+		{
+			zones.Remove(this);
+		}
+	}
+
 	public void Init()
 	{
+		areaBox = new OBB(base.transform.position, base.transform.lossyScale, base.transform.rotation, bounds);
+		if (!zones.Contains(this))
+		{
+			zones.Add(this);
+		}
 		if (!initd)
 		{
 			initd = true;
 			AddInitialPoints();
-			areaBox = new OBB(base.transform.position, base.transform.lossyScale, base.transform.rotation, bounds);
-			zones.Add(this);
 			grid = GetComponent<AIInformationGrid>();
 			if (grid != null)
 			{
 				grid.Init();
+			}
+		}
+	}
+
+	private void SetMovePointsY(int layerMask, float yStartOffset, float yDistance, float localYDefault)
+	{
+		foreach (AIMovePoint movePoint in movePoints)
+		{
+			if (!(movePoint == null))
+			{
+				if (UnityEngine.Physics.Raycast(movePoint.transform.position + Vector3.up * yStartOffset, Vector3.down, out var hitInfo, yDistance, layerMask))
+				{
+					movePoint.transform.position = hitInfo.point + Vector3.up * 0.1f;
+				}
+				else
+				{
+					movePoint.transform.localPosition = new Vector3(movePoint.transform.localPosition.x, localYDefault, movePoint.transform.localPosition.z);
+				}
 			}
 		}
 	}
@@ -393,13 +439,6 @@ public class AIInformationZone : BaseMonoBehaviour, IServerComponent
 		return areaBox.ClosestPoint(target);
 	}
 
-	public void OnDrawGizmos()
-	{
-		Gizmos.matrix = base.transform.localToWorldMatrix;
-		Gizmos.color = new Color(1f, 0f, 0f, 0.5f);
-		Gizmos.DrawCube(bounds.center, bounds.size);
-	}
-
 	public void AddInitialPoints()
 	{
 		AICoverPoint[] componentsInChildren = base.transform.GetComponentsInChildren<AICoverPoint>();
@@ -542,14 +581,18 @@ public class AIInformationZone : BaseMonoBehaviour, IServerComponent
 		return areaBox.Contains(point);
 	}
 
-	public AIMovePoint GetBestMovePointNear(Vector3 targetPosition, Vector3 fromPosition, float minRange, float maxRange, bool checkLOS = false, BaseEntity forObject = null, bool returnClosest = false)
+	public AIMovePoint GetBestMovePointNear(BaseEntity targetEntity, BaseEntity fromEntity, float minRange, float maxRange, bool checkLOS = false, BaseEntity forObject = null, bool returnClosest = false, bool returnRandom = false)
 	{
+		if (targetEntity == null || fromEntity == null)
+		{
+			return null;
+		}
 		AIPoint aIPoint = null;
 		AIPoint aIPoint2 = null;
 		float num = -1f;
 		float num2 = float.PositiveInfinity;
 		int pointCount;
-		AIPoint[] movePointsInRange = GetMovePointsInRange(targetPosition, maxRange, out pointCount);
+		AIPoint[] movePointsInRange = GetMovePointsInRange(targetEntity.transform.position, maxRange, out pointCount);
 		if (movePointsInRange == null || pointCount <= 0)
 		{
 			return null;
@@ -557,28 +600,56 @@ public class AIInformationZone : BaseMonoBehaviour, IServerComponent
 		for (int i = 0; i < pointCount; i++)
 		{
 			AIPoint aIPoint3 = movePointsInRange[i];
-			if (!aIPoint3.transform.parent.gameObject.activeSelf || (!(fromPosition.y < WaterSystem.OceanLevel) && aIPoint3.transform.position.y < WaterSystem.OceanLevel))
+			if (!aIPoint3.transform.parent.gameObject.activeSelf || (!(fromEntity.transform.position.y < WaterSystem.OceanLevel) && aIPoint3.transform.position.y < WaterSystem.OceanLevel))
 			{
 				continue;
 			}
 			float num3 = 0f;
 			Vector3 position = aIPoint3.transform.position;
-			float num4 = Vector3.Distance(targetPosition, position);
+			float num4 = Vector3.Distance(targetEntity.transform.position, position);
 			if (num4 < num2)
 			{
 				aIPoint2 = aIPoint3;
 				num2 = num4;
 			}
-			if (!(num4 > maxRange))
+			if (num4 > maxRange)
 			{
-				num3 += (aIPoint3.CanBeUsedBy(forObject) ? 100f : 0f);
-				num3 += (1f - Mathf.InverseLerp(minRange, maxRange, num4)) * 100f;
-				if (!(num3 < num) && (!checkLOS || !UnityEngine.Physics.Linecast(targetPosition + Vector3.up * 1f, position + Vector3.up * 1f, 1218519297, QueryTriggerInteraction.Ignore)) && num3 > num)
+				continue;
+			}
+			num3 += (aIPoint3.CanBeUsedBy(forObject) ? 100f : 0f);
+			num3 += (1f - Mathf.InverseLerp(minRange, maxRange, num4)) * 100f;
+			if (num3 < num)
+			{
+				continue;
+			}
+			if (checkLOS)
+			{
+				BasePlayer basePlayer = targetEntity as BasePlayer;
+				HumanNPC humanNPC = fromEntity as HumanNPC;
+				bool flag;
+				if (!UseSimpleLOSCheck && basePlayer != null && humanNPC != null)
 				{
-					aIPoint = aIPoint3;
-					num = num3;
+					Vector3 fromOffset = position - humanNPC.transform.position;
+					flag = humanNPC.CanSeeTarget(basePlayer, fromOffset);
+				}
+				else
+				{
+					flag = !UnityEngine.Physics.Linecast(targetEntity.transform.position + Vector3.up, position + Vector3.up, 1218519297, QueryTriggerInteraction.Ignore);
+				}
+				if (!flag)
+				{
+					continue;
 				}
 			}
+			if (num3 > num)
+			{
+				aIPoint = aIPoint3;
+				num = num3;
+			}
+		}
+		if (aIPoint == null && returnRandom)
+		{
+			return movePointsInRange[UnityEngine.Random.Range(0, movePointsInRange.Length)] as AIMovePoint;
 		}
 		if (aIPoint == null && returnClosest)
 		{

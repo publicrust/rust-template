@@ -21,8 +21,8 @@ public class CardTable : BaseCardGameEntity
 		}
 	}
 
-	[Header("Card Table")]
 	[SerializeField]
+	[Header("Card Table")]
 	private ViewModel viewModel;
 
 	[SerializeField]

@@ -1,5 +1,6 @@
 using Facepunch;
 using ProtoBuf;
+using UnityEngine;
 
 public class PercentFullStorageContainer : StorageContainer
 {
@@ -40,14 +41,14 @@ public class PercentFullStorageContainer : StorageContainer
 	public override void Load(LoadInfo info)
 	{
 		base.Load(info);
-		_ = info.msg.simpleFloat;
+		_ = info.msg.simpleInt;
 	}
 
 	public override void Save(SaveInfo info)
 	{
 		base.Save(info);
-		info.msg.simpleFloat = Pool.Get<SimpleFloat>();
-		info.msg.simpleFloat.value = GetPercentFull();
+		info.msg.simpleInt = Pool.Get<SimpleInt>();
+		info.msg.simpleInt.value = Mathf.CeilToInt(GetPercentFull() * 100f);
 	}
 
 	protected override void OnInventoryDirty()

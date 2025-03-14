@@ -4,14 +4,17 @@ using UnityEngine;
 [Serializable]
 public struct SubsurfaceProfileData
 {
-	[Range(0.1f, 50f)]
+	[Range(0.1f, 100f)]
 	public float ScatterRadius;
 
-	[ColorUsage(false, true, 1f, 1f, 1f, 1f)]
+	[ColorUsage(false, false)]
 	public Color SubsurfaceColor;
 
-	[ColorUsage(false, true, 1f, 1f, 1f, 1f)]
+	[ColorUsage(false, false)]
 	public Color FalloffColor;
+
+	[ColorUsage(false, true)]
+	public Color TransmissionTint;
 
 	public static SubsurfaceProfileData Default
 	{
@@ -21,6 +24,7 @@ public struct SubsurfaceProfileData
 			result.ScatterRadius = 1.2f;
 			result.SubsurfaceColor = new Color(0.48f, 0.41f, 0.28f);
 			result.FalloffColor = new Color(1f, 0.37f, 0.3f);
+			result.TransmissionTint = new Color(0.48f, 0.41f, 0.28f);
 			return result;
 		}
 	}
@@ -33,6 +37,7 @@ public struct SubsurfaceProfileData
 			result.ScatterRadius = 0f;
 			result.SubsurfaceColor = Color.clear;
 			result.FalloffColor = Color.clear;
+			result.TransmissionTint = Color.clear;
 			return result;
 		}
 	}

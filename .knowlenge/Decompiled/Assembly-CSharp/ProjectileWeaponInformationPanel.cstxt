@@ -9,4 +9,8 @@ public class ProjectileWeaponInformationPanel : ItemInformationPanel
 	public ItemStatValue accuracyDisplay;
 
 	public ItemStatValue rangeDisplay;
+
+	public ItemStatValue minigunMoveDisplay;
+
+	public ItemIcon[] attachmentIcons;
 }

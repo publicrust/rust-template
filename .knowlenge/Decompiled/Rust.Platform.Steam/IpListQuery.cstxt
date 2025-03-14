@@ -1,0 +1,98 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Rust.Platform.Steam;
+using Steamworks.Data;
+using Steamworks.ServerList;
+
+internal class IpListQuery : IServerQuery, IDisposable
+{
+	private readonly List<string> _ips;
+
+	private readonly CancellationTokenSource _cts;
+
+	private readonly List<(string Key, string Value)> _filters;
+
+	private readonly Action<Steamworks.Data.ServerInfo> _serverFoundHandler;
+
+	public IReadOnlyList<ServerInfo> Servers { get; }
+
+	public event Action<ServerInfo> OnServerFound;
+
+	public IpListQuery(IEnumerable<string> list)
+	{
+		IpListQuery ipListQuery = this;
+		if (list == null)
+		{
+			throw new ArgumentNullException("list");
+		}
+		_ips = new List<string>(list);
+		_cts = new CancellationTokenSource();
+		_filters = new List<(string, string)>();
+		List<ServerInfo> serverList = new List<ServerInfo>();
+		Servers = serverList;
+		HashSet<(uint, int)> foundServers = new HashSet<(uint, int)>();
+		_serverFoundHandler = delegate(Steamworks.Data.ServerInfo server)
+		{
+			ServerInfo serverInfo = SteamPlatform.ToPlatformServer(server);
+			if (foundServers.Add((server.AddressRaw, server.QueryPort)))
+			{
+				serverList.Add(serverInfo);
+				ipListQuery.OnServerFound?.Invoke(serverInfo);
+			}
+		};
+	}
+
+	public void Dispose()
+	{
+		_cts.Cancel();
+	}
+
+	public void AddFilter(string key, string value)
+	{
+		_filters.Add((key, value));
+	}
+
+	public async Task RunQueryAsync(double timeoutSeconds = 10.0)
+	{
+		if (_ips == null || _ips.Count == 0)
+		{
+			return;
+		}
+		List<string> source = _ips.ToList();
+		List<(string, string)> filters = _filters.ToList();
+		int count = 5;
+		int num = 0;
+		List<Task> list = new List<Task>();
+		while (!_cts.Token.IsCancellationRequested)
+		{
+			List<string> list2 = source.Skip(num).Take(count).ToList();
+			if (list2.Count == 0)
+			{
+				break;
+			}
+			list.Add(QueryServers(list2, filters, timeoutSeconds));
+			num += list2.Count;
+		}
+		await Task.WhenAll(list);
+	}
+
+	private async Task QueryServers(List<string> servers, List<(string Key, string Value)> filters, double timeoutSeconds)
+	{
+		using Internet query = new Internet();
+		foreach (var (key, value) in filters)
+		{
+			query.AddFilter(key, value);
+		}
+		query.AddFilter("or", (servers.Count * 2).ToString());
+		foreach (string server in servers)
+		{
+			query.AddFilter("gameaddr", server);
+			query.AddFilter("addr", server);
+		}
+		query.OnResponsiveServer += _serverFoundHandler;
+		await query.RunQueryAsync((float)timeoutSeconds);
+	}
+}

@@ -1,18 +1,22 @@
 using System;
 using System.IO;
 using System.Text;
+using System.Threading;
 using Facepunch;
 using Facepunch.Extend;
 using Network;
+using SilentOrbit.ProtocolBuffers;
 using UnityEngine;
 
-public class NetRead : Stream, Pool.IPooled
+public class NetRead : Stream, Pool.IPooled, IStreamReader
 {
 	public byte[] Data;
 
 	private int _length;
 
 	private int _position;
+
+	public int refCount;
 
 	public ulong guid;
 
@@ -48,6 +52,36 @@ public class NetRead : Stream, Pool.IPooled
 
 	public override bool CanSeek => true;
 
+	public void AddReference()
+	{
+		Interlocked.Increment(ref refCount);
+	}
+
+	public void RemoveReference()
+	{
+		if (Interlocked.Decrement(ref refCount) == 0)
+		{
+			NetRead obj = this;
+			Pool.Free(ref obj);
+		}
+	}
+
+	private unsafe bool Init(IntPtr data, int length)
+	{
+		if (length > 6291456)
+		{
+			throw new Exception($"Packet was too large (max is {6291456})");
+		}
+		EnsureCapacity(length);
+		SetLength(length);
+		Position = 0L;
+		fixed (byte* data2 = Data)
+		{
+			Buffer.MemoryCopy((void*)data, data2, Data.Length, length);
+		}
+		return true;
+	}
+
 	public void EnterPool()
 	{
 		connection = null;
@@ -60,6 +94,7 @@ public class NetRead : Stream, Pool.IPooled
 
 	public void LeavePool()
 	{
+		refCount = 1;
 	}
 
 	public bool Start(ulong guid, string ipaddress, IntPtr data, int length)
@@ -94,35 +129,19 @@ public class NetRead : Stream, Pool.IPooled
 		return Init(data, length);
 	}
 
-	private unsafe bool Init(IntPtr data, int length)
+	public string String(int maxLength = 256, bool variableLength = false)
 	{
-		if (length > 6291456)
-		{
-			throw new Exception($"Packet was too large (max is {6291456})");
-		}
-		EnsureCapacity(length);
-		SetLength(length);
-		Position = 0L;
-		fixed (byte* data2 = Data)
-		{
-			Buffer.MemoryCopy((void*)data, data2, Data.Length, length);
-		}
-		return true;
+		return StringInternal(maxLength, allowNewLine: false, variableLength);
 	}
 
-	public string String(int maxLength = 256)
+	public string StringMultiLine(int maxLength = 2048, bool variableLength = false)
 	{
-		return StringInternal(maxLength, allowNewLine: false);
+		return StringInternal(maxLength, allowNewLine: true, variableLength);
 	}
 
-	public string StringMultiLine(int maxLength = 2048)
+	private string StringInternal(int maxLength, bool allowNewLine, bool variableLength = false)
 	{
-		return StringInternal(maxLength, allowNewLine: true);
-	}
-
-	private string StringInternal(int maxLength, bool allowNewLine)
-	{
-		int num = BytesWithSize(byteBuffer, 8388608u);
+		int num = BytesWithSize(byteBuffer, 8388608u, variableLength);
 		if (num <= 0)
 		{
 			return string.Empty;
@@ -143,14 +162,16 @@ public class NetRead : Stream, Pool.IPooled
 		return new string(charBuffer, 0, num2);
 	}
 
-	public string StringRaw(uint maxLength = 8388608u)
+	public string StringRaw(int maxLength = 8388608, bool variableLength = false)
 	{
-		int num = BytesWithSize(byteBuffer, maxLength);
-		if (num <= 0)
+		int num = (int)(variableLength ? VarUInt32() : UInt32());
+		if (num <= 0 || num > maxLength)
 		{
 			return string.Empty;
 		}
-		return Encoding.UTF8.GetString(byteBuffer, 0, num);
+		string @string = Encoding.UTF8.GetString(Data, (int)Position, num);
+		Position += num;
+		return @string;
 	}
 
 	public bool TemporaryBytesWithSize(out byte[] buffer, out int size)
@@ -194,9 +215,9 @@ public class NetRead : Stream, Pool.IPooled
 		return UInt32();
 	}
 
-	public int BytesWithSize(byte[] buffer, uint maxLength = uint.MaxValue)
+	public int BytesWithSize(byte[] buffer, uint maxLength = uint.MaxValue, bool variableLength = false)
 	{
-		uint num = UInt32();
+		uint num = (variableLength ? VarUInt32() : UInt32());
 		if (num == 0)
 		{
 			return 0;
@@ -212,9 +233,9 @@ public class NetRead : Stream, Pool.IPooled
 		return (int)num;
 	}
 
-	public byte[] BytesWithSize(uint maxSize = 10485760u)
+	public byte[] BytesWithSize(uint maxSize = 10485760u, bool variableLength = false)
 	{
-		uint num = UInt32();
+		uint num = (variableLength ? VarUInt32() : UInt32());
 		if (num == 0)
 		{
 			return null;
@@ -229,6 +250,22 @@ public class NetRead : Stream, Pool.IPooled
 			return null;
 		}
 		return array;
+	}
+
+	public ArraySegment<byte> PooledBytes(uint maxSize = 6291456u, bool variableLength = false)
+	{
+		uint num = (variableLength ? VarUInt32() : UInt32());
+		if (num == 0)
+		{
+			return default(ArraySegment<byte>);
+		}
+		int num2 = (int)Position;
+		if (num > maxSize || num2 + num > Data.Length)
+		{
+			return default(ArraySegment<byte>);
+		}
+		Seek(num, SeekOrigin.Current);
+		return new ArraySegment<byte>(Data, num2, (int)num);
 	}
 
 	public override int ReadByte()
@@ -282,6 +319,11 @@ public class NetRead : Stream, Pool.IPooled
 	public byte PeekPacketID()
 	{
 		return Peek<byte>();
+	}
+
+	public bool Bool()
+	{
+		return UInt8() != 0;
 	}
 
 	public bool Bit()
@@ -339,9 +381,22 @@ public class NetRead : Stream, Pool.IPooled
 		return Read<double>();
 	}
 
+	public uint VarUInt32()
+	{
+		int length;
+		uint result = ProtocolParser.ReadUInt32(Data, (int)Position, out length);
+		_position += length;
+		return result;
+	}
+
 	public Vector3 Vector3()
 	{
 		return Read<Vector3>();
+	}
+
+	public Vector4 Vector4()
+	{
+		return Read<Vector4>();
 	}
 
 	public Quaternion Quaternion()
@@ -357,6 +412,11 @@ public class NetRead : Stream, Pool.IPooled
 	public Color Color()
 	{
 		return Read<Color>();
+	}
+
+	public Color32 Color32()
+	{
+		return Read<Color32>();
 	}
 
 	public unsafe override int Read(byte[] buffer, int offset, int count)

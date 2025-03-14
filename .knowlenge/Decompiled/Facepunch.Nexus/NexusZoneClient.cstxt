@@ -1,0 +1,640 @@
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using Facepunch.Nexus;
+using Facepunch.Nexus.Connector;
+using Facepunch.Nexus.Logging;
+using Facepunch.Nexus.Models;
+using Facepunch.Nexus.Time;
+using Newtonsoft.Json;
+
+public sealed class NexusZoneClient : BaseNexusClient
+{
+	private readonly INexusLogger _logger;
+
+	private readonly INexusZoneConnector _connector;
+
+	private readonly INexusSocketConnector _socket;
+
+	private readonly IClockProvider _clock;
+
+	private readonly VariableContainer _nexusVariables;
+
+	private readonly VariableContainer _zoneVariables;
+
+	private readonly CachedValue<ZoneDetails> _cachedZoneInfo;
+
+	private readonly CachedValue<NexusDetails> _cachedNexusInfo;
+
+	private readonly Dictionary<string, NexusPlayer> _players;
+
+	private readonly Dictionary<long, NexusClan> _clans;
+
+	private readonly Queue<NewClanScoreEventBatchEntry> _scoreEventQueue;
+
+	private readonly List<NewClanScoreEventBatchEntry> _scoreEventBatch;
+
+	private bool _submittingScoreEventsBatch;
+
+	public INexusClanEventListener ClanEventListener { get; set; }
+
+	public ZoneDetails Zone { get; private set; }
+
+	public NexusDetails Nexus { get; private set; }
+
+	public async ValueTask<NexusClanResult<NexusClan>> GetClan(long clanId)
+	{
+		AssertInitialized();
+		lock (_clans)
+		{
+			if (_clans.TryGetValue(clanId, out var value))
+			{
+				return new NexusClanResult<NexusClan>(value);
+			}
+		}
+		ApiResult<ClanDetails> apiResult = await _connector.GetClan(clanId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return new NexusClanResult<NexusClan>(NexusClanResultCode.NotFound);
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return new NexusClanResult<NexusClan>(NexusClanResultCode.Fail);
+		}
+		apiResult.EnsureSuccessfulWithResponse();
+		NexusClan response = UpsertClan(apiResult.Response);
+		return new NexusClanResult<NexusClan>(response);
+	}
+
+	public async ValueTask<NexusClanResult<NexusClan>> GetClanByMember(string playerId)
+	{
+		AssertInitialized();
+		ApiResult<ClanDetails> apiResult = await _connector.GetClanByMember(playerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.NotFound)
+		{
+			return new NexusClanResult<NexusClan>(NexusClanResultCode.NoClan);
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return new NexusClanResult<NexusClan>(NexusClanResultCode.Fail);
+		}
+		apiResult.EnsureSuccessfulWithResponse();
+		NexusClan response = UpsertClan(apiResult.Response);
+		return new NexusClanResult<NexusClan>(response);
+	}
+
+	public bool TryGetClan(long clanId, out NexusClan clan)
+	{
+		AssertInitialized();
+		lock (_clans)
+		{
+			return _clans.TryGetValue(clanId, out clan);
+		}
+	}
+
+	public async ValueTask<NexusClanResult<NexusClan>> CreateClan(ClanCreateParameters parameters)
+	{
+		AssertInitialized();
+		ApiResult<ClanDetails> apiResult = await _connector.CreateClan(parameters).ConfigureAwait(continueOnCapturedContext: false);
+		if (apiResult.StatusCode == HttpStatusCode.Conflict)
+		{
+			return new NexusClanResult<NexusClan>(NexusClanResultCode.DuplicateName);
+		}
+		if (apiResult.StatusCode == HttpStatusCode.ExpectationFailed)
+		{
+			return new NexusClanResult<NexusClan>(NexusClanResultCode.AlreadyInAClan);
+		}
+		if (!apiResult.IsSuccess)
+		{
+			return new NexusClanResult<NexusClan>(NexusClanResultCode.Fail);
+		}
+		apiResult.EnsureSuccessfulWithResponse();
+		NexusClan response = UpsertClan(apiResult.Response);
+		return new NexusClanResult<NexusClan>(response);
+	}
+
+	public async ValueTask<NexusClanResult<List<ClanInvitation>>> ListClanInvitations(string playerId)
+	{
+		AssertInitialized();
+		ApiResult<List<ClanInvitation>> apiResult = await _connector.ListInvitations(playerId).ConfigureAwait(continueOnCapturedContext: false);
+		if (!apiResult.IsSuccess)
+		{
+			return new NexusClanResult<List<ClanInvitation>>(NexusClanResultCode.Fail);
+		}
+		return new NexusClanResult<List<ClanInvitation>>(apiResult.Response);
+	}
+
+	public async ValueTask<NexusClanResult<List<ClanLeaderboardEntry>>> GetClanLeaderboard(int limit = 100)
+	{
+		AssertInitialized();
+		ApiResult<List<ClanLeaderboardEntry>> apiResult = await _connector.GetClanLeaderboard(limit).ConfigureAwait(continueOnCapturedContext: false);
+		if (!apiResult.IsSuccess)
+		{
+			return new NexusClanResult<List<ClanLeaderboardEntry>>(NexusClanResultCode.Fail);
+		}
+		return new NexusClanResult<List<ClanLeaderboardEntry>>(apiResult.Response);
+	}
+
+	internal void EnqueueClanScoreEvent(in NewClanScoreEventBatchEntry entry)
+	{
+		lock (_scoreEventQueue)
+		{
+			_scoreEventQueue.Enqueue(entry);
+		}
+	}
+
+	private void UpdateClanScoreEvents()
+	{
+		if (_submittingScoreEventsBatch)
+		{
+			return;
+		}
+		lock (_scoreEventQueue)
+		{
+			if (_scoreEventQueue.Count == 0)
+			{
+				return;
+			}
+			_scoreEventBatch.Clear();
+			while (_scoreEventQueue.Count > 0)
+			{
+				_scoreEventBatch.Add(_scoreEventQueue.Dequeue());
+			}
+		}
+		SubmitClanScoreEventBatch();
+	}
+
+	private async void SubmitClanScoreEventBatch()
+	{
+		_submittingScoreEventsBatch = true;
+		try
+		{
+			await _connector.AddClanScoreEventBatch(_scoreEventBatch);
+			_scoreEventBatch.Clear();
+		}
+		catch (Exception exception)
+		{
+			DispatchError(exception);
+		}
+		finally
+		{
+			_submittingScoreEventsBatch = false;
+		}
+	}
+
+	private void HandleClanEvent(in NexusMessage message)
+	{
+		try
+		{
+			if (!message.IsString)
+			{
+				_logger.LogError("Received clan event type " + message.ContentType + " but the payload is not a string");
+			}
+			else if (message.ContentType.EndsWith("-disband"))
+			{
+				ClanDisbandedEvent args = JsonConvert.DeserializeObject<ClanDisbandedEvent>(message.AsString);
+				RemoveClan(args.ClanId);
+				ClanEventListener?.OnDisbanded(in args);
+			}
+			else if (message.ContentType.EndsWith("-invite"))
+			{
+				ClanInvitedEvent args2 = JsonConvert.DeserializeObject<ClanInvitedEvent>(message.AsString);
+				RefreshClan(args2.ClanId);
+				ClanEventListener?.OnInvitation(in args2);
+			}
+			else if (message.ContentType.EndsWith("-join"))
+			{
+				ClanJoinedEvent args3 = JsonConvert.DeserializeObject<ClanJoinedEvent>(message.AsString);
+				RefreshClan(args3.ClanId);
+				ClanEventListener?.OnJoined(in args3);
+			}
+			else if (message.ContentType.EndsWith("-kick"))
+			{
+				ClanKickedEvent args4 = JsonConvert.DeserializeObject<ClanKickedEvent>(message.AsString);
+				RefreshClan(args4.ClanId);
+				ClanEventListener?.OnKicked(in args4);
+			}
+			else if (message.ContentType.EndsWith("-change"))
+			{
+				RefreshClan(JsonConvert.DeserializeObject<ClanChangedEvent>(message.AsString).ClanId);
+			}
+			else
+			{
+				_logger.LogError("Cannot handle clan event: " + message.ContentType);
+			}
+		}
+		catch (Exception exception)
+		{
+			_logger.LogError("Failed to handle clan event (type=" + message.ContentType + "): " + message.AsString, exception);
+		}
+		AcknowledgeMessage(in message);
+	}
+
+	private void RefreshClan(long clanId)
+	{
+		lock (_clans)
+		{
+			if (_clans.TryGetValue(clanId, out var value))
+			{
+				value.RefreshInBackground();
+			}
+		}
+	}
+
+	internal NexusClan UpsertClan(in ClanDetails details)
+	{
+		lock (_clans)
+		{
+			if (_clans.TryGetValue(details.ClanId, out var value))
+			{
+				UpdateClan(value, in details);
+			}
+			else
+			{
+				value = new NexusClan(this, _connector, _clock, _logger, details.ClanId);
+				UpdateClan(value, in details);
+				_clans.Add(details.ClanId, value);
+			}
+			return value;
+		}
+	}
+
+	private void UpdateClan(NexusClan clan, in ClanDetails details)
+	{
+		if (clan.UpdateFromModel(in details))
+		{
+			ClanChangedEvent clanChangedEvent = default(ClanChangedEvent);
+			clanChangedEvent.ClanId = clan.ClanId;
+			ClanChangedEvent args = clanChangedEvent;
+			ClanEventListener?.OnChanged(in args);
+		}
+	}
+
+	internal void RemoveClan(long clanId)
+	{
+		lock (_clans)
+		{
+			if (!_clans.Remove(clanId))
+			{
+				return;
+			}
+		}
+		try
+		{
+			ClanEventListener?.OnUnload(in clanId);
+		}
+		catch (Exception exception)
+		{
+			_logger.LogError("Clan event listener for OnUnload threw an exception", exception);
+		}
+	}
+
+	public NexusZoneClient(INexusLogger logger, string baseUrl, string secretKey, int lockDuration = 30)
+		: this(logger, new NexusZoneConnector(logger, baseUrl, secretKey), new NexusSocketConnector(logger, baseUrl, secretKey, lockDuration), DefaultClockProvider.Instance, 30.0)
+	{
+	}
+
+	internal NexusZoneClient(INexusLogger logger, INexusZoneConnector connector, INexusSocketConnector socket, IClockProvider clock, double updateInterval)
+		: base(connector, clock, updateInterval)
+	{
+		_logger = logger ?? throw new ArgumentNullException("logger");
+		_connector = connector ?? throw new ArgumentNullException("connector");
+		_socket = socket ?? throw new ArgumentNullException("socket");
+		_clock = clock ?? throw new ArgumentNullException("clock");
+		_nexusVariables = new VariableContainer();
+		_zoneVariables = new VariableContainer();
+		_cachedNexusInfo = new CachedValue<NexusDetails>(clock);
+		_cachedZoneInfo = new CachedValue<ZoneDetails>(clock);
+		_players = new Dictionary<string, NexusPlayer>();
+		_clans = new Dictionary<long, NexusClan>();
+		_scoreEventQueue = new Queue<NewClanScoreEventBatchEntry>();
+		_scoreEventBatch = new List<NewClanScoreEventBatchEntry>();
+	}
+
+	protected override void Dispose(bool disposing)
+	{
+		base.Dispose(disposing);
+		_socket.Dispose();
+		lock (_players)
+		{
+			_players.Clear();
+		}
+		lock (_clans)
+		{
+			_clans.Clear();
+		}
+	}
+
+	protected override async ValueTask Initialize(CancellationToken ct)
+	{
+		Zone = await GetZoneDetails();
+		Nexus = await GetNexusDetails(Zone.NexusId);
+	}
+
+	protected override async ValueTask Update(CancellationToken ct)
+	{
+		Zone = await GetZoneDetails();
+		Nexus = await GetNexusDetails(Zone.NexusId);
+		if (_socket.IsStarted && !_socket.IsConnected)
+		{
+			DispatchError(new Exception("Socket is not connected for zone " + Zone.Key));
+		}
+		lock (_players)
+		{
+			foreach (NexusPlayer value in _players.Values)
+			{
+				value.RefreshIfNeeded();
+			}
+		}
+		lock (_clans)
+		{
+			foreach (NexusClan value2 in _clans.Values)
+			{
+				value2.RefreshIfNeeded();
+			}
+		}
+		UpdateClanScoreEvents();
+	}
+
+	public void StartListening()
+	{
+		_socket.Start();
+	}
+
+	public bool TryGetNexusVariable(string key, out Variable variable)
+	{
+		return _nexusVariables.TryGet(key, out variable);
+	}
+
+	public bool TryGetZoneVariable(string key, out Variable variable)
+	{
+		return _zoneVariables.TryGet(key, out variable);
+	}
+
+	public async Task SetNexusVariable(string key, string value, bool isTransient = true, bool isSecret = true)
+	{
+		AssertInitialized();
+		if (!_nexusVariables.TryGet(key, out var variable) || variable != value)
+		{
+			await _connector.SetNexusVariable(key, value, isTransient, isSecret).ConfigureAwait(continueOnCapturedContext: false);
+			_nexusVariables.Set(key, value);
+			DispatchVariableChanged(key);
+		}
+	}
+
+	public async Task SetNexusVariable(string key, byte[] value, bool isTransient = true, bool isSecret = true)
+	{
+		AssertInitialized();
+		if (!_nexusVariables.TryGet(key, out var variable) || variable != value)
+		{
+			await _connector.SetNexusVariable(key, value, isTransient, isSecret).ConfigureAwait(continueOnCapturedContext: false);
+			_nexusVariables.Set(key, value);
+			DispatchVariableChanged(key);
+		}
+	}
+
+	public async Task SetZoneVariable(string key, string value, bool isTransient = true, bool isSecret = true)
+	{
+		AssertInitialized();
+		if (!_zoneVariables.TryGet(key, out var variable) || variable != value)
+		{
+			await _connector.SetZoneVariable(key, value, isTransient, isSecret).ConfigureAwait(continueOnCapturedContext: false);
+			_zoneVariables.Set(key, value);
+			DispatchVariableChanged(key);
+		}
+	}
+
+	public async Task SetZoneVariable(string key, byte[] value, bool isTransient = true, bool isSecret = true)
+	{
+		AssertInitialized();
+		if (!_zoneVariables.TryGet(key, out var variable) || variable != value)
+		{
+			await _connector.SetZoneVariable(key, value, isTransient, isSecret).ConfigureAwait(continueOnCapturedContext: false);
+			_zoneVariables.Set(key, value);
+			DispatchVariableChanged(key);
+		}
+	}
+
+	public Task<List<string>> FindPlayersWithVariable(string key, string value)
+	{
+		return _connector.FindPlayersWithVariable(key, value);
+	}
+
+	public async Task<NexusLoginResult> PlayerLogin(string playerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		AssertInitialized();
+		NexusLoginResult result = new NexusLoginResult(await _connector.PlayerLogin(playerId));
+		if (!result.IsRedirect && result.AssignedZoneKey != null && result.AssignedZoneKey != Zone.Key)
+		{
+			throw new InvalidOperationException("Player is assigned to a different zone");
+		}
+		NexusPlayer value;
+		lock (_players)
+		{
+			if (!_players.TryGetValue(playerId, out value))
+			{
+				value = new NexusPlayer(_logger, _connector, _clock, playerId);
+				_players.Add(playerId, value);
+			}
+		}
+		value.UpdateZone(result.AssignedZoneKey);
+		value.UpdateVariables(result.Variables);
+		return result;
+	}
+
+	public void PlayerLogout(string playerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		AssertInitialized();
+		lock (_players)
+		{
+			_players.Remove(playerId);
+		}
+	}
+
+	public async ValueTask<NexusPlayer> GetPlayer(string playerId)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		AssertInitialized();
+		lock (_players)
+		{
+			if (_players.TryGetValue(playerId, out var value))
+			{
+				return value;
+			}
+		}
+		NexusPlayer newPlayer = new NexusPlayer(_logger, _connector, _clock, playerId);
+		await newPlayer.Refresh();
+		lock (_players)
+		{
+			if (_players.TryGetValue(playerId, out var value2))
+			{
+				return value2;
+			}
+			_players.Add(playerId, newPlayer);
+		}
+		return newPlayer;
+	}
+
+	public bool TryGetPlayer(string playerId, out NexusPlayer player)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		AssertInitialized();
+		lock (_players)
+		{
+			return _players.TryGetValue(playerId, out player);
+		}
+	}
+
+	public async Task Assign(string playerId, string toZone)
+	{
+		if (string.IsNullOrWhiteSpace(playerId))
+		{
+			throw new ArgumentNullException("playerId");
+		}
+		if (string.IsNullOrWhiteSpace(toZone))
+		{
+			throw new ArgumentNullException("toZone");
+		}
+		AssertInitialized();
+		await _connector.Assign(playerId, toZone);
+		if (TryGetPlayer(playerId, out var player))
+		{
+			player.UpdateZone(toZone);
+		}
+	}
+
+	public Task RegisterTransfers(string toZone, IEnumerable<string> playerIds)
+	{
+		if (string.IsNullOrWhiteSpace(toZone))
+		{
+			throw new ArgumentNullException("toZone");
+		}
+		if (playerIds == null)
+		{
+			throw new ArgumentNullException("playerIds");
+		}
+		AssertInitialized();
+		return _connector.RegisterTransfers(toZone, playerIds);
+	}
+
+	public Task CompleteTransfers(IEnumerable<string> playerIds)
+	{
+		if (playerIds == null)
+		{
+			throw new ArgumentNullException("playerIds");
+		}
+		AssertInitialized();
+		return _connector.CompleteTransfers(playerIds);
+	}
+
+	public bool TryReceiveMessage(out NexusMessage message)
+	{
+		AssertInitialized();
+		while (true)
+		{
+			if (!_socket.TryReceive(out message))
+			{
+				message = default(NexusMessage);
+				return false;
+			}
+			if (!message.ContentType.StartsWith("application/json+clan-"))
+			{
+				break;
+			}
+			HandleClanEvent(in message);
+		}
+		return true;
+	}
+
+	public void AcknowledgeMessage(in NexusMessage message)
+	{
+		AssertInitialized();
+		_socket.Acknowledge(message.MessageId);
+	}
+
+	public Task SendMessage(string toZone, Uuid id, string message, int? ttl = null)
+	{
+		if (id == Uuid.Empty)
+		{
+			throw new ArgumentNullException("id");
+		}
+		if (string.IsNullOrWhiteSpace(message))
+		{
+			throw new ArgumentNullException("message");
+		}
+		AssertInitialized();
+		return _connector.SendMessage(toZone, id, message, ttl);
+	}
+
+	public Task SendMessage(string toZone, Uuid id, Memory<byte> message, int? ttl = null)
+	{
+		if (id == Uuid.Empty)
+		{
+			throw new ArgumentNullException("id");
+		}
+		if (message.IsEmpty)
+		{
+			throw new ArgumentNullException("message");
+		}
+		AssertInitialized();
+		return _connector.SendMessage(toZone, id, message, ttl);
+	}
+
+	public Task<ZoneMapCheckResult> CheckUploadedMap()
+	{
+		AssertInitialized();
+		return _connector.CheckUploadedMap();
+	}
+
+	public Task UploadMap(string key, byte[] pngMapImage)
+	{
+		AssertInitialized();
+		return _connector.UploadMap(key, pngMapImage);
+	}
+
+	internal async ValueTask<ZoneDetails> GetZoneDetails()
+	{
+		if (!_cachedZoneInfo.TryGetValue(out var value))
+		{
+			ZoneDetails value2 = await _connector.GetZoneDetails();
+			value = _cachedZoneInfo.Update(in value2);
+			UpdateVariables(_nexusVariables, value.NexusVariables);
+			UpdateVariables(_zoneVariables, value.Variables);
+		}
+		return value;
+	}
+
+	internal new async ValueTask<NexusDetails> GetNexusDetails(int nexusId)
+	{
+		if (!_cachedNexusInfo.TryGetValue(out var value))
+		{
+			NexusDetails value2 = await _connector.GetNexus(nexusId);
+			value = _cachedNexusInfo.Update(in value2);
+		}
+		return value;
+	}
+
+	private void AssertInitialized()
+	{
+		if (Zone == null)
+		{
+			throw new InvalidOperationException("Zone is not initialized");
+		}
+	}
+}

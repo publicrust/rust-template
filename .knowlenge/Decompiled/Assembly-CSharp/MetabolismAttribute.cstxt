@@ -59,6 +59,11 @@ public class MetabolismAttribute
 		value = Mathf.Clamp(value - val, min, max);
 	}
 
+	public void Set(float val)
+	{
+		value = Mathf.Clamp(val, min, max);
+	}
+
 	public void Increase(float fTarget)
 	{
 		fTarget = Mathf.Clamp(fTarget, min, max);

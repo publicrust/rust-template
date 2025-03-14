@@ -12,7 +12,7 @@ public class DeliveryDroneConfig : BaseScriptableObject
 
 	public float testHeight = 200f;
 
-	public LayerMask layerMask = 27328768;
+	public LayerMask layerMask = 161546496;
 
 	public void FindDescentPoints(VendingMachine vendingMachine, float currentY, out Vector3 waitPosition, out Vector3 descendPosition)
 	{
@@ -45,6 +45,6 @@ public class DeliveryDroneConfig : BaseScriptableObject
 		{
 			return false;
 		}
-		return vendingMachine.IsVisibleAndCanSee(vector, 2f);
+		return vendingMachine.IsVisible(vector, 2f);
 	}
 }

@@ -1,13 +1,16 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
 using Facepunch;
 using Facepunch.Extend;
 using Network;
+using SilentOrbit.ProtocolBuffers;
 using UnityEngine;
 
-public class NetWrite : Stream, Pool.IPooled
+public class NetWrite : Stream, Pool.IPooled, IStreamWriter
 {
 	private static MemoryStream stringBuffer = new MemoryStream();
 
@@ -18,6 +21,8 @@ public class NetWrite : Stream, Pool.IPooled
 	private int _position;
 
 	private int _length;
+
+	public int refCount = 1;
 
 	public SendMethod method;
 
@@ -47,6 +52,20 @@ public class NetWrite : Stream, Pool.IPooled
 		}
 	}
 
+	public void AddReference()
+	{
+		Interlocked.Increment(ref refCount);
+	}
+
+	public void RemoveReference()
+	{
+		if (Interlocked.Decrement(ref refCount) == 0)
+		{
+			NetWrite obj = this;
+			Pool.Free(ref obj);
+		}
+	}
+
 	public void EnterPool()
 	{
 		peer = null;
@@ -60,6 +79,7 @@ public class NetWrite : Stream, Pool.IPooled
 
 	public void LeavePool()
 	{
+		refCount = 1;
 	}
 
 	public bool Start(BaseNetwork peer)
@@ -79,10 +99,18 @@ public class NetWrite : Stream, Pool.IPooled
 		if (info.connections != null)
 		{
 			connections.AddRange(info.connections);
+			if (PacketProfiler.enabled)
+			{
+				PacketProfiler.LogOutbound(Data[0] - 140, info.connections.Count, _length);
+			}
 		}
 		if (info.connection != null)
 		{
 			connections.Add(info.connection);
+			if (PacketProfiler.enabled)
+			{
+				PacketProfiler.LogOutbound(Data[0] - 140, 1, _length);
+			}
 		}
 		if (BaseNetwork.Multithreading)
 		{
@@ -106,6 +134,10 @@ public class NetWrite : Stream, Pool.IPooled
 		if (info.connection != null)
 		{
 			connections.Add(info.connection);
+		}
+		if (DemoConVars.ServerDemosEnabled && peer.SupportsServerDemos)
+		{
+			peer.EnqueueToDemoThread(new DemoQueueItem(this));
 		}
 		peer.ProcessWrite(this);
 	}
@@ -186,11 +218,30 @@ public class NetWrite : Stream, Pool.IPooled
 		Write(val, 0, val.Length);
 	}
 
-	public void String(string val)
+	public void VarUInt32(uint val)
+	{
+		EnsureCapacity(9);
+		_position += ProtocolParser.WriteUInt32(val, Data, (int)Position);
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	public void WriteUInt32(uint value, bool variableLength)
+	{
+		if (variableLength)
+		{
+			VarUInt32(value);
+		}
+		else
+		{
+			UInt32(value);
+		}
+	}
+
+	public void String(string val, bool variableLength = false)
 	{
 		if (string.IsNullOrEmpty(val))
 		{
-			BytesWithSize((MemoryStream)null);
+			BytesWithSize((MemoryStream)null, variableLength);
 			return;
 		}
 		if (stringBuffer.Capacity < val.Length * 8)
@@ -201,7 +252,7 @@ public class NetWrite : Stream, Pool.IPooled
 		stringBuffer.SetLength(stringBuffer.Capacity);
 		int bytes = Encoding.UTF8.GetBytes(val, 0, val.Length, stringBuffer.GetBuffer(), 0);
 		stringBuffer.SetLength(bytes);
-		BytesWithSize(stringBuffer);
+		BytesWithSize(stringBuffer, variableLength);
 	}
 
 	public void Vector3(in Vector3 obj)
@@ -209,6 +260,14 @@ public class NetWrite : Stream, Pool.IPooled
 		Float(obj.x);
 		Float(obj.y);
 		Float(obj.z);
+	}
+
+	public void Vector4(in Vector4 obj)
+	{
+		Float(obj.x);
+		Float(obj.y);
+		Float(obj.z);
+		Float(obj.w);
 	}
 
 	public void Quaternion(in Quaternion obj)
@@ -233,6 +292,14 @@ public class NetWrite : Stream, Pool.IPooled
 		Float(obj.a);
 	}
 
+	public void Color32(in Color32 obj)
+	{
+		UInt8(obj.r);
+		UInt8(obj.g);
+		UInt8(obj.b);
+		UInt8(obj.a);
+	}
+
 	public void EntityID(NetworkableId id)
 	{
 		UInt64(id.Value);
@@ -253,37 +320,37 @@ public class NetWrite : Stream, Pool.IPooled
 		UInt32(id);
 	}
 
-	public void BytesWithSize(MemoryStream val)
+	public void BytesWithSize(MemoryStream val, bool variableLength = false)
 	{
 		if (val == null || val.Length == 0L)
 		{
-			UInt32(0u);
+			WriteUInt32(0u, variableLength);
 		}
 		else
 		{
-			BytesWithSize(val.GetBuffer(), (int)val.Length);
+			BytesWithSize(val.GetBuffer(), (int)val.Length, variableLength);
 		}
 	}
 
-	public void BytesWithSize(byte[] b)
+	public void BytesWithSize(byte[] b, bool variableLength = false)
 	{
-		BytesWithSize(b, b.Length);
+		BytesWithSize(b, b.Length, variableLength);
 	}
 
-	public void BytesWithSize(byte[] b, int length)
+	public void BytesWithSize(byte[] b, int length, bool variableLength = false)
 	{
 		if (b == null || b.Length == 0 || length == 0)
 		{
-			UInt32(0u);
+			WriteUInt32(0u, variableLength);
 		}
 		else if ((uint)length > 10485760u)
 		{
-			UInt32(0u);
+			WriteUInt32(0u, variableLength);
 			Debug.LogError("BytesWithSize: Too big " + length);
 		}
 		else
 		{
-			UInt32((uint)length);
+			WriteUInt32((uint)length, variableLength);
 			Write(b, 0, length);
 		}
 	}

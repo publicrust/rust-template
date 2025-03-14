@@ -19,4 +19,6 @@ public class SellOrderEntry : MonoBehaviour, IInventoryChanged
 	private IVendingMachineInterface vendingPanel;
 
 	public UIIntegerEntry intEntry;
+
+	public VendingPriceMultiplierWidget priceMultiplier;
 }

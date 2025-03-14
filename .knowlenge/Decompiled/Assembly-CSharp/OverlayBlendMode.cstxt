@@ -5,5 +5,6 @@ public enum OverlayBlendMode
 	Multiply,
 	Overlay,
 	AlphaBlend,
-	AdditiveNonLit
+	AdditiveNonLit,
+	AlpbaBlendConst
 }

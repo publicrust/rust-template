@@ -1,6 +1,5 @@
 #define UNITY_ASSERTIONS
 using System;
-using System.Collections.Generic;
 using ConVar;
 using Facepunch;
 using Facepunch.Rust;
@@ -13,26 +12,6 @@ using UnityEngine.Assertions;
 
 public class BaseFishingRod : HeldEntity
 {
-	public class UpdateFishingRod : ObjectWorkQueue<BaseFishingRod>
-	{
-		protected override void RunJob(BaseFishingRod entity)
-		{
-			if (ShouldAdd(entity))
-			{
-				entity.CatchProcessBudgeted();
-			}
-		}
-
-		protected override bool ShouldAdd(BaseFishingRod entity)
-		{
-			if (base.ShouldAdd(entity))
-			{
-				return entity.IsValid();
-			}
-			return false;
-		}
-	}
-
 	public enum CatchState
 	{
 		None,
@@ -67,46 +46,25 @@ public class BaseFishingRod : HeldEntity
 		PlayerMoved
 	}
 
-	public static UpdateFishingRod updateFishingRodQueue = new UpdateFishingRod();
+	public class UpdateFishingRod : ObjectWorkQueue<BaseFishingRod>
+	{
+		protected override void RunJob(BaseFishingRod entity)
+		{
+			if (ShouldAdd(entity))
+			{
+				entity.CatchProcessBudgeted();
+			}
+		}
 
-	private FishLookup fishLookup;
-
-	private TimeUntil nextFishStateChange;
-
-	private TimeSince fishCatchDuration;
-
-	private float strainTimer;
-
-	private const float strainMax = 6f;
-
-	private TimeSince lastStrainUpdate;
-
-	private TimeUntil catchTime;
-
-	private TimeSince lastSightCheck;
-
-	private Vector3 playerStartPosition;
-
-	private WaterBody surfaceBody;
-
-	private ItemDefinition lureUsed;
-
-	private ItemDefinition currentFishTarget;
-
-	private ItemModFishable fishableModifier;
-
-	private ItemModFishable lastFish;
-
-	private bool inQueue;
-
-	[ServerVar]
-	public static bool ForceSuccess = false;
-
-	[ServerVar]
-	public static bool ForceFail = false;
-
-	[ServerVar]
-	public static bool ImmediateHook = false;
+		protected override bool ShouldAdd(BaseFishingRod entity)
+		{
+			if (base.ShouldAdd(entity))
+			{
+				return entity.IsValid();
+			}
+			return false;
+		}
+	}
 
 	public GameObjectRef FishingBobberRef;
 
@@ -148,6 +106,45 @@ public class BaseFishingRod : HeldEntity
 
 	public SoundDefinition tensionBreakSoundDef;
 
+	public static UpdateFishingRod updateFishingRodQueue = new UpdateFishingRod();
+
+	private TimeUntil nextFishStateChange;
+
+	private TimeSince fishCatchDuration;
+
+	private float strainTimer;
+
+	private const float strainMax = 6f;
+
+	private TimeSince lastStrainUpdate;
+
+	private TimeUntil catchTime;
+
+	private TimeSince lastSightCheck;
+
+	private Vector3 playerStartPosition;
+
+	private WaterBody surfaceBody;
+
+	private ItemDefinition lureUsed;
+
+	private ItemDefinition currentFishTarget;
+
+	private ItemModFishable fishableModifier;
+
+	private ItemModFishable lastFish;
+
+	private bool inQueue;
+
+	[ServerVar]
+	public static bool ForceSuccess = false;
+
+	[ServerVar]
+	public static bool ForceFail = false;
+
+	[ServerVar]
+	public static bool ImmediateHook = false;
+
 	public CatchState CurrentState { get; private set; }
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
@@ -159,7 +156,7 @@ public class BaseFishingRod : HeldEntity
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - Server_Cancel "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - Server_Cancel ");
 				}
 				using (TimeWarning.New("Server_Cancel"))
 				{
@@ -195,7 +192,7 @@ public class BaseFishingRod : HeldEntity
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - Server_RequestCast "));
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - Server_RequestCast ");
 				}
 				using (TimeWarning.New("Server_RequestCast"))
 				{
@@ -230,6 +227,117 @@ public class BaseFishingRod : HeldEntity
 		return base.OnRpcMessage(player, rpc, msg);
 	}
 
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if ((!base.isServer || !info.fromDisk) && info.msg.simpleUID != null)
+		{
+			currentBobber.uid = info.msg.simpleUID.uid;
+		}
+	}
+
+	public override bool BlocksGestures()
+	{
+		return CurrentState != CatchState.None;
+	}
+
+	private bool AllowPullInDirection(Vector3 worldDirection, Vector3 bobberPosition)
+	{
+		Vector3 position = base.transform.position;
+		Vector3 vector = bobberPosition.WithY(position.y);
+		return Vector3.Dot(worldDirection, (vector - position).normalized) < 0f;
+	}
+
+	private bool EvaluateFishingPosition(ref Vector3 pos, BasePlayer ply, out FailReason reason, out WaterBody waterBody)
+	{
+		RaycastHit hitInfo;
+		bool num = GamePhysics.Trace(new Ray(pos + Vector3.up, Vector3.down), 0f, out hitInfo, 1.5f, 16);
+		if (num)
+		{
+			waterBody = RaycastHitEx.GetWaterBody(hitInfo);
+			pos.y = hitInfo.point.y;
+		}
+		else
+		{
+			waterBody = null;
+		}
+		if (!num)
+		{
+			reason = FailReason.NoWaterFound;
+			return false;
+		}
+		if (Vector3.Distance(ply.transform.position.WithY(pos.y), pos) < 5f)
+		{
+			reason = FailReason.TooClose;
+			return false;
+		}
+		if (!GamePhysics.LineOfSight(ply.eyes.position, pos, 1218652417))
+		{
+			reason = FailReason.Obstructed;
+			return false;
+		}
+		Vector3 p = pos + Vector3.up * 2f;
+		if (!GamePhysics.LineOfSight(ply.eyes.position, p, 1218652417))
+		{
+			reason = FailReason.Obstructed;
+			return false;
+		}
+		Vector3 position = ply.transform.position;
+		position.y = pos.y;
+		float num2 = Vector3.Distance(pos, position);
+		Vector3 p2 = pos + (position - pos).normalized * (num2 - FishCatchDistance);
+		if (!GamePhysics.LineOfSight(pos, p2, 1218652417))
+		{
+			reason = FailReason.Obstructed;
+			return false;
+		}
+		if (WaterLevel.GetOverallWaterDepth(Vector3.Lerp(pos, ply.transform.position.WithY(pos.y), 0.95f), waves: true, volumes: true) < 0.1f && ply.eyes.position.y > 0f)
+		{
+			reason = FailReason.TooShallow;
+			return false;
+		}
+		if (WaterLevel.GetOverallWaterDepth(pos, waves: true, volumes: true) < 0.3f && ply.eyes.position.y > 0f)
+		{
+			reason = FailReason.TooShallow;
+			return false;
+		}
+		Vector3 p3 = Vector3.MoveTowards(ply.transform.position.WithY(pos.y), pos, 1f);
+		if (!GamePhysics.LineOfSight(ply.eyes.position, p3, 1218652417))
+		{
+			reason = FailReason.Obstructed;
+			return false;
+		}
+		if (GamePhysics.CheckSphere(pos, 0.25f, 153092352))
+		{
+			reason = FailReason.Obstructed;
+			return false;
+		}
+		reason = FailReason.Success;
+		return true;
+	}
+
+	private Item GetCurrentLure()
+	{
+		if (GetItem() == null)
+		{
+			return null;
+		}
+		if (GetItem().contents == null)
+		{
+			return null;
+		}
+		return GetItem().contents.GetSlot(0);
+	}
+
+	private bool HasReelInInput(InputState state)
+	{
+		if (!state.IsDown(BUTTON.BACKWARD))
+		{
+			return state.IsDown(BUTTON.FIRE_PRIMARY);
+		}
+		return true;
+	}
+
 	[RPC_Server]
 	[RPC_Server.IsActiveItem]
 	private void Server_RequestCast(RPCMessage msg)
@@ -247,27 +355,27 @@ public class BaseFishingRod : HeldEntity
 			FailedCast(reason);
 			return;
 		}
-		object obj = Interface.CallHook("CanCastFishingRod", ownerPlayer, this, currentLure, pos);
-		if (!(obj is bool) || (bool)obj)
+		ItemModCompostable component = (ItemModCompostable)Interface.CallHook("CanCastFishingRod", ownerPlayer, this, currentLure, pos);
+		if (!(component is bool) || (bool)(object)component)
 		{
-			FishingBobber component = base.gameManager.CreateEntity(FishingBobberRef.resourcePath, base.transform.position + Vector3.up * 2.8f + ownerPlayer.eyes.BodyForward() * 1.8f, GetOwnerPlayer().ServerRotation).GetComponent<FishingBobber>();
-			component.transform.forward = GetOwnerPlayer().eyes.BodyForward();
-			component.Spawn();
-			component.InitialiseBobber(ownerPlayer, surfaceBody, pos);
-			lureUsed = currentLure.info;
-			currentLure.UseItem();
-			if (fishLookup == null)
+			FishingBobber component2 = base.gameManager.CreateEntity(FishingBobberRef.resourcePath, base.transform.position + Vector3.up * 2.8f + ownerPlayer.eyes.BodyForward() * 1.8f, GetOwnerPlayer().ServerRotation).GetComponent<FishingBobber>();
+			component2.transform.forward = GetOwnerPlayer().eyes.BodyForward();
+			component2.Spawn();
+			component2.InitialiseBobber(ownerPlayer, surfaceBody, pos, 150f);
+			int usedLureAmount = 0;
+			if (FishLookup.Instance != null)
 			{
-				fishLookup = PrefabAttribute.server.Find<FishLookup>(prefabID);
+				currentFishTarget = FishLookup.Instance.GetFish(component2.transform.position, surfaceBody, currentLure, out fishableModifier, lastFish, out usedLureAmount);
 			}
-			currentFishTarget = fishLookup.GetFish(component.transform.position, surfaceBody, lureUsed, out fishableModifier, lastFish);
+			lureUsed = currentLure.info;
+			currentLure.UseItem(usedLureAmount);
 			lastFish = fishableModifier;
-			currentBobber.Set(component);
-			ClientRPC(null, "Client_ReceiveCastPoint", component.net.ID);
+			currentBobber.Set(component2);
+			ClientRPC(RpcTarget.NetworkGroup("Client_ReceiveCastPoint"), component2.net.ID);
 			ownerPlayer.SignalBroadcast(Signal.Attack);
 			catchTime = (ImmediateHook ? 0f : UnityEngine.Random.Range(10f, 20f));
 			catchTime = (float)catchTime * fishableModifier.CatchWaitTimeMultiplier;
-			float val = (lureUsed.TryGetComponent<ItemModCompostable>(out var component2) ? component2.BaitValue : 0f);
+			float val = (lureUsed.TryGetComponent<ItemModCompostable>(out component) ? component.BaitValue : 0f);
 			val = Mathx.RemapValClamped(val, 0f, 20f, 1f, 10f);
 			catchTime = Mathf.Clamp((float)catchTime - val, 3f, 20f);
 			playerStartPosition = ownerPlayer.transform.position;
@@ -282,7 +390,7 @@ public class BaseFishingRod : HeldEntity
 	private void FailedCast(FailReason reason)
 	{
 		CurrentState = CatchState.None;
-		ClientRPC(null, "Client_ResetLine", (int)reason);
+		ClientRPC(RpcTarget.NetworkGroup("Client_ResetLine"), (int)reason);
 	}
 
 	private void CatchProcess()
@@ -314,7 +422,7 @@ public class BaseFishingRod : HeldEntity
 		}
 		if (num2 > 1.2f && (float)lastSightCheck > 0.4f)
 		{
-			if (!GamePhysics.LineOfSight(ownerPlayer.eyes.position, fishingBobber.transform.position, 1218511105))
+			if (!GamePhysics.LineOfSight(ownerPlayer.eyes.position, fishingBobber.transform.position, 1084293377))
 			{
 				Server_Cancel(FailReason.Obstructed);
 				return;
@@ -335,7 +443,7 @@ public class BaseFishingRod : HeldEntity
 		{
 			if ((float)catchTime < 0f)
 			{
-				ClientRPC(null, "Client_HookedSomething");
+				ClientRPC(RpcTarget.NetworkGroup("Client_HookedSomething"));
 				CurrentState = CatchState.Catching;
 				fishingBobber.SetFlag(Flags.Reserved1, b: true);
 				nextFishStateChange = 0f;
@@ -439,19 +547,15 @@ public class BaseFishingRod : HeldEntity
 		SetFlag(Flags.Reserved1, flag4 && num5 > 0.25f);
 		if ((float)lastStrainUpdate > 0.4f || fishState != currentFishState)
 		{
-			ClientRPC(null, "Client_UpdateFishState", (int)currentFishState, num5);
+			ClientRPC(RpcTarget.NetworkGroup("Client_UpdateFishState"), (int)currentFishState, num5);
 			lastStrainUpdate = 0f;
 		}
 		if (strainTimer > 7f || ForceFail)
 		{
 			Server_Cancel(FailReason.TensionBreak);
 		}
-		else
+		else if (num2 <= FishCatchDistance || ForceSuccess)
 		{
-			if (!(num2 <= FishCatchDistance) && !ForceSuccess)
-			{
-				return;
-			}
 			CurrentState = CatchState.Caught;
 			if (currentFishTarget != null)
 			{
@@ -476,16 +580,19 @@ public class BaseFishingRod : HeldEntity
 				{
 					ownerPlayer.stats.Add(fishableModifier.SteamStatName, 1);
 					ownerPlayer.stats.Save(forceSteamSave: true);
-					fishLookup.CheckCatchAllAchievement(ownerPlayer);
+					FishLookup.Instance.CheckCatchAllAchievement(ownerPlayer);
 				}
 			}
 			Facepunch.Rust.Analytics.Server.FishCaught(currentFishTarget);
-			ClientRPC(null, "Client_OnCaughtFish", currentFishTarget.itemid);
+			ClientRPC(RpcTarget.NetworkGroup("Client_OnCaughtFish"), currentFishTarget.itemid);
 			ownerPlayer.SignalBroadcast(Signal.Alt_Attack);
 			Invoke(ResetLine, 6f);
 			fishingBobber.Kill();
 			currentBobber.Set(null);
 			CancelInvoke(CatchProcess);
+		}
+		else
+		{
 			Interface.CallHook("OnFishCaught", currentFishTarget, this, ownerPlayer);
 		}
 	}
@@ -522,7 +629,7 @@ public class BaseFishingRod : HeldEntity
 			fishingBobber.Kill();
 			currentBobber.Set(null);
 		}
-		ClientRPC(null, "Client_ResetLine", (int)reason);
+		ClientRPC(RpcTarget.NetworkGroup("Client_ResetLine"), (int)reason);
 		Interface.CallHook("OnFishingStopped", this, reason);
 	}
 
@@ -550,137 +657,5 @@ public class BaseFishingRod : HeldEntity
 		SetFlag(PullingLeftFlag, CurrentState == CatchState.Catching && inputLeft);
 		SetFlag(PullingRightFlag, CurrentState == CatchState.Catching && inputRight);
 		SetFlag(ReelingInFlag, CurrentState == CatchState.Catching && back);
-	}
-
-	public override void Load(LoadInfo info)
-	{
-		base.Load(info);
-		if ((!base.isServer || !info.fromDisk) && info.msg.simpleUID != null)
-		{
-			currentBobber.uid = info.msg.simpleUID.uid;
-		}
-	}
-
-	public override bool BlocksGestures()
-	{
-		return CurrentState != CatchState.None;
-	}
-
-	private bool AllowPullInDirection(Vector3 worldDirection, Vector3 bobberPosition)
-	{
-		Vector3 position = base.transform.position;
-		Vector3 vector = bobberPosition.WithY(position.y);
-		return Vector3.Dot(worldDirection, (vector - position).normalized) < 0f;
-	}
-
-	private bool EvaluateFishingPosition(ref Vector3 pos, BasePlayer ply, out FailReason reason, out WaterBody waterBody)
-	{
-		waterBody = null;
-		bool flag = false;
-		List<Collider> obj = Facepunch.Pool.GetList<Collider>();
-		GamePhysics.OverlapSphere(pos, 1f, obj, 16, QueryTriggerInteraction.Collide);
-		if (obj.Count > 0)
-		{
-			foreach (Collider item in obj)
-			{
-				item.TryGetComponent<WaterBody>(out waterBody);
-				if (waterBody == null)
-				{
-					waterBody = item.transform.parent.GetComponentInChildren<WaterBody>();
-				}
-				if (!(waterBody != null) || waterBody.FishingType == (WaterBody.FishingTag)0)
-				{
-					continue;
-				}
-				flag = true;
-				if (GamePhysics.Trace(new Ray(pos + Vector3.up, -Vector3.up), 0f, out var hitInfo, 1.5f, 16, QueryTriggerInteraction.Collide))
-				{
-					pos.y = hitInfo.point.y;
-				}
-				else
-				{
-					pos.y = obj[0].transform.position.y;
-				}
-				if (!waterBody.IsOcean)
-				{
-					if (waterBody.Renderer != null && (waterBody.FishingType & WaterBody.FishingTag.MoonPool) == WaterBody.FishingTag.MoonPool)
-					{
-						pos.y = waterBody.Renderer.transform.position.y;
-					}
-					break;
-				}
-			}
-		}
-		Facepunch.Pool.FreeList(ref obj);
-		if (!flag)
-		{
-			reason = FailReason.NoWaterFound;
-			return false;
-		}
-		if (Vector3.Distance(ply.transform.position.WithY(pos.y), pos) < 5f)
-		{
-			reason = FailReason.TooClose;
-			return false;
-		}
-		if (!GamePhysics.LineOfSight(ply.eyes.position, pos, 1218652417))
-		{
-			reason = FailReason.Obstructed;
-			return false;
-		}
-		Vector3 p = pos + Vector3.up * 2f;
-		if (!GamePhysics.LineOfSight(ply.eyes.position, p, 1218652417))
-		{
-			reason = FailReason.Obstructed;
-			return false;
-		}
-		Vector3 position = ply.transform.position;
-		position.y = pos.y;
-		float num = Vector3.Distance(pos, position);
-		Vector3 p2 = pos + (position - pos).normalized * (num - FishCatchDistance);
-		if (!GamePhysics.LineOfSight(pos, p2, 1218652417))
-		{
-			reason = FailReason.Obstructed;
-			return false;
-		}
-		if (WaterLevel.GetOverallWaterDepth(Vector3.Lerp(pos, ply.transform.position.WithY(pos.y), 0.95f), waves: true, null, noEarlyExit: true) < 0.1f && ply.eyes.position.y > 0f)
-		{
-			reason = FailReason.TooShallow;
-			return false;
-		}
-		if (WaterLevel.GetOverallWaterDepth(pos, waves: true, null, noEarlyExit: true) < 0.3f && ply.eyes.position.y > 0f)
-		{
-			reason = FailReason.TooShallow;
-			return false;
-		}
-		Vector3 p3 = Vector3.MoveTowards(ply.transform.position.WithY(pos.y), pos, 1f);
-		if (!GamePhysics.LineOfSight(ply.eyes.position, p3, 1218652417))
-		{
-			reason = FailReason.Obstructed;
-			return false;
-		}
-		reason = FailReason.Success;
-		return true;
-	}
-
-	private Item GetCurrentLure()
-	{
-		if (GetItem() == null)
-		{
-			return null;
-		}
-		if (GetItem().contents == null)
-		{
-			return null;
-		}
-		return GetItem().contents.GetSlot(0);
-	}
-
-	private bool HasReelInInput(InputState state)
-	{
-		if (!state.IsDown(BUTTON.BACKWARD))
-		{
-			return state.IsDown(BUTTON.FIRE_PRIMARY);
-		}
-		return true;
 	}
 }

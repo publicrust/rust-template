@@ -1,0 +1,240 @@
+using System;
+using System.IO;
+using System.Net.WebSockets;
+using System.Threading;
+using System.Threading.Tasks;
+using Oxide.Ext.Discord.Clients;
+using Oxide.Ext.Discord.Entities;
+using Oxide.Ext.Discord.Exceptions;
+using Oxide.Ext.Discord.Interfaces;
+using Oxide.Ext.Discord.Json;
+using Oxide.Ext.Discord.Logging;
+using Oxide.Ext.Discord.WebSockets;
+
+internal class WebSocketHandler
+{
+	private readonly IWebSocketEventHandler _handler;
+
+	private readonly ILogger _logger;
+
+	private readonly Memory<byte> _receiveBuffer;
+
+	private readonly Memory<byte> _sendBuffer;
+
+	private readonly AutoResetEvent _sendLock = new AutoResetEvent(initialState: true);
+
+	private DiscordWebsocketClient _client;
+
+	private readonly BotClient _botClient;
+
+	private const int SendChunkSize = 1024;
+
+	private const int ReceiveChunkSize = 2048;
+
+	public SocketState SocketState => _client?.SocketState ?? SocketState.Disconnected;
+
+	public Snowflake WebsocketId => _client?.WebsocketId ?? default(Snowflake);
+
+	private string ClientName => _botClient.BotUser?.Username ?? _botClient.Connection.HiddenToken;
+
+	public WebSocketHandler(IWebSocketEventHandler handler, BotClient botClient, ILogger logger)
+	{
+		_handler = handler;
+		_botClient = botClient;
+		_logger = logger;
+		_receiveBuffer = new byte[Math.Max(2048, 1024)];
+		_sendBuffer = new byte[1024];
+	}
+
+	public void Connect(string url)
+	{
+		SocketState socketState = SocketState;
+		if (socketState == SocketState.Connecting || socketState == SocketState.Connected)
+		{
+			throw new DiscordWebSocketException("Socket is already running. Please disconnect before attempting to connect.");
+		}
+		DisposeSocket();
+		_client = new DiscordWebsocketClient(_logger);
+		_logger.Debug("WebSocketHandler.Connect Created Websocket Client: {0} for {1}", _client.WebsocketId, ClientName);
+		Task.Factory.StartNew(RunInternal, url, _client.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+	}
+
+	private async void RunInternal(object url)
+	{
+		await RunWebsocket((string)url).ConfigureAwait(continueOnCapturedContext: false);
+	}
+
+	private async ValueTask RunWebsocket(string url)
+	{
+		DiscordWebsocketClient client = _client;
+		Snowflake id = client.WebsocketId;
+		try
+		{
+			_logger.Debug("WebSocketHandler.Connect Connecting Websocket {0} {1} To: {2}", _client.WebsocketId, ClientName, url);
+			await client.ConnectAsync(new Uri(url)).ConfigureAwait(continueOnCapturedContext: false);
+			await _handler.SocketOpened(id).ConfigureAwait(continueOnCapturedContext: false);
+			_logger.Debug("WebSocketHandler.Connect Websocket Connected for {0} {1}", _client.WebsocketId, ClientName);
+			await ReceiveHandlerAsync(client).ConfigureAwait(continueOnCapturedContext: false);
+			_logger.Debug("WebSocketHandler.Connect Websocket Disconnecting {0} {1} State: {2} Websocket: {3}", _client.WebsocketId, ClientName, client.SocketState, client.WebSocketState);
+			if (client.SocketState == SocketState.Connected)
+			{
+				await client.CloseSocket(WebSocketCloseStatus.NormalClosure, "Websocket completed").ConfigureAwait(continueOnCapturedContext: false);
+				DisposeSocket();
+			}
+		}
+		catch (OperationCanceledException)
+		{
+			DisposeSocket();
+		}
+		catch (WebSocketException ex2)
+		{
+			DisposeSocket();
+			if (ex2.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely)
+			{
+				_logger.Verbose("Disconnected Socket {0} {1} Because: {2} Error Code: {3} HResult:{4}\n{5}", _client.WebsocketId, ClientName, ex2.WebSocketErrorCode, ex2.ErrorCode, ex2.HResult, ex2);
+				await _handler.SocketClosed(id, WebSocketCloseStatus.NormalClosure, string.Empty).ConfigureAwait(continueOnCapturedContext: false);
+			}
+			else
+			{
+				_logger.Debug("Disconnected Socket {0} {1} Because: {2} Error Code: {3} HResult:{4}\n{5}", _client.WebsocketId, ClientName, ex2.WebSocketErrorCode, ex2.ErrorCode, ex2.HResult, ex2);
+				await _handler.SocketErrored(id, ex2).ConfigureAwait(continueOnCapturedContext: false);
+			}
+		}
+		catch (Exception ex3)
+		{
+			DisposeSocket();
+			await _handler.SocketErrored(id, ex3).ConfigureAwait(continueOnCapturedContext: false);
+			_logger.Exception("A Unhandled Websocket Error Occured for {0} {1}", _client.WebsocketId, ClientName, ex3);
+		}
+	}
+
+	private async ValueTask ReceiveHandlerAsync(DiscordWebsocketClient client)
+	{
+		DiscordJsonReader reader = new DiscordJsonReader();
+		MemoryStream input = reader.Stream;
+		Memory<byte> array = _receiveBuffer;
+		_logger.Debug("WebSocketHandler.ReceiveHandlerAsync Start Receive for {0} {1}", client.WebsocketId, ClientName);
+		while (!client.IsCancelRequested && client.WebSocketState == WebSocketState.Open && client.SocketState == SocketState.Connected)
+		{
+			_logger.Debug("WebSocketHandler.ReceiveHandlerAsync Waiting to receive for {0} {1} State: {2} Is Cancelled: {3}", client.WebsocketId, ClientName, client.SocketState, client.IsCancelRequested);
+			ValueWebSocketReceiveResult result = await client.ReceiveAsync(array).ConfigureAwait(continueOnCapturedContext: false);
+			if (client.Token.IsCancellationRequested)
+			{
+				break;
+			}
+			await input.WriteAsync(array.Slice(0, result.Count), client.Token).ConfigureAwait(continueOnCapturedContext: false);
+			if (!result.EndOfMessage)
+			{
+				continue;
+			}
+			try
+			{
+				input.Position = 0L;
+				await ProcessReceivedMessageAsync(client, result, reader).ConfigureAwait(continueOnCapturedContext: false);
+			}
+			catch (Exception ex)
+			{
+				Exception ex2 = ex;
+				_logger.Exception("An error occured processing websocket message {0} {1}", _client.WebsocketId, ClientName, ex2);
+			}
+			finally
+			{
+				input.SetLength(0L);
+			}
+		}
+	}
+
+	private ValueTask ProcessReceivedMessageAsync(DiscordWebsocketClient client, ValueWebSocketReceiveResult result, DiscordJsonReader reader)
+	{
+		_logger.Verbose("WebSocketHandler.ProcessReceivedMessageAsync Processing Receive Message For: {0} {1} State: {2} Type: {3} Size: {4}", client.WebsocketId, ClientName, client.SocketState, result.MessageType, reader.Stream.Length);
+		if (client.WebSocketState == WebSocketState.CloseReceived && result.MessageType == WebSocketMessageType.Close)
+		{
+			if (client.SocketState != SocketState.Disconnected && client.SocketState != SocketState.Disconnecting)
+			{
+				WebSocketCloseStatus status = client.CloseStatus ?? WebSocketCloseStatus.NormalClosure;
+				return DisconnectInternal(client, status, "Websocket closed by Discord. " + client.CloseStatusDescription, closeReceived: true);
+			}
+			return default(ValueTask);
+		}
+		return _handler.SocketMessage(client.WebsocketId, reader);
+	}
+
+	public ValueTask<bool> SendAsync(MemoryStream stream)
+	{
+		if (stream.Length == 0)
+		{
+			return new ValueTask<bool>(result: false);
+		}
+		_sendLock.WaitOne();
+		try
+		{
+			DiscordWebsocketClient client = _client;
+			if (client == null || client.WebSocketState != WebSocketState.Open)
+			{
+				return new ValueTask<bool>(result: false);
+			}
+			return SendInternalAsync(_client, stream);
+		}
+		finally
+		{
+			_sendLock.Set();
+		}
+	}
+
+	private async ValueTask<bool> SendInternalAsync(DiscordWebsocketClient client, MemoryStream stream)
+	{
+		stream.Position = 0L;
+		int readIndex = 0;
+		while (!client.IsCancelRequested)
+		{
+			int read = await stream.ReadAsync(_sendBuffer, client.Token).ConfigureAwait(continueOnCapturedContext: false);
+			readIndex += read;
+			bool endOfMessage = readIndex == stream.Length;
+			await client.SendAsync(_sendBuffer.Slice(0, read), WebSocketMessageType.Text, endOfMessage).ConfigureAwait(continueOnCapturedContext: false);
+			if (endOfMessage)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public ValueTask Disconnect(int code, string reason)
+	{
+		return Disconnect((WebSocketCloseStatus)code, reason);
+	}
+
+	public ValueTask Disconnect(WebSocketCloseStatus status, string reason)
+	{
+		return DisconnectInternal(_client, status, reason, closeReceived: false);
+	}
+
+	private async ValueTask DisconnectInternal(DiscordWebsocketClient client, WebSocketCloseStatus status, string reason, bool closeReceived)
+	{
+		_logger.Debug("WebSocketHandler.Disconnect {0} {1} Status: {2} Reason: {3} Close Received: {4} Socket State: {5} Client State: {6} Cancel Requested {7}", _client.WebsocketId, ClientName, status, reason, closeReceived, client?.WebSocketState, client?.SocketState, client?.IsCancelRequested);
+		if (client == null)
+		{
+			return;
+		}
+		Snowflake id = client.WebsocketId;
+		try
+		{
+			if (client.SocketState == SocketState.Connected && !client.IsCancelRequested)
+			{
+				await client.CloseSocket(status, reason).ConfigureAwait(continueOnCapturedContext: false);
+				DisposeSocket();
+				await _handler.SocketClosed(id, status, reason).ConfigureAwait(continueOnCapturedContext: false);
+			}
+		}
+		catch (Exception exception)
+		{
+			_logger.Exception("An error occured closing socket ID: {0} {1}", id, ClientName, exception);
+		}
+	}
+
+	private void DisposeSocket()
+	{
+		_client?.Dispose();
+		_client = null;
+	}
+}

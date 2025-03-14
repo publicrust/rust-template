@@ -1,4 +1,3 @@
-using Rust;
 using UnityEngine;
 
 public class SubsurfaceProfile : ScriptableObject
@@ -21,23 +20,32 @@ public class SubsurfaceProfile : ScriptableObject
 		}
 	}
 
-	public int Id => id;
-
-	private void OnEnable()
+	public static Vector4[] TransmissionTints
 	{
-		id = profileTexture.AddProfile(Data, this);
-	}
-
-	private void OnDisable()
-	{
-		if (!Rust.Application.isQuitting)
+		get
 		{
-			profileTexture.RemoveProfile(id);
+			if (profileTexture == null)
+			{
+				return null;
+			}
+			return profileTexture.TransmissionTints;
 		}
 	}
 
-	public void Update()
+	public int Id
 	{
-		profileTexture.UpdateProfile(id, Data);
+		get
+		{
+			return id;
+		}
+		set
+		{
+			id = value;
+		}
+	}
+
+	private void OnEnable()
+	{
+		profileTexture.AddProfile(this);
 	}
 }

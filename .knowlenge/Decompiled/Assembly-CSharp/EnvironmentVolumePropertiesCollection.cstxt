@@ -53,6 +53,8 @@ public class EnvironmentVolumePropertiesCollection : ScriptableObject
 
 	public float TransitionSpeed = 1f;
 
+	public LayerMask ReflectionMask = 1084293120;
+
 	[Horizontal(1, 0)]
 	public EnvironmentMultiplier[] ReflectionMultipliers;
 

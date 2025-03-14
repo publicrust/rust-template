@@ -6,7 +6,7 @@ public class CarWheel
 {
 	public WheelCollider wheelCollider;
 
-	[Range(0.1f, 3f)]
+	[Range(0.0001f, 3f)]
 	public float tyreFriction = 1f;
 
 	public bool steerWheel;

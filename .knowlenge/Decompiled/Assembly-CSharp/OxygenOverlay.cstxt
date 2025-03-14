@@ -9,7 +9,7 @@ public class OxygenOverlay : MonoBehaviour
 	[SerializeField]
 	private float smoothTime = 1f;
 
-	[Tooltip("If true, only show this effect when the player is mounted in a submarine.")]
 	[SerializeField]
+	[Tooltip("If true, only show this effect when the player is mounted in a submarine.")]
 	private bool submarinesOnly;
 }

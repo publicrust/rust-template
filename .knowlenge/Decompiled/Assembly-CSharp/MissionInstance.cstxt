@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Facepunch;
+using Facepunch.Extend;
 using UnityEngine;
 
 public class MissionInstance : Pool.IPooled
@@ -14,9 +15,11 @@ public class MissionInstance : Pool.IPooled
 
 		public bool failed;
 
-		public int genericInt1;
+		public float progressTarget;
 
-		public float genericFloat1;
+		public float progressCurrent;
+
+		public RealTimeSince sinceLastThink;
 	}
 
 	public enum ObjectiveType
@@ -35,8 +38,6 @@ public class MissionInstance : Pool.IPooled
 
 	public MissionStatus status;
 
-	public float completionScale;
-
 	public float startTime;
 
 	public float endTime;
@@ -47,11 +48,11 @@ public class MissionInstance : Pool.IPooled
 
 	public Dictionary<string, Vector3> missionPoints = new Dictionary<string, Vector3>();
 
+	public Dictionary<string, MissionEntity> missionEntities = new Dictionary<string, MissionEntity>();
+
+	private int playerInputCounter;
+
 	public ObjectiveStatus[] objectiveStatuses;
-
-	public List<MissionEntity> createdEntities;
-
-	public ItemAmount[] rewards;
 
 	public BaseEntity ProviderEntity()
 	{
@@ -85,14 +86,33 @@ public class MissionInstance : Pool.IPooled
 		return ShouldShowOnMap();
 	}
 
-	public virtual void ProcessMissionEvent(BasePlayer playerFor, MissionEventType type, string identifier, float amount)
+	public bool NeedsPlayerInput()
+	{
+		return playerInputCounter > 0;
+	}
+
+	public void EnablePlayerInput()
+	{
+		playerInputCounter++;
+	}
+
+	public void DisablePlayerInput()
+	{
+		playerInputCounter--;
+		if (playerInputCounter < 0)
+		{
+			playerInputCounter = 0;
+		}
+	}
+
+	public virtual void ProcessMissionEvent(BasePlayer playerFor, MissionEventType type, MissionEventPayload payload, float amount)
 	{
 		if (status == MissionStatus.Active)
 		{
 			BaseMission mission = GetMission();
 			for (int i = 0; i < mission.objectives.Length; i++)
 			{
-				mission.objectives[i].objective.ProcessMissionEvent(playerFor, this, i, type, identifier, amount);
+				mission.objectives[i].objective.ProcessMissionEvent(playerFor, this, i, type, payload, amount);
 			}
 		}
 	}
@@ -111,47 +131,119 @@ public class MissionInstance : Pool.IPooled
 		}
 	}
 
-	public Vector3 GetMissionPoint(string identifier, BasePlayer playerFor)
+	public Vector3 GetMissionPoint(string identifier, BasePlayer playerFor, int depth = 0)
 	{
-		if (missionPoints.ContainsKey(identifier))
+		if (identifier == null)
 		{
-			return missionPoints[identifier];
+			identifier = "";
 		}
-		if ((bool)playerFor)
+		if (missionPoints.TryGetValue(identifier, out var value))
 		{
-			GetMission().SetupPositions(this, playerFor);
-			Debug.Log("Mission point not found, regenerating");
-			if (missionPoints.ContainsKey(identifier))
-			{
-				return missionPoints[identifier];
-			}
+			return value;
+		}
+		BaseMission mission = GetMission();
+		if (playerFor == null)
+		{
+			Debug.LogError("Massive mission failure to get point, correct mission definition of: " + mission.shortname + " (player is null)");
 			return Vector3.zero;
 		}
-		Debug.Log("Massive mission failure to get point, correct mission definition of : " + GetMission().shortname);
-		return Vector3.zero;
+		PositionGenerator positionGenerator = ((IReadOnlyCollection<PositionGenerator>)(object)mission.positionGenerators).FindWith((PositionGenerator p) => p.identifier, identifier);
+		if (positionGenerator == null)
+		{
+			Debug.LogError("Massive mission failure to get point, correct mission definition of: " + mission.shortname + " (cannot find position '" + identifier + "')");
+			return Vector3.zero;
+		}
+		Vector3 position = positionGenerator.GetPosition(this, playerFor, depth);
+		missionPoints.Add(identifier, position);
+		AddBlocker(position);
+		return position;
 	}
 
-	public void EnterPool()
+	public MissionEntity GetMissionEntity(string identifier, BasePlayer playerFor)
+	{
+		if (identifier == null)
+		{
+			identifier = "";
+		}
+		if (missionEntities.TryGetValue(identifier, out var value))
+		{
+			return value;
+		}
+		MissionEntityEntry missionEntityEntry = ((IReadOnlyCollection<MissionEntityEntry>)(object)GetMission().missionEntities).FindWith((MissionEntityEntry e) => e.identifier, identifier);
+		if (missionEntityEntry == null)
+		{
+			Debug.LogError($"Cannot spawn mission entity, identifier '{identifier}' not found in mission ID {missionID}");
+			value = null;
+		}
+		else if (!missionEntityEntry.entityRef.isValid)
+		{
+			Debug.LogError($"Cannot spawn mission entity, identifier '{identifier}' has no entity set in mission ID {missionID}");
+			value = null;
+		}
+		else
+		{
+			Vector3 missionPoint = GetMissionPoint(missionEntityEntry.spawnPositionToUse, playerFor);
+			BaseEntity baseEntity = GameManager.server.CreateEntity(missionEntityEntry.entityRef.resourcePath, missionPoint, Quaternion.identity);
+			MissionEntity component;
+			MissionEntity obj = (baseEntity.gameObject.TryGetComponent<MissionEntity>(out component) ? component : baseEntity.gameObject.AddComponent<MissionEntity>());
+			obj.Setup(playerFor, this, identifier, missionEntityEntry.cleanupOnMissionSuccess, missionEntityEntry.cleanupOnMissionFailed);
+			baseEntity.Spawn();
+			value = obj;
+		}
+		missionEntities.Add(identifier, value);
+		if (value != null)
+		{
+			value.MissionStarted(playerFor, this);
+		}
+		return value;
+	}
+
+	public void PostServerLoad(BasePlayer player)
+	{
+		BaseMission mission = GetMission();
+		for (int i = 0; i < mission.objectives.Length; i++)
+		{
+			if (i >= 0 && i < objectiveStatuses.Length)
+			{
+				mission.objectives[i].objective.PostServerLoad(player, objectiveStatuses[i]);
+			}
+		}
+	}
+
+	public int GetTotalRequiredRewardItemSlots()
+	{
+		BaseMission mission = GetMission();
+		int num = 0;
+		for (int i = 0; i < mission.objectives.Length; i++)
+		{
+			if (!mission.objectives[i].isRequired && objectiveStatuses[i].completed)
+			{
+				num += mission.objectives[i].bonusRewards.Length;
+			}
+		}
+		return mission.baseRewards.Length + num;
+	}
+
+	public void Reset()
 	{
 		providerID = default(NetworkableId);
 		missionID = 0u;
 		status = MissionStatus.Default;
-		completionScale = 0f;
 		startTime = -1f;
 		endTime = -1f;
 		missionLocation = Vector3.zero;
 		_cachedMission = null;
 		timePassed = 0f;
-		rewards = null;
 		missionPoints.Clear();
-		if (createdEntities != null)
-		{
-			Pool.FreeList(ref createdEntities);
-		}
+		missionEntities.Clear();
+	}
+
+	public void EnterPool()
+	{
+		Reset();
 	}
 
 	public void LeavePool()
 	{
-		createdEntities = Pool.GetList<MissionEntity>();
 	}
 }

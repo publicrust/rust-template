@@ -6,7 +6,7 @@ using UnityEngine;
 public class Spawnable : MonoBehaviour, IServerComponent
 {
 	[ReadOnly]
-	public SpawnPopulation Population;
+	public SpawnPopulationBase Population;
 
 	[SerializeField]
 	private bool ForceSpawnOnly;
@@ -81,7 +81,7 @@ public class Spawnable : MonoBehaviour, IServerComponent
 	{
 		if (info.msg.spawnable != null)
 		{
-			Population = FileSystem.Load<SpawnPopulation>(StringPool.Get(info.msg.spawnable.population));
+			Population = FileSystem.Load<SpawnPopulationBase>(StringPool.Get(info.msg.spawnable.population));
 		}
 		Add();
 	}

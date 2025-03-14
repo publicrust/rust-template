@@ -52,6 +52,7 @@ public class flamethrowerFire : MonoBehaviour
 	private void Start()
 	{
 		previousflameState = (flameState = flamethrowerState.OFF);
+		ShutOff();
 	}
 
 	private void Update()

@@ -286,6 +286,11 @@ public static class ImageProcessing
 		}
 	}
 
+	public static bool IsValidPNG(byte[] data, int maxSizeSquare)
+	{
+		return IsValidPNG(data, maxSizeSquare, maxSizeSquare);
+	}
+
 	public static bool IsValidPNG(byte[] data, int maxWidth, int maxHeight)
 	{
 		if (data == null || data.Length < 29)
@@ -351,6 +356,11 @@ public static class ImageProcessing
 			return false;
 		}
 		return true;
+	}
+
+	public static bool IsValidJPG(byte[] data, int maxSizeSquare)
+	{
+		return IsValidJPG(data, maxSizeSquare, maxSizeSquare);
 	}
 
 	public static bool IsValidJPG(byte[] data, int maxWidth, int maxHeight)
