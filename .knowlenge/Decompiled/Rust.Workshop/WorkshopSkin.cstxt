@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Text;
 using Facepunch.Steamworks;
 using Rust;
@@ -10,151 +11,178 @@ public class WorkshopSkin : MonoBehaviour
 {
 	public static bool AllowApply = true;
 
+	private static WaitForSeconds waitForSeconds = new WaitForSeconds(1f);
+
+	private static ListDictionary<ulong, ListHashSet<WorkshopSkin>> RefreshQueue = new ListDictionary<ulong, ListHashSet<WorkshopSkin>>();
+
+	private static Queue<ulong> ItemQueue = new Queue<ulong>();
+
+	private static Queue<ulong> SkinQueue = new Queue<ulong>();
+
 	private static ListDictionary<ulong, Workshop.Item> ItemCache = new ListDictionary<ulong, Workshop.Item>();
 
 	private static ListDictionary<ulong, Skin> SkinCache = new ListDictionary<ulong, Skin>();
 
+	private ulong WorkshopID;
+
 	private Action OnRefresh;
+
+	public static int QueuedCount => ItemQueue.Count + SkinQueue.Count;
+
+	public static int LoadedCount => ItemCache.Count + SkinCache.Count;
 
 	public static string GetStatus()
 	{
-		BufferList<Workshop.Item> values = ItemCache.Values;
-		BufferList<Skin> values2 = SkinCache.Values;
 		StringBuilder stringBuilder = new StringBuilder();
-		int num = 0;
-		int num2 = 0;
-		int num3 = 0;
-		int num4 = 0;
-		for (int i = 0; i < values.Count; i++)
-		{
-			if (!values[i].Installed)
-			{
-				num2++;
-			}
-			else
-			{
-				num++;
-			}
-		}
-		for (int j = 0; j < values2.Count; j++)
-		{
-			if (values2[j].IsLoading)
-			{
-				num4++;
-			}
-			else
-			{
-				num3++;
-			}
-		}
+		int count = ItemCache.Count;
+		int count2 = ItemQueue.Count;
+		int count3 = SkinCache.Count;
+		int count4 = SkinQueue.Count;
 		stringBuilder.Append("Items: ");
-		stringBuilder.Append(num);
+		stringBuilder.Append(count);
 		stringBuilder.Append(" in cache + ");
-		stringBuilder.Append(num2);
+		stringBuilder.Append(count2);
 		stringBuilder.Append(" loading");
 		stringBuilder.AppendLine();
 		stringBuilder.Append("Skins: ");
-		stringBuilder.Append(num3);
+		stringBuilder.Append(count3);
 		stringBuilder.Append(" in cache + ");
-		stringBuilder.Append(num4);
+		stringBuilder.Append(count4);
 		stringBuilder.Append(" loading");
 		stringBuilder.AppendLine();
 		return stringBuilder.ToString();
 	}
 
-	public static int GetDownloadingSkinCount()
+	public static Skin GetSkin(ulong workshopId)
 	{
-		int num = 0;
-		BufferList<Workshop.Item> values = ItemCache.Values;
-		for (int i = 0; i < values.Count; i++)
+		LoadFromWorkshop(workshopId);
+		return SkinCache[workshopId];
+	}
+
+	public static Workshop.Item GetItem(ulong workshopId)
+	{
+		LoadFromWorkshop(workshopId);
+		return ItemCache[workshopId];
+	}
+
+	public static void Apply(GameObject gameobj, ulong workshopId, Action callback = null)
+	{
+		if (Global.SteamClient != null)
 		{
-			if (!values[i].Installed)
+			WorkshopSkin workshopSkin = gameobj.GetComponent<WorkshopSkin>();
+			if (workshopSkin == null)
 			{
-				num++;
+				workshopSkin = gameobj.AddComponent<WorkshopSkin>();
 			}
+			workshopSkin.Apply(workshopId, callback);
 		}
-		return num;
 	}
 
-	public static int GetProcessingSkinCount()
+	protected void OnDisable()
 	{
-		int num = 0;
-		BufferList<Skin> values = SkinCache.Values;
-		for (int i = 0; i < values.Count; i++)
+		if (!Rust.Application.isQuitting)
 		{
-			if (values[i].IsLoading)
-			{
-				num++;
-			}
+			DequeueSkinRefresh(WorkshopID);
 		}
-		return num;
 	}
 
-	public static Coroutine Apply(GameObject gameobj, ulong WorkshopId, Action callback = null)
+	private void Apply(ulong workshopId, Action callback = null)
 	{
-		if (Global.SteamClient == null)
-		{
-			return null;
-		}
-		WorkshopSkin workshopSkin = gameobj.GetComponent<WorkshopSkin>();
-		if (workshopSkin == null)
-		{
-			workshopSkin = gameobj.AddComponent<WorkshopSkin>();
-		}
-		workshopSkin.OnRefresh = callback;
-		return workshopSkin.StartApplySkin(WorkshopId);
-	}
-
-	private Coroutine StartApplySkin(ulong workshopId)
-	{
-		TimeWarning.BeginSample("WorkshopSkin.StartApplySkin");
+		DequeueSkinRefresh(WorkshopID);
+		WorkshopID = workshopId;
+		OnRefresh = callback;
 		Skin val = null;
-		if (SkinCache.TryGetValue(workshopId, out val) && !val.IsLoading)
+		if (SkinCache.TryGetValue(WorkshopID, out val) && val.Loaded)
 		{
 			ApplySkin(val);
-			TimeWarning.EndSample();
-			return null;
 		}
-		TimeWarning.EndSample();
-		return Global.Runner.StartCoroutine(DownloadAndApplyWorkshopSkin(val, workshopId));
+		else
+		{
+			EnqueueSkinRefresh(workshopId);
+		}
 	}
 
-	private IEnumerator DownloadAndApplyWorkshopSkin(Skin skin, ulong workshopId)
+	private void EnqueueSkinRefresh(ulong workshopId)
 	{
-		TimeWarning.BeginSample("WorkshopSkin.DownloadAndApplyWorkshopSkin");
-		TimeWarning.BeginSample("Item.New");
-		Workshop.Item item = null;
-		TimeWarning.EndSample();
-		if (skin != null)
+		if (workshopId != 0L)
 		{
-			TimeWarning.BeginSample("Skin.Loading");
-			while (skin.IsLoading)
+			ListHashSet<WorkshopSkin> val = null;
+			if (!RefreshQueue.TryGetValue(workshopId, out val))
 			{
-				TimeWarning.EndSample();
-				TimeWarning.EndSample();
-				yield return null;
-				TimeWarning.BeginSample("WorkshopSkin.DownloadAndApplyWorkshopSkin");
-				TimeWarning.BeginSample("Skin.Loading");
+				RefreshQueue.Add(workshopId, val = new ListHashSet<WorkshopSkin>());
 			}
-			TimeWarning.EndSample();
-			TimeWarning.BeginSample("ApplySkin");
-			ApplySkin(skin);
-			TimeWarning.EndSample();
-			TimeWarning.EndSample();
-			yield break;
+			val.Add(this);
+			LoadFromWorkshop(workshopId);
 		}
-		TimeWarning.BeginSample("ItemCache.TryGetValue");
-		bool num = ItemCache.TryGetValue(workshopId, out item);
-		TimeWarning.EndSample();
-		if (!num)
+	}
+
+	private static void LoadFromWorkshop(ulong workshopId)
+	{
+		if (!ItemCache.Contains(workshopId))
 		{
 			TimeWarning.BeginSample("Workshop.GetItem");
-			item = Global.SteamClient.Workshop.GetItem(workshopId);
+			Workshop.Item item = Global.SteamClient.Workshop.GetItem(workshopId);
 			TimeWarning.EndSample();
 			TimeWarning.BeginSample("ItemCache.Add");
 			ItemCache.Add(workshopId, item);
 			TimeWarning.EndSample();
+			TimeWarning.BeginSample("Skin.New");
+			Skin val = new Skin();
+			TimeWarning.EndSample();
+			TimeWarning.BeginSample("SkinCache.Add");
+			SkinCache.Add(workshopId, val);
+			TimeWarning.EndSample();
+			ItemQueue.Enqueue(workshopId);
+			if (ItemQueue.Count == 1)
+			{
+				Global.Runner.StartCoroutine(ItemQueueCoroutine());
+			}
 		}
+	}
+
+	private void DequeueSkinRefresh(ulong workshopId)
+	{
+		if (workshopId == 0L)
+		{
+			return;
+		}
+		ListHashSet<WorkshopSkin> val = null;
+		if (RefreshQueue.TryGetValue(workshopId, out val))
+		{
+			val.Remove(this);
+			if (val.Count == 0)
+			{
+				RefreshQueue.Remove(workshopId);
+			}
+		}
+	}
+
+	private static IEnumerator ItemQueueCoroutine()
+	{
+		while (ItemQueue.Count > 0)
+		{
+			ulong workshopId = ItemQueue.Peek();
+			yield return Global.Runner.StartCoroutine(LoadItem(workshopId));
+			ItemQueue.Dequeue();
+		}
+	}
+
+	private static IEnumerator SkinQueueCoroutine()
+	{
+		while (SkinQueue.Count > 0)
+		{
+			ulong workshopId = SkinQueue.Peek();
+			yield return Global.Runner.StartCoroutine(LoadSkin(workshopId));
+			SkinQueue.Dequeue();
+		}
+	}
+
+	private static IEnumerator LoadItem(ulong workshopId)
+	{
+		TimeWarning.BeginSample("WorkshopSkin.LoadItem");
+		TimeWarning.BeginSample("ItemCache.Get");
+		Workshop.Item item = ItemCache[workshopId];
+		TimeWarning.EndSample();
 		TimeWarning.BeginSample("Item.Installed");
 		bool installed = item.Installed;
 		TimeWarning.EndSample();
@@ -163,58 +191,51 @@ public class WorkshopSkin : MonoBehaviour
 			TimeWarning.BeginSample("Item.Download");
 			item.Download();
 			TimeWarning.EndSample();
-			TimeWarning.BeginSample("Item.Installing");
+			TimeWarning.BeginSample("Item.Installed");
 			while (!item.Installed)
 			{
 				TimeWarning.EndSample();
 				TimeWarning.EndSample();
-				yield return null;
-				TimeWarning.BeginSample("WorkshopSkin.DownloadAndApplyWorkshopSkin");
-				TimeWarning.BeginSample("Item.Installing");
+				yield return waitForSeconds;
+				TimeWarning.BeginSample("WorkshopSkin.LoadItem");
+				TimeWarning.BeginSample("Item.Installed");
 			}
 			TimeWarning.EndSample();
 		}
-		if (!AllowApply)
+		SkinQueue.Enqueue(workshopId);
+		if (SkinQueue.Count == 1)
 		{
-			TimeWarning.EndSample();
-			yield break;
+			Global.Runner.StartCoroutine(SkinQueueCoroutine());
 		}
-		TimeWarning.BeginSample("SkinCache.TryGetValue");
-		bool num2 = SkinCache.TryGetValue(workshopId, out skin);
 		TimeWarning.EndSample();
-		if (num2)
+	}
+
+	private static IEnumerator LoadSkin(ulong workshopId)
+	{
+		TimeWarning.BeginSample("WorkshopSkin.LoadSkin");
+		TimeWarning.BeginSample("ItemCache.Get");
+		Workshop.Item item = ItemCache[workshopId];
+		TimeWarning.EndSample();
+		TimeWarning.BeginSample("SkinCache.Get");
+		Skin skin = SkinCache[workshopId];
+		TimeWarning.EndSample();
+		TimeWarning.EndSample();
+		yield return Global.Runner.StartCoroutine(skin.FromFolder(item.Directory, null));
+		TimeWarning.BeginSample("WorkshopSkin.LoadSkin");
+		if (RefreshQueue.Contains(workshopId))
 		{
-			TimeWarning.BeginSample("Skin.Loading");
-			while (skin.IsLoading)
+			ListHashSet<WorkshopSkin> instances = RefreshQueue[workshopId];
+			while (instances.Count > 0)
 			{
-				TimeWarning.EndSample();
+				instances[0].ApplySkin(skin);
+				instances.RemoveAt(0);
 				TimeWarning.EndSample();
 				yield return null;
-				TimeWarning.BeginSample("WorkshopSkin.DownloadAndApplyWorkshopSkin");
-				TimeWarning.BeginSample("Skin.Loading");
+				TimeWarning.BeginSample("WorkshopSkin.LoadSkin");
 			}
-			TimeWarning.EndSample();
-			TimeWarning.BeginSample("ApplySkin");
-			ApplySkin(skin);
-			TimeWarning.EndSample();
-			TimeWarning.EndSample();
+			RefreshQueue.Remove(workshopId);
 		}
-		else
-		{
-			TimeWarning.BeginSample("Skin.New");
-			skin = new Skin();
-			TimeWarning.EndSample();
-			TimeWarning.BeginSample("SkinCache.Add");
-			SkinCache.Add(workshopId, skin);
-			TimeWarning.EndSample();
-			TimeWarning.EndSample();
-			yield return Global.Runner.StartCoroutine(skin.FromFolder(item.Directory, null));
-			TimeWarning.BeginSample("WorkshopSkin.DownloadAndApplyWorkshopSkin");
-			TimeWarning.BeginSample("ApplySkin");
-			ApplySkin(skin);
-			TimeWarning.EndSample();
-			TimeWarning.EndSample();
-		}
+		TimeWarning.EndSample();
 	}
 
 	private void ApplySkin(Skin skin)

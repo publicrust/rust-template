@@ -1,15 +1,23 @@
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
+using Rust;
 using Rust.Ai;
 using UnityEngine;
 using UnityEngine.AI;
 
 public class DynamicNavMesh : SingletonComponent<DynamicNavMesh>, IServerComponent
 {
-	[Tooltip("TODO: Replace with actual agent type id on the NavMeshAgent when we upgrade to 5.6.1 or above.")]
 	public int NavMeshAgentTypeIndex;
+
+	[Tooltip("The default area associated with the NavMeshAgent index.")]
+	public string DefaultAreaName = "Walkable";
+
+	public int AsyncTerrainNavMeshBakeCellSize = 80;
+
+	public int AsyncTerrainNavMeshBakeCellHeight = 100;
 
 	public Bounds Bounds;
 
@@ -21,21 +29,29 @@ public class DynamicNavMesh : SingletonComponent<DynamicNavMesh>, IServerCompone
 
 	public NavMeshCollectGeometry NavMeshCollectGeometry;
 
+	private List<AsyncTerrainNavMeshBake> terrainBakes;
+
 	private List<NavMeshBuildSource> sources;
 
 	private AsyncOperation BuildingOperation;
 
+	private bool HasBuildOperationStarted;
+
 	private Stopwatch BuildTimer = new Stopwatch();
+
+	private int defaultArea;
+
+	private int agentTypeId;
 
 	public bool IsBuilding
 	{
 		get
 		{
-			if (BuildingOperation == null)
+			if (!HasBuildOperationStarted || BuildingOperation != null)
 			{
-				return false;
+				return true;
 			}
-			return true;
+			return false;
 		}
 	}
 
@@ -46,14 +62,17 @@ public class DynamicNavMesh : SingletonComponent<DynamicNavMesh>, IServerCompone
 			base.enabled = false;
 			return;
 		}
-		NavMeshData = new NavMeshData(0);
+		agentTypeId = NavMesh.GetSettingsByIndex(NavMeshAgentTypeIndex).agentTypeID;
+		NavMeshData = new NavMeshData(agentTypeId);
 		sources = new List<NavMeshBuildSource>();
+		terrainBakes = new List<AsyncTerrainNavMeshBake>();
+		defaultArea = NavMesh.GetAreaFromName(DefaultAreaName);
 		InvokeRepeating(FinishBuildingNavmesh, 0f, 1f);
 	}
 
 	private void OnDisable()
 	{
-		if (!AiManager.nav_grid)
+		if (!Rust.Application.isQuitting && !AiManager.nav_grid)
 		{
 			CancelInvoke(FinishBuildingNavmesh);
 			NavMeshDataInstance.Remove();
@@ -63,11 +82,9 @@ public class DynamicNavMesh : SingletonComponent<DynamicNavMesh>, IServerCompone
 	[ContextMenu("Update Nav Mesh")]
 	public void UpdateNavMeshAsync()
 	{
-		if (!IsBuilding && !AiManager.nav_disable)
+		if (!HasBuildOperationStarted && !AiManager.nav_disable)
 		{
 			float realtimeSinceStartup = Time.realtimeSinceStartup;
-			List<NavMeshBuildMarkup> markups = new List<NavMeshBuildMarkup>();
-			NavMeshBuilder.CollectSources(Bounds, LayerMask, NavMeshCollectGeometry, 0, markups, sources);
 			UnityEngine.Debug.Log("Starting Navmesh Build with " + sources.Count + " sources");
 			NavMeshBuildSettings settingsByIndex = NavMesh.GetSettingsByIndex(NavMeshAgentTypeIndex);
 			settingsByIndex.overrideVoxelSize = true;
@@ -75,6 +92,7 @@ public class DynamicNavMesh : SingletonComponent<DynamicNavMesh>, IServerCompone
 			BuildingOperation = NavMeshBuilder.UpdateNavMeshDataAsync(NavMeshData, settingsByIndex, sources, Bounds);
 			BuildTimer.Reset();
 			BuildTimer.Start();
+			HasBuildOperationStarted = true;
 			float num = Time.realtimeSinceStartup - realtimeSinceStartup;
 			if (num > 0.1f)
 			{
@@ -83,19 +101,63 @@ public class DynamicNavMesh : SingletonComponent<DynamicNavMesh>, IServerCompone
 		}
 	}
 
+	private IEnumerator CollectSourcesAsync(Action callback)
+	{
+		float time = Time.realtimeSinceStartup;
+		UnityEngine.Debug.Log("Starting Navmesh Source Collecting.");
+		NavMeshBuilder.CollectSources(markups: new List<NavMeshBuildMarkup>(), includedWorldBounds: Bounds, includedLayerMask: LayerMask, geometry: NavMeshCollectGeometry, defaultArea: defaultArea, results: sources);
+		if (TerrainMeta.HeightMap != null)
+		{
+			for (float x = 0f - Bounds.extents.x; x < Bounds.extents.x; x += (float)AsyncTerrainNavMeshBakeCellSize)
+			{
+				for (float z = 0f - Bounds.extents.z; z < Bounds.extents.z; z += (float)AsyncTerrainNavMeshBakeCellSize)
+				{
+					AsyncTerrainNavMeshBake terrainSource = new AsyncTerrainNavMeshBake(new Vector3(x, 0f, z), AsyncTerrainNavMeshBakeCellSize, AsyncTerrainNavMeshBakeCellHeight, normal: false, alpha: true);
+					yield return terrainSource;
+					terrainBakes.Add(terrainSource);
+					sources.Add(terrainSource.CreateNavMeshBuildSource(addSourceObject: true));
+				}
+			}
+		}
+		AppendModifierVolumes(ref sources);
+		float timeTaken = Time.realtimeSinceStartup - time;
+		if (timeTaken > 0.1f)
+		{
+			UnityEngine.Debug.LogWarning("Calling CollectSourcesAsync took " + timeTaken);
+		}
+		callback?.Invoke();
+	}
+
 	public IEnumerator UpdateNavMeshAndWait()
 	{
-		if (IsBuilding || AiManager.nav_disable)
+		if (HasBuildOperationStarted || AiManager.nav_disable)
 		{
 			yield break;
 		}
-		UpdateNavMeshAsync();
+		HasBuildOperationStarted = false;
+		Bounds.size = TerrainMeta.Size;
+		AsyncTerrainNavMeshBakeCellSize = AiManager.nav_grid_cell_width;
+		AsyncTerrainNavMeshBakeCellHeight = AiManager.nav_grid_cell_height;
+		NavMesh.pathfindingIterationsPerFrame = AiManager.pathfindingIterationsPerFrame;
+		if (AiManager.nav_wait)
+		{
+			yield return CollectSourcesAsync(UpdateNavMeshAsync);
+		}
+		else
+		{
+			StartCoroutine(CollectSourcesAsync(UpdateNavMeshAsync));
+		}
 		if (!AiManager.nav_wait)
 		{
 			UnityEngine.Debug.Log("nav_wait is false, so we're not waiting for the navmesh to finish generating. This might cause your server to sputter while it's generating.");
 			yield break;
 		}
 		int lastPct = 0;
+		while (!HasBuildOperationStarted)
+		{
+			Thread.Sleep(250);
+			yield return null;
+		}
 		while (BuildingOperation != null)
 		{
 			int pctDone = (int)(BuildingOperation.progress * 100f);
@@ -107,6 +169,26 @@ public class DynamicNavMesh : SingletonComponent<DynamicNavMesh>, IServerCompone
 			Thread.Sleep(250);
 			FinishBuildingNavmesh();
 			yield return null;
+		}
+	}
+
+	private void AppendModifierVolumes(ref List<NavMeshBuildSource> sources)
+	{
+		List<NavMeshModifierVolume> activeModifiers = NavMeshModifierVolume.activeModifiers;
+		foreach (NavMeshModifierVolume item2 in activeModifiers)
+		{
+			if (((int)LayerMask & (1 << item2.gameObject.layer)) != 0 && item2.AffectsAgentType(agentTypeId))
+			{
+				Vector3 pos = item2.transform.TransformPoint(item2.center);
+				Vector3 lossyScale = item2.transform.lossyScale;
+				Vector3 size = new Vector3(item2.size.x * Mathf.Abs(lossyScale.x), item2.size.y * Mathf.Abs(lossyScale.y), item2.size.z * Mathf.Abs(lossyScale.z));
+				NavMeshBuildSource item = default(NavMeshBuildSource);
+				item.shape = NavMeshBuildSourceShape.ModifierBox;
+				item.transform = Matrix4x4.TRS(pos, item2.transform.rotation, Vector3.one);
+				item.size = size;
+				item.area = item2.area;
+				sources.Add(item);
+			}
 		}
 	}
 

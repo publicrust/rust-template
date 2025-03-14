@@ -36,12 +36,16 @@ public class BuildingBlock : StabilityEntity
 	}
 
 	[NonSerialized]
-	public uint buildingID;
-
-	[NonSerialized]
 	public Construction blockDefinition;
 
-	private static uint maxBuildingID = 0u;
+	private static Vector3[] outsideLookupOffsets = new Vector3[5]
+	{
+		new Vector3(0f, 1f, 0f).normalized,
+		new Vector3(1f, 1f, 0f).normalized,
+		new Vector3(-1f, 1f, 0f).normalized,
+		new Vector3(0f, 1f, 1f).normalized,
+		new Vector3(0f, 1f, -1f).normalized
+	};
 
 	public BuildingGrade.Enum grade;
 
@@ -233,7 +237,6 @@ public class BuildingBlock : StabilityEntity
 	public override void ResetState()
 	{
 		base.ResetState();
-		buildingID = 0u;
 		blockDefinition = null;
 		lastSkinGrade = BuildingGrade.Enum.None;
 		DestroySkin();
@@ -260,21 +263,6 @@ public class BuildingBlock : StabilityEntity
 		base.DestroyShared();
 	}
 
-	public override void OnKilled(HitInfo info)
-	{
-		Kill(DestroyMode.Gib);
-	}
-
-	public static uint NewBuildingID()
-	{
-		return ++maxBuildingID;
-	}
-
-	public void AttachToBuilding(BuildingBlock other)
-	{
-		buildingID = ((!other) ? NewBuildingID() : other.buildingID);
-	}
-
 	public override string Categorize()
 	{
 		return "building";
@@ -288,6 +276,23 @@ public class BuildingBlock : StabilityEntity
 	public override float BoundsPadding()
 	{
 		return 1f;
+	}
+
+	public override bool IsOutside()
+	{
+		float outside_test_range = ConVar.Decay.outside_test_range;
+		Vector3 vector = PivotPoint();
+		for (int i = 0; i < outsideLookupOffsets.Length; i++)
+		{
+			Vector3 vector2 = outsideLookupOffsets[i];
+			Vector3 origin = vector + vector2 * outside_test_range;
+			Ray ray = new Ray(origin, -vector2);
+			if (!UnityEngine.Physics.Raycast(ray, outside_test_range - 0.5f, 2097152))
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private bool CanDemolish(BasePlayer player)
@@ -318,17 +323,17 @@ public class BuildingBlock : StabilityEntity
 	[RPC_Server.MaxDistance(3f)]
 	private void DoDemolish(RPCMessage msg)
 	{
-		if (msg.player.CanInteract() && CanDemolish(msg.player) && Interface.CallHook("IOnStructureDemolish", this, msg.player) == null)
+		if (msg.player.CanInteract() && CanDemolish(msg.player) && Interface.CallHook("OnStructureDemolish", this, msg.player, false) == null)
 		{
 			Kill(DestroyMode.Gib);
 		}
 	}
 
-	[RPC_Server.MaxDistance(3f)]
 	[RPC_Server]
+	[RPC_Server.MaxDistance(3f)]
 	private void DoImmediateDemolish(RPCMessage msg)
 	{
-		if (msg.player.CanInteract() && msg.player.IsAdmin && Interface.CallHook("IOnStructureImmediateDemolish", this, msg.player) == null)
+		if (msg.player.CanInteract() && msg.player.IsAdmin && Interface.CallHook("OnStructureDemolish", this, msg.player, true) == null)
 		{
 			Kill(DestroyMode.Gib);
 		}
@@ -437,15 +442,15 @@ public class BuildingBlock : StabilityEntity
 		base.health = MaxHealth();
 	}
 
-	[RPC_Server]
 	[RPC_Server.MaxDistance(3f)]
+	[RPC_Server]
 	private void DoUpgradeToGrade(RPCMessage msg)
 	{
 		if (msg.player.CanInteract())
 		{
 			BuildingGrade.Enum @enum = (BuildingGrade.Enum)msg.read.Int32();
 			ConstructionGrade constructionGrade = GetGrade(@enum);
-			if (!(constructionGrade == null) && CanChangeToGrade(@enum, msg.player) && CanAffordUpgrade(@enum, msg.player) && !(base.SecondsSinceAttacked < 8f) && Interface.CallHook("OnStructureUpgrade", this, msg.player, @enum) == null)
+			if (!(constructionGrade == null) && CanChangeToGrade(@enum, msg.player) && CanAffordUpgrade(@enum, msg.player) && !(base.SecondsSinceAttacked < 30f) && Interface.CallHook("OnStructureUpgrade", this, msg.player, @enum) == null)
 			{
 				PayForUpgrade(constructionGrade, msg.player);
 				SetGrade(@enum);
@@ -453,6 +458,8 @@ public class BuildingBlock : StabilityEntity
 				StartBeingRotatable();
 				SendNetworkUpdate();
 				UpdateSkin();
+				ResetUpkeepTime();
+				BuildingManager.server.GetBuilding(buildingID)?.Dirty();
 				Effect.server.Run("assets/bundled/prefabs/fx/build/promote_" + @enum.ToString().ToLower() + ".prefab", this, 0u, Vector3.zero, Vector3.zero);
 			}
 		}
@@ -617,6 +624,11 @@ public class BuildingBlock : StabilityEntity
 		return currentGrade.maxHealth;
 	}
 
+	public override List<ItemAmount> BuildCost()
+	{
+		return currentGrade.costToBuild;
+	}
+
 	public override void OnHealthChanged(float oldvalue, float newvalue)
 	{
 		base.OnHealthChanged(oldvalue, newvalue);
@@ -629,11 +641,6 @@ public class BuildingBlock : StabilityEntity
 	public override float RepairCostFraction()
 	{
 		return 1f;
-	}
-
-	public override List<ItemAmount> BuildCost()
-	{
-		return currentGrade.costToBuild;
 	}
 
 	private bool CanRotate(BasePlayer player)
@@ -673,8 +680,8 @@ public class BuildingBlock : StabilityEntity
 		return !player.IsBuildingBlocked(base.transform.position, base.transform.rotation, bounds);
 	}
 
-	[RPC_Server.MaxDistance(3f)]
 	[RPC_Server]
+	[RPC_Server.MaxDistance(3f)]
 	private void DoRotation(RPCMessage msg)
 	{
 		if (msg.player.CanInteract() && CanRotate(msg.player) && blockDefinition.canRotate && Interface.CallHook("OnStructureRotate", this, msg.player) == null)
@@ -711,7 +718,6 @@ public class BuildingBlock : StabilityEntity
 		base.Save(info);
 		info.msg.buildingBlock = Facepunch.Pool.Get<ProtoBuf.BuildingBlock>();
 		info.msg.buildingBlock.grade = (int)grade;
-		info.msg.buildingBlock.buildingID = buildingID;
 	}
 
 	public override void Load(LoadInfo info)
@@ -719,12 +725,10 @@ public class BuildingBlock : StabilityEntity
 		base.Load(info);
 		if (info.msg.buildingBlock != null)
 		{
-			buildingID = info.msg.buildingBlock.buildingID;
 			SetGrade((BuildingGrade.Enum)info.msg.buildingBlock.grade);
 		}
 		if (info.fromDisk)
 		{
-			maxBuildingID = Mathx.Max(maxBuildingID, buildingID);
 			SetFlag(Flags.Reserved2, b: false);
 			SetFlag(Flags.Reserved1, b: false);
 			UpdateSkin();
@@ -761,5 +765,10 @@ public class BuildingBlock : StabilityEntity
 		{
 			base.Hurt(info);
 		}
+	}
+
+	public override void OnKilled(HitInfo info)
+	{
+		Kill(DestroyMode.Gib);
 	}
 }

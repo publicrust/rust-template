@@ -13,11 +13,9 @@ using Facepunch.Steamworks;
 using Ionic.Crc;
 using Network;
 using Network.Visibility;
-using Newtonsoft.Json;
 using Oxide.Core;
 using ProtoBuf;
 using Rust;
-using Rust.Workshop;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -26,6 +24,8 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 	private ConnectionAuth auth;
 
 	private bool runFrameUpdate;
+
+	private bool useQueryPort;
 
 	public UserPersistance persistance;
 
@@ -107,6 +107,7 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 
 	public void OpenConnection()
 	{
+		useQueryPort = ConVar.Server.queryport > 0 && ConVar.Server.queryport != ConVar.Server.port;
 		Network.Net.sv.ip = ConVar.Server.ip;
 		Network.Net.sv.port = ConVar.Server.port;
 		if (!Network.Net.sv.Start())
@@ -116,24 +117,25 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 		}
 		StartSteamServer();
 		Network.Net.sv.onMessage = OnNetworkMessage;
-		Network.Net.sv.onUnconnectedMessage = OnUnconnectedMessage;
 		Network.Net.sv.onDisconnected = OnDisconnected;
-		EACServer.DoStartup();
-		InvokeRepeating("EACUpdate", 1f, 1f);
+		if (!useQueryPort)
+		{
+			Network.Net.sv.onUnconnectedMessage = OnUnconnectedMessage;
+		}
+		Network.Net.sv.cryptography = new NetworkCryptographyServer();
 		InvokeRepeating("DoTick", 1f, 1f / (float)ConVar.Server.tickrate);
 		InvokeRepeating("DoHeartbeat", 1f, 1f);
 		runFrameUpdate = true;
 		Interface.CallHook("OnServerInitialized", null);
 	}
 
-	private void OnDisable()
+	private void CloseConnection()
 	{
 		if (persistance != null)
 		{
 			persistance.Dispose();
 			persistance = null;
 		}
-		EACServer.DoShutdown();
 		Network.Server sv = Network.Net.sv;
 		sv.onDisconnected = (Action<string, Connection>)Delegate.Remove(sv.onDisconnected, new Action<string, Connection>(OnDisconnected));
 		using (TimeWarning.New("sv.Stop"))
@@ -154,6 +156,20 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 				UnityEngine.Debug.Log("Okay");
 			}
 		}
+	}
+
+	private void OnDisable()
+	{
+		if (!Rust.Application.isQuitting)
+		{
+			CloseConnection();
+		}
+	}
+
+	private void OnApplicationQuit()
+	{
+		Rust.Application.isQuitting = true;
+		CloseConnection();
 	}
 
 	private void CreateImportantEntities()
@@ -198,8 +214,15 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 			serverInit.IpAddress = num;
 			serverInit.GamePort = (ushort)Network.Net.sv.port;
 			serverInit.Secure = ConVar.Server.secure;
-			serverInit.VersionString = 2013.ToString();
-			serverInit.QueryShareGamePort();
+			serverInit.VersionString = 2054.ToString();
+			if (useQueryPort)
+			{
+				serverInit.QueryPort = (ushort)ConVar.Server.queryport;
+			}
+			else
+			{
+				serverInit.QueryShareGamePort();
+			}
 			Rust.Global.SteamServer = new Facepunch.Steamworks.Server(Defines.appID, serverInit);
 			if (!Rust.Global.SteamServer.IsValid)
 			{
@@ -246,7 +269,6 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 
 	private void EACUpdate()
 	{
-		EACServer.DoUpdate();
 	}
 
 	private void Update()
@@ -266,24 +288,56 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 			}
 			catch (Exception exception)
 			{
-				UnityEngine.Debug.LogWarning("Server Network Exception");
+				UnityEngine.Debug.LogWarning("Server Exception: Network Cycle");
 				UnityEngine.Debug.LogException(exception, this);
 			}
-			using (TimeWarning.New("BuildingManager.ServerCycle"))
+			try
 			{
-				BuildingManager.ServerCycle();
+				using (TimeWarning.New("ServerBuildingManager.Cycle"))
+				{
+					BuildingManager.server.Cycle();
+				}
 			}
-			using (TimeWarning.New("BasePlayer.ServerCycle"))
+			catch (Exception exception2)
 			{
-				BasePlayer.ServerCycle(UnityEngine.Time.deltaTime);
+				UnityEngine.Debug.LogWarning("Server Exception: Building Manager");
+				UnityEngine.Debug.LogException(exception2, this);
 			}
-			using (TimeWarning.New("SteamQueryResponse"))
+			try
 			{
-				SteamQueryResponse();
+				using (TimeWarning.New("BasePlayer.ServerCycle"))
+				{
+					BasePlayer.ServerCycle(UnityEngine.Time.deltaTime);
+				}
 			}
-			using (TimeWarning.New("connectionQueue.Cycle"))
+			catch (Exception exception3)
 			{
-				connectionQueue.Cycle(AvailableSlots);
+				UnityEngine.Debug.LogWarning("Server Exception: Player Update");
+				UnityEngine.Debug.LogException(exception3, this);
+			}
+			try
+			{
+				using (TimeWarning.New("SteamQueryResponse"))
+				{
+					SteamQueryResponse();
+				}
+			}
+			catch (Exception exception4)
+			{
+				UnityEngine.Debug.LogWarning("Server Exception: Steam Query");
+				UnityEngine.Debug.LogException(exception4, this);
+			}
+			try
+			{
+				using (TimeWarning.New("connectionQueue.Cycle"))
+				{
+					connectionQueue.Cycle(AvailableSlots);
+				}
+			}
+			catch (Exception exception5)
+			{
+				UnityEngine.Debug.LogWarning("Server Exception: Connection Queue");
+				UnityEngine.Debug.LogException(exception5, this);
 			}
 		}
 	}
@@ -345,10 +399,10 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 				text = "strst";
 			}
 			string text2 = $"born{Epoch.FromDateTime(SaveRestore.SaveCreatedTime)}";
-			string text3 = string.Format("mp{0},cp{1},qp{5},v{2}{3},h{4},{6},{7}", ConVar.Server.maxplayers, BasePlayer.activePlayerList.Count, 2013, (!ConVar.Server.pve) ? string.Empty : ",pve", AssemblyHash, SingletonComponent<ServerMgr>.Instance.connectionQueue.Queued, text, text2);
+			string text3 = string.Format("mp{0},cp{1},qp{5},v{2}{3},h{4},{6},{7}", ConVar.Server.maxplayers, BasePlayer.activePlayerList.Count, 2054, (!ConVar.Server.pve) ? string.Empty : ",pve", AssemblyHash, SingletonComponent<ServerMgr>.Instance.connectionQueue.Queued, text, text2);
 			if (Interface.Oxide.Config.Options.Modded)
 			{
-				text3 = "oxide,modded," + text3;
+				text3 += ",modded,oxide";
 			}
 			Rust.Global.SteamServer.GameTags = text3;
 			if (ConVar.Server.description != null && ConVar.Server.description.Length > 100)
@@ -395,7 +449,6 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 		connectionQueue.RemoveConnection(connection);
 		ConnectionAuth.OnDisconnect(connection);
 		Rust.Global.SteamServer.Auth.EndSession(connection.userid);
-		EACServer.OnLeaveGame(connection);
 		BasePlayer basePlayer = connection.player as BasePlayer;
 		if ((bool)basePlayer)
 		{
@@ -490,25 +543,28 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 	{
 		using (Approval approval = Facepunch.Pool.Get<Approval>())
 		{
+			uint num = (uint)ConVar.Server.encryption;
+			if (num > 1 && connection.os == "editor" && DeveloperList.Contains(connection.ownerid))
+			{
+				num = 1u;
+			}
 			approval.level = UnityEngine.Application.loadedLevelName;
 			approval.levelSeed = World.Seed;
 			approval.levelSize = World.Size;
 			approval.checksum = World.Checksum;
 			approval.hostname = ConVar.Server.hostname;
 			approval.official = ConVar.Server.official;
+			approval.encryption = num;
 			if (Network.Net.sv.write.Start())
 			{
 				Network.Net.sv.write.PacketID(Message.Type.Approved);
 				approval.WriteToStream(Network.Net.sv.write);
 				Network.Net.sv.write.Send(new SendInfo(connection));
 			}
+			connection.encryptionLevel = num;
+			connection.encryptOutgoing = true;
 		}
 		connection.connected = true;
-	}
-
-	private void OnApplicationQuit()
-	{
-		Rust.Application.isQuitting = true;
 	}
 
 	internal void Shutdown()
@@ -571,44 +627,7 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 
 	public IEnumerator UpdateInventoryFromSchema()
 	{
-		while (Rust.Global.SteamServer == null)
-		{
-			yield return CoroutineEx.waitForSecondsRealtime(1f);
-		}
-		while (true)
-		{
-			WWW www = new WWW("http://s3.amazonaws.com/s3.playrust.com/icons/inventory/rust/schema.json");
-			yield return www;
-			if (www.error != null || www.text.Trim().Length <= 8)
-			{
-				www.Dispose();
-				yield return CoroutineEx.waitForSecondsRealtime(10f);
-				continue;
-			}
-			try
-			{
-				ItemSchema itemSchema = JsonConvert.DeserializeObject<ItemSchema>(www.text);
-				if (itemSchema.items == null)
-				{
-					throw new Exception("No items in schema!");
-				}
-				ItemSchema.Item[] items = itemSchema.items;
-				foreach (ItemSchema.Item item in items)
-				{
-					Facepunch.Steamworks.Inventory.Definition definition = Rust.Global.SteamServer.Inventory.CreateDefinition((int)item.itemdefid);
-					definition.Name = item.name;
-					definition.SetProperty("itemshortname", item.itemshortname);
-					definition.SetProperty("workshopid", item.workshopid);
-					definition.SetProperty("workshopdownload", item.workshopdownload);
-				}
-			}
-			catch (Exception ex)
-			{
-				UnityEngine.Debug.LogWarning("Error parsing schema " + ex.Message);
-			}
-			www.Dispose();
-			yield return CoroutineEx.waitForSecondsRealtime(ConVar.Server.schematime);
-		}
+		yield break;
 	}
 
 	private void Log(Exception e)
@@ -621,13 +640,110 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 
 	private void OnNetworkMessage(Message packet)
 	{
-		switch (packet.type)
+		Message.Type type = packet.type;
+		switch (type)
 		{
+		case Message.Type.RPCMessage:
+			if (!packet.connection.isAuthenticated)
+			{
+				return;
+			}
+			if (packet.connection.GetPacketsPerSecond(packet.type) > (ulong)ConVar.Server.maxrpcspersecond)
+			{
+				Network.Net.sv.Kick(packet.connection, "Paket Flooding: RPC Message");
+				return;
+			}
+			using (TimeWarning.New("OnRPCMessage", 20L))
+			{
+				try
+				{
+					OnRPCMessage(packet);
+				}
+				catch (Exception e2)
+				{
+					Log(e2);
+					Network.Net.sv.Kick(packet.connection, "Invalid Packet: RPC Message");
+				}
+			}
+			packet.connection.AddPacketsPerSecond(packet.type);
+			return;
+		case Message.Type.ConsoleCommand:
+			if (!packet.connection.isAuthenticated)
+			{
+				return;
+			}
+			if (packet.connection.GetPacketsPerSecond(packet.type) > (ulong)ConVar.Server.maxcommandspersecond)
+			{
+				Network.Net.sv.Kick(packet.connection, "Packet Flooding: Client Command");
+				return;
+			}
+			using (TimeWarning.New("OnClientCommand", 20L))
+			{
+				try
+				{
+					ConsoleNetwork.OnClientCommand(packet);
+				}
+				catch (Exception e3)
+				{
+					Log(e3);
+					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Client Command");
+				}
+			}
+			packet.connection.AddPacketsPerSecond(packet.type);
+			return;
+		case Message.Type.DisconnectReason:
+			if (!packet.connection.isAuthenticated)
+			{
+				return;
+			}
+			if (packet.connection.GetPacketsPerSecond(packet.type) > 1)
+			{
+				Network.Net.sv.Kick(packet.connection, "Packet Flooding: Disconnect Reason");
+				return;
+			}
+			using (TimeWarning.New("ReadDisconnectReason", 20L))
+			{
+				try
+				{
+					ReadDisconnectReason(packet);
+				}
+				catch (Exception e5)
+				{
+					Log(e5);
+					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Disconnect Reason");
+				}
+			}
+			packet.connection.AddPacketsPerSecond(packet.type);
+			return;
+		case Message.Type.Tick:
+			if (!packet.connection.isAuthenticated)
+			{
+				return;
+			}
+			if (packet.connection.GetPacketsPerSecond(packet.type) > (ulong)ConVar.Server.maxtickspersecond)
+			{
+				Network.Net.sv.Kick(packet.connection, "Packet Flooding: Player Tick");
+				return;
+			}
+			using (TimeWarning.New("OnPlayerTick", 20L))
+			{
+				try
+				{
+					OnPlayerTick(packet);
+				}
+				catch (Exception e4)
+				{
+					Log(e4);
+					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Player Tick");
+				}
+			}
+			packet.connection.AddPacketsPerSecond(packet.type);
+			return;
 		case Message.Type.GiveUserInformation:
 			if (packet.connection.GetPacketsPerSecond(packet.type) > 1)
 			{
 				Network.Net.sv.Kick(packet.connection, "Packet Flooding: User Information");
-				break;
+				return;
 			}
 			using (TimeWarning.New("GiveUserInformation", 20L))
 			{
@@ -635,13 +751,19 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 				{
 					OnGiveUserInformation(packet);
 				}
-				catch (Exception e3)
+				catch (Exception e)
 				{
-					Log(e3);
+					Log(e);
 					Network.Net.sv.Kick(packet.connection, "Invalid Packet: User Information");
 				}
 			}
 			packet.connection.AddPacketsPerSecond(packet.type);
+			return;
+		}
+		switch (type)
+		{
+		default:
+			ProcessUnhandledPacket(packet);
 			break;
 		case Message.Type.Ready:
 			if (!packet.connection.isAuthenticated)
@@ -659,115 +781,37 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 				{
 					ClientReady(packet);
 				}
-				catch (Exception e5)
+				catch (Exception e7)
 				{
-					Log(e5);
+					Log(e7);
 					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Client Ready");
 				}
 			}
 			packet.connection.AddPacketsPerSecond(packet.type);
 			break;
-		case Message.Type.RPCMessage:
+		case Message.Type.VoiceData:
 			if (!packet.connection.isAuthenticated)
 			{
 				break;
 			}
-			if (packet.connection.GetPacketsPerSecond(packet.type) > (ulong)ConVar.Server.maxrpcspersecond)
-			{
-				Network.Net.sv.Kick(packet.connection, "Paket Flooding: RPC Message");
-				break;
-			}
-			using (TimeWarning.New("OnRPCMessage", 20L))
-			{
-				try
-				{
-					OnRPCMessage(packet);
-				}
-				catch (Exception e4)
-				{
-					Log(e4);
-					Network.Net.sv.Kick(packet.connection, "Invalid Packet: RPC Message");
-				}
-			}
-			packet.connection.AddPacketsPerSecond(packet.type);
-			break;
-		case Message.Type.ConsoleCommand:
-			if (!packet.connection.isAuthenticated)
-			{
-				break;
-			}
-			if (packet.connection.GetPacketsPerSecond(packet.type) > (ulong)ConVar.Server.maxcommandspersecond)
-			{
-				Network.Net.sv.Kick(packet.connection, "Packet Flooding: Client Command");
-				break;
-			}
-			using (TimeWarning.New("OnClientCommand", 20L))
-			{
-				try
-				{
-					ConsoleNetwork.OnClientCommand(packet);
-				}
-				catch (Exception e2)
-				{
-					Log(e2);
-					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Client Command");
-				}
-			}
-			packet.connection.AddPacketsPerSecond(packet.type);
-			break;
-		case Message.Type.DisconnectReason:
-			if (!packet.connection.isAuthenticated)
-			{
-				break;
-			}
-			if (packet.connection.GetPacketsPerSecond(packet.type) > 1)
+			if (packet.connection.GetPacketsPerSecond(packet.type) > 100)
 			{
 				Network.Net.sv.Kick(packet.connection, "Packet Flooding: Disconnect Reason");
 				break;
 			}
-			using (TimeWarning.New("ReadDisconnectReason", 20L))
+			using (TimeWarning.New("OnPlayerVoice", 20L))
 			{
 				try
 				{
-					ReadDisconnectReason(packet);
+					OnPlayerVoice(packet);
 				}
 				catch (Exception e6)
 				{
 					Log(e6);
-					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Disconnect Reason");
+					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Player Voice");
 				}
 			}
 			packet.connection.AddPacketsPerSecond(packet.type);
-			break;
-		case Message.Type.Tick:
-			if (!packet.connection.isAuthenticated)
-			{
-				break;
-			}
-			if (packet.connection.GetPacketsPerSecond(packet.type) > (ulong)ConVar.Server.maxtickspersecond)
-			{
-				Network.Net.sv.Kick(packet.connection, "Packet Flooding: Player Tick");
-				break;
-			}
-			using (TimeWarning.New("OnPlayerTick", 20L))
-			{
-				try
-				{
-					OnPlayerTick(packet);
-				}
-				catch (Exception e)
-				{
-					Log(e);
-					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Player Tick");
-				}
-			}
-			packet.connection.AddPacketsPerSecond(packet.type);
-			break;
-		case Message.Type.EAC:
-			EACServer.OnMessageReceived(packet);
-			break;
-		default:
-			ProcessUnhandledPacket(packet);
 			break;
 		}
 	}
@@ -784,7 +828,7 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 		string text2 = packet.connection.ToString();
 		if (!string.IsNullOrEmpty(text) && !string.IsNullOrEmpty(text2))
 		{
-			UnityEngine.Debug.Log(text2 + " disconnecting: " + text);
+			DebugEx.Log(text2 + " disconnecting: " + text, StackTraceLogType.None);
 		}
 	}
 
@@ -803,7 +847,7 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 		}
 		basePlayer.PlayerInit(connection);
 		basePlayer.inventory.SendSnapshot();
-		UnityEngine.Debug.Log(basePlayer.net.connection.ToString() + " joined [" + basePlayer.net.connection.os + "/" + basePlayer.net.connection.ownerid + "]");
+		DebugEx.Log(basePlayer.net.connection.ToString() + " joined [" + basePlayer.net.connection.os + "/" + basePlayer.net.connection.ownerid + "]", StackTraceLogType.None);
 		return true;
 	}
 
@@ -829,12 +873,13 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 			{
 				basePlayer.SendRespawnOptions();
 			}
-			UnityEngine.Debug.Log(basePlayer.net.connection.ToString() + " joined [" + basePlayer.net.connection.os + "/" + basePlayer.net.connection.ownerid + "]");
+			DebugEx.Log(basePlayer.net.connection.ToString() + " joined [" + basePlayer.net.connection.os + "/" + basePlayer.net.connection.ownerid + "]", StackTraceLogType.None);
 		}
 	}
 
 	private void ClientReady(Message packet)
 	{
+		packet.connection.decryptIncoming = true;
 		using ClientReady clientReady = ProtoBuf.ClientReady.Deserialize(packet.read);
 		foreach (ClientReady.ClientInfo item in clientReady.clientInfo)
 		{
@@ -875,6 +920,15 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 		if (!(basePlayer == null))
 		{
 			basePlayer.OnReceivedTick(packet.read);
+		}
+	}
+
+	private void OnPlayerVoice(Message packet)
+	{
+		BasePlayer basePlayer = NetworkPacketEx.Player(packet);
+		if (!(basePlayer == null))
+		{
+			basePlayer.OnReceivedVoice(packet.read.BytesWithSize());
 		}
 	}
 
@@ -921,17 +975,17 @@ public class ServerMgr : SingletonComponent<ServerMgr>
 		}
 		if (branch != string.Empty && branch != text)
 		{
-			UnityEngine.Debug.Log(string.Concat("Kicking ", packet.connection, " - their branch is '", text, "' not '", branch, "'"));
+			DebugEx.Log(string.Concat("Kicking ", packet.connection, " - their branch is '", text, "' not '", branch, "'"), StackTraceLogType.None);
 			Network.Net.sv.Kick(packet.connection, "Wrong Steam Beta: Requires '" + branch + "' branch!");
 		}
-		else if (packet.connection.protocol > 2013)
+		else if (packet.connection.protocol > 2054)
 		{
-			UnityEngine.Debug.Log(string.Concat("Kicking ", packet.connection, " - their protocol is ", packet.connection.protocol, " not ", 2013));
+			DebugEx.Log(string.Concat("Kicking ", packet.connection, " - their protocol is ", packet.connection.protocol, " not ", 2054), StackTraceLogType.None);
 			Network.Net.sv.Kick(packet.connection, "Wrong Connection Protocol: Server update required!");
 		}
-		else if (packet.connection.protocol < 2013)
+		else if (packet.connection.protocol < 2054)
 		{
-			UnityEngine.Debug.Log(string.Concat("Kicking ", packet.connection, " - their protocol is ", packet.connection.protocol, " not ", 2013));
+			DebugEx.Log(string.Concat("Kicking ", packet.connection, " - their protocol is ", packet.connection.protocol, " not ", 2054), StackTraceLogType.None);
 			Network.Net.sv.Kick(packet.connection, "Wrong Connection Protocol: Client update required!");
 		}
 		else

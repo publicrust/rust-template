@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Facepunch;
 using UnityEngine;
 
 public class Construction : PrefabAttribute, IPrefabNeedsWarming
@@ -24,9 +25,7 @@ public class Construction : PrefabAttribute, IPrefabNeedsWarming
 
 		public Ray ray;
 
-		public BaseEntity transformParent;
-
-		public BuildingBlock construction;
+		public BaseEntity entity;
 
 		public Socket_Base socket;
 
@@ -49,12 +48,12 @@ public class Construction : PrefabAttribute, IPrefabNeedsWarming
 			{
 				quaternion = socket.rotation * Quaternion.Euler(180f, 0f, 180f);
 			}
-			return construction.transform.rotation * quaternion;
+			return entity.transform.rotation * quaternion;
 		}
 
 		public Vector3 GetWorldPosition()
 		{
-			return construction.transform.localToWorldMatrix.MultiplyPoint3x4(socket.position);
+			return entity.transform.localToWorldMatrix.MultiplyPoint3x4(socket.position);
 		}
 	}
 
@@ -101,6 +100,9 @@ public class Construction : PrefabAttribute, IPrefabNeedsWarming
 	public Bounds bounds;
 
 	[NonSerialized]
+	public bool isBuildingPrivilege;
+
+	[NonSerialized]
 	public ConstructionGrade[] grades;
 
 	[NonSerialized]
@@ -128,35 +130,43 @@ public class Construction : PrefabAttribute, IPrefabNeedsWarming
 			}
 			return null;
 		}
-		BuildingBlock buildingBlock = baseEntity as BuildingBlock;
-		if ((bool)buildingBlock)
+		DecayEntity decayEntity = baseEntity as DecayEntity;
+		if ((bool)decayEntity)
 		{
-			buildingBlock.AttachToBuilding(target.construction);
+			decayEntity.AttachToBuilding(target.entity as DecayEntity);
 		}
 		return baseEntity;
 	}
 
-	public Socket_Base[] FindMaleSockets(Target target)
+	public bool HasMaleSockets(Target target)
 	{
-		List<Socket_Base> list = new List<Socket_Base>();
 		Socket_Base[] array = allSockets;
 		foreach (Socket_Base socket_Base in array)
 		{
-			if (socket_Base.male && !socket_Base.dummy && socket_Base.TestTarget(target))
+			if (socket_Base.male && !socket_Base.maleDummy && socket_Base.TestTarget(target))
 			{
-				list.Add(socket_Base);
+				return true;
 			}
 		}
-		if (list.Count == 0)
+		return false;
+	}
+
+	public void FindMaleSockets(Target target, List<Socket_Base> sockets)
+	{
+		Socket_Base[] array = allSockets;
+		foreach (Socket_Base socket_Base in array)
 		{
-			return null;
+			if (socket_Base.male && !socket_Base.maleDummy && socket_Base.TestTarget(target))
+			{
+				sockets.Add(socket_Base);
+			}
 		}
-		return list.ToArray();
 	}
 
 	protected override void AttributeSetup(GameObject rootObj, string name, bool serverside, bool clientside, bool bundling)
 	{
 		base.AttributeSetup(rootObj, name, serverside, clientside, bundling);
+		isBuildingPrivilege = rootObj.GetComponent<BuildingPrivlidge>();
 		bounds = rootObj.GetComponent<BaseEntity>().bounds;
 		deployable = GetComponent<Deployable>();
 		placeholder = GetComponentInChildren<ConstructionPlaceholder>();
@@ -196,29 +206,24 @@ public class Construction : PrefabAttribute, IPrefabNeedsWarming
 			lastPlacementError = "Player doesn't have permission";
 			return false;
 		}
-		Socket_Base[] array = common.FindMaleSockets(target);
-		if (array == null)
-		{
-			lastPlacementError = "Couldn't find male socket on " + common.fullName;
-			return false;
-		}
-		Socket_Base[] array2 = array;
-		foreach (Socket_Base socket_Base in array2)
+		List<Socket_Base> obj = Pool.GetList<Socket_Base>();
+		common.FindMaleSockets(target, obj);
+		foreach (Socket_Base item in obj)
 		{
 			Placement placement = null;
-			if (target.construction != null && target.socket != null && target.construction.IsOccupied(target.socket))
+			if (target.entity != null && target.socket != null && target.entity.IsOccupied(target.socket))
 			{
 				continue;
 			}
 			if (placement == null)
 			{
-				placement = socket_Base.DoPlacement(target);
+				placement = item.DoPlacement(target);
 			}
 			if (placement == null)
 			{
 				continue;
 			}
-			if (!socket_Base.CheckSocketMods(placement))
+			if (!item.CheckSocketMods(placement))
 			{
 				transform.position = placement.position;
 				transform.rotation = placement.rotation;
@@ -254,15 +259,21 @@ public class Construction : PrefabAttribute, IPrefabNeedsWarming
 				continue;
 			}
 			BuildingProximity[] volumes2 = PrefabAttribute.server.FindAll<BuildingProximity>(prefabID);
-			if (BuildingProximity.Check(this, placement.position, placement.rotation, target.construction, volumes2))
+			if (BuildingProximity.Check(target.player, this, placement.position, placement.rotation, volumes2))
 			{
 				transform.position = placement.position;
 				transform.rotation = placement.rotation;
-				lastPlacementError = "Building too close";
 				continue;
 			}
-			bool flag = BuildingPrivlidge.IsBlocked(target.player, placement.position, placement.rotation, common.bounds);
-			if (flag && !common.canBypassBuildingPermission)
+			if (common.isBuildingPrivilege && !target.player.CanPlaceBuildingPrivilege(placement.position, placement.rotation, common.bounds))
+			{
+				transform.position = placement.position;
+				transform.rotation = placement.rotation;
+				lastPlacementError = "Cannot stack building privileges";
+				continue;
+			}
+			bool flag = target.player.IsBuildingBlocked(placement.position, placement.rotation, common.bounds);
+			if (!common.canBypassBuildingPermission && flag)
 			{
 				transform.position = placement.position;
 				transform.rotation = placement.rotation;
@@ -272,8 +283,10 @@ public class Construction : PrefabAttribute, IPrefabNeedsWarming
 			target.inBuildingPrivilege = flag;
 			transform.position = placement.position;
 			transform.rotation = placement.rotation;
+			Pool.FreeList(ref obj);
 			return true;
 		}
+		Pool.FreeList(ref obj);
 		return false;
 	}
 
@@ -302,8 +315,8 @@ public class Construction : PrefabAttribute, IPrefabNeedsWarming
 		{
 			return true;
 		}
-		BuildingBlock buildingBlock = RaycastHitEx.GetEntity(hitInfo) as BuildingBlock;
-		if (buildingBlock != null && target.construction == buildingBlock)
+		StabilityEntity stabilityEntity = RaycastHitEx.GetEntity(hitInfo) as StabilityEntity;
+		if (stabilityEntity != null && target.entity == stabilityEntity)
 		{
 			return true;
 		}

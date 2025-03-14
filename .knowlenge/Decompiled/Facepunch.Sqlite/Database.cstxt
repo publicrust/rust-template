@@ -1,0 +1,286 @@
+using System;
+using System.Linq;
+using System.Runtime.InteropServices;
+using Facepunch.Sqlite;
+
+public class Database
+{
+	private IntPtr _connection;
+
+	private bool IsConnectionOpen { get; set; }
+
+	public void Open(string path)
+	{
+		if (IsConnectionOpen)
+		{
+			throw new SqliteException("There is already an open connection");
+		}
+		if (Interop.sqlite3_open(path, out _connection) != 0)
+		{
+			throw new SqliteException("Could not open database file: " + path);
+		}
+		IsConnectionOpen = true;
+	}
+
+	public string Safe(string str)
+	{
+		if (!str.Contains('\''))
+		{
+			return str;
+		}
+		return str.Replace("'", "''");
+	}
+
+	public bool TableExists(string name)
+	{
+		return QueryInt($"select count(type) from sqlite_master where type='table' and name='{Safe(name)}';") > 0;
+	}
+
+	public void Close()
+	{
+		if (IsConnectionOpen)
+		{
+			Interop.sqlite3_close(_connection);
+		}
+		IsConnectionOpen = false;
+	}
+
+	public void Execute(string query, params object[] arguments)
+	{
+		if (!IsConnectionOpen)
+		{
+			throw new SqliteException("SQLite database is not open.");
+		}
+		IntPtr stmHandle = Prepare(query);
+		PushArguments(arguments, stmHandle);
+		if (Interop.sqlite3_step(stmHandle) != 101)
+		{
+			throw new SqliteException("Could not execute SQL statement.");
+		}
+		Finalize(stmHandle);
+	}
+
+	private void PushArguments(object[] arguments, IntPtr stmHandle)
+	{
+		if (arguments != null)
+		{
+			for (int i = 0; i < arguments.Length; i++)
+			{
+				Bind(stmHandle, i + 1, arguments[i]);
+			}
+		}
+	}
+
+	private unsafe void Bind(IntPtr stmHandle, int index, object value)
+	{
+		Type type = value.GetType();
+		if (value is string s)
+		{
+			IntPtr intPtr = Marshal.StringToHGlobalUni(s);
+			Interop.sqlite3_bind_text16(stmHandle, index, intPtr, -1, Interop.SQLITE_TRANSIENT);
+			Marshal.ZeroFreeGlobalAllocUnicode(intPtr);
+			return;
+		}
+		object obj = value;
+		bool num = obj is uint;
+		uint num2 = (num ? ((uint)obj) : 0u);
+		if (num)
+		{
+			Interop.sqlite3_bind_int64(stmHandle, index, num2);
+			return;
+		}
+		obj = value;
+		bool num3 = obj is int;
+		int num4 = (num3 ? ((int)obj) : 0);
+		if (num3)
+		{
+			Interop.sqlite3_bind_int64(stmHandle, index, num4);
+			return;
+		}
+		obj = value;
+		bool num5 = obj is long;
+		long val = (num5 ? ((long)obj) : 0);
+		if (num5)
+		{
+			Interop.sqlite3_bind_int64(stmHandle, index, val);
+			return;
+		}
+		obj = value;
+		bool num6 = obj is ulong;
+		ulong val2 = (num6 ? ((ulong)obj) : 0);
+		if (num6)
+		{
+			Interop.sqlite3_bind_int64(stmHandle, index, (long)val2);
+			return;
+		}
+		obj = value;
+		bool num7 = obj is float;
+		float num8 = (num7 ? ((float)obj) : 0f);
+		if (num7)
+		{
+			Interop.sqlite3_bind_double(stmHandle, index, num8);
+			return;
+		}
+		obj = value;
+		bool num9 = obj is double;
+		double val3 = (num9 ? ((double)obj) : 0.0);
+		if (num9)
+		{
+			Interop.sqlite3_bind_double(stmHandle, index, val3);
+		}
+		else if (value is byte[] array)
+		{
+			fixed (byte* ptr = array)
+			{
+				Interop.sqlite3_bind_blob(stmHandle, index, (IntPtr)ptr, array.Length, Interop.SQLITE_TRANSIENT);
+			}
+		}
+		else
+		{
+			Interop.sqlite3_bind_null(stmHandle, index);
+		}
+	}
+
+	public Table Query(string query, params object[] arguments)
+	{
+		if (!IsConnectionOpen)
+		{
+			throw new SqliteException("SQLite database is not open.");
+		}
+		IntPtr stmHandle = Prepare(query);
+		PushArguments(arguments, stmHandle);
+		int num = Interop.sqlite3_column_count(stmHandle);
+		Table table = new Table();
+		string[] array = new string[num];
+		for (int i = 0; i < num; i++)
+		{
+			array[i] = Marshal.PtrToStringAnsi(Interop.sqlite3_column_name(stmHandle, i));
+		}
+		int num2 = 0;
+		while (Interop.sqlite3_step(stmHandle) == 100)
+		{
+			Row row = GetRow(stmHandle, array);
+			table.Add(num2, row);
+			num2++;
+		}
+		Finalize(stmHandle);
+		return table;
+	}
+
+	private Row GetRow(IntPtr stmHandle, string[] columnNames)
+	{
+		Row row = new Row();
+		for (int i = 0; i < columnNames.Length; i++)
+		{
+			string key = columnNames[i];
+			row[key] = GetColumnValue(stmHandle, i);
+		}
+		return row;
+	}
+
+	private object GetColumnValue(IntPtr stmHandle, int i)
+	{
+		switch (Interop.sqlite3_column_type(stmHandle, i))
+		{
+		case 1:
+			return Interop.sqlite3_column_int64(stmHandle, i);
+		case 3:
+		{
+			IntPtr ptr = Interop.sqlite3_column_text16(stmHandle, i);
+			return Marshal.PtrToStringUni(ptr);
+		}
+		case 2:
+			return Interop.sqlite3_column_double(stmHandle, i);
+		case 4:
+		{
+			IntPtr intPtr = Interop.sqlite3_column_blob(stmHandle, i);
+			if (intPtr == IntPtr.Zero)
+			{
+				return null;
+			}
+			int num = Interop.sqlite3_column_bytes(stmHandle, i);
+			byte[] array = new byte[num];
+			Marshal.Copy(intPtr, array, 0, num);
+			return array;
+		}
+		case 5:
+			return null;
+		default:
+			return null;
+		}
+	}
+
+	public Row QueryRow(string query, params object[] arguments)
+	{
+		if (!IsConnectionOpen)
+		{
+			throw new SqliteException("SQLite database is not open.");
+		}
+		IntPtr stmHandle = Prepare(query);
+		PushArguments(arguments, stmHandle);
+		int num = Interop.sqlite3_column_count(stmHandle);
+		string[] array = new string[num];
+		for (int i = 0; i < num; i++)
+		{
+			array[i] = Marshal.PtrToStringAnsi(Interop.sqlite3_column_name(stmHandle, i));
+		}
+		Row result = null;
+		if (Interop.sqlite3_step(stmHandle) == 100)
+		{
+			result = GetRow(stmHandle, array);
+		}
+		Finalize(stmHandle);
+		return result;
+	}
+
+	public int QueryInt(string query, params object[] arguments)
+	{
+		return (int)QueryValue<long>(query, arguments);
+	}
+
+	public byte[] QueryBlob(string query, params object[] arguments)
+	{
+		return QueryValue<byte[]>(query, arguments);
+	}
+
+	private T QueryValue<T>(string query, object[] arguments)
+	{
+		if (!IsConnectionOpen)
+		{
+			throw new SqliteException("SQLite database is not open.");
+		}
+		IntPtr stmHandle = Prepare(query);
+		PushArguments(arguments, stmHandle);
+		try
+		{
+			if (Interop.sqlite3_step(stmHandle) == 100)
+			{
+				object columnValue = GetColumnValue(stmHandle, 0);
+				return (T)columnValue;
+			}
+		}
+		finally
+		{
+			Finalize(stmHandle);
+		}
+		return default(T);
+	}
+
+	private IntPtr Prepare(string query)
+	{
+		if (Interop.sqlite3_prepare_v2(_connection, query, query.Length, out var ppStmpt, IntPtr.Zero) != 0)
+		{
+			IntPtr ptr = Interop.sqlite3_errmsg(_connection);
+			throw new SqliteException(Marshal.PtrToStringAnsi(ptr));
+		}
+		return ppStmpt;
+	}
+
+	private void Finalize(IntPtr stmHandle)
+	{
+		if (Interop.sqlite3_finalize(stmHandle) != 0)
+		{
+			throw new SqliteException("Could not finalize SQL statement.");
+		}
+	}
+}

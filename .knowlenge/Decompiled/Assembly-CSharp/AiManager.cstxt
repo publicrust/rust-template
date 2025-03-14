@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using Apex.DataStructures;
 using Apex.LoadBalancing;
 using Facepunch;
+using Rust;
 using Rust.Ai;
 using UnityEngine;
 using UnityEngine.AI;
@@ -91,10 +92,10 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 						continue;
 					}
 					Vector2i coord2 = SingletonComponent<AiManager>.Instance.GetCoord(activePlayer.ServerPosition);
-					Vector2i[] directions = Directions;
-					foreach (Vector2i vector2i in directions)
+					for (int i = 0; i < Directions.Length; i++)
 					{
-						if (coord == coord2 + vector2i)
+						Vector2i vector2i = coord2 + Directions[i];
+						if (coord.x == vector2i.x && coord.y == vector2i.y)
 						{
 							return 0;
 						}
@@ -161,6 +162,8 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	public float CoverPointVolumeCellHeight = 8f;
 
+	public float CoverPointRayLength = 1f;
+
 	public CoverPointVolume cpvPrefab;
 
 	[SerializeField]
@@ -169,13 +172,13 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 	private WorldSpaceGrid<CoverPointVolume> coverPointVolumeGrid;
 
 	[ServerVar(Help = "If true we'll wait for the navmesh to generate before completely starting the server. This might cause your server to hitch and lag as it generates in the background.")]
-	public static bool nav_wait = false;
+	public static bool nav_wait = true;
 
 	[ServerVar(Help = "If set to true the navmesh won't generate.. which means Ai that uses the navmesh won't be able to move")]
 	public static bool nav_disable = false;
 
 	[ServerVar(Help = "If set to true the ai manager will control a navmesh grid, only building navmesh patches in those areas where it's needed and for those agent types. If this is false, we bake a single huge navmesh for the entire island, and can only support a single agent type.")]
-	public static bool nav_grid = true;
+	public static bool nav_grid = false;
 
 	[ServerVar(Help = "If ai_dormant is true, any npc outside the range of players will render itself dormant and take up less resources, but wildlife won't simulate as well.")]
 	public static bool ai_dormant = true;
@@ -195,6 +198,9 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 	[ServerVar(Help = "If nav_grid_rebake_cells_enabled is true, we rebake cells in player areas to adapt to construction and destruction.")]
 	public static bool nav_grid_rebake_cells_enabled = true;
 
+	[ServerVar(Help = "If nav_grid_agents_expand_domain_enabled is true, agents add new cells for baking as they walk around the world, as needed.")]
+	public static bool nav_grid_agents_expand_domain_enabled = true;
+
 	[ServerVar(Help = "nav_grid_rebake_cooldown defines how long a navmesh grid cell must wait between rebakes. Higher number means a cell will rebake less often.")]
 	public static float nav_grid_rebake_cooldown = 30f;
 
@@ -202,7 +208,23 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 	public static int nav_grid_cell_width = 80;
 
 	[ServerVar(Help = "nav_grid_cell_height adjust how much vertical difference within a cell we can cope with when generating navmesh.")]
-	public static int nav_grid_cell_height = 80;
+	public static int nav_grid_cell_height = 100;
+
+	[ServerVar(Help = "The maximum amount of nodes processed each frame in the asynchronous pathfinding process. Increasing this value will cause the paths to be processed faster, but can cause some hiccups in frame rate. Default value is 100, a good range for tuning is between 50 and 500.")]
+	public static int pathfindingIterationsPerFrame = 100;
+
+	[ServerVar(Help = "If an agent is beyond this distance to a player, it's flagged for becoming dormant.")]
+	public static float ai_to_player_distance_wakeup_range = 160f;
+
+	[ServerVar(Help = "nav_obstacles_carve_state defines which obstacles can carve the terrain. 0 - No carving, 1 - Only player construction carves, 2 - All obstacles carve.")]
+	public static int nav_obstacles_carve_state = 2;
+
+	[ServerVar(Help = "ai_dormant_max_wakeup_per_tick defines the maximum number of dormant agents we will wake up in a single tick. (default: 20)")]
+	public static int ai_dormant_max_wakeup_per_tick = 20;
+
+	private readonly BasePlayer[] playerVicinityQuery = new BasePlayer[1];
+
+	private readonly Func<BasePlayer, bool> filter = InterestedInPlayersOnly;
 
 	[SerializeField]
 	[Header("Intensity System")]
@@ -226,11 +248,13 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	public float NoEngagementToDecayTime = 5f;
 
+	public float DebugIntensityHeightMultiplier = 100f;
+
+	public Color DebugMinColor = Color.green;
+
+	public Color DebugMaxColor = Color.red;
+
 	private WorldSpaceGrid<EngagementInfo> intensityGrid;
-
-	public WorldSpaceGrid<NavMeshGridCell> NavMeshGrid;
-
-	private int lastUpdateCellIndex;
 
 	[Header("NavMesh Grid")]
 	[SerializeField]
@@ -242,23 +266,25 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	public float CellTimeoutThreshold = 30f;
 
+	public GameObjectRef NavMeshLinkPrefab;
+
+	internal WorldSpaceGrid<NavMeshGridCell> NavMeshGrid;
+
+	private int lastUpdateCellIndex;
+
 	private Dictionary<int, NavMeshGridCell.NavMeshLinkInfo> AgentLinks;
 
-	public PrefabPool LinkPool;
-
-	public GameObjectRef NavMeshLinkPrefab;
+	internal PrefabPool LinkPool;
 
 	private int lastPlayerIndexForRebake;
 
 	private int lastDirectionIndexForRebake;
 
-	public int NumCellsCurrentlyBaking;
+	internal int NumCellsCurrentlyBaking;
 
-	public int NumLinksCurrentlyGenerating;
+	internal int NumLinksCurrentlyGenerating;
 
 	private BinaryHeap<BakeInfo> bakeHeap;
-
-	private Queue<LinkInfo> linkGenQueue;
 
 	public static Vector2i[] Directions = new Vector2i[9]
 	{
@@ -285,11 +311,7 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	public void Add(IAIAgent agent)
 	{
-		if (!UseNavMesh)
-		{
-			AddActiveAgency(agent);
-		}
-		else if (ai_dormant)
+		if (ai_dormant)
 		{
 			if (IsAgentCloseToPlayers(agent))
 			{
@@ -308,7 +330,7 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	internal void InternalAdd(IAIAgent agent)
 	{
-		if (NavMeshAddAgent(agent, delegate(IAIAgent a)
+		if (!nav_grid || !UseNavMesh || NavMeshAddAgent(agent, delegate(IAIAgent a)
 		{
 			if (a != null)
 			{
@@ -323,11 +345,32 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 	internal void InternalAddPlusAdjacents(IAIAgent agent)
 	{
 		AddActiveAgency(agent);
-		Vector2i vector2i = NavMeshGrid.WorldToGridCoords(agent.Entity.ServerPosition);
-		for (int i = 1; i < Directions.Length; i++)
+		if (nav_grid && UseNavMesh)
 		{
-			Vector2i vector2i2 = Directions[i];
-			NavMeshAddAtCoord(agent, vector2i + vector2i2, agent.Entity.ServerPosition.y, agent.AgentTypeIndex);
+			Vector2i vector2i = NavMeshGrid.WorldToGridCoords(agent.Entity.ServerPosition);
+			for (int i = 1; i < Directions.Length; i++)
+			{
+				NavMeshAddAtCoord(agent, vector2i + Directions[i], agent.Entity.ServerPosition.y, agent.AgentTypeIndex);
+			}
+		}
+	}
+
+	internal void UpdateAgentSurroundings()
+	{
+		if (!nav_grid || !UseNavMesh)
+		{
+			return;
+		}
+		foreach (IAIAgent activeAgent in activeAgents)
+		{
+			if (activeAgent.AgencyUpdateRequired)
+			{
+				activeAgent.AgencyUpdateRequired = false;
+				for (int i = 1; i < Directions.Length; i++)
+				{
+					NavMeshAddAtCoord(activeAgent, activeAgent.CurrentCoord + Directions[i], activeAgent.Entity.ServerPosition.y, activeAgent.AgentTypeIndex);
+				}
+			}
 		}
 	}
 
@@ -342,22 +385,34 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	internal void AddActiveAgency(IAIAgent agent)
 	{
-		pendingAddToActive.Add(agent);
+		if (!pendingAddToActive.Contains(agent))
+		{
+			pendingAddToActive.Add(agent);
+		}
 	}
 
 	internal void AddDormantAgency(IAIAgent agent)
 	{
-		pendingAddToDormant.Add(agent);
+		if (!pendingAddToDormant.Contains(agent))
+		{
+			pendingAddToDormant.Add(agent);
+		}
 	}
 
 	internal void RemoveActiveAgency(IAIAgent agent)
 	{
-		pendingRemoveFromActive.Add(agent);
+		if (!pendingRemoveFromActive.Contains(agent))
+		{
+			pendingRemoveFromActive.Add(agent);
+		}
 	}
 
 	internal void RemoveDormantAgency(IAIAgent agent)
 	{
-		pendingRemoveFromDormant.Add(agent);
+		if (!pendingRemoveFromDormant.Contains(agent))
+		{
+			pendingRemoveFromDormant.Add(agent);
+		}
 	}
 
 	internal void UpdateAgency()
@@ -368,6 +423,10 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 		{
 			TryWakeUpDormantAgents();
 			TryMakeAgentsDormant();
+		}
+		if (!nav_disable && nav_grid && nav_grid_agents_expand_domain_enabled)
+		{
+			UpdateAgentSurroundings();
 		}
 	}
 
@@ -389,7 +448,10 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 			if (item2 != null)
 			{
 				activeAgents.Remove(item2);
-				RemoveAgentLinkReference(item2, removeAgentFromCache: true);
+				if (nav_grid && UseNavMesh)
+				{
+					RemoveAgentLinkReference(item2, removeAgentFromCache: true);
+				}
 			}
 		}
 		pendingRemoveFromActive.Clear();
@@ -424,16 +486,25 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 		{
 			return;
 		}
+		int num = 0;
 		foreach (IAIAgent dormantAgent in dormantAgents)
 		{
 			if (dormantAgent.Entity.IsDestroyed)
 			{
 				RemoveDormantAgency(dormantAgent);
+				continue;
 			}
-			else if (IsAgentCloseToPlayers(dormantAgent))
+			if (IsAgentCloseToPlayers(dormantAgent))
 			{
 				InternalAdd(dormantAgent);
+				RemoveDormantAgency(dormantAgent);
+				num++;
 			}
+			if (num <= ai_dormant_max_wakeup_per_tick)
+			{
+				continue;
+			}
+			break;
 		}
 	}
 
@@ -449,7 +520,7 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 			{
 				RemoveActiveAgency(activeAgent);
 			}
-			else if (UseNavMesh && !IsAgentCloseToPlayers(activeAgent))
+			else if (!IsAgentCloseToPlayers(activeAgent))
 			{
 				AddDormantAgency(activeAgent);
 				RemoveActiveAgency(activeAgent);
@@ -459,7 +530,7 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	internal void ForceAgentsDormant(Vector2i coord)
 	{
-		if (!UseNavMesh || !ai_dormant)
+		if (!nav_grid || !UseNavMesh || !ai_dormant)
 		{
 			return;
 		}
@@ -484,13 +555,16 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	internal void OnDisableCover()
 	{
-		for (int i = 0; i < coverPointVolumeGrid.Cells.Length; i++)
+		if (coverPointVolumeGrid != null && coverPointVolumeGrid.Cells != null)
 		{
-			UnityEngine.Object.Destroy(coverPointVolumeGrid.Cells[i]);
+			for (int i = 0; i < coverPointVolumeGrid.Cells.Length; i++)
+			{
+				UnityEngine.Object.Destroy(coverPointVolumeGrid.Cells[i]);
+			}
 		}
 	}
 
-	public static CoverPointVolume CreateNewCoverVolume(BaseEntity sampleCharacterSizePrefab, Vector3 point)
+	public static CoverPointVolume CreateNewCoverVolume(Vector3 point, Transform coverPointGroup)
 	{
 		if (SingletonComponent<AiManager>.Instance != null && SingletonComponent<AiManager>.Instance.enabled && SingletonComponent<AiManager>.Instance.UseCover)
 		{
@@ -502,11 +576,10 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 				coverPointVolume.transform.localPosition = default(Vector3);
 				coverPointVolume.transform.position = SingletonComponent<AiManager>.Instance.coverPointVolumeGrid.GridToWorldCoords(vector2i) + Vector3.up * point.y;
 				coverPointVolume.transform.localScale = new Vector3(SingletonComponent<AiManager>.Instance.CoverPointVolumeCellSize, SingletonComponent<AiManager>.Instance.CoverPointVolumeCellHeight, SingletonComponent<AiManager>.Instance.CoverPointVolumeCellSize);
-				coverPointVolume.SampleCharacterSizePrefab = sampleCharacterSizePrefab;
 				coverPointVolume.CoverLayerMask = SingletonComponent<AiManager>.Instance.DynamicCoverPointVolumeLayerMask;
-				coverPointVolume.CoverPointRayLength = 1.75f;
+				coverPointVolume.CoverPointRayLength = SingletonComponent<AiManager>.Instance.CoverPointRayLength;
 				SingletonComponent<AiManager>.Instance.coverPointVolumeGrid[vector2i] = coverPointVolume;
-				coverPointVolume.GenerateCoverPoints();
+				coverPointVolume.GenerateCoverPoints(coverPointGroup);
 			}
 			return coverPointVolume;
 		}
@@ -547,24 +620,31 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	private void OnDisable()
 	{
-		OnDisableAgency();
-		if (UseNavMesh)
+		if (!Rust.Application.isQuitting)
 		{
-			OnDisableNavMeshGrid();
+			OnDisableAgency();
+			if (UseNavMesh)
+			{
+				OnDisableNavMeshGrid();
+			}
+			if (UseCover)
+			{
+				OnDisableCover();
+			}
+			if (UseIntensity)
+			{
+				OnDisableIntensity();
+			}
+			Apex.LoadBalancing.LoadBalancer.defaultBalancer.Remove(this);
 		}
-		if (UseCover)
-		{
-			OnDisableCover();
-		}
-		if (UseIntensity)
-		{
-			OnDisableIntensity();
-		}
-		Apex.LoadBalancing.LoadBalancer.defaultBalancer.Remove(this);
 	}
 
 	public float? ExecuteUpdate(float deltaTime, float nextInterval)
 	{
+		if (nav_disable)
+		{
+			return nextInterval;
+		}
 		UpdateAgency();
 		if (UseNavMesh)
 		{
@@ -579,12 +659,32 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	private bool IsAgentCloseToPlayers(IAIAgent agent)
 	{
-		if (UseNavMesh)
+		bool flag = false;
+		if (nav_grid && UseNavMesh)
 		{
 			Vector2i coord = GetCoord(agent.Entity.ServerPosition);
 			return IsCoordCloseToPlayers(coord);
 		}
-		return false;
+		int playersInSphere = BaseEntity.Query.Server.GetPlayersInSphere(agent.Entity.ServerPosition, ai_to_player_distance_wakeup_range, playerVicinityQuery, filter);
+		return playersInSphere > 0;
+	}
+
+	private static bool InterestedInPlayersOnly(BaseEntity entity)
+	{
+		BasePlayer basePlayer = entity as BasePlayer;
+		if (basePlayer == null)
+		{
+			return false;
+		}
+		if (basePlayer is IAIAgent)
+		{
+			return false;
+		}
+		if (basePlayer.IsSleeping() || !basePlayer.IsConnected)
+		{
+			return false;
+		}
+		return true;
 	}
 
 	private bool IsCoordCloseToPlayers(Vector2i coord)
@@ -758,7 +858,7 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 		AgentLinks = new Dictionary<int, NavMeshGridCell.NavMeshLinkInfo>();
 		LinkPool = new PrefabPool();
 		bakeHeap = new BinaryHeap<BakeInfo>(256, new BakeInfo.Comparer());
-		linkGenQueue = new Queue<LinkInfo>();
+		NavMesh.pathfindingIterationsPerFrame = pathfindingIterationsPerFrame;
 	}
 
 	internal void OnDisableNavMeshGrid()
@@ -817,7 +917,8 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 		NavMeshGridCell navMeshGridCell = NavMeshGrid[coord];
 		if (navMeshGridCell == null)
 		{
-			navMeshGridCell = new GameObject("Cell").AddComponent<NavMeshGridCell>();
+			string text = "cell";
+			navMeshGridCell = new GameObject(text).AddComponent<NavMeshGridCell>();
 			navMeshGridCell.Setup(coord, NavMeshGrid.GridToWorldCoords(coord) + Vector3.up * y, new Vector3(nav_grid_cell_width, nav_grid_cell_height, nav_grid_cell_width), LayerMask, NavMeshCollectGeometry);
 			navMeshGridCell.transform.SetParent(base.transform);
 			NavMeshGrid[coord] = navMeshGridCell;
@@ -860,7 +961,6 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 		UpdateCellTimeouts();
 		UpdateCellPlayerTimestamps();
 		TryQueueCellRebakes();
-		TryQueueLinkGeneration();
 	}
 
 	private void TryBake()
@@ -875,11 +975,28 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	private void TryGenerateLinks()
 	{
-		while (linkGenQueue.Count > 0 && NumLinksCurrentlyGenerating < nav_grid_max_links_generated_per_frame)
+		if (!nav_grid_links_enabled || NumLinksCurrentlyGenerating >= nav_grid_max_links_generated_per_frame)
 		{
-			LinkInfo linkInfo = linkGenQueue.Dequeue();
-			NumLinksCurrentlyGenerating++;
-			StartCoroutine(linkInfo.LinkGenAction);
+			return;
+		}
+		foreach (IAIAgent activeAgent in activeAgents)
+		{
+			if (activeAgent.Entity == null)
+			{
+				RemoveActiveAgency(activeAgent);
+				continue;
+			}
+			Vector2i coord = GetCoord(activeAgent.Entity.ServerPosition);
+			NavMeshGridCell navMeshGridCell = NavMeshGrid[coord];
+			if (NumLinksCurrentlyGenerating < nav_grid_max_links_generated_per_frame && navMeshGridCell != null && !navMeshGridCell.Timeout(CellTimeoutThreshold) && navMeshGridCell.IsAtBorder(activeAgent.Entity.ServerPosition, (float)nav_grid_cell_width * 0.05f, mustHaveValidNeighbour: true))
+			{
+				NumLinksCurrentlyGenerating++;
+				StartCoroutine(LinkGeneration(activeAgent, navMeshGridCell));
+			}
+			else
+			{
+				RemoveAgentLinkReference(activeAgent);
+			}
 		}
 	}
 
@@ -968,37 +1085,6 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 		Pool.Free(ref obj);
 	}
 
-	private void TryQueueLinkGeneration()
-	{
-		if (!nav_grid_links_enabled)
-		{
-			return;
-		}
-		foreach (IAIAgent activeAgent in activeAgents)
-		{
-			if (activeAgent.Entity == null)
-			{
-				RemoveActiveAgency(activeAgent);
-				continue;
-			}
-			Vector2i coord = GetCoord(activeAgent.Entity.ServerPosition);
-			NavMeshGridCell navMeshGridCell = NavMeshGrid[coord];
-			if (navMeshGridCell != null && !navMeshGridCell.Timeout(CellTimeoutThreshold) && navMeshGridCell.IsAtBorder(activeAgent.Entity.ServerPosition, (float)nav_grid_cell_width * 0.1f, mustHaveValidNeighbour: true))
-			{
-				linkGenQueue.Enqueue(new LinkInfo
-				{
-					Agent = activeAgent,
-					Cell = navMeshGridCell,
-					LinkGenAction = LinkGeneration(activeAgent, navMeshGridCell)
-				});
-			}
-			else
-			{
-				RemoveAgentLinkReference(activeAgent);
-			}
-		}
-	}
-
 	private void DecreaseNumCellsCurrentlyBaking(NavMeshGridCell.Layer layer)
 	{
 		DecreaseNumCellsCurrentlyBaking();
@@ -1015,7 +1101,7 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	private IEnumerator LinkGeneration(IAIAgent agent, NavMeshGridCell cell)
 	{
-		if (agent != null && agent.Entity != null && cell != null && cell.IsAtBorder(agent.Entity.ServerPosition, (float)nav_grid_cell_width * 0.1f, mustHaveValidNeighbour: false))
+		if (agent != null && agent.Entity != null && cell != null && cell.IsAtBorder(agent.Entity.ServerPosition, (float)nav_grid_cell_width * 0.05f, mustHaveValidNeighbour: false))
 		{
 			NavMeshGridCell.NavMeshLinkInfo link = cell.GetOrCreateLink(agent.AgentTypeIndex, agent.Entity.ServerPosition, (float)nav_grid_cell_width * 0.1f);
 			if (link != null)
@@ -1160,10 +1246,9 @@ public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadB
 
 	public bool IsCoordEqualOrAdjacentToOther(Vector2i coord, Vector2i other)
 	{
-		Vector2i[] directions = Directions;
-		foreach (Vector2i vector2i in directions)
+		for (int i = 0; i < Directions.Length; i++)
 		{
-			if (coord + vector2i == other)
+			if (coord.x + Directions[i].x == other.x && coord.y + Directions[i].y == other.y)
 			{
 				return true;
 			}

@@ -120,7 +120,10 @@ public class BaseEntity : BaseNetworkable
 		Reserved4 = 0x400,
 		Reserved5 = 0x800,
 		Broken = 0x1000,
-		Busy = 0x2000
+		Busy = 0x2000,
+		Reserved6 = 0x4000,
+		Reserved7 = 0x8000,
+		Reserved8 = 0x10000
 	}
 
 	public static class Query
@@ -129,9 +132,12 @@ public class BaseEntity : BaseNetworkable
 		{
 			private Grid<BaseEntity> Grid;
 
+			private Grid<BasePlayer> PlayerGrid;
+
 			public EntityTree(float worldSize)
 			{
 				Grid = new Grid<BaseEntity>(32, worldSize);
+				PlayerGrid = new Grid<BasePlayer>(32, worldSize);
 			}
 
 			public void Add(BaseEntity ent)
@@ -140,20 +146,55 @@ public class BaseEntity : BaseNetworkable
 				Grid.Add(ent, localPosition.x, localPosition.z);
 			}
 
-			public void Remove(BaseEntity ent)
+			public void AddPlayer(BasePlayer player)
+			{
+				Vector3 localPosition = player.transform.localPosition;
+				PlayerGrid.Add(player, localPosition.x, localPosition.z);
+			}
+
+			public void Remove(BaseEntity ent, bool isPlayer = false)
 			{
 				Grid.Remove(ent);
+				if (isPlayer)
+				{
+					BasePlayer basePlayer = ent as BasePlayer;
+					if (basePlayer != null)
+					{
+						PlayerGrid.Remove(basePlayer);
+					}
+				}
+			}
+
+			public void RemovePlayer(BasePlayer player)
+			{
+				PlayerGrid.Remove(player);
 			}
 
 			public void Move(BaseEntity ent)
 			{
 				Vector3 localPosition = ent.transform.localPosition;
 				Grid.Move(ent, localPosition.x, localPosition.z);
+				BasePlayer basePlayer = ent as BasePlayer;
+				if (basePlayer != null)
+				{
+					MovePlayer(basePlayer);
+				}
+			}
+
+			public void MovePlayer(BasePlayer player)
+			{
+				Vector3 localPosition = player.transform.localPosition;
+				PlayerGrid.Move(player, localPosition.x, localPosition.z);
 			}
 
 			public int GetInSphere(Vector3 position, float distance, BaseEntity[] results, Func<BaseEntity, bool> filter = null)
 			{
 				return Grid.Query(position.x, position.z, distance, results, filter);
+			}
+
+			public int GetPlayersInSphere(Vector3 position, float distance, BasePlayer[] results, Func<BasePlayer, bool> filter = null)
+			{
+				return PlayerGrid.Query(position.x, position.z, distance, results, filter);
 			}
 		}
 
@@ -305,7 +346,8 @@ public class BaseEntity : BaseNetworkable
 		Relax,
 		Gesture,
 		PhysImpact,
-		Eat
+		Eat,
+		Startled
 	}
 
 	public enum Slot
@@ -315,6 +357,7 @@ public class BaseEntity : BaseNetworkable
 		UpperModifier,
 		MiddleModifier,
 		LowerModifier,
+		CenterDecoration,
 		Count
 	}
 
@@ -395,7 +438,9 @@ public class BaseEntity : BaseNetworkable
 	private EntityComponentBase[] _components;
 
 	[NonSerialized]
-	protected string _name;
+	public string _name;
+
+	private static Queue<BaseEntity> globalBroadcastQueue = new Queue<BaseEntity>();
 
 	private static uint globalBroadcastProtocol = 0u;
 
@@ -419,7 +464,7 @@ public class BaseEntity : BaseNetworkable
 
 	private bool isCallingUpdateNetworkGroup;
 
-	private EntityRef[] entitySlots = new EntityRef[5];
+	private EntityRef[] entitySlots = new EntityRef[6];
 
 	protected List<TriggerBase> triggers;
 
@@ -740,7 +785,18 @@ public class BaseEntity : BaseNetworkable
 		return IsVisible(position, CenterPoint()) || IsVisible(position, ClosestPoint(position));
 	}
 
-	public bool IsOutside()
+	public bool IsOlderThan(BaseEntity other)
+	{
+		if (other == null)
+		{
+			return true;
+		}
+		uint num = ((net != null) ? net.ID : 0u);
+		uint num2 = ((other.net != null) ? other.net.ID : 0u);
+		return num < num2;
+	}
+
+	public virtual bool IsOutside()
 	{
 		OBB oBB = WorldSpaceBounds();
 		Vector3 position = oBB.position + oBB.up * oBB.extents.y;
@@ -1075,29 +1131,66 @@ public class BaseEntity : BaseNetworkable
 	public void EntityLinkBroadcast<T>(Action<T> action) where T : BaseEntity
 	{
 		globalBroadcastProtocol++;
-		EntityLinkBroadcastInternal(action);
-	}
-
-	private void EntityLinkBroadcastInternal<T>(Action<T> action) where T : BaseEntity
-	{
-		if (broadcastProtocol == globalBroadcastProtocol)
-		{
-			return;
-		}
+		globalBroadcastQueue.Clear();
 		broadcastProtocol = globalBroadcastProtocol;
+		globalBroadcastQueue.Enqueue(this);
 		if (this is T)
 		{
 			action(this as T);
 		}
-		List<EntityLink> entityLinks = GetEntityLinks();
-		for (int i = 0; i < entityLinks.Count; i++)
+		while (globalBroadcastQueue.Count > 0)
 		{
-			EntityLink entityLink = entityLinks[i];
-			for (int j = 0; j < entityLink.connections.Count; j++)
+			BaseEntity baseEntity = globalBroadcastQueue.Dequeue();
+			List<EntityLink> entityLinks = baseEntity.GetEntityLinks();
+			for (int i = 0; i < entityLinks.Count; i++)
 			{
-				entityLink.connections[j].owner.EntityLinkBroadcastInternal(action);
+				EntityLink entityLink = entityLinks[i];
+				for (int j = 0; j < entityLink.connections.Count; j++)
+				{
+					BaseEntity owner = entityLink.connections[j].owner;
+					if (owner.broadcastProtocol != globalBroadcastProtocol)
+					{
+						owner.broadcastProtocol = globalBroadcastProtocol;
+						globalBroadcastQueue.Enqueue(owner);
+						if (owner is T)
+						{
+							action(owner as T);
+						}
+					}
+				}
 			}
 		}
+	}
+
+	public void EntityLinkBroadcast()
+	{
+		globalBroadcastProtocol++;
+		globalBroadcastQueue.Clear();
+		broadcastProtocol = globalBroadcastProtocol;
+		globalBroadcastQueue.Enqueue(this);
+		while (globalBroadcastQueue.Count > 0)
+		{
+			BaseEntity baseEntity = globalBroadcastQueue.Dequeue();
+			List<EntityLink> entityLinks = baseEntity.GetEntityLinks();
+			for (int i = 0; i < entityLinks.Count; i++)
+			{
+				EntityLink entityLink = entityLinks[i];
+				for (int j = 0; j < entityLink.connections.Count; j++)
+				{
+					BaseEntity owner = entityLink.connections[j].owner;
+					if (owner.broadcastProtocol != globalBroadcastProtocol)
+					{
+						owner.broadcastProtocol = globalBroadcastProtocol;
+						globalBroadcastQueue.Enqueue(owner);
+					}
+				}
+			}
+		}
+	}
+
+	public bool ReceivedEntityLinkBroadcast()
+	{
+		return broadcastProtocol == globalBroadcastProtocol;
 	}
 
 	public List<EntityLink> GetEntityLinks(bool linkToNeighbours = true)
@@ -1157,7 +1250,11 @@ public class BaseEntity : BaseNetworkable
 			Vis.Entities(oBB.position, oBB.extents.magnitude + 1f, obj);
 			for (int i = 0; i < obj.Count; i++)
 			{
-				LinkToEntity(obj[i]);
+				BaseEntity baseEntity = obj[i];
+				if (baseEntity.isServer == base.isServer)
+				{
+					LinkToEntity(baseEntity);
+				}
 			}
 			Facepunch.Pool.FreeList(ref obj);
 		}
@@ -1199,7 +1296,7 @@ public class BaseEntity : BaseNetworkable
 			{
 				channel = 2,
 				method = SendMethod.Reliable
-			}, null, funcName, new Facepunch.ObjectList(num, (uint)array.Length, array));
+			}, null, funcName, num, (uint)array.Length, array);
 		}
 	}
 
@@ -1243,7 +1340,7 @@ public class BaseEntity : BaseNetworkable
 			}
 			if (HasChild(entity))
 			{
-				Debug.LogError("Trying to to child " + this, base.gameObject);
+				Debug.LogError("Trying to parent to child " + this, base.gameObject);
 				return;
 			}
 		}
@@ -1266,6 +1363,7 @@ public class BaseEntity : BaseNetworkable
 			if (parentEntity.IsValid(base.isServer))
 			{
 				parentEntity.Set(null);
+				base.transform.SetParent(null, worldPositionStays: false);
 				parentBone = 0u;
 				UpdateNetworkGroup();
 				SendNetworkUpdate();
@@ -1279,6 +1377,7 @@ public class BaseEntity : BaseNetworkable
 			Debug.Assert(entity.net.ID != 0, "Setting parent to entity that hasn't spawned yet! (id = 0)");
 			entity.AddChild(this);
 			parentEntity.Set(entity);
+			base.transform.SetParent(entity.transform, worldPositionStays: false);
 			parentBone = boneID;
 			UpdateNetworkGroup();
 			SendNetworkUpdate();
@@ -1325,28 +1424,45 @@ public class BaseEntity : BaseNetworkable
 
 	public Vector3 GetEstimatedWorldPosition()
 	{
-		if (base.isServer)
-		{
-			BaseEntity baseEntity = GetParentEntity();
-			if (baseEntity.IsValid())
-			{
-				return baseEntity.GetEstimatedWorldPosition() + baseEntity.GetEstimatedWorldRotation() * base.transform.position;
-			}
-		}
 		return base.transform.position;
 	}
 
 	public Quaternion GetEstimatedWorldRotation()
 	{
-		if (base.isServer)
+		return base.transform.rotation;
+	}
+
+	public virtual BuildingPrivlidge GetBuildingPrivilege()
+	{
+		return GetBuildingPrivilege(WorldSpaceBounds());
+	}
+
+	public BuildingPrivlidge GetBuildingPrivilege(OBB obb)
+	{
+		BuildingBlock other = null;
+		BuildingPrivlidge result = null;
+		List<BuildingBlock> obj = Facepunch.Pool.GetList<BuildingBlock>();
+		Vis.Entities(obb.position, 16f + obb.extents.magnitude, obj, 2097152);
+		for (int i = 0; i < obj.Count; i++)
 		{
-			BaseEntity baseEntity = GetParentEntity();
-			if (baseEntity.IsValid())
+			BuildingBlock buildingBlock = obj[i];
+			if (buildingBlock.isServer != base.isServer || !buildingBlock.IsOlderThan(other) || obb.Distance(buildingBlock.WorldSpaceBounds()) > 16f)
 			{
-				return baseEntity.GetEstimatedWorldRotation() * base.transform.rotation;
+				continue;
+			}
+			BuildingManager.Building building = buildingBlock.GetBuilding();
+			if (building != null)
+			{
+				BuildingPrivlidge dominatingBuildingPrivilege = building.GetDominatingBuildingPrivilege();
+				if (!(dominatingBuildingPrivilege == null))
+				{
+					other = buildingBlock;
+					result = dominatingBuildingPrivilege;
+				}
 			}
 		}
-		return base.transform.rotation;
+		Facepunch.Pool.FreeList(ref obj);
+		return result;
 	}
 
 	public void SV_RPCMessage(uint nameID, Message message)
@@ -1375,40 +1491,185 @@ public class BaseEntity : BaseNetworkable
 		}
 	}
 
-	public void ClientRPCPlayer(Connection sourceConnection, BasePlayer player, string funcName, object obj0 = null, object obj1 = null, object obj2 = null, object obj3 = null, object obj4 = null)
+	public void ClientRPCPlayer<T1, T2, T3, T4, T5>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
 	{
 		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
 		{
-			ClientRPCEx(new SendInfo(player.net.connection), sourceConnection, funcName, new Facepunch.ObjectList(obj0, obj1, obj2, obj3, obj4));
+			ClientRPCEx(new SendInfo(player.net.connection), sourceConnection, funcName, arg1, arg2, arg3, arg4, arg5);
 		}
 	}
 
-	public void ClientRPC(Connection sourceConnection, string funcName, object obj0 = null, object obj1 = null, object obj2 = null, object obj3 = null, object obj4 = null)
+	public void ClientRPCPlayer<T1, T2, T3, T4>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
 	{
-		if (Network.Net.sv.IsConnected() && net != null)
+		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
 		{
-			ClientRPCEx(new SendInfo(net.group), sourceConnection, funcName, new Facepunch.ObjectList(obj0, obj1, obj2, obj3, obj4));
+			ClientRPCEx(new SendInfo(player.net.connection), sourceConnection, funcName, arg1, arg2, arg3, arg4);
 		}
 	}
 
-	public void ClientRPCEx(SendInfo sendInfo, Connection sourceConnection, string funcName, Facepunch.ObjectList? objects = null)
+	public void ClientRPCPlayer<T1, T2, T3>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1, T2 arg2, T3 arg3)
 	{
-		if (!Network.Net.sv.IsConnected() || net == null || !Network.Net.sv.write.Start())
+		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
 		{
-			return;
+			ClientRPCEx(new SendInfo(player.net.connection), sourceConnection, funcName, arg1, arg2, arg3);
 		}
-		Network.Net.sv.write.PacketID(Message.Type.RPCMessage);
-		Network.Net.sv.write.UInt32(net.ID);
-		Network.Net.sv.write.UInt32(StringPool.Get(funcName));
-		Network.Net.sv.write.UInt64(sourceConnection?.userid ?? 0);
-		if (objects.HasValue)
+	}
+
+	public void ClientRPCPlayer<T1, T2>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1, T2 arg2)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
 		{
-			Facepunch.ObjectList value = objects.Value;
-			for (int i = 0; i < value.Length; i++)
-			{
-				Network.Net.sv.write.WriteObject(value.Get(i));
-			}
+			ClientRPCEx(new SendInfo(player.net.connection), sourceConnection, funcName, arg1, arg2);
 		}
+	}
+
+	public void ClientRPCPlayer<T1>(Connection sourceConnection, BasePlayer player, string funcName, T1 arg1)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
+		{
+			ClientRPCEx(new SendInfo(player.net.connection), sourceConnection, funcName, arg1);
+		}
+	}
+
+	public void ClientRPCPlayer(Connection sourceConnection, BasePlayer player, string funcName)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && player.net.connection != null)
+		{
+			ClientRPCEx(new SendInfo(player.net.connection), sourceConnection, funcName);
+		}
+	}
+
+	public void ClientRPC<T1, T2, T3, T4, T5>(Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
+		{
+			ClientRPCEx(new SendInfo(net.group.subscribers), sourceConnection, funcName, arg1, arg2, arg3, arg4, arg5);
+		}
+	}
+
+	public void ClientRPC<T1, T2, T3, T4>(Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
+		{
+			ClientRPCEx(new SendInfo(net.group.subscribers), sourceConnection, funcName, arg1, arg2, arg3, arg4);
+		}
+	}
+
+	public void ClientRPC<T1, T2, T3>(Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
+		{
+			ClientRPCEx(new SendInfo(net.group.subscribers), sourceConnection, funcName, arg1, arg2, arg3);
+		}
+	}
+
+	public void ClientRPC<T1, T2>(Connection sourceConnection, string funcName, T1 arg1, T2 arg2)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
+		{
+			ClientRPCEx(new SendInfo(net.group.subscribers), sourceConnection, funcName, arg1, arg2);
+		}
+	}
+
+	public void ClientRPC<T1>(Connection sourceConnection, string funcName, T1 arg1)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
+		{
+			ClientRPCEx(new SendInfo(net.group.subscribers), sourceConnection, funcName, arg1);
+		}
+	}
+
+	public void ClientRPC(Connection sourceConnection, string funcName)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && net.group != null)
+		{
+			ClientRPCEx(new SendInfo(net.group.subscribers), sourceConnection, funcName);
+		}
+	}
+
+	public void ClientRPCEx<T1, T2, T3, T4, T5>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4, T5 arg5)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && ClientRPCStart(sourceConnection, funcName))
+		{
+			ClientRPCWrite(arg1);
+			ClientRPCWrite(arg2);
+			ClientRPCWrite(arg3);
+			ClientRPCWrite(arg4);
+			ClientRPCWrite(arg5);
+			ClientRPCSend(sendInfo);
+		}
+	}
+
+	public void ClientRPCEx<T1, T2, T3, T4>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && ClientRPCStart(sourceConnection, funcName))
+		{
+			ClientRPCWrite(arg1);
+			ClientRPCWrite(arg2);
+			ClientRPCWrite(arg3);
+			ClientRPCWrite(arg4);
+			ClientRPCSend(sendInfo);
+		}
+	}
+
+	public void ClientRPCEx<T1, T2, T3>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1, T2 arg2, T3 arg3)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && ClientRPCStart(sourceConnection, funcName))
+		{
+			ClientRPCWrite(arg1);
+			ClientRPCWrite(arg2);
+			ClientRPCWrite(arg3);
+			ClientRPCSend(sendInfo);
+		}
+	}
+
+	public void ClientRPCEx<T1, T2>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1, T2 arg2)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && ClientRPCStart(sourceConnection, funcName))
+		{
+			ClientRPCWrite(arg1);
+			ClientRPCWrite(arg2);
+			ClientRPCSend(sendInfo);
+		}
+	}
+
+	public void ClientRPCEx<T1>(SendInfo sendInfo, Connection sourceConnection, string funcName, T1 arg1)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && ClientRPCStart(sourceConnection, funcName))
+		{
+			ClientRPCWrite(arg1);
+			ClientRPCSend(sendInfo);
+		}
+	}
+
+	public void ClientRPCEx(SendInfo sendInfo, Connection sourceConnection, string funcName)
+	{
+		if (Network.Net.sv.IsConnected() && net != null && ClientRPCStart(sourceConnection, funcName))
+		{
+			ClientRPCSend(sendInfo);
+		}
+	}
+
+	private bool ClientRPCStart(Connection sourceConnection, string funcName)
+	{
+		if (Network.Net.sv.write.Start())
+		{
+			Network.Net.sv.write.PacketID(Message.Type.RPCMessage);
+			Network.Net.sv.write.UInt32(net.ID);
+			Network.Net.sv.write.UInt32(StringPool.Get(funcName));
+			Network.Net.sv.write.UInt64(sourceConnection?.userid ?? 0);
+			return true;
+		}
+		return false;
+	}
+
+	private void ClientRPCWrite<T>(T arg)
+	{
+		NetworkWriteEx.WriteObject(Network.Net.sv.write, arg);
+	}
+
+	private void ClientRPCSend(SendInfo sendInfo)
+	{
 		Network.Net.sv.write.Send(sendInfo);
 	}
 
@@ -1418,8 +1679,8 @@ public class BaseEntity : BaseNetworkable
 		info.msg.baseEntity = Facepunch.Pool.Get<ProtoBuf.BaseEntity>();
 		if (info.forDisk)
 		{
-			info.msg.baseEntity.pos = base.transform.position;
-			info.msg.baseEntity.rot = base.transform.rotation.eulerAngles;
+			info.msg.baseEntity.pos = base.transform.localPosition;
+			info.msg.baseEntity.rot = base.transform.localRotation.eulerAngles;
 		}
 		else
 		{
@@ -1440,6 +1701,7 @@ public class BaseEntity : BaseNetworkable
 			info.msg.entitySlots.slotLock = entitySlots[0].uid;
 			info.msg.entitySlots.slotFireMod = entitySlots[1].uid;
 			info.msg.entitySlots.slotUpperModification = entitySlots[2].uid;
+			info.msg.entitySlots.centerDecoration = entitySlots[5].uid;
 		}
 		if (info.forDisk && (bool)_spawnable)
 		{
@@ -1483,6 +1745,7 @@ public class BaseEntity : BaseNetworkable
 			entitySlots[0].uid = info.msg.entitySlots.slotLock;
 			entitySlots[1].uid = info.msg.entitySlots.slotFireMod;
 			entitySlots[2].uid = info.msg.entitySlots.slotUpperModification;
+			entitySlots[5].uid = info.msg.entitySlots.centerDecoration;
 		}
 		if (info.msg.parent != null)
 		{
@@ -1518,17 +1781,13 @@ public class BaseEntity : BaseNetworkable
 			Assert.IsTrue(!saveList.Contains(this), "Already in save list - server Init being called twice?");
 			saveList.Add(this);
 		}
-		if (base.transform.parent != null)
-		{
-			base.transform.parent = null;
-		}
 		if (flags != 0)
 		{
 			OnFlagsChanged((Flags)0, flags);
 		}
-		if (syncPosition)
+		if (syncPosition && PositionTickRate >= 0f)
 		{
-			InvokeRandomized(NetworkPositionTick, PositionTickRate, PositionTickRate, PositionTickRate * 0.1f);
+			InvokeRandomized(NetworkPositionTick, PositionTickRate, PositionTickRate - PositionTickRate * 0.05f, PositionTickRate * 0.05f);
 		}
 		Query.Server.Add(this);
 	}
@@ -1537,7 +1796,7 @@ public class BaseEntity : BaseNetworkable
 	{
 	}
 
-	private void NetworkPositionTick()
+	protected void NetworkPositionTick()
 	{
 		if (base.transform.hasChanged)
 		{
@@ -1548,7 +1807,10 @@ public class BaseEntity : BaseNetworkable
 
 	private void TransformChanged()
 	{
-		Query.Server.Move(this);
+		if (Query.Server != null)
+		{
+			Query.Server.Move(this);
+		}
 		if (net == null)
 		{
 			return;
@@ -1690,7 +1952,6 @@ public class BaseEntity : BaseNetworkable
 
 	public virtual void Eat(BaseNpc baseNpc, float timeSpent)
 	{
-		Debug.LogWarning(string.Concat(ToString(), " is being eaten by ", baseNpc, " but not implemented!"));
 		baseNpc.AddCalories(100f);
 	}
 
@@ -1778,8 +2039,8 @@ public class BaseEntity : BaseNetworkable
 		return 1f;
 	}
 
-	[RPC_Server.FromOwner]
 	[RPC_Server]
+	[RPC_Server.FromOwner]
 	private void BroadcastSignalFromClient(RPCMessage msg)
 	{
 		Signal signal = (Signal)msg.read.Int32();
@@ -1789,25 +2050,25 @@ public class BaseEntity : BaseNetworkable
 
 	public void SignalBroadcast(Signal signal, string arg, Connection sourceConnection = null)
 	{
-		if (net != null)
+		if (net != null && net.group != null)
 		{
-			ClientRPCEx(new SendInfo(net.group)
+			ClientRPCEx(new SendInfo(net.group.subscribers)
 			{
 				method = SendMethod.Unreliable,
 				priority = Priority.Immediate
-			}, sourceConnection, "SignalFromServerEx", new Facepunch.ObjectList((int)signal, arg));
+			}, sourceConnection, "SignalFromServerEx", (int)signal, arg);
 		}
 	}
 
 	public void SignalBroadcast(Signal signal, Connection sourceConnection = null)
 	{
-		if (net != null)
+		if (net != null && net.group != null)
 		{
-			ClientRPCEx(new SendInfo(net.group)
+			ClientRPCEx(new SendInfo(net.group.subscribers)
 			{
 				method = SendMethod.Unreliable,
 				priority = Priority.Immediate
-			}, sourceConnection, "SignalFromServer", new Facepunch.ObjectList((int)signal));
+			}, sourceConnection, "SignalFromServer", (int)signal);
 		}
 	}
 

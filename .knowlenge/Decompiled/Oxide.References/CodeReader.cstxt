@@ -1,0 +1,563 @@
+using System;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+using Mono.Cecil.PE;
+using Mono.Collections.Generic;
+
+internal sealed class CodeReader : ByteBuffer
+{
+	internal readonly MetadataReader reader;
+
+	private int start;
+
+	private Section code_section;
+
+	private MethodDefinition method;
+
+	private MethodBody body;
+
+	private int Offset => position - start;
+
+	public CodeReader(Section section, MetadataReader reader)
+		: base(section.Data)
+	{
+		code_section = section;
+		this.reader = reader;
+	}
+
+	public MethodBody ReadMethodBody(MethodDefinition method)
+	{
+		this.method = method;
+		body = new MethodBody(method);
+		reader.context = method;
+		ReadMethodBody();
+		return body;
+	}
+
+	public void MoveTo(int rva)
+	{
+		if (!IsInSection(rva))
+		{
+			code_section = reader.image.GetSectionAtVirtualAddress((uint)rva);
+			Reset(code_section.Data);
+		}
+		position = rva - (int)code_section.VirtualAddress;
+	}
+
+	private bool IsInSection(int rva)
+	{
+		if (code_section.VirtualAddress <= rva)
+		{
+			return rva < code_section.VirtualAddress + code_section.SizeOfRawData;
+		}
+		return false;
+	}
+
+	private void ReadMethodBody()
+	{
+		MoveTo(method.RVA);
+		byte b = ReadByte();
+		switch (b & 3)
+		{
+		case 2:
+			body.code_size = b >> 2;
+			body.MaxStackSize = 8;
+			ReadCode();
+			break;
+		case 3:
+			position--;
+			ReadFatMethod();
+			break;
+		default:
+			throw new InvalidOperationException();
+		}
+		ISymbolReader symbol_reader = reader.module.symbol_reader;
+		if (symbol_reader != null)
+		{
+			Collection<Instruction> instructions = body.Instructions;
+			symbol_reader.Read(body, (int offset) => GetInstruction(instructions, offset));
+		}
+	}
+
+	private void ReadFatMethod()
+	{
+		ushort num = ReadUInt16();
+		body.max_stack_size = ReadUInt16();
+		body.code_size = (int)ReadUInt32();
+		body.local_var_token = new MetadataToken(ReadUInt32());
+		body.init_locals = (num & 0x10) != 0;
+		if (body.local_var_token.RID != 0)
+		{
+			body.variables = ReadVariables(body.local_var_token);
+		}
+		ReadCode();
+		if ((num & 8) != 0)
+		{
+			ReadSection();
+		}
+	}
+
+	public VariableDefinitionCollection ReadVariables(MetadataToken local_var_token)
+	{
+		int num = reader.position;
+		VariableDefinitionCollection result = reader.ReadVariables(local_var_token);
+		reader.position = num;
+		return result;
+	}
+
+	private void ReadCode()
+	{
+		start = position;
+		int num = body.code_size;
+		if (num < 0 || buffer.Length <= (uint)(num + position))
+		{
+			num = 0;
+		}
+		int num2 = start + num;
+		Collection<Instruction> collection = (body.instructions = new InstructionCollection((num + 1) / 2));
+		while (position < num2)
+		{
+			int offset = position - start;
+			OpCode opCode = ReadOpCode();
+			Instruction instruction = new Instruction(offset, opCode);
+			if (opCode.OperandType != OperandType.InlineNone)
+			{
+				instruction.operand = ReadOperand(instruction);
+			}
+			collection.Add(instruction);
+		}
+		ResolveBranches(collection);
+	}
+
+	private OpCode ReadOpCode()
+	{
+		byte b = ReadByte();
+		if (b == 254)
+		{
+			return OpCodes.TwoBytesOpCode[ReadByte()];
+		}
+		return OpCodes.OneByteOpCode[b];
+	}
+
+	private object ReadOperand(Instruction instruction)
+	{
+		switch (instruction.opcode.OperandType)
+		{
+		case OperandType.InlineSwitch:
+		{
+			int num = ReadInt32();
+			int num2 = Offset + 4 * num;
+			int[] array = new int[num];
+			for (int i = 0; i < num; i++)
+			{
+				array[i] = num2 + ReadInt32();
+			}
+			return array;
+		}
+		case OperandType.ShortInlineBrTarget:
+			return ReadSByte() + Offset;
+		case OperandType.InlineBrTarget:
+			return ReadInt32() + Offset;
+		case OperandType.ShortInlineI:
+			if (instruction.opcode == OpCodes.Ldc_I4_S)
+			{
+				return ReadSByte();
+			}
+			return ReadByte();
+		case OperandType.InlineI:
+			return ReadInt32();
+		case OperandType.ShortInlineR:
+			return ReadSingle();
+		case OperandType.InlineR:
+			return ReadDouble();
+		case OperandType.InlineI8:
+			return ReadInt64();
+		case OperandType.ShortInlineVar:
+			return GetVariable(ReadByte());
+		case OperandType.InlineVar:
+			return GetVariable(ReadUInt16());
+		case OperandType.ShortInlineArg:
+			return GetParameter(ReadByte());
+		case OperandType.InlineArg:
+			return GetParameter(ReadUInt16());
+		case OperandType.InlineSig:
+			return GetCallSite(ReadToken());
+		case OperandType.InlineString:
+			return GetString(ReadToken());
+		case OperandType.InlineField:
+		case OperandType.InlineMethod:
+		case OperandType.InlineTok:
+		case OperandType.InlineType:
+			return reader.LookupToken(ReadToken());
+		default:
+			throw new NotSupportedException();
+		}
+	}
+
+	public string GetString(MetadataToken token)
+	{
+		return reader.image.UserStringHeap.Read(token.RID);
+	}
+
+	public ParameterDefinition GetParameter(int index)
+	{
+		return body.GetParameter(index);
+	}
+
+	public VariableDefinition GetVariable(int index)
+	{
+		return body.GetVariable(index);
+	}
+
+	public CallSite GetCallSite(MetadataToken token)
+	{
+		return reader.ReadCallSite(token);
+	}
+
+	private void ResolveBranches(Collection<Instruction> instructions)
+	{
+		Instruction[] items = instructions.items;
+		int size = instructions.size;
+		for (int i = 0; i < size; i++)
+		{
+			Instruction instruction = items[i];
+			switch (instruction.opcode.OperandType)
+			{
+			case OperandType.InlineBrTarget:
+			case OperandType.ShortInlineBrTarget:
+				instruction.operand = GetInstruction((int)instruction.operand);
+				break;
+			case OperandType.InlineSwitch:
+			{
+				int[] array = (int[])instruction.operand;
+				Instruction[] array2 = new Instruction[array.Length];
+				for (int j = 0; j < array.Length; j++)
+				{
+					array2[j] = GetInstruction(array[j]);
+				}
+				instruction.operand = array2;
+				break;
+			}
+			}
+		}
+	}
+
+	private Instruction GetInstruction(int offset)
+	{
+		return GetInstruction(body.Instructions, offset);
+	}
+
+	private static Instruction GetInstruction(Collection<Instruction> instructions, int offset)
+	{
+		int size = instructions.size;
+		Instruction[] items = instructions.items;
+		if (offset < 0 || offset > items[size - 1].offset)
+		{
+			return null;
+		}
+		int num = 0;
+		int num2 = size - 1;
+		while (num <= num2)
+		{
+			int num3 = num + (num2 - num) / 2;
+			Instruction instruction = items[num3];
+			int offset2 = instruction.offset;
+			if (offset == offset2)
+			{
+				return instruction;
+			}
+			if (offset < offset2)
+			{
+				num2 = num3 - 1;
+			}
+			else
+			{
+				num = num3 + 1;
+			}
+		}
+		return null;
+	}
+
+	private void ReadSection()
+	{
+		Align(4);
+		byte num = ReadByte();
+		if ((num & 0x40) == 0)
+		{
+			ReadSmallSection();
+		}
+		else
+		{
+			ReadFatSection();
+		}
+		if ((num & 0x80) != 0)
+		{
+			ReadSection();
+		}
+	}
+
+	private void ReadSmallSection()
+	{
+		int count = ReadByte() / 12;
+		Advance(2);
+		ReadExceptionHandlers(count, () => ReadUInt16(), () => ReadByte());
+	}
+
+	private void ReadFatSection()
+	{
+		position--;
+		int count = (ReadInt32() >> 8) / 24;
+		ReadExceptionHandlers(count, base.ReadInt32, base.ReadInt32);
+	}
+
+	private void ReadExceptionHandlers(int count, Func<int> read_entry, Func<int> read_length)
+	{
+		for (int i = 0; i < count; i++)
+		{
+			ExceptionHandler exceptionHandler = new ExceptionHandler((ExceptionHandlerType)(read_entry() & 7));
+			exceptionHandler.TryStart = GetInstruction(read_entry());
+			exceptionHandler.TryEnd = GetInstruction(exceptionHandler.TryStart.Offset + read_length());
+			exceptionHandler.HandlerStart = GetInstruction(read_entry());
+			exceptionHandler.HandlerEnd = GetInstruction(exceptionHandler.HandlerStart.Offset + read_length());
+			ReadExceptionHandlerSpecific(exceptionHandler);
+			body.ExceptionHandlers.Add(exceptionHandler);
+		}
+	}
+
+	private void ReadExceptionHandlerSpecific(ExceptionHandler handler)
+	{
+		switch (handler.HandlerType)
+		{
+		case ExceptionHandlerType.Catch:
+			handler.CatchType = (TypeReference)reader.LookupToken(ReadToken());
+			break;
+		case ExceptionHandlerType.Filter:
+			handler.FilterStart = GetInstruction(ReadInt32());
+			break;
+		default:
+			Advance(4);
+			break;
+		}
+	}
+
+	private void Align(int align)
+	{
+		align--;
+		Advance(((position + align) & ~align) - position);
+	}
+
+	public MetadataToken ReadToken()
+	{
+		return new MetadataToken(ReadUInt32());
+	}
+
+	public ByteBuffer PatchRawMethodBody(MethodDefinition method, CodeWriter writer, out MethodSymbols symbols)
+	{
+		ByteBuffer byteBuffer = new ByteBuffer();
+		symbols = new MethodSymbols(method.Name);
+		this.method = method;
+		reader.context = method;
+		MoveTo(method.RVA);
+		byte b = ReadByte();
+		MetadataToken local_var_token;
+		switch (b & 3)
+		{
+		case 2:
+			byteBuffer.WriteByte(b);
+			local_var_token = MetadataToken.Zero;
+			symbols.code_size = b >> 2;
+			PatchRawCode(byteBuffer, symbols.code_size, writer);
+			break;
+		case 3:
+			position--;
+			PatchRawFatMethod(byteBuffer, symbols, writer, out local_var_token);
+			break;
+		default:
+			throw new NotSupportedException();
+		}
+		ISymbolReader symbol_reader = reader.module.symbol_reader;
+		if (symbol_reader != null && writer.metadata.write_symbols)
+		{
+			symbols.method_token = GetOriginalToken(writer.metadata, method);
+			symbols.local_var_token = local_var_token;
+			symbol_reader.Read(symbols);
+		}
+		return byteBuffer;
+	}
+
+	private void PatchRawFatMethod(ByteBuffer buffer, MethodSymbols symbols, CodeWriter writer, out MetadataToken local_var_token)
+	{
+		ushort num = ReadUInt16();
+		buffer.WriteUInt16(num);
+		buffer.WriteUInt16(ReadUInt16());
+		symbols.code_size = ReadInt32();
+		buffer.WriteInt32(symbols.code_size);
+		local_var_token = ReadToken();
+		if (local_var_token.RID != 0)
+		{
+			buffer.WriteUInt32(((symbols.variables = ReadVariables(local_var_token)) != null) ? writer.GetStandAloneSignature(symbols.variables).ToUInt32() : 0u);
+		}
+		else
+		{
+			buffer.WriteUInt32(0u);
+		}
+		PatchRawCode(buffer, symbols.code_size, writer);
+		if ((num & 8) != 0)
+		{
+			PatchRawSection(buffer, writer.metadata);
+		}
+	}
+
+	private static MetadataToken GetOriginalToken(MetadataBuilder metadata, MethodDefinition method)
+	{
+		if (metadata.TryGetOriginalMethodToken(method.token, out var original))
+		{
+			return original;
+		}
+		return MetadataToken.Zero;
+	}
+
+	private void PatchRawCode(ByteBuffer buffer, int code_size, CodeWriter writer)
+	{
+		MetadataBuilder metadata = writer.metadata;
+		buffer.WriteBytes(ReadBytes(code_size));
+		int num = buffer.position;
+		buffer.position -= code_size;
+		while (buffer.position < num)
+		{
+			byte b = buffer.ReadByte();
+			OpCode opCode;
+			if (b != 254)
+			{
+				opCode = OpCodes.OneByteOpCode[b];
+			}
+			else
+			{
+				byte b2 = buffer.ReadByte();
+				opCode = OpCodes.TwoBytesOpCode[b2];
+			}
+			switch (opCode.OperandType)
+			{
+			case OperandType.ShortInlineBrTarget:
+			case OperandType.ShortInlineI:
+			case OperandType.ShortInlineVar:
+			case OperandType.ShortInlineArg:
+				buffer.position++;
+				break;
+			case OperandType.InlineVar:
+			case OperandType.InlineArg:
+				buffer.position += 2;
+				break;
+			case OperandType.InlineBrTarget:
+			case OperandType.InlineI:
+			case OperandType.ShortInlineR:
+				buffer.position += 4;
+				break;
+			case OperandType.InlineI8:
+			case OperandType.InlineR:
+				buffer.position += 8;
+				break;
+			case OperandType.InlineSwitch:
+			{
+				int num2 = buffer.ReadInt32();
+				buffer.position += num2 * 4;
+				break;
+			}
+			case OperandType.InlineString:
+			{
+				string @string = GetString(new MetadataToken(buffer.ReadUInt32()));
+				buffer.position -= 4;
+				buffer.WriteUInt32(new MetadataToken(TokenType.String, metadata.user_string_heap.GetStringIndex(@string)).ToUInt32());
+				break;
+			}
+			case OperandType.InlineSig:
+			{
+				CallSite callSite = GetCallSite(new MetadataToken(buffer.ReadUInt32()));
+				buffer.position -= 4;
+				buffer.WriteUInt32(writer.GetStandAloneSignature(callSite).ToUInt32());
+				break;
+			}
+			case OperandType.InlineField:
+			case OperandType.InlineMethod:
+			case OperandType.InlineTok:
+			case OperandType.InlineType:
+			{
+				IMetadataTokenProvider provider = reader.LookupToken(new MetadataToken(buffer.ReadUInt32()));
+				buffer.position -= 4;
+				buffer.WriteUInt32(metadata.LookupToken(provider).ToUInt32());
+				break;
+			}
+			}
+		}
+	}
+
+	private void PatchRawSection(ByteBuffer buffer, MetadataBuilder metadata)
+	{
+		int num = position;
+		Align(4);
+		buffer.WriteBytes(position - num);
+		byte b = ReadByte();
+		if ((b & 0x40) == 0)
+		{
+			buffer.WriteByte(b);
+			PatchRawSmallSection(buffer, metadata);
+		}
+		else
+		{
+			PatchRawFatSection(buffer, metadata);
+		}
+		if ((b & 0x80) != 0)
+		{
+			PatchRawSection(buffer, metadata);
+		}
+	}
+
+	private void PatchRawSmallSection(ByteBuffer buffer, MetadataBuilder metadata)
+	{
+		byte b = ReadByte();
+		buffer.WriteByte(b);
+		Advance(2);
+		buffer.WriteUInt16(0);
+		int count = b / 12;
+		PatchRawExceptionHandlers(buffer, metadata, count, fat_entry: false);
+	}
+
+	private void PatchRawFatSection(ByteBuffer buffer, MetadataBuilder metadata)
+	{
+		position--;
+		int num = ReadInt32();
+		buffer.WriteInt32(num);
+		int count = (num >> 8) / 24;
+		PatchRawExceptionHandlers(buffer, metadata, count, fat_entry: true);
+	}
+
+	private void PatchRawExceptionHandlers(ByteBuffer buffer, MetadataBuilder metadata, int count, bool fat_entry)
+	{
+		for (int i = 0; i < count; i++)
+		{
+			ExceptionHandlerType exceptionHandlerType;
+			if (fat_entry)
+			{
+				uint num = ReadUInt32();
+				exceptionHandlerType = (ExceptionHandlerType)(num & 7);
+				buffer.WriteUInt32(num);
+			}
+			else
+			{
+				ushort num2 = ReadUInt16();
+				exceptionHandlerType = (ExceptionHandlerType)(num2 & 7);
+				buffer.WriteUInt16(num2);
+			}
+			buffer.WriteBytes(ReadBytes(fat_entry ? 16 : 6));
+			if (exceptionHandlerType == ExceptionHandlerType.Catch)
+			{
+				IMetadataTokenProvider provider = reader.LookupToken(ReadToken());
+				buffer.WriteUInt32(metadata.LookupToken(provider).ToUInt32());
+			}
+			else
+			{
+				buffer.WriteUInt32(ReadUInt32());
+			}
+		}
+	}
+}

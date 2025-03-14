@@ -2,42 +2,61 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using Facepunch.Math;
+using Facepunch.Sqlite;
 using ProtoBuf;
+using UnityEngine;
 
 public class UserPersistance : IDisposable
 {
-	private static Dictionary<ulong, PersistantPlayer> cachedData = new Dictionary<ulong, PersistantPlayer>();
+	private static Database blueprints;
+
+	private static Database deaths;
 
 	private string Folder;
 
 	public UserPersistance(string strFolder)
 	{
-		Folder = strFolder + "/user/";
+		Folder = strFolder + "/user." + 1 + "/";
+		blueprints = new Database();
+		blueprints.Open(strFolder + "/player.blueprints." + 1 + ".db");
+		if (!blueprints.TableExists("data"))
+		{
+			blueprints.Execute("CREATE TABLE data ( userid TEXT PRIMARY KEY, info BLOB, updated INTEGER )");
+		}
 	}
 
 	public virtual void Dispose()
 	{
-		cachedData.Clear();
+		if (blueprints != null)
+		{
+			blueprints.Close();
+			blueprints = null;
+		}
+		if (deaths != null)
+		{
+			deaths.Close();
+			deaths = null;
+		}
 	}
 
 	public PersistantPlayer GetPlayerInfo(ulong playerID)
 	{
-		PersistantPlayer value = null;
-		if (cachedData.TryGetValue(playerID, out value))
+		PersistantPlayer persistantPlayer = null;
+		persistantPlayer = FetchFromDatabase(playerID);
+		if (persistantPlayer == null)
 		{
-			return value;
+			persistantPlayer = new PersistantPlayer();
 		}
-		value = FetchFromDatabase(playerID);
-		if (value == null)
+		persistantPlayer.ShouldPool = false;
+		if (persistantPlayer.unlockedItems == null)
 		{
-			value = new PersistantPlayer();
+			persistantPlayer.unlockedItems = new List<int>();
 		}
-		cachedData[playerID] = value;
-		value.ShouldPool = false;
-		return value;
+		return persistantPlayer;
 	}
 
-	public string GetUserFolder(ulong playerID)
+	private string GetUserFolder(ulong playerID)
 	{
 		return Folder + string.Join("/", (from x in playerID.ToString()
 			select string.Empty + x).ToArray());
@@ -45,79 +64,83 @@ public class UserPersistance : IDisposable
 
 	private PersistantPlayer FetchFromDatabase(ulong playerID)
 	{
-		string path = GetUserFolder(playerID) + "/current.data";
-		if (!File.Exists(path))
+		try
 		{
-			return null;
+			Row row = blueprints.QueryRow("SELECT info FROM data WHERE userid = ?", playerID.ToString());
+			if (row != null)
+			{
+				byte[] blob = row.GetBlob("info");
+				return PersistantPlayer.Deserialize(blob);
+			}
+			string path = GetUserFolder(playerID) + "/current.data";
+			if (!File.Exists(path))
+			{
+				return null;
+			}
+			byte[] array = File.ReadAllBytes(path);
+			if (array == null)
+			{
+				return null;
+			}
+			return PersistantPlayer.Deserialize(array);
 		}
-		byte[] array = File.ReadAllBytes(path);
-		if (array == null)
+		catch (Exception ex)
 		{
-			return null;
+			Debug.LogError("Error loading player blueprints: (" + ex.Message + ")");
 		}
-		return PersistantPlayer.Deserialize(array);
-	}
-
-	public void ClearUnlockedDataForAllPlayers()
-	{
-		foreach (KeyValuePair<ulong, PersistantPlayer> cachedDatum in cachedData)
-		{
-			cachedDatum.Value.unlockedItems.Clear();
-		}
+		return null;
 	}
 
 	public void SetPlayerInfo(ulong playerID, PersistantPlayer info)
 	{
-		cachedData[playerID] = info;
 		using (TimeWarning.New("SetPlayerInfo"))
 		{
-			byte[] bytes;
+			byte[] array;
 			using (TimeWarning.New("ToProtoBytes"))
 			{
-				bytes = info.ToProtoBytes();
+				array = info.ToProtoBytes();
 			}
-			string userFolder = GetUserFolder(playerID);
-			if (!Directory.Exists(userFolder))
-			{
-				Directory.CreateDirectory(userFolder);
-			}
-			string path = userFolder + "/current.data";
-			File.WriteAllBytes(path, bytes);
+			blueprints.Execute("INSERT OR REPLACE INTO data ( userid, info, updated ) VALUES ( ?, ?, ? )", playerID.ToString(), array, Epoch.Current);
 		}
 	}
 
 	public void AddLifeStory(ulong playerID, PlayerLifeStory lifeStory)
 	{
-		if (lifeStory == null)
+		if (deaths == null || lifeStory == null)
 		{
 			return;
 		}
 		using (TimeWarning.New("AddLifeStory"))
 		{
-			string userFolder = GetUserFolder(playerID);
-			if (!Directory.Exists(userFolder))
-			{
-				Directory.CreateDirectory(userFolder);
-			}
-			string path = userFolder + "/previous.life";
-			byte[] bytes = lifeStory.ToProtoBytes();
-			File.WriteAllBytes(path, bytes);
+			byte[] array = lifeStory.ToProtoBytes();
+			deaths.Execute("INSERT INTO data ( userid, born, died, info ) VALUES ( ?, ?, ?, ? )", playerID.ToString(), (int)lifeStory.timeBorn, (int)lifeStory.timeDied, array);
 		}
 	}
 
 	public PlayerLifeStory GetLastLifeStory(ulong playerID)
 	{
+		if (deaths == null)
+		{
+			return null;
+		}
 		using (TimeWarning.New("GetLastLifeStory"))
 		{
-			string path = GetUserFolder(playerID) + "/previous.life";
-			if (!File.Exists(path))
+			try
 			{
-				return null;
+				byte[] array = deaths.QueryBlob("SELECT info FROM data WHERE userid = ? ORDER BY died DESC LIMIT 1", playerID.ToString());
+				if (array == null)
+				{
+					return null;
+				}
+				PlayerLifeStory playerLifeStory = PlayerLifeStory.Deserialize(array);
+				playerLifeStory.ShouldPool = false;
+				return playerLifeStory;
 			}
-			byte[] buffer = File.ReadAllBytes(path);
-			PlayerLifeStory playerLifeStory = PlayerLifeStory.Deserialize(buffer);
-			playerLifeStory.ShouldPool = false;
-			return playerLifeStory;
+			catch (Exception ex)
+			{
+				Debug.LogError("Error loading lifestory from database: (" + ex.Message + ")");
+			}
+			return null;
 		}
 	}
 }

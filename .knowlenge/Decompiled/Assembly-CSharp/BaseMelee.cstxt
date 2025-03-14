@@ -7,6 +7,7 @@ using Network;
 using Oxide.Core;
 using ProtoBuf;
 using Rust;
+using Rust.Ai;
 using UnityEngine;
 using UnityEngine.Assertions;
 
@@ -34,10 +35,15 @@ public class BaseMelee : AttackEntity
 	[Header("Effects")]
 	public GameObjectRef strikeFX;
 
+	[Header("NPCUsage")]
+	public float aiStrikeDelay = 0.2f;
+
+	public GameObjectRef swingEffect;
+
 	public List<MaterialFX> materialStrikeFX = new List<MaterialFX>();
 
-	[Header("Other")]
 	[Range(0f, 1f)]
+	[Header("Other")]
 	public float heartStress = 0.5f;
 
 	public ResourceDispenser.GatherProperties gathering;
@@ -133,7 +139,7 @@ public class BaseMelee : AttackEntity
 
 	public virtual void DoAttackShared(HitInfo info)
 	{
-		if (Interface.CallHook("IOnPlayerAttack", this, info) != null)
+		if (Interface.CallHook("OnPlayerAttack", GetOwnerPlayer(), info) != null)
 		{
 			return;
 		}
@@ -227,8 +233,8 @@ public class BaseMelee : AttackEntity
 		ownerItem.LoseCondition(conditionLoss);
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsActiveItem]
+	[RPC_Server]
 	public void PlayerAttack(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
@@ -356,8 +362,86 @@ public class BaseMelee : AttackEntity
 		return strikeFX.resourcePath;
 	}
 
-	[RPC_Server]
+	public override void ServerUse()
+	{
+		if (base.isClient || HasAttackCooldown())
+		{
+			return;
+		}
+		BasePlayer ownerPlayer = GetOwnerPlayer();
+		if (!(ownerPlayer == null))
+		{
+			StartAttackCooldown(repeatDelay * 2f);
+			ownerPlayer.SignalBroadcast(Signal.Attack, string.Empty);
+			if (swingEffect.isValid)
+			{
+				Effect.server.Run(swingEffect.resourcePath, base.transform.position, Vector3.forward, ownerPlayer.net.connection);
+			}
+			if (IsInvoking(ServerUse_Strike))
+			{
+				CancelInvoke(ServerUse_Strike);
+			}
+			Invoke(ServerUse_Strike, aiStrikeDelay);
+		}
+	}
+
+	public void ServerUse_Strike()
+	{
+		BasePlayer ownerPlayer = GetOwnerPlayer();
+		if (ownerPlayer == null)
+		{
+			return;
+		}
+		Vector3 position = ownerPlayer.eyes.position;
+		Vector3 vector = ownerPlayer.eyes.BodyForward();
+		for (int i = 0; i < 2; i++)
+		{
+			List<RaycastHit> obj = Facepunch.Pool.GetList<RaycastHit>();
+			GamePhysics.TraceAll(new Ray(position - vector * ((i != 0) ? 0.2f : 0f), vector), (i != 0) ? attackRadius : 0f, obj, effectiveRange + 0.2f, 1084435201);
+			bool flag = false;
+			for (int j = 0; j < obj.Count; j++)
+			{
+				RaycastHit hit = obj[j];
+				BaseEntity entity = RaycastHitEx.GetEntity(hit);
+				if (entity == null || (entity != null && (entity == ownerPlayer || entity.EqualNetID(ownerPlayer))) || (entity != null && entity.isClient) || entity.Categorize() == ownerPlayer.Categorize())
+				{
+					continue;
+				}
+				float num = 0f;
+				foreach (DamageTypeEntry damageType in damageTypes)
+				{
+					num += damageType.amount;
+				}
+				entity.OnAttacked(new HitInfo(this, entity, DamageType.Slash, num * npcDamageScale));
+				HitInfo obj2 = Facepunch.Pool.Get<HitInfo>();
+				obj2.HitPositionWorld = hit.point;
+				obj2.HitNormalWorld = -vector;
+				if (entity is BaseNpc || entity is BasePlayer)
+				{
+					obj2.HitMaterial = StringPool.Get("Flesh");
+				}
+				else
+				{
+					obj2.HitMaterial = StringPool.Get((!(RaycastHitEx.GetCollider(hit).sharedMaterial != null)) ? "generic" : AssetNameCache.GetName(RaycastHitEx.GetCollider(hit).sharedMaterial));
+				}
+				Effect.server.ImpactEffect(obj2);
+				Facepunch.Pool.Free(ref obj2);
+				flag = true;
+				if (!(entity != null) || entity.ShouldBlockProjectiles())
+				{
+					break;
+				}
+			}
+			Facepunch.Pool.FreeList(ref obj);
+			if (flag)
+			{
+				break;
+			}
+		}
+	}
+
 	[RPC_Server.FromOwner]
+	[RPC_Server]
 	private void CLProject(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
@@ -402,6 +486,10 @@ public class BaseMelee : AttackEntity
 				player.stats.combat.Log(this, "duplicate_id");
 				continue;
 			}
+			if (!ValidateEyePos(player, projectile.startPos))
+			{
+				projectile.startPos = player.eyes.position;
+			}
 			player.NoteFiredProjectile(projectile.projectileID, projectile.startPos, projectile.startVel, this, item.info, item);
 			Effect effect = new Effect();
 			effect.Init(Effect.Type.Projectile, projectile.startPos, projectile.startVel, msg.connection);
@@ -412,5 +500,13 @@ public class BaseMelee : AttackEntity
 		}
 		item.SetParent(null);
 		Interface.CallHook("OnMeleeThrown", player, item);
+		if (player != null)
+		{
+			Sensation sensation = default(Sensation);
+			sensation.Type = SensationType.ThrownWeapon;
+			sensation.Position = player.GetNetworkPosition();
+			sensation.Radius = 50f;
+			Sense.Stimulate(sensation);
+		}
 	}
 }

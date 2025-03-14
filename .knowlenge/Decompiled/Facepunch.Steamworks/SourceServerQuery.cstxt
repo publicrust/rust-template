@@ -1,0 +1,339 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+
+internal class SourceServerQuery : IDisposable
+{
+	public class PlayersResponse
+	{
+		public class Player
+		{
+			public string name { get; set; }
+
+			public int score { get; set; }
+
+			public float playtime { get; set; }
+		}
+
+		public short player_count;
+
+		public List<Player> players = new List<Player>();
+	}
+
+	private IPEndPoint endPoint;
+
+	private Socket socket;
+
+	private UdpClient client;
+
+	private int send_timeout = 2500;
+
+	private int receive_timeout = 2500;
+
+	private byte[] raw_data;
+
+	private int offset = 0;
+
+	private readonly byte[] FFFFFFFF = new byte[4] { 255, 255, 255, 255 };
+
+	public SourceServerQuery(string ip, int port)
+	{
+		endPoint = new IPEndPoint(IPAddress.Parse(ip), port);
+	}
+
+	public PlayersResponse GetPlayerList()
+	{
+		GetSocket();
+		offset = 5;
+		try
+		{
+			PlayersResponse playersResponse = new PlayersResponse();
+			byte[] challenge = GetChallenge(85);
+			byte[] array = new byte[challenge.Length + FFFFFFFF.Length + 1];
+			Array.Copy(FFFFFFFF, 0, array, 0, FFFFFFFF.Length);
+			array[FFFFFFFF.Length] = 85;
+			Array.Copy(challenge, 0, array, FFFFFFFF.Length + 1, challenge.Length);
+			socket.Send(array);
+			raw_data = new byte[2048];
+			socket.Receive(raw_data);
+			byte b = ReadByte();
+			for (int i = 0; i < b; i++)
+			{
+				ReadByte();
+				PlayersResponse.Player player = new PlayersResponse.Player();
+				player.name = ReadString();
+				player.score = ReadInt32();
+				player.playtime = ReadFloat();
+				playersResponse.players.Add(player);
+			}
+			playersResponse.player_count = b;
+			return playersResponse;
+		}
+		catch (SocketException)
+		{
+			return null;
+		}
+	}
+
+	public Dictionary<string, string> GetRules()
+	{
+		GetClient();
+		try
+		{
+			Dictionary<string, string> dictionary = new Dictionary<string, string>();
+			byte[] challenge = GetChallenge(86, socket: false);
+			byte[] array = new byte[challenge.Length + FFFFFFFF.Length + 1];
+			Array.Copy(FFFFFFFF, 0, array, 0, FFFFFFFF.Length);
+			array[FFFFFFFF.Length] = 86;
+			Array.Copy(challenge, 0, array, FFFFFFFF.Length + 1, challenge.Length);
+			client.Send(array, array.Length);
+			byte[] array2 = new byte[4096];
+			raw_data = client.Receive(ref endPoint);
+			int num = raw_data.Length;
+			offset = 0;
+			int paket = ReadInt32();
+			int num2 = ReadInt32();
+			offset = 4;
+			if (PacketIsSplit(paket))
+			{
+				bool flag = false;
+				int num3 = 1;
+				int packetChecksum = 0;
+				int num4 = 0;
+				int uncompressedSize = 0;
+				List<byte[]> list = new List<byte[]>();
+				int num5;
+				do
+				{
+					int value = ReverseBytes(ReadInt32());
+					flag = PacketIsCompressed(value);
+					num5 = ReadByte();
+					int num6 = ReadByte() + 1;
+					short num7 = ReadInt16();
+					num7 -= 4;
+					if (num3 == 1)
+					{
+						for (int i = 0; i < num5; i++)
+						{
+							list.Add(new byte[0]);
+						}
+					}
+					if (flag)
+					{
+						uncompressedSize = ReverseBytes(ReadInt32());
+						packetChecksum = ReverseBytes(ReadInt32());
+					}
+					if (num6 == 1)
+					{
+						ReadInt32();
+					}
+					byte[] array3 = new byte[num7];
+					list[num6 - 1] = ReadBytes();
+					if (list[num6 - 1].Length - 1 > 0 && list[num6 - 1][list[num6 - 1].Length - 1] != 0)
+					{
+						list[num6 - 1][list[num6 - 1].Length - 1] = 0;
+					}
+					offset = 0;
+					if (num3 < num5)
+					{
+						raw_data = client.Receive(ref endPoint);
+						num = raw_data.Length;
+						num4 = ReadInt32();
+						num3++;
+					}
+					else
+					{
+						num = 0;
+					}
+				}
+				while (num3 <= num5 && num > 0 && num4 == -2);
+				array2 = ((!flag) ? ReassemblePacket(list, isCompressed: false, 0, 0) : ReassemblePacket(list, isCompressed: true, uncompressedSize, packetChecksum));
+			}
+			else
+			{
+				array2 = raw_data;
+			}
+			raw_data = array2;
+			offset++;
+			short num8 = ReadInt16();
+			for (int j = 0; j < num8; j++)
+			{
+				string key = ReadString();
+				string value2 = ReadString();
+				if (!dictionary.ContainsKey(key))
+				{
+					dictionary.Add(key, value2);
+				}
+			}
+			return dictionary;
+		}
+		catch (SocketException value3)
+		{
+			Console.WriteLine(value3);
+			return null;
+		}
+	}
+
+	public void Dispose()
+	{
+		if (socket != null)
+		{
+			socket.Close();
+		}
+		if (client != null)
+		{
+			client.Close();
+		}
+	}
+
+	private void GetSocket()
+	{
+		if (socket == null)
+		{
+			socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+			socket.SendTimeout = send_timeout;
+			socket.ReceiveTimeout = receive_timeout;
+			socket.Connect(endPoint);
+		}
+	}
+
+	private void GetClient()
+	{
+		if (client == null)
+		{
+			client = new UdpClient();
+			client.Connect(endPoint);
+			client.DontFragment = true;
+			client.Client.SendTimeout = send_timeout;
+			client.Client.ReceiveTimeout = receive_timeout;
+		}
+	}
+
+	private byte[] ReassemblePacket(List<byte[]> splitPackets, bool isCompressed, int uncompressedSize, int packetChecksum)
+	{
+		byte[] array = new byte[0];
+		foreach (byte[] splitPacket in splitPackets)
+		{
+			if (splitPacket == null)
+			{
+				throw new Exception();
+			}
+			byte[] array2 = array;
+			array = new byte[array2.Length + splitPacket.Length];
+			MemoryStream memoryStream = new MemoryStream(array);
+			memoryStream.Write(array2, 0, array2.Length);
+			memoryStream.Write(splitPacket, 0, splitPacket.Length);
+		}
+		if (isCompressed)
+		{
+			throw new NotImplementedException();
+		}
+		return array;
+	}
+
+	private int ReverseBytes(int value)
+	{
+		byte[] bytes = BitConverter.GetBytes(value);
+		if (BitConverter.IsLittleEndian)
+		{
+			Array.Reverse(bytes);
+		}
+		return BitConverter.ToInt32(bytes, 0);
+	}
+
+	private bool PacketIsCompressed(int value)
+	{
+		return (value & 0x8000) != 0;
+	}
+
+	private bool PacketIsSplit(int paket)
+	{
+		return paket == -2;
+	}
+
+	private byte[] GetChallenge(byte type, bool socket = true)
+	{
+		byte[] array = new byte[FFFFFFFF.Length + FFFFFFFF.Length + 1];
+		Array.Copy(FFFFFFFF, 0, array, 0, FFFFFFFF.Length);
+		array[FFFFFFFF.Length] = type;
+		Array.Copy(FFFFFFFF, 0, array, FFFFFFFF.Length + 1, FFFFFFFF.Length);
+		byte[] array2 = new byte[24];
+		byte[] array3 = new byte[4];
+		if (socket)
+		{
+			this.socket.Send(array);
+			this.socket.Receive(array2);
+		}
+		else
+		{
+			client.Send(array, array.Length);
+			array2 = client.Receive(ref endPoint);
+		}
+		Array.Copy(array2, 5, array3, 0, 4);
+		return array3;
+	}
+
+	private byte ReadByte()
+	{
+		byte[] array = new byte[1];
+		Array.Copy(raw_data, offset, array, 0, 1);
+		offset++;
+		return array[0];
+	}
+
+	private byte[] ReadBytes()
+	{
+		int num = raw_data.Length - offset - 4;
+		if (num < 1)
+		{
+			return new byte[0];
+		}
+		byte[] array = new byte[num];
+		Array.Copy(raw_data, offset, array, 0, raw_data.Length - offset - 4);
+		offset += raw_data.Length - offset - 4;
+		return array;
+	}
+
+	private int ReadInt32()
+	{
+		byte[] array = new byte[4];
+		Array.Copy(raw_data, offset, array, 0, 4);
+		offset += 4;
+		return BitConverter.ToInt32(array, 0);
+	}
+
+	private short ReadInt16()
+	{
+		byte[] array = new byte[2];
+		Array.Copy(raw_data, offset, array, 0, 2);
+		offset += 2;
+		return BitConverter.ToInt16(array, 0);
+	}
+
+	private float ReadFloat()
+	{
+		byte[] array = new byte[4];
+		Array.Copy(raw_data, offset, array, 0, 4);
+		offset += 4;
+		return BitConverter.ToSingle(array, 0);
+	}
+
+	private string ReadString()
+	{
+		byte[] array = new byte[1] { 1 };
+		string text = "";
+		while (array[0] != 0 && offset != raw_data.Length)
+		{
+			Array.Copy(raw_data, offset, array, 0, 1);
+			offset++;
+			if (array[0] != 0)
+			{
+				text += Encoding.UTF8.GetString(array);
+			}
+		}
+		return text;
+	}
+}

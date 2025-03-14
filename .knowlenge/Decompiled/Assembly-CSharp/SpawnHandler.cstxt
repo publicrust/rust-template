@@ -81,7 +81,6 @@ public class SpawnHandler : SingletonComponent<SpawnHandler>
 		Vector3 size = TerrainMeta.Size;
 		Vector3 position = TerrainMeta.Position;
 		int pop_res = Mathf.NextPowerOfTwo((int)((float)World.Size * 0.25f));
-		float pop_normfac = 1f / ((float)pop_res - 1f);
 		for (int i = 0; i < AllSpawnPopulations.Length; i++)
 		{
 			SpawnPopulation spawnPopulation = AllSpawnPopulations[i];
@@ -96,8 +95,8 @@ public class SpawnHandler : SingletonComponent<SpawnHandler>
 			{
 				for (int j = 0; j < pop_res; j++)
 				{
-					float normX = (float)j * pop_normfac;
-					float normZ = (float)z * pop_normfac;
+					float normX = ((float)j + 0.5f) / (float)pop_res;
+					float normZ = ((float)z + 0.5f) / (float)pop_res;
 					map[z * pop_res + j] = (byte)(255f * filter.GetFactor(normX, normZ));
 				}
 			});
@@ -105,15 +104,14 @@ public class SpawnHandler : SingletonComponent<SpawnHandler>
 			population2distribution.Add(spawnPopulation, value);
 		}
 		int char_res = Mathf.NextPowerOfTwo((int)((float)World.Size * 0.5f));
-		float char_normfac = 1f / ((float)char_res - 1f);
 		byte[] map2 = new byte[char_res * char_res];
 		SpawnFilter filter2 = CharacterSpawn;
 		Parallel.For(0, char_res, delegate(int z)
 		{
 			for (int k = 0; k < char_res; k++)
 			{
-				float normX2 = (float)k * char_normfac;
-				float normZ2 = (float)z * char_normfac;
+				float normX2 = ((float)k + 0.5f) / (float)char_res;
+				float normZ2 = ((float)z + 0.5f) / (float)char_res;
 				map2[z * char_res + k] = (byte)(255f * filter2.GetFactor(normX2, normZ2));
 			}
 		});
@@ -238,25 +236,39 @@ public class SpawnHandler : SingletonComponent<SpawnHandler>
 
 	public void SpawnInitial(SpawnPopulation population, SpawnDistribution distribution)
 	{
-		int num = GetTargetCount(population, distribution) - GetCurrentCount(population, distribution);
-		Spawn(population, distribution, num, num * population.SpawnAttemptsInitial);
+		int targetCount = GetTargetCount(population, distribution);
+		int currentCount = GetCurrentCount(population, distribution);
+		int num = targetCount - currentCount;
+		Spawn(population, distribution, targetCount, num, num * population.SpawnAttemptsInitial);
 	}
 
 	public void SpawnRepeating(SpawnPopulation population, SpawnDistribution distribution)
 	{
-		int num = GetTargetCount(population, distribution) - GetCurrentCount(population, distribution);
+		int targetCount = GetTargetCount(population, distribution);
+		int currentCount = GetCurrentCount(population, distribution);
+		int num = targetCount - currentCount;
 		num = Mathf.RoundToInt((float)num * population.GetCurrentSpawnRate());
 		num = UnityEngine.Random.Range(Mathf.Min(num, MinSpawnsPerTick), Mathf.Min(num, MaxSpawnsPerTick));
-		Spawn(population, distribution, num, num * population.SpawnAttemptsRepeating);
+		Spawn(population, distribution, targetCount, num, num * population.SpawnAttemptsRepeating);
 	}
 
-	private void Spawn(SpawnPopulation population, SpawnDistribution distribution, int numToFill, int numToTry)
+	private void Spawn(SpawnPopulation population, SpawnDistribution distribution, int targetCount, int numToFill, int numToTry)
 	{
+		if (targetCount == 0)
+		{
+			return;
+		}
+		if (!population.Initialize())
+		{
+			Debug.LogError("[Spawn] No prefabs to spawn in " + population.ResourceFolder, population);
+			return;
+		}
 		if (Global.developer > 1)
 		{
-			Debug.Log("[Spawn]".PadRight(10) + "Population " + population.ResourceFolder + " needs to spawn " + numToFill);
+			Debug.Log("[Spawn] Population " + population.ResourceFolder + " needs to spawn " + numToFill);
 		}
-		float num = Mathf.Max(population.ClusterSizeMax, distribution.Grid.CellArea * population.GetMaximumSpawnDensity());
+		float num = Mathf.Max(population.ClusterSizeMax, distribution.GetGridCellArea() * population.GetMaximumSpawnDensity());
+		population.UpdateWeights(distribution, targetCount);
 		while (numToFill >= population.ClusterSizeMin && numToTry > 0)
 		{
 			ByteQuadtree.Element node = distribution.SampleNode();
@@ -264,14 +276,68 @@ public class SpawnHandler : SingletonComponent<SpawnHandler>
 			f = Mathx.Min(numToTry, numToFill, f);
 			for (int i = 0; i < f; i++)
 			{
-				if (distribution.Sample(out var spawnPos, out var spawnRot, node, population.AlignToNormal, population.ClusterDithering) && population.Filter.GetFactor(spawnPos) > 0f && (float)distribution.Grid[spawnPos] < num)
+				if (distribution.Sample(out var spawnPos, out var spawnRot, node, population.AlignToNormal, population.ClusterDithering) && population.Filter.GetFactor(spawnPos) > 0f && (float)distribution.GetCount(spawnPos) < num)
 				{
-					population.Spawn(spawnPos, spawnRot);
+					Spawn(population, distribution, spawnPos, spawnRot);
 					numToFill--;
 				}
 				numToTry--;
 			}
 		}
+	}
+
+	private GameObject Spawn(SpawnPopulation population, SpawnDistribution distribution, Vector3 pos, Quaternion rot)
+	{
+		Prefab<Spawnable> randomPrefab = population.GetRandomPrefab();
+		if (randomPrefab == null)
+		{
+			return null;
+		}
+		if (randomPrefab.Component == null)
+		{
+			Debug.LogError("[Spawn] Missing component 'Spawnable' on " + randomPrefab.Name);
+			return null;
+		}
+		Vector3 scale = Vector3.one;
+		DecorComponent[] components = PrefabAttribute.server.FindAll<DecorComponent>(randomPrefab.ID);
+		randomPrefab.Object.transform.ApplyDecorComponents(components, ref pos, ref rot, ref scale);
+		if (!randomPrefab.ApplyTerrainAnchors(ref pos, rot, scale, TerrainAnchorMode.MinimizeMovement, population.Filter))
+		{
+			return null;
+		}
+		if (!randomPrefab.ApplyTerrainChecks(pos, rot, scale, population.Filter))
+		{
+			return null;
+		}
+		if (!randomPrefab.ApplyTerrainFilters(pos, rot, scale))
+		{
+			return null;
+		}
+		LayerMask layerMask = ((!SingletonComponent<SpawnHandler>.Instance) ? default(LayerMask) : SingletonComponent<SpawnHandler>.Instance.BoundsCheckMask);
+		if ((int)layerMask != 0)
+		{
+			BaseEntity component = randomPrefab.Object.GetComponent<BaseEntity>();
+			if (component != null && UnityEngine.Physics.CheckBox(pos + rot * Vector3.Scale(component.bounds.center, scale), Vector3.Scale(component.bounds.extents, scale), rot, layerMask))
+			{
+				return null;
+			}
+		}
+		if (randomPrefab.Component.Population != population)
+		{
+			randomPrefab.Component.Population = population;
+		}
+		if (Global.developer > 1)
+		{
+			Debug.Log("[Spawn] Spawning " + randomPrefab.Name);
+		}
+		BaseEntity baseEntity = randomPrefab.SpawnEntity(pos, rot);
+		if (baseEntity == null)
+		{
+			Debug.LogWarning("[Spawn] Couldn't create prefab as entity - " + randomPrefab.Name);
+			return null;
+		}
+		baseEntity.Spawn();
+		return baseEntity.gameObject;
 	}
 
 	public void EnforceLimits(bool forceAll = false)
@@ -347,10 +413,11 @@ public class SpawnHandler : SingletonComponent<SpawnHandler>
 		if (!population2distribution.TryGetValue(spawnable.Population, out var value))
 		{
 			Debug.LogWarning("[SpawnHandler] trying to add instance to invalid population: " + spawnable.Population);
-			return;
 		}
-		value.Count++;
-		value.Grid[spawnable.SpawnPosition]++;
+		else
+		{
+			value.AddInstance(spawnable);
+		}
 	}
 
 	public void RemoveInstance(Spawnable spawnable)
@@ -358,10 +425,11 @@ public class SpawnHandler : SingletonComponent<SpawnHandler>
 		if (!population2distribution.TryGetValue(spawnable.Population, out var value))
 		{
 			Debug.LogWarning("[SpawnHandler] trying to remove instance from invalid population: " + spawnable.Population);
-			return;
 		}
-		value.Count--;
-		value.Grid[spawnable.SpawnPosition]--;
+		else
+		{
+			value.RemoveInstance(spawnable);
+		}
 	}
 
 	public static float PlayerFraction()

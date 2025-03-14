@@ -3,7 +3,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using ConVar;
-using EasyAntiCheat.Server.Hydra.Cerberus;
+using EasyAntiCheat.Server.Cerberus;
+using EasyAntiCheat.Server.Hydra;
 using Facepunch;
 using Network;
 using Oxide.Core;
@@ -167,6 +168,8 @@ public class BaseProjectile : AttackEntity
 
 	public float aimconePenaltyRecoverDelay = 0.1f;
 
+	public float stancePenaltyScale = 1f;
+
 	[Header("Iconsights")]
 	public bool hasADS = true;
 
@@ -184,6 +187,8 @@ public class BaseProjectile : AttackEntity
 	public bool aiming;
 
 	private float nextReloadTime = float.NegativeInfinity;
+
+	private float stancePenalty;
 
 	private float aimconePenalty;
 
@@ -401,14 +406,14 @@ public class BaseProjectile : AttackEntity
 		primaryMagazine.contents = primaryMagazine.capacity;
 	}
 
-	public override UnityEngine.Vector3 ModifyAIAim(UnityEngine.Vector3 eulerInput)
+	public override UnityEngine.Vector3 ModifyAIAim(UnityEngine.Vector3 eulerInput, float swayModifier = 1f)
 	{
 		bool flag = false;
 		float num = UnityEngine.Time.time * (aimSwaySpeed * 1f + aiAimSwayOffset);
 		float num2 = Mathf.Sin(UnityEngine.Time.time * 2f);
 		float num3 = ((!(num2 < 0f)) ? 1f : (1f - Mathf.Clamp(Mathf.Abs(num2) / 1f, 0f, 1f)));
 		float num4 = ((!flag) ? 1f : 0.6f);
-		float num5 = (aimSway * 1f + aiAimSwayOffset) * num4 * num3;
+		float num5 = (aimSway * 1f + aiAimSwayOffset) * num4 * num3 * swayModifier;
 		eulerInput.y += (Mathf.PerlinNoise(num, num) - 0.5f) * num5 * UnityEngine.Time.deltaTime;
 		eulerInput.x += (Mathf.PerlinNoise(num + 0.1f, num + 0.2f) - 0.5f) * num5 * UnityEngine.Time.deltaTime;
 		return eulerInput;
@@ -556,9 +561,9 @@ public class BaseProjectile : AttackEntity
 		float num4 = ProjectileWeaponMod.Sum(this, (ProjectileWeaponMod x) => x.hipAimCone, (ProjectileWeaponMod.Modifier y) => y.offset, 0f);
 		if (aiming || base.isServer)
 		{
-			return (aimCone + aimconePenalty) * num + num2;
+			return (aimCone + aimconePenalty + stancePenalty * stancePenaltyScale) * num + num2;
 		}
-		return (aimCone + aimconePenalty) * num + num2 + hipAimCone * num3 + num4;
+		return (aimCone + aimconePenalty + stancePenalty * stancePenaltyScale) * num + num2 + hipAimCone * num3 + num4;
 	}
 
 	public float ScaleRepeatDelay(float delay)
@@ -590,8 +595,8 @@ public class BaseProjectile : AttackEntity
 		}
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsActiveItem]
+	[RPC_Server]
 	private void SwitchAmmoTo(RPCMessage msg)
 	{
 		BasePlayer ownerPlayer = GetOwnerPlayer();
@@ -610,7 +615,7 @@ public class BaseProjectile : AttackEntity
 			return;
 		}
 		ItemModProjectile component = itemDefinition.GetComponent<ItemModProjectile>();
-		if ((bool)component && component.IsAmmo(primaryMagazine.definition.ammoTypes))
+		if ((bool)component && component.IsAmmo(primaryMagazine.definition.ammoTypes) && Interface.CallHook("OnSwitchAmmo", ownerPlayer, this) == null)
 		{
 			if (primaryMagazine.contents > 0)
 			{
@@ -683,8 +688,8 @@ public class BaseProjectile : AttackEntity
 		}
 	}
 
-	[RPC_Server]
 	[RPC_Server.FromOwner]
+	[RPC_Server]
 	private void CLProject(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
@@ -741,12 +746,14 @@ public class BaseProjectile : AttackEntity
 			{
 				AntiHack.Log(player, AntiHackType.ProjectileHack, "Duplicate ID (" + projectile.projectileID + ")");
 				player.stats.combat.Log(this, "duplicate_id");
+				continue;
 			}
-			else
+			if (!ValidateEyePos(player, projectile.startPos))
 			{
-				player.NoteFiredProjectile(projectile.projectileID, projectile.startPos, projectile.startVel, this, ammoType);
-				CreateProjectileEffectClientside(component.projectileObject.resourcePath, projectile.startPos, projectile.startVel, projectile.seed, msg.connection, IsSilenced());
+				projectile.startPos = player.eyes.position;
 			}
+			player.NoteFiredProjectile(projectile.projectileID, projectile.startPos, projectile.startVel, this, ammoType);
+			CreateProjectileEffectClientside(component.projectileObject.resourcePath, projectile.startPos, projectile.startVel, projectile.seed, msg.connection, IsSilenced());
 		}
 		player.stats.Add(component.category + "_fired", projectileShoot.projectiles.Count());
 		StartAttackCooldown(ScaleRepeatDelay(repeatDelay));
@@ -765,12 +772,12 @@ public class BaseProjectile : AttackEntity
 			UnityEngine.Vector3 networkPosition = player.GetNetworkPosition();
 			UnityEngine.Vector3 networkRotation = player.GetNetworkRotation();
 			int weaponID = GetItem()?.info.itemid ?? 0;
-			PlayerUseWeapon useWeapon = default(PlayerUseWeapon);
-			useWeapon.Client = EACServer.GetClient(player.userID);
-			useWeapon.PlayerPosition = new EasyAntiCheat.Server.Hydra.Cerberus.Vector3(networkPosition.x, networkPosition.y, networkPosition.z);
-			useWeapon.PlayerViewAngles = new EasyAntiCheat.Server.Hydra.Cerberus.Vector3(networkRotation.x, networkRotation.y, networkRotation.z);
-			useWeapon.WeaponID = weaponID;
-			EACServer.playerTracker.LogPlayerUseWeapon(useWeapon);
+			EasyAntiCheat.Server.Hydra.Client client = EACServer.GetClient(player.net.connection);
+			PlayerUseWeapon eventParams = default(PlayerUseWeapon);
+			eventParams.Position = new EasyAntiCheat.Server.Cerberus.Vector3(networkPosition.x, networkPosition.y, networkPosition.z);
+			eventParams.ViewAngles = new EasyAntiCheat.Server.Cerberus.Vector3(networkRotation.x, networkRotation.y, networkRotation.z);
+			eventParams.WeaponID = weaponID;
+			EACServer.playerTracker.LogPlayerUseWeapon(client, eventParams);
 		}
 	}
 
@@ -830,10 +837,15 @@ public class BaseProjectile : AttackEntity
 	{
 		base.Save(info);
 		info.msg.baseProjectile = Facepunch.Pool.Get<ProtoBuf.BaseProjectile>();
-		if (info.forDisk || info.SendingTo(GetOwnerConnection()))
+		if (info.forDisk || info.SendingTo(GetOwnerConnection()) || ForceSendMagazine())
 		{
 			info.msg.baseProjectile.primaryMagazine = primaryMagazine.Save();
 		}
+	}
+
+	public virtual bool ForceSendMagazine()
+	{
+		return false;
 	}
 
 	public override void Load(LoadInfo info)

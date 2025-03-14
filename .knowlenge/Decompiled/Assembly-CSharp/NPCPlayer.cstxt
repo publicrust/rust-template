@@ -1,4 +1,5 @@
 using System;
+using Rust.Ai;
 using UnityEngine;
 using UnityEngine.AI;
 
@@ -16,9 +17,11 @@ public class NPCPlayer : BasePlayer
 
 	public float stoppingDistance = 0.1f;
 
-	public LayerMask movementMask = 1403068673;
+	public LayerMask movementMask = 295772417;
 
 	public NavMeshAgent NavAgent;
+
+	public bool IsDormant;
 
 	private float triggerEndTime;
 
@@ -27,6 +30,16 @@ public class NPCPlayer : BasePlayer
 	private float lastThinkTime;
 
 	private Vector3 lastPos;
+
+	public Vector2i CurrentCoord { get; set; }
+
+	public Vector2i PreviousCoord { get; set; }
+
+	public bool AgencyUpdateRequired { get; set; }
+
+	public bool IsOnOffmeshLinkAndReachedNewCoord { get; set; }
+
+	protected override float PositionTickRate => 0.05f;
 
 	public override void ServerInit()
 	{
@@ -37,10 +50,12 @@ public class NPCPlayer : BasePlayer
 			base.ServerInit();
 			UpdateNetworkGroup();
 			loadouts[UnityEngine.Random.Range(0, loadouts.Length)].GiveToPlayer(this);
-			InvokeRepeating(ServerThink_Internal, 0f, 0.2f);
+			InvokeRepeating(ServerThink_Internal, 0f, 0.1f);
 			lastThinkTime = Time.time;
 			Invoke(EquipTest, 1f);
 			finalDestination = base.transform.position;
+			AgencyUpdateRequired = false;
+			IsOnOffmeshLinkAndReachedNewCoord = false;
 			if (NavAgent == null)
 			{
 				NavAgent = GetComponent<NavMeshAgent>();
@@ -83,8 +98,13 @@ public class NPCPlayer : BasePlayer
 		if ((bool)baseProjectile && baseProjectile.primaryMagazine.contents <= 0)
 		{
 			baseProjectile.ServerReload();
+			NPCPlayerApex nPCPlayerApex = this as NPCPlayerApex;
+			if ((bool)nPCPlayerApex && nPCPlayerApex.OnReload != null)
+			{
+				nPCPlayerApex.OnReload();
+			}
 		}
-		if (Mathf.Approximately(attackEntity.attackLengthMin, -1f))
+		if (!Mathf.Approximately(attackEntity.attackLengthMin, -1f))
 		{
 			if (!IsInvoking(TriggerDown) && !(Time.time < nextTriggerTime))
 			{
@@ -99,6 +119,23 @@ public class NPCPlayer : BasePlayer
 		}
 	}
 
+	public bool MeleeAttack()
+	{
+		HeldEntity heldEntity = GetHeldEntity();
+		AttackEntity attackEntity = heldEntity as AttackEntity;
+		if (attackEntity == null)
+		{
+			return false;
+		}
+		BaseMelee baseMelee = attackEntity as BaseMelee;
+		if (baseMelee == null)
+		{
+			return false;
+		}
+		baseMelee.ServerUse();
+		return true;
+	}
+
 	public void TriggerDown()
 	{
 		HeldEntity heldEntity = GetHeldEntity();
@@ -110,7 +147,7 @@ public class NPCPlayer : BasePlayer
 		if (Time.time > triggerEndTime)
 		{
 			CancelInvoke(TriggerDown);
-			nextTriggerTime = Time.time + attackEntity.attackSpacing;
+			nextTriggerTime = Time.time + ((!(attackEntity != null)) ? 1f : attackEntity.attackSpacing);
 		}
 	}
 
@@ -128,49 +165,121 @@ public class NPCPlayer : BasePlayer
 
 	public virtual void ServerThink(float delta)
 	{
+		TickAi(delta);
+	}
+
+	public virtual void Resume()
+	{
+	}
+
+	public virtual bool IsNavRunning()
+	{
+		return false;
+	}
+
+	public virtual void TickAi(float delta)
+	{
 		MovementUpdate(delta);
 	}
 
 	public virtual void MovementUpdate(float delta)
 	{
-		if (base.isClient || !IsAlive() || IsWounded())
+		if (!base.isClient && IsAlive() && !IsWounded() && IsNavRunning())
 		{
-			return;
-		}
-		Vector3 vector = base.transform.position;
-		if (NavAgent != null && NavAgent.enabled && NavAgent.isOnNavMesh)
-		{
+			Vector3 moveToPosition = base.transform.position;
 			if (NavAgent.isOnOffMeshLink)
 			{
-				Vector3 vector2 = NavAgent.currentOffMeshLinkData.endPos + Vector3.up * NavAgent.baseOffset;
-				if (NavMesh.SamplePosition(vector2, out var _, NavAgent.height * 2f, 1 << NavMesh.GetAreaFromName("HumanNPC")))
-				{
-					if (Vector3Ex.Distance2D(vector, vector2) < 0.15f)
-					{
-						NavAgent.CompleteOffMeshLink();
-					}
-					else
-					{
-						vector = Vector3.MoveTowards(vector, vector2, NavAgent.speed * Time.smoothDeltaTime);
-					}
-				}
+				TickNavMeshLinkTraversal(delta, ref moveToPosition);
 			}
 			else if (NavAgent.hasPath)
 			{
-				vector = NavAgent.nextPosition;
+				moveToPosition = NavAgent.nextPosition;
+			}
+			if (ValidateNextPosition(ref moveToPosition))
+			{
+				UpdateSpeed(delta);
+				UpdatePositionAndRotation(moveToPosition);
 			}
 		}
-		Vector3 vector3 = vector - GetPosition();
-		vector3 = new Vector3(vector3.x, 0f, vector3.z);
-		float range = 5f;
+	}
+
+	private void TickNavMeshLinkTraversal(float delta, ref Vector3 moveToPosition)
+	{
+		OffMeshLinkData currentOffMeshLinkData = NavAgent.currentOffMeshLinkData;
+		if (!currentOffMeshLinkData.valid)
+		{
+			CompleteNavMeshLinkTraversal(failed: true, ref moveToPosition);
+			return;
+		}
+		Vector3 sourcePosition = currentOffMeshLinkData.endPos + Vector3.up * NavAgent.baseOffset;
+		if (NavMesh.SamplePosition(sourcePosition, out var hit, NavAgent.height * 2f, NavAgent.areaMask))
+		{
+			sourcePosition = hit.position;
+			if (IsNavMeshLinkTraversalComplete(moveToPosition, sourcePosition))
+			{
+				CompleteNavMeshLinkTraversal(failed: false, ref moveToPosition);
+			}
+			else
+			{
+				TraverseLink(delta, ref moveToPosition, sourcePosition);
+			}
+		}
+		else
+		{
+			CompleteNavMeshLinkTraversal(failed: true, ref moveToPosition);
+		}
+	}
+
+	private bool IsNavMeshLinkTraversalComplete(Vector3 moveToPosition, Vector3 targetPosition)
+	{
+		return (AiManager.nav_grid && IsOnOffmeshLinkAndReachedNewCoord) || (!AiManager.nav_grid && Vector3Ex.Distance2D(moveToPosition, targetPosition) < 0.15f);
+	}
+
+	private void TraverseLink(float delta, ref Vector3 moveToPosition, Vector3 targetPosition)
+	{
+		float maxDistanceDelta = Mathf.Clamp01(NavAgent.speed * delta);
+		moveToPosition = Vector3.MoveTowards(moveToPosition, targetPosition, maxDistanceDelta);
+		if (TransformUtil.GetGroundInfo(moveToPosition + new Vector3(0f, 1.25f, 0f), out var hitOut, NavAgent.height, movementMask, base.transform))
+		{
+			moveToPosition = hitOut.point;
+		}
+	}
+
+	private void CompleteNavMeshLinkTraversal(bool failed, ref Vector3 moveToPosition)
+	{
+		NavAgent.CompleteOffMeshLink();
+		IsOnOffmeshLinkAndReachedNewCoord = false;
+		if (failed)
+		{
+			NavAgent.ResetPath();
+		}
+		else if (NavAgent.hasPath)
+		{
+			moveToPosition = NavAgent.nextPosition;
+		}
+		Resume();
+	}
+
+	private bool ValidateNextPosition(ref Vector3 moveToPosition)
+	{
+		if (!ValidBounds.Test(moveToPosition))
+		{
+			Debug.Log(string.Concat("Invalid NavAgent Position: ", this, " ", moveToPosition, " (destroying)"));
+			Kill();
+			return false;
+		}
+		return true;
+	}
+
+	private void UpdateSpeed(float delta)
+	{
 		float b = DesiredMoveSpeed();
 		NavAgent.speed = Mathf.Lerp(NavAgent.speed, b, delta * 1f);
-		Vector3 vector4 = vector;
-		if (TransformUtil.GetGroundInfo(vector4, out var hitOut, range, movementMask, base.transform))
-		{
-			vector4 = hitOut.point;
-		}
-		ServerPosition = vector4;
+	}
+
+	private void UpdatePositionAndRotation(Vector3 moveToPosition)
+	{
+		ServerPosition = moveToPosition;
 		SetAimDirection(GetAimDirection());
 	}
 
@@ -201,7 +310,7 @@ public class NPCPlayer : BasePlayer
 		return eyes.BodyForward();
 	}
 
-	public void SetAimDirection(Vector3 newAim)
+	public virtual void SetAimDirection(Vector3 newAim)
 	{
 		if (!(newAim == Vector3.zero))
 		{

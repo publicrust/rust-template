@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using Apex.LoadBalancing;
+using Rust;
 using Rust.Ai;
 using UnityEngine;
 using UnityEngine.AI;
@@ -15,21 +16,21 @@ public class CoverPointVolume : MonoBehaviour, IServerComponent, ILoadBalanced
 
 	public float DefaultCoverPointScore = 1f;
 
-	public float SampleStepSize = 1f;
-
-	public float SampleStepHeight = 1f;
-
 	public float CoverPointRayLength = 1f;
-
-	public BaseEntity SampleCharacterSizePrefab;
 
 	public LayerMask CoverLayerMask;
 
 	public Transform BlockerGroup;
 
-	public readonly List<CoverPoint> CoverPoints = new List<CoverPoint>();
+	public Transform ManualCoverPointGroup;
 
-	private PlayerEyes _eyes;
+	[ServerVar(Help = "cover_point_sample_step_size defines the size of the steps we do horizontally for the cover point volume's cover point generation (smaller steps gives more accurate cover points, but at a higher processing cost). (default: 6.0)")]
+	public static float cover_point_sample_step_size = 6f;
+
+	[ServerVar(Help = "cover_point_sample_step_height defines the height of the steps we do vertically for the cover point volume's cover point generation (smaller steps gives more accurate cover points, but at a higher processing cost). (default: 2.0)")]
+	public static float cover_point_sample_step_height = 2f;
+
+	public readonly List<CoverPoint> CoverPoints = new List<CoverPoint>();
 
 	private readonly List<CoverPointBlockerVolume> _coverPointBlockers = new List<CoverPointBlockerVolume>();
 
@@ -37,22 +38,23 @@ public class CoverPointVolume : MonoBehaviour, IServerComponent, ILoadBalanced
 
 	private int _genAttempts;
 
+	private Bounds bounds = new Bounds(Vector3.zero, Vector3.zero);
+
 	private float[] tempVisRange = new float[8];
 
 	public bool repeat => true;
 
 	private void OnEnable()
 	{
-		if (_eyes == null && SampleCharacterSizePrefab != null)
-		{
-			_eyes = SampleCharacterSizePrefab.GetComponent<PlayerEyes>();
-		}
 		Apex.LoadBalancing.LoadBalancer.defaultBalancer.Add(this);
 	}
 
 	private void OnDisable()
 	{
-		Apex.LoadBalancing.LoadBalancer.defaultBalancer.Remove(this);
+		if (!Rust.Application.isQuitting)
+		{
+			Apex.LoadBalancing.LoadBalancer.defaultBalancer.Remove(this);
+		}
 	}
 
 	public float? ExecuteUpdate(float deltaTime, float nextInterval)
@@ -68,7 +70,7 @@ public class CoverPointVolume : MonoBehaviour, IServerComponent, ILoadBalanced
 			}
 			else if (_genAttempts < 4 && Time.realtimeSinceStartup - _dynNavMeshBuildCompletionTime > 0.25f)
 			{
-				GenerateCoverPoints();
+				GenerateCoverPoints(null);
 				if (CoverPoints.Count != 0)
 				{
 					Apex.LoadBalancing.LoadBalancer.defaultBalancer.Remove(this);
@@ -94,18 +96,50 @@ public class CoverPointVolume : MonoBehaviour, IServerComponent, ILoadBalanced
 		_coverPointBlockers.Clear();
 	}
 
+	public Bounds GetBounds()
+	{
+		if (Mathf.Approximately(bounds.center.sqrMagnitude, 0f))
+		{
+			bounds = new Bounds(base.transform.position, base.transform.localScale);
+		}
+		return bounds;
+	}
+
 	[ContextMenu("Pre-Generate Cover Points")]
-	public void GenerateCoverPoints()
+	public void PreGenerateCoverPoints()
+	{
+		GenerateCoverPoints(null);
+	}
+
+	[ContextMenu("Convert to Manual Cover Points")]
+	public void ConvertToManualCoverPoints()
+	{
+		foreach (CoverPoint coverPoint in CoverPoints)
+		{
+			ManualCoverPoint manualCoverPoint = new GameObject("MCP").AddComponent<ManualCoverPoint>();
+			manualCoverPoint.transform.localPosition = Vector3.zero;
+			manualCoverPoint.transform.position = coverPoint.Position;
+			manualCoverPoint.Normal = coverPoint.Normal;
+			manualCoverPoint.NormalCoverType = coverPoint.NormalCoverType;
+			manualCoverPoint.Volume = this;
+		}
+	}
+
+	public void GenerateCoverPoints(Transform coverPointGroup)
 	{
 		float realtimeSinceStartup = Time.realtimeSinceStartup;
 		ClearCoverPoints();
-		if (_eyes == null && SampleCharacterSizePrefab != null)
+		if (ManualCoverPointGroup == null)
 		{
-			_eyes = SampleCharacterSizePrefab.GetComponent<PlayerEyes>();
+			ManualCoverPointGroup = coverPointGroup;
 		}
-		if (base.transform.childCount > 0)
+		if (ManualCoverPointGroup == null)
 		{
-			ManualCoverPoint[] componentsInChildren = base.transform.GetComponentsInChildren<ManualCoverPoint>();
+			ManualCoverPointGroup = base.transform;
+		}
+		if (ManualCoverPointGroup.childCount > 0)
+		{
+			ManualCoverPoint[] componentsInChildren = ManualCoverPointGroup.GetComponentsInChildren<ManualCoverPoint>();
 			ManualCoverPoint[] array = componentsInChildren;
 			foreach (ManualCoverPoint manualCoverPoint in array)
 			{
@@ -121,20 +155,34 @@ public class CoverPointVolume : MonoBehaviour, IServerComponent, ILoadBalanced
 				_coverPointBlockers.AddRange(componentsInChildren2);
 			}
 		}
-		if (!NavMesh.SamplePosition(base.transform.position, out var hit, base.transform.localScale.y * SampleStepHeight, -1))
+		if (CoverPoints.Count != 0 || !NavMesh.SamplePosition(base.transform.position, out var hit, base.transform.localScale.y * cover_point_sample_step_height, -1))
 		{
 			return;
 		}
 		Vector3 position = base.transform.position;
 		Vector3 vector = base.transform.lossyScale * 0.5f;
-		for (float num = position.x - vector.x + 1f; num < position.x + vector.x - 1f; num += SampleStepSize)
+		for (float num = position.x - vector.x + 1f; num < position.x + vector.x - 1f; num += cover_point_sample_step_size)
 		{
-			for (float num2 = position.z - vector.z + 1f; num2 < position.z + vector.z - 1f; num2 += SampleStepSize)
+			for (float num2 = position.z - vector.z + 1f; num2 < position.z + vector.z - 1f; num2 += cover_point_sample_step_size)
 			{
-				for (float num3 = position.y - vector.y; num3 < position.y + vector.y; num3 += SampleStepHeight)
+				for (float num3 = position.y - vector.y; num3 < position.y + vector.y; num3 += cover_point_sample_step_height)
 				{
 					Vector3 sourcePosition = new Vector3(num, num3, num2);
-					if (NavMesh.FindClosestEdge(sourcePosition, out var hit2, hit.mask) && !((hit2.position - base.transform.position).sqrMagnitude >= vector.x - 0.5f))
+					if (!NavMesh.FindClosestEdge(sourcePosition, out var hit2, hit.mask) || (AiManager.nav_grid && (hit2.position - base.transform.position).sqrMagnitude >= vector.x - 0.5f))
+					{
+						continue;
+					}
+					hit2.position = new Vector3(hit2.position.x, hit2.position.y + 0.5f, hit2.position.z);
+					bool flag = true;
+					foreach (CoverPoint coverPoint2 in CoverPoints)
+					{
+						if ((coverPoint2.Position - hit2.position).sqrMagnitude < cover_point_sample_step_size * cover_point_sample_step_size)
+						{
+							flag = false;
+							break;
+						}
+					}
+					if (flag)
 					{
 						CoverPoint coverPoint = CalculateCoverPoint(hit2);
 						if (coverPoint != null)
@@ -156,7 +204,7 @@ public class CoverPointVolume : MonoBehaviour, IServerComponent, ILoadBalanced
 			return null;
 		}
 		CoverPoint coverPoint = new CoverPoint(this, DefaultCoverPointScore);
-		coverPoint.LocalPosition = info.position - base.transform.position;
+		coverPoint.Position = info.position;
 		coverPoint.Normal = -info.normal;
 		CoverPoint coverPoint2 = coverPoint;
 		switch (coverType)
@@ -174,10 +222,6 @@ public class CoverPointVolume : MonoBehaviour, IServerComponent, ILoadBalanced
 	internal CoverType ProvidesCoverInDir(Ray ray, float maxDistance, out RaycastHit rayHit)
 	{
 		rayHit = default(RaycastHit);
-		if (SampleCharacterSizePrefab == null)
-		{
-			return CoverType.None;
-		}
 		if (ray.origin.IsNaNOrInfinity())
 		{
 			return CoverType.None;
@@ -190,28 +234,13 @@ public class CoverPointVolume : MonoBehaviour, IServerComponent, ILoadBalanced
 		{
 			return CoverType.None;
 		}
-		OBB oBB = SampleCharacterSizePrefab.WorldSpaceBounds();
-		oBB.position = ray.origin;
-		oBB.rotation.SetLookRotation(ray.direction);
-		if (!oBB.Trace(ray, out var hit, maxDistance))
-		{
-			return CoverType.None;
-		}
-		rayHit = hit;
-		if (_eyes != null)
-		{
-			ray.origin = ray.origin + _eyes.position - _eyes.transform.position;
-		}
-		else
-		{
-			ray.origin += PlayerEyes.EyeOffset;
-		}
-		if (Physics.Raycast(ray.origin, ray.origin + ray.direction * maxDistance, out rayHit, (int)CoverLayerMask))
+		ray.origin += PlayerEyes.EyeOffset;
+		if (Physics.Raycast(ray.origin, ray.direction, out rayHit, maxDistance, CoverLayerMask))
 		{
 			return CoverType.Full;
 		}
 		ray.origin += PlayerEyes.DuckOffset;
-		if (Physics.Raycast(ray.origin, ray.origin + ray.direction * maxDistance, out rayHit, (int)CoverLayerMask))
+		if (Physics.Raycast(ray.origin, ray.direction, out rayHit, maxDistance, CoverLayerMask))
 		{
 			return CoverType.Partial;
 		}

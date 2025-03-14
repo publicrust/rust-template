@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
 using System.Reflection;
 using Oxide.Core;
 using Oxide.Core.Libraries;
@@ -7,26 +9,110 @@ using Oxide.Core.Plugins;
 
 public abstract class CSPlugin : Plugin
 {
-	public struct HookMethod
+	public class HookMethod
 	{
-		public MethodInfo Method;
-
 		public string Name;
 
-		public ParameterInfo[] Parameters;
+		public MethodInfo Method;
 
-		public bool IsBaseHook;
+		public ParameterInfo[] Parameters => Method.GetParameters();
+
+		public bool IsBaseHook => Name.StartsWith("base_");
 
 		public HookMethod(MethodInfo method)
 		{
 			Method = method;
 			Name = method.Name;
-			Parameters = method.GetParameters();
-			IsBaseHook = method.Name.StartsWith("base_");
+			if (Parameters.Length != 0)
+			{
+				Name += string.Format("({0})", string.Join(", ", Parameters.Select((ParameterInfo x) => x.ParameterType.ToString()).ToArray()));
+			}
+		}
+
+		public bool HasMatchingSignature(object[] args, out bool exact)
+		{
+			exact = true;
+			if (Parameters.Length == 0 && (args == null || args.Length == 0))
+			{
+				return true;
+			}
+			for (int i = 0; i < args.Length; i++)
+			{
+				if (args[i] == null)
+				{
+					if (!CanAssignNull(Parameters[i].ParameterType))
+					{
+						return false;
+					}
+					continue;
+				}
+				if (exact && args[i].GetType() != Parameters[i].ParameterType && args[i].GetType().MakeByRefType() != Parameters[i].ParameterType && !CanConvertNumber(args[i], Parameters[i].ParameterType))
+				{
+					exact = false;
+				}
+				if (exact)
+				{
+					continue;
+				}
+				if (args[i].GetType().IsValueType)
+				{
+					if (!TypeDescriptor.GetConverter(Parameters[i].ParameterType).IsValid(args[i]))
+					{
+						return false;
+					}
+				}
+				else if (!Parameters[i].ParameterType.IsInstanceOfType(args[i]))
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		private bool CanAssignNull(Type type)
+		{
+			if (!type.IsValueType)
+			{
+				return true;
+			}
+			return Nullable.GetUnderlyingType(type) != null;
+		}
+
+		private bool IsNumber(object obj)
+		{
+			if (obj != null)
+			{
+				return IsNumber(Nullable.GetUnderlyingType(obj.GetType()) ?? obj.GetType());
+			}
+			return false;
+		}
+
+		private bool IsNumber(Type type)
+		{
+			if (type.IsPrimitive)
+			{
+				if (type != typeof(bool) && type != typeof(char) && type != typeof(IntPtr))
+				{
+					return type != typeof(UIntPtr);
+				}
+				return false;
+			}
+			return type == typeof(decimal);
+		}
+
+		private bool CanConvertNumber(object value, Type type)
+		{
+			if (!IsNumber(value) || !IsNumber(type))
+			{
+				return false;
+			}
+			return TypeDescriptor.GetConverter(type).IsValid(value);
 		}
 	}
 
-	protected Dictionary<string, List<HookMethod>> hooks = new Dictionary<string, List<HookMethod>>();
+	protected Dictionary<string, List<HookMethod>> Hooks = new Dictionary<string, List<HookMethod>>();
+
+	protected Dictionary<string, List<HookMethod>> HooksCache = new Dictionary<string, List<HookMethod>>();
 
 	public static T GetLibrary<T>(string name = null) where T : Library
 	{
@@ -35,9 +121,8 @@ public abstract class CSPlugin : Plugin
 
 	public CSPlugin()
 	{
-		List<Type> list = new List<Type>();
 		Type type = GetType();
-		list.Add(type);
+		List<Type> list = new List<Type> { type };
 		while (type != typeof(CSPlugin))
 		{
 			list.Add(type = type.BaseType);
@@ -59,7 +144,7 @@ public abstract class CSPlugin : Plugin
 	public override void HandleAddedToManager(PluginManager manager)
 	{
 		base.HandleAddedToManager(manager);
-		foreach (string key in hooks.Keys)
+		foreach (string key in Hooks.Keys)
 		{
 			Subscribe(key);
 		}
@@ -79,72 +164,144 @@ public abstract class CSPlugin : Plugin
 
 	protected void AddHookMethod(string name, MethodInfo method)
 	{
-		if (!hooks.TryGetValue(name, out var value))
+		if (!Hooks.TryGetValue(name, out var value))
 		{
 			value = new List<HookMethod>();
-			hooks[name] = value;
+			Hooks[name] = value;
 		}
 		value.Add(new HookMethod(method));
 	}
 
 	protected sealed override object OnCallHook(string name, object[] args)
 	{
-		if (!hooks.TryGetValue(name, out var value))
-		{
-			return null;
-		}
 		object result = null;
-		for (int i = 0; i < value.Count; i++)
+		foreach (HookMethod item in FindHooks(name, args))
 		{
-			HookMethod method = value[i];
-			object[] array = args;
 			int num = ((args != null) ? args.Length : 0);
-			ParameterInfo[] parameters = method.Parameters;
-			if (num != parameters.Length)
+			object[] array;
+			if (num != item.Parameters.Length)
 			{
-				array = new object[parameters.Length];
+				array = new object[item.Parameters.Length];
 				if (num > 0 && array.Length != 0)
 				{
 					Array.Copy(args, array, Math.Min(num, array.Length));
 				}
 				if (array.Length > num)
 				{
-					for (int j = num; j < array.Length; j++)
+					for (int i = num; i < array.Length; i++)
 					{
-						ParameterInfo parameterInfo = parameters[j];
+						ParameterInfo parameterInfo = item.Parameters[i];
 						if (parameterInfo.DefaultValue != null && parameterInfo.DefaultValue != DBNull.Value)
 						{
-							array[j] = parameterInfo.DefaultValue;
+							array[i] = parameterInfo.DefaultValue;
 						}
 						else if (parameterInfo.ParameterType.IsValueType)
 						{
-							array[j] = Activator.CreateInstance(parameterInfo.ParameterType);
+							array[i] = Activator.CreateInstance(parameterInfo.ParameterType);
 						}
 					}
 				}
 			}
+			else
+			{
+				array = args;
+			}
 			try
 			{
-				result = InvokeMethod(method, array);
+				result = InvokeMethod(item, array);
 			}
 			catch (TargetInvocationException ex)
 			{
-				throw ex.InnerException;
+				throw ex.InnerException ?? ex;
 			}
-			if (num == parameters.Length)
+			if (num == item.Parameters.Length)
 			{
 				continue;
 			}
-			for (int k = 0; k < parameters.Length; k++)
+			for (int j = 0; j < item.Parameters.Length; j++)
 			{
-				ParameterInfo parameterInfo2 = parameters[k];
-				if (parameterInfo2.IsOut || parameterInfo2.ParameterType.IsByRef)
+				if (item.Parameters[j].IsOut || item.Parameters[j].ParameterType.IsByRef)
 				{
-					args[k] = array[k];
+					args[j] = array[j];
 				}
 			}
 		}
 		return result;
+	}
+
+	protected List<HookMethod> FindHooks(string name, object[] args)
+	{
+		string text = name;
+		if (args != null && args.Length != 0)
+		{
+			text += string.Format("({0})", string.Join(", ", args.Select((object x) => x?.GetType().ToString() ?? "null").ToArray()));
+		}
+		if (HooksCache.ContainsKey(text))
+		{
+			return HooksCache[text];
+		}
+		List<HookMethod> list = new List<HookMethod>();
+		if (!Hooks.TryGetValue(name, out var value))
+		{
+			return list;
+		}
+		HookMethod hookMethod = null;
+		HookMethod hookMethod2 = null;
+		foreach (HookMethod item in value)
+		{
+			if (item.IsBaseHook)
+			{
+				list.Add(item);
+				continue;
+			}
+			int num = ((args != null) ? args.Length : 0);
+			object[] array;
+			if (num != item.Parameters.Length)
+			{
+				array = new object[item.Parameters.Length];
+				if (num > 0 && array.Length != 0)
+				{
+					Array.Copy(args, array, Math.Min(num, array.Length));
+				}
+				if (array.Length > num)
+				{
+					for (int i = num; i < array.Length; i++)
+					{
+						ParameterInfo parameterInfo = item.Parameters[i];
+						if (parameterInfo.DefaultValue != null && parameterInfo.DefaultValue != DBNull.Value)
+						{
+							array[i] = parameterInfo.DefaultValue;
+						}
+						else if (parameterInfo.ParameterType.IsValueType)
+						{
+							array[i] = Activator.CreateInstance(parameterInfo.ParameterType);
+						}
+					}
+				}
+			}
+			else
+			{
+				array = args;
+			}
+			if (item.HasMatchingSignature(array, out var exact))
+			{
+				if (exact)
+				{
+					hookMethod = item;
+					break;
+				}
+				hookMethod2 = item;
+			}
+		}
+		if (hookMethod != null)
+		{
+			list.Add(hookMethod);
+		}
+		else if (hookMethod2 != null)
+		{
+			list.Add(hookMethod2);
+		}
+		return HooksCache[text] = list;
 	}
 
 	protected virtual object InvokeMethod(HookMethod method, object[] args)

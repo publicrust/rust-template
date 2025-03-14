@@ -1,12 +1,13 @@
 #define UNITY_ASSERTIONS
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
+using ConVar;
+using Facepunch.Sqlite;
 using Ionic.Crc;
 using UnityEngine.Assertions;
 
-public abstract class FileStorage : IDisposable
+public class FileStorage : IDisposable
 {
 	private class CacheData
 	{
@@ -23,11 +24,25 @@ public abstract class FileStorage : IDisposable
 		jpg
 	}
 
+	private Database db;
+
+	public const int MaxSize = 4194304;
+
 	private CRC32 crc = new CRC32();
 
 	private Dictionary<uint, CacheData> _cache = new Dictionary<uint, CacheData>();
 
-	public static FileStorage server = new ServerStorage();
+	public static FileStorage server = new FileStorage("sv.files.0");
+
+	protected FileStorage(string name, bool server = false)
+	{
+		db = new Database();
+		db.Open(Server.rootFolder + "/" + name + ".db");
+		if (!db.TableExists("data"))
+		{
+			db.Execute("CREATE TABLE data ( crc INTEGER PRIMARY KEY, data BLOB, updated INTEGER, entid INTEGER, filetype INTEGER, part INTEGER )");
+		}
+	}
 
 	~FileStorage()
 	{
@@ -36,6 +51,8 @@ public abstract class FileStorage : IDisposable
 
 	public void Dispose()
 	{
+		db.Close();
+		db = null;
 	}
 
 	private uint GetCRC(byte[] data, Type type)
@@ -50,9 +67,12 @@ public abstract class FileStorage : IDisposable
 	{
 		using (TimeWarning.New("FileStorage.Store"))
 		{
-			string folder = GetFolder(entityID, numID, create: true);
+			if (data.Length > 4194304)
+			{
+				Array.Resize(ref data, 4194304);
+			}
 			uint cRC = GetCRC(data, type);
-			File.WriteAllBytes(folder + cRC, data);
+			db.Execute("INSERT OR REPLACE INTO data ( crc, data, entid, filetype, part ) VALUES ( ?, ?, ?, ?, ? )", cRC, data, (int)entityID, (int)type, (int)numID);
 			_cache.Remove(cRC);
 			_cache.Add(cRC, new CacheData
 			{
@@ -64,36 +84,26 @@ public abstract class FileStorage : IDisposable
 		}
 	}
 
-	public byte[] Get(uint crcId, Type type, uint entityID)
+	public byte[] Get(uint crc, Type type, uint entityID)
 	{
 		using (TimeWarning.New("FileStorage.Get"))
 		{
-			if (_cache.TryGetValue(crcId, out var value))
+			if (_cache.TryGetValue(crc, out var value))
 			{
 				Assert.IsTrue(value.data != null, "FileStorage cache contains a null texture");
 				return value.data;
 			}
-			DirectoryInfo directoryInfo = new DirectoryInfo(GetFolder(entityID, 0u, create: false));
-			if (!directoryInfo.Exists)
-			{
-				return null;
-			}
-			string path = directoryInfo.FullName + crcId;
-			if (!File.Exists(path))
-			{
-				return null;
-			}
-			byte[] array = File.ReadAllBytes(path);
+			byte[] array = db.QueryBlob("SELECT data FROM data WHERE crc = ? AND filetype = ? AND entid = ? LIMIT 1", (int)crc, (int)type, (int)entityID);
 			if (array == null)
 			{
 				return null;
 			}
-			if (GetCRC(array, type) != crcId)
+			if (array.Length > 4194304)
 			{
-				return null;
+				Array.Resize(ref array, 4194304);
 			}
-			_cache.Remove(crcId);
-			_cache.Add(crcId, new CacheData
+			_cache.Remove(crc);
+			_cache.Add(crc, new CacheData
 			{
 				data = array,
 				entityID = entityID,
@@ -103,30 +113,18 @@ public abstract class FileStorage : IDisposable
 		}
 	}
 
-	public abstract string GetFolder(uint entityid, uint numid, bool create);
-
-	public abstract void Cleanup();
-
 	public void Remove(uint crc, Type type, uint entityID)
 	{
-		DirectoryInfo parent = new DirectoryInfo(GetFolder(entityID, 0u, create: false)).Parent;
-		if (parent.Exists)
+		db.Execute("DELETE FROM data WHERE crc = ? AND filetype = ? AND entid = ?", (int)crc, (int)type, (int)entityID);
+		if (_cache.ContainsKey(crc))
 		{
-			if (_cache.ContainsKey(crc))
-			{
-				_cache.Remove(crc);
-			}
-			parent.Delete(recursive: true);
+			_cache.Remove(crc);
 		}
 	}
 
 	public void RemoveEntityNum(uint entityid, uint numid)
 	{
-		DirectoryInfo directoryInfo = new DirectoryInfo(GetFolder(entityid, numid, create: false));
-		if (directoryInfo.Exists)
-		{
-			directoryInfo.Delete(recursive: true);
-		}
+		db.Execute("DELETE FROM data WHERE entid = ? AND part = ?", (int)entityid, (int)numid);
 		uint[] array = (from x in _cache
 			where x.Value.entityID == entityid && x.Value.numID == numid
 			select x.Key).ToArray();
@@ -138,5 +136,6 @@ public abstract class FileStorage : IDisposable
 
 	internal void RemoveAllByEntity(uint entityid)
 	{
+		db.Execute("DELETE FROM data WHERE entid = ?", (int)entityid);
 	}
 }

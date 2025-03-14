@@ -10,11 +10,41 @@ using ProtoBuf;
 using UnityEngine;
 using UnityEngine.Assertions;
 
-public class BuildingPrivlidge : DecayEntity
+public class BuildingPrivlidge : StorageContainer
 {
-	public BuildPrivilegeTrigger privilegeTrigger;
+	public class UpkeepBracket
+	{
+		public int objectsUpTo;
+
+		public float fraction;
+
+		public float blocksTaxPaid;
+
+		public UpkeepBracket(int numObjs, float frac)
+		{
+			objectsUpTo = numObjs;
+			fraction = frac;
+			blocksTaxPaid = 0f;
+		}
+	}
 
 	public List<PlayerNameID> authorizedPlayers = new List<PlayerNameID>();
+
+	private float cachedUpkeepPeriodMinutes;
+
+	private float cachedUpkeepCostFraction;
+
+	private float cachedProtectedMinutes;
+
+	private float nextProtectedCalcTime;
+
+	private static UpkeepBracket[] upkeepBrackets = new UpkeepBracket[4]
+	{
+		new UpkeepBracket(ConVar.Decay.bracket_0_blockcount, ConVar.Decay.bracket_0_costfraction),
+		new UpkeepBracket(ConVar.Decay.bracket_1_blockcount, ConVar.Decay.bracket_1_costfraction),
+		new UpkeepBracket(ConVar.Decay.bracket_2_blockcount, ConVar.Decay.bracket_2_costfraction),
+		new UpkeepBracket(ConVar.Decay.bracket_3_blockcount, ConVar.Decay.bracket_3_costfraction)
+	};
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -128,6 +158,42 @@ public class BuildingPrivlidge : DecayEntity
 				}
 				return true;
 			}
+			if (rpc == 1023681781 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_Rotate "));
+				}
+				using (TimeWarning.New("RPC_Rotate"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test("RPC_Rotate", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							RPC_Rotate(msg2);
+						}
+					}
+					catch (Exception exception4)
+					{
+						player.Kick("RPC Error in RPC_Rotate");
+						Debug.LogException(exception4);
+					}
+				}
+				return true;
+			}
 		}
 		return base.OnRpcMessage(player, rpc, msg);
 	}
@@ -136,36 +202,6 @@ public class BuildingPrivlidge : DecayEntity
 	{
 		base.ResetState();
 		authorizedPlayers.Clear();
-	}
-
-	public static BuildingPrivlidge Get(Vector3 position, Quaternion rotation, Bounds bounds)
-	{
-		BuildingPrivlidge buildingPrivlidge = null;
-		OBB obb = new OBB(position, rotation, bounds);
-		List<Collider> obj = Facepunch.Pool.GetList<Collider>();
-		GamePhysics.OverlapOBB(obb, obj, 262144, QueryTriggerInteraction.Collide);
-		for (int i = 0; i < obj.Count; i++)
-		{
-			BuildingPrivlidge buildingPrivlidge2 = GameObjectEx.ToBaseEntity(obj[i].gameObject) as BuildingPrivlidge;
-			if (!(buildingPrivlidge2 == null) && buildingPrivlidge2.Dominates(buildingPrivlidge))
-			{
-				buildingPrivlidge = buildingPrivlidge2;
-			}
-		}
-		Facepunch.Pool.FreeList(ref obj);
-		return buildingPrivlidge;
-	}
-
-	public static bool IsAuthed(BasePlayer player, Vector3 position, Quaternion rotation, Bounds bounds)
-	{
-		BuildingPrivlidge buildingPrivlidge = Get(position, rotation, bounds);
-		return buildingPrivlidge != null && buildingPrivlidge.IsAuthed(player);
-	}
-
-	public static bool IsBlocked(BasePlayer player, Vector3 position, Quaternion rotation, Bounds bounds)
-	{
-		BuildingPrivlidge buildingPrivlidge = Get(position, rotation, bounds);
-		return buildingPrivlidge != null && !buildingPrivlidge.IsAuthed(player);
 	}
 
 	public bool IsAuthed(BasePlayer player)
@@ -178,20 +214,9 @@ public class BuildingPrivlidge : DecayEntity
 		return authorizedPlayers.Count > 0;
 	}
 
-	public bool CheckEntity(BaseEntity ent)
+	public override bool ItemFilter(Item item, int targetSlot)
 	{
-		return !privilegeTrigger || privilegeTrigger.CheckEntity(ent);
-	}
-
-	public bool Dominates(BuildingPrivlidge other)
-	{
-		if (other == null)
-		{
-			return true;
-		}
-		uint num = ((net != null) ? net.ID : 0u);
-		uint num2 = ((other.net != null) ? other.net.ID : 0u);
-		return num < num2;
+		return base.ItemFilter(item, targetSlot);
 	}
 
 	public override void Save(SaveInfo info)
@@ -199,6 +224,12 @@ public class BuildingPrivlidge : DecayEntity
 		base.Save(info);
 		info.msg.buildingPrivilege = Facepunch.Pool.Get<BuildingPrivilege>();
 		info.msg.buildingPrivilege.users = authorizedPlayers;
+		if (!info.forDisk)
+		{
+			info.msg.buildingPrivilege.upkeepPeriodMinutes = CalculateUpkeepPeriodMinutes();
+			info.msg.buildingPrivilege.costFraction = CalculateUpkeepCostFraction();
+			info.msg.buildingPrivilege.protectedMinutes = GetProtectedMinutes();
+		}
 	}
 
 	public override void PostSave(SaveInfo info)
@@ -213,22 +244,49 @@ public class BuildingPrivlidge : DecayEntity
 		if (info.msg.buildingPrivilege != null && info.msg.buildingPrivilege.users != null)
 		{
 			authorizedPlayers = info.msg.buildingPrivilege.users;
+			if (!info.fromDisk)
+			{
+				cachedUpkeepPeriodMinutes = info.msg.buildingPrivilege.upkeepPeriodMinutes;
+				cachedUpkeepCostFraction = info.msg.buildingPrivilege.costFraction;
+				cachedProtectedMinutes = info.msg.buildingPrivilege.protectedMinutes;
+			}
 			info.msg.buildingPrivilege.users = null;
 		}
+	}
+
+	public void BuildingDirty()
+	{
 		if (base.isServer)
 		{
-			UpdateAllPlayers();
+			AddDelayedUpdate();
 		}
 	}
 
-	public void PlayerEnterInfluence(BasePlayer ply)
+	protected override void OnInventoryDirty()
 	{
-		ply.SetInsideBuildingPrivilege(this, inside: true);
+		base.OnInventoryDirty();
+		AddDelayedUpdate();
 	}
 
-	public void PlayerLeaveInfluence(BasePlayer ply)
+	public override void OnItemAddedOrRemoved(Item item, bool bAdded)
 	{
-		ply.SetInsideBuildingPrivilege(this, inside: false);
+		base.OnItemAddedOrRemoved(item, bAdded);
+		AddDelayedUpdate();
+	}
+
+	public void AddDelayedUpdate()
+	{
+		if (IsInvoking(DelayedUpdate))
+		{
+			CancelInvoke(DelayedUpdate);
+		}
+		Invoke(DelayedUpdate, 1f);
+	}
+
+	public void DelayedUpdate()
+	{
+		MarkProtectedMinutesDirty();
+		SendNetworkUpdate();
 	}
 
 	private bool CanAdministrate(BasePlayer player)
@@ -243,7 +301,7 @@ public class BuildingPrivlidge : DecayEntity
 
 	[RPC_Server.IsVisible(3f)]
 	[RPC_Server]
-	private void AddSelfAuthorize(RPCMessage rpc)
+	public void AddSelfAuthorize(RPCMessage rpc)
 	{
 		RPCMessage rpc2 = rpc;
 		if (rpc2.player.CanInteract() && CanAdministrate(rpc2.player) && Interface.CallHook("OnCupboardAuthorize", this, rpc.player) == null)
@@ -253,52 +311,52 @@ public class BuildingPrivlidge : DecayEntity
 			playerNameID.userid = rpc2.player.userID;
 			playerNameID.username = rpc2.player.displayName;
 			authorizedPlayers.Add(playerNameID);
-			UpdateAllPlayers();
 			SendNetworkUpdate();
 		}
 	}
 
 	[RPC_Server.IsVisible(3f)]
 	[RPC_Server]
-	private void RemoveSelfAuthorize(RPCMessage rpc)
+	public void RemoveSelfAuthorize(RPCMessage rpc)
 	{
 		RPCMessage rpc2 = rpc;
 		if (rpc2.player.CanInteract() && CanAdministrate(rpc2.player) && Interface.CallHook("OnCupboardDeauthorize", this, rpc.player) == null)
 		{
 			authorizedPlayers.RemoveAll((PlayerNameID x) => x.userid == rpc2.player.userID);
-			UpdateAllPlayers();
 			SendNetworkUpdate();
 		}
 	}
 
 	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
-	private void ClearList(RPCMessage rpc)
+	public void ClearList(RPCMessage rpc)
 	{
-		if (rpc.player.CanInteract() && Interface.CallHook("OnCupboardClearList", this, rpc.player) == null && CanAdministrate(rpc.player))
+		if (rpc.player.CanInteract() && CanAdministrate(rpc.player) && Interface.CallHook("OnCupboardClearList", this, rpc.player) == null)
 		{
 			authorizedPlayers.Clear();
-			UpdateAllPlayers();
 			SendNetworkUpdate();
 		}
 	}
 
-	private void UpdateAllPlayers()
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
+	public void RPC_Rotate(RPCMessage msg)
 	{
-		TriggerBase[] componentsInChildren = GetComponentsInChildren<TriggerBase>();
-		foreach (TriggerBase triggerBase in componentsInChildren)
+		BasePlayer player = msg.player;
+		if (player.CanBuild() && (bool)player.GetHeldEntity() && player.GetHeldEntity().GetComponent<Hammer>() != null && (GetSlot(Slot.Lock) == null || !GetSlot(Slot.Lock).IsLocked()))
 		{
-			if (triggerBase.entityContents == null)
+			base.transform.rotation = Quaternion.LookRotation(-base.transform.forward, base.transform.up);
+			SendNetworkUpdate();
+			Deployable component = GetComponent<Deployable>();
+			if (component != null && component.placeEffect.isValid)
 			{
-				continue;
+				Effect.server.Run(component.placeEffect.resourcePath, base.transform.position, Vector3.up);
 			}
-			foreach (BaseEntity entityContent in triggerBase.entityContents)
-			{
-				if (!(entityContent.ToPlayer() == null))
-				{
-					entityContent.ToPlayer().SetInsideBuildingPrivilege(this, inside: true);
-				}
-			}
+		}
+		BaseEntity slot = GetSlot(Slot.Lock);
+		if (slot != null)
+		{
+			slot.SendNetworkUpdate();
 		}
 	}
 
@@ -314,5 +372,176 @@ public class BuildingPrivlidge : DecayEntity
 	public override bool SupportsPooling()
 	{
 		return true;
+	}
+
+	public float CalculateUpkeepPeriodMinutes()
+	{
+		if (base.isServer)
+		{
+			return ConVar.Decay.upkeep_period_minutes;
+		}
+		return 0f;
+	}
+
+	public float CalculateUpkeepCostFraction()
+	{
+		if (base.isServer)
+		{
+			return CalculateBuildingTaxRate();
+		}
+		return 0f;
+	}
+
+	public void CalculateUpkeepCostAmounts(List<ItemAmount> itemAmounts)
+	{
+		BuildingManager.Building building = GetBuilding();
+		if (building == null || !building.HasDecayEntities())
+		{
+			return;
+		}
+		float multiplier = CalculateUpkeepCostFraction();
+		foreach (DecayEntity decayEntity in building.decayEntities)
+		{
+			decayEntity.CalculateUpkeepCostAmounts(itemAmounts, multiplier);
+		}
+	}
+
+	public float GetProtectedMinutes(bool force = false)
+	{
+		if (!force && UnityEngine.Time.realtimeSinceStartup < nextProtectedCalcTime)
+		{
+			return cachedProtectedMinutes;
+		}
+		nextProtectedCalcTime = UnityEngine.Time.realtimeSinceStartup + 60f;
+		List<ItemAmount> obj = Facepunch.Pool.GetList<ItemAmount>();
+		CalculateUpkeepCostAmounts(obj);
+		float num = CalculateUpkeepPeriodMinutes();
+		float num2 = 60f / num * 24f;
+		float num3 = -1f;
+		if (inventory != null)
+		{
+			foreach (ItemAmount item in obj)
+			{
+				List<Item> source = inventory.FindItemsByItemID(item.itemid);
+				int num4 = source.Sum((Item x) => x.amount);
+				if (num4 > 0 && item.amount > 0f)
+				{
+					float num5 = (float)num4 / item.amount * num;
+					if (num3 == -1f || num5 < num3)
+					{
+						num3 = num5;
+					}
+				}
+				else
+				{
+					num3 = 0f;
+				}
+			}
+			if (num3 == -1f)
+			{
+				num3 = 0f;
+			}
+		}
+		Facepunch.Pool.FreeList(ref obj);
+		cachedProtectedMinutes = num3;
+		return cachedProtectedMinutes;
+	}
+
+	public override void DecayTick()
+	{
+		if (EnsurePrimary())
+		{
+			base.DecayTick();
+		}
+	}
+
+	private bool EnsurePrimary()
+	{
+		BuildingManager.Building building = GetBuilding();
+		if (building != null)
+		{
+			BuildingPrivlidge dominatingBuildingPrivilege = building.GetDominatingBuildingPrivilege();
+			if (dominatingBuildingPrivilege != null && dominatingBuildingPrivilege != this)
+			{
+				Kill(DestroyMode.Gib);
+				return false;
+			}
+		}
+		return true;
+	}
+
+	public void MarkProtectedMinutesDirty(float delay = 0f)
+	{
+		nextProtectedCalcTime = UnityEngine.Time.realtimeSinceStartup + delay;
+	}
+
+	private float CalculateBuildingTaxRate()
+	{
+		BuildingManager.Building building = GetBuilding();
+		if (building == null)
+		{
+			return ConVar.Decay.bracket_0_costfraction;
+		}
+		if (!building.HasBuildingBlocks())
+		{
+			return ConVar.Decay.bracket_0_costfraction;
+		}
+		int count = building.buildingBlocks.Count;
+		int num = count;
+		for (int i = 0; i < upkeepBrackets.Length; i++)
+		{
+			UpkeepBracket upkeepBracket = upkeepBrackets[i];
+			upkeepBracket.blocksTaxPaid = 0f;
+			if (num > 0)
+			{
+				int num2 = 0;
+				num2 = ((i != upkeepBrackets.Length - 1) ? Mathf.Min(num, upkeepBrackets[i].objectsUpTo) : num);
+				num -= num2;
+				upkeepBracket.blocksTaxPaid = (float)num2 * upkeepBracket.fraction;
+			}
+		}
+		float num3 = 0f;
+		for (int j = 0; j < upkeepBrackets.Length; j++)
+		{
+			UpkeepBracket upkeepBracket2 = upkeepBrackets[j];
+			if (upkeepBracket2.blocksTaxPaid > 0f)
+			{
+				num3 += upkeepBracket2.blocksTaxPaid;
+				continue;
+			}
+			break;
+		}
+		return num3 / (float)count;
+	}
+
+	public float PurchaseUpkeepTime(DecayEntity entity, float deltaTime)
+	{
+		float num = CalculateUpkeepCostFraction();
+		float num2 = CalculateUpkeepPeriodMinutes() * 60f;
+		float multiplier = num * deltaTime / num2;
+		float num3 = 0f;
+		float num4 = 0f;
+		List<ItemAmount> obj = Facepunch.Pool.GetList<ItemAmount>();
+		List<Item> obj2 = Facepunch.Pool.GetList<Item>();
+		entity.CalculateUpkeepCostAmounts(obj, multiplier);
+		foreach (ItemAmount item in obj)
+		{
+			float amount = item.amount;
+			int num5 = inventory.Take(obj2, item.itemid, Mathf.CeilToInt(amount));
+			num3 += amount;
+			num4 += (float)num5;
+			foreach (Item item2 in obj2)
+			{
+				item2.UseItem(item2.amount);
+			}
+			obj2.Clear();
+		}
+		Facepunch.Pool.FreeList(ref obj2);
+		Facepunch.Pool.FreeList(ref obj);
+		if (num3 == 0f)
+		{
+			return deltaTime;
+		}
+		return deltaTime * num4 / Mathf.Max(num3, 0.001f);
 	}
 }
