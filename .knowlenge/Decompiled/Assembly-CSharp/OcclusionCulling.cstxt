@@ -253,8 +253,6 @@ public class OcclusionCulling : MonoBehaviour
 		}
 	}
 
-	public delegate void OnVisibilityChanged(bool visible);
-
 	public enum DebugFilter
 	{
 		Off,
@@ -699,6 +697,52 @@ public class OcclusionCulling : MonoBehaviour
 		}
 	}
 
+	public delegate void OnVisibilityChanged(bool visible);
+
+	public DebugSettings debugSettings = new DebugSettings();
+
+	private Material debugMipMat;
+
+	private const float debugDrawDuration = 0.0334f;
+
+	private Material downscaleMat;
+
+	private Material blitCopyMat;
+
+	private int hiZLevelCount;
+
+	private int hiZWidth;
+
+	private int hiZHeight;
+
+	private RenderTexture depthTexture;
+
+	private RenderTexture hiZTexture;
+
+	private RenderTexture[] hiZLevels;
+
+	private const int GridCellsPerAxis = 2097152;
+
+	private const int GridHalfCellsPerAxis = 1048576;
+
+	private const int GridMinHalfCellsPerAxis = -1048575;
+
+	private const int GridMaxHalfCellsPerAxis = 1048575;
+
+	private const float GridCellSize = 100f;
+
+	private const float GridHalfCellSize = 50f;
+
+	private const float GridRcpCellSize = 0.01f;
+
+	private const int GridPoolCapacity = 16384;
+
+	private const int GridPoolGranularity = 4096;
+
+	private static HashedPool<Cell> grid = new HashedPool<Cell>(16384, 4096);
+
+	private static Queue<Cell> gridChanged = new Queue<Cell>();
+
 	public ComputeShader computeShader;
 
 	public bool usePixelShaderFallback = true;
@@ -781,49 +825,17 @@ public class OcclusionCulling : MonoBehaviour
 
 	private static DebugFilter _debugShow = DebugFilter.Off;
 
-	public DebugSettings debugSettings = new DebugSettings();
-
-	private Material debugMipMat;
-
-	private const float debugDrawDuration = 0.0334f;
-
-	private Material downscaleMat;
-
-	private Material blitCopyMat;
-
-	private int hiZLevelCount;
-
-	private int hiZWidth;
-
-	private int hiZHeight;
-
-	private RenderTexture depthTexture;
-
-	private RenderTexture hiZTexture;
-
-	private RenderTexture[] hiZLevels;
-
-	private const int GridCellsPerAxis = 2097152;
-
-	private const int GridHalfCellsPerAxis = 1048576;
-
-	private const int GridMinHalfCellsPerAxis = -1048575;
-
-	private const int GridMaxHalfCellsPerAxis = 1048575;
-
-	private const float GridCellSize = 100f;
-
-	private const float GridHalfCellSize = 50f;
-
-	private const float GridRcpCellSize = 0.01f;
-
-	private const int GridPoolCapacity = 16384;
-
-	private const int GridPoolGranularity = 4096;
-
-	private static HashedPool<Cell> grid = new HashedPool<Cell>(16384, 4096);
-
-	private static Queue<Cell> gridChanged = new Queue<Cell>();
+	public bool HiZReady
+	{
+		get
+		{
+			if (hiZTexture != null && hiZWidth > 0)
+			{
+				return hiZHeight > 0;
+			}
+			return false;
+		}
+	}
 
 	public static OcclusionCulling Instance => instance;
 
@@ -869,15 +881,371 @@ public class OcclusionCulling : MonoBehaviour
 		}
 	}
 
-	public bool HiZReady
+	public static bool DebugFilterIsDynamic(int filter)
 	{
-		get
+		if (filter != 1)
 		{
-			if (hiZTexture != null && hiZWidth > 0)
+			return filter == 4;
+		}
+		return true;
+	}
+
+	public static bool DebugFilterIsStatic(int filter)
+	{
+		if (filter != 2)
+		{
+			return filter == 4;
+		}
+		return true;
+	}
+
+	public static bool DebugFilterIsGrid(int filter)
+	{
+		if (filter != 3)
+		{
+			return filter == 4;
+		}
+		return true;
+	}
+
+	private void DebugInitialize()
+	{
+		debugMipMat = new Material(Shader.Find("Hidden/OcclusionCulling/DebugMip"))
+		{
+			hideFlags = HideFlags.HideAndDontSave
+		};
+	}
+
+	private void DebugShutdown()
+	{
+		if (debugMipMat != null)
+		{
+			UnityEngine.Object.DestroyImmediate(debugMipMat);
+			debugMipMat = null;
+		}
+	}
+
+	private void DebugUpdate()
+	{
+		if (HiZReady)
+		{
+			debugSettings.showMainLod = Mathf.Clamp(debugSettings.showMainLod, 0, hiZLevels.Length - 1);
+		}
+	}
+
+	private void DebugDraw()
+	{
+	}
+
+	public static void NormalizePlane(ref Vector4 plane)
+	{
+		float num = Mathf.Sqrt(plane.x * plane.x + plane.y * plane.y + plane.z * plane.z);
+		plane.x /= num;
+		plane.y /= num;
+		plane.z /= num;
+		plane.w /= num;
+	}
+
+	public static void ExtractFrustum(Matrix4x4 viewProjMatrix, ref Vector4[] planes)
+	{
+		planes[0].x = viewProjMatrix.m30 + viewProjMatrix.m00;
+		planes[0].y = viewProjMatrix.m31 + viewProjMatrix.m01;
+		planes[0].z = viewProjMatrix.m32 + viewProjMatrix.m02;
+		planes[0].w = viewProjMatrix.m33 + viewProjMatrix.m03;
+		NormalizePlane(ref planes[0]);
+		planes[1].x = viewProjMatrix.m30 - viewProjMatrix.m00;
+		planes[1].y = viewProjMatrix.m31 - viewProjMatrix.m01;
+		planes[1].z = viewProjMatrix.m32 - viewProjMatrix.m02;
+		planes[1].w = viewProjMatrix.m33 - viewProjMatrix.m03;
+		NormalizePlane(ref planes[1]);
+		planes[2].x = viewProjMatrix.m30 - viewProjMatrix.m10;
+		planes[2].y = viewProjMatrix.m31 - viewProjMatrix.m11;
+		planes[2].z = viewProjMatrix.m32 - viewProjMatrix.m12;
+		planes[2].w = viewProjMatrix.m33 - viewProjMatrix.m13;
+		NormalizePlane(ref planes[2]);
+		planes[3].x = viewProjMatrix.m30 + viewProjMatrix.m10;
+		planes[3].y = viewProjMatrix.m31 + viewProjMatrix.m11;
+		planes[3].z = viewProjMatrix.m32 + viewProjMatrix.m12;
+		planes[3].w = viewProjMatrix.m33 + viewProjMatrix.m13;
+		NormalizePlane(ref planes[3]);
+		planes[4].x = viewProjMatrix.m20;
+		planes[4].y = viewProjMatrix.m21;
+		planes[4].z = viewProjMatrix.m22;
+		planes[4].w = viewProjMatrix.m23;
+		NormalizePlane(ref planes[4]);
+		planes[5].x = viewProjMatrix.m30 - viewProjMatrix.m20;
+		planes[5].y = viewProjMatrix.m31 - viewProjMatrix.m21;
+		planes[5].z = viewProjMatrix.m32 - viewProjMatrix.m22;
+		planes[5].w = viewProjMatrix.m33 - viewProjMatrix.m23;
+		NormalizePlane(ref planes[5]);
+	}
+
+	public void CheckResizeHiZMap()
+	{
+		int pixelWidth = camera.pixelWidth;
+		int pixelHeight = camera.pixelHeight;
+		if (pixelWidth <= 0 || pixelHeight <= 0)
+		{
+			return;
+		}
+		int num = pixelWidth / 4;
+		int num2 = pixelHeight / 4;
+		if (hiZLevels == null || hiZWidth != num || hiZHeight != num2)
+		{
+			InitializeHiZMap(num, num2);
+			hiZWidth = num;
+			hiZHeight = num2;
+			if (debugSettings.log)
 			{
-				return hiZHeight > 0;
+				Debug.Log("[OcclusionCulling] Resized HiZ Map to " + hiZWidth + " x " + hiZHeight);
 			}
-			return false;
+		}
+	}
+
+	private void InitializeHiZMap()
+	{
+		Shader shader = Shader.Find("Hidden/OcclusionCulling/DepthDownscale");
+		Shader shader2 = Shader.Find("Hidden/OcclusionCulling/BlitCopy");
+		downscaleMat = new Material(shader)
+		{
+			hideFlags = HideFlags.HideAndDontSave
+		};
+		blitCopyMat = new Material(shader2)
+		{
+			hideFlags = HideFlags.HideAndDontSave
+		};
+		CheckResizeHiZMap();
+	}
+
+	private void FinalizeHiZMap()
+	{
+		DestroyHiZMap();
+		if (downscaleMat != null)
+		{
+			UnityEngine.Object.DestroyImmediate(downscaleMat);
+			downscaleMat = null;
+		}
+		if (blitCopyMat != null)
+		{
+			UnityEngine.Object.DestroyImmediate(blitCopyMat);
+			blitCopyMat = null;
+		}
+	}
+
+	private void InitializeHiZMap(int width, int height)
+	{
+		DestroyHiZMap();
+		width = Mathf.Clamp(width, 1, 65536);
+		height = Mathf.Clamp(height, 1, 65536);
+		int num = Mathf.Min(width, height);
+		hiZLevelCount = (int)(Mathf.Log(num, 2f) + 1f);
+		hiZLevels = new RenderTexture[hiZLevelCount];
+		depthTexture = CreateDepthTexture("DepthTex", width, height);
+		hiZTexture = CreateDepthTexture("HiZMapTex", width, height, mips: true);
+		for (int i = 0; i < hiZLevelCount; i++)
+		{
+			hiZLevels[i] = CreateDepthTextureMip("HiZMap" + i, width, height, i);
+		}
+	}
+
+	private void DestroyHiZMap()
+	{
+		if (depthTexture != null)
+		{
+			RenderTexture.active = null;
+			UnityEngine.Object.DestroyImmediate(depthTexture);
+			depthTexture = null;
+		}
+		if (hiZTexture != null)
+		{
+			RenderTexture.active = null;
+			UnityEngine.Object.DestroyImmediate(hiZTexture);
+			hiZTexture = null;
+		}
+		if (hiZLevels != null)
+		{
+			for (int i = 0; i < hiZLevels.Length; i++)
+			{
+				UnityEngine.Object.DestroyImmediate(hiZLevels[i]);
+			}
+			hiZLevels = null;
+		}
+	}
+
+	private RenderTexture CreateDepthTexture(string name, int width, int height, bool mips = false)
+	{
+		RenderTexture renderTexture = new RenderTexture(width, height, 0, RenderTextureFormat.RFloat, RenderTextureReadWrite.Linear);
+		renderTexture.name = name;
+		renderTexture.useMipMap = mips;
+		renderTexture.autoGenerateMips = false;
+		renderTexture.wrapMode = TextureWrapMode.Clamp;
+		renderTexture.filterMode = FilterMode.Point;
+		renderTexture.Create();
+		return renderTexture;
+	}
+
+	private RenderTexture CreateDepthTextureMip(string name, int width, int height, int mip)
+	{
+		int width2 = width >> mip;
+		int height2 = height >> mip;
+		RenderTexture renderTexture = new RenderTexture(width2, height2, 0, RenderTextureFormat.RFloat, RenderTextureReadWrite.Linear);
+		renderTexture.name = name;
+		renderTexture.useMipMap = false;
+		renderTexture.wrapMode = TextureWrapMode.Clamp;
+		renderTexture.filterMode = FilterMode.Point;
+		renderTexture.Create();
+		return renderTexture;
+	}
+
+	public void GrabDepthTexture()
+	{
+		if (depthTexture != null)
+		{
+			UnityEngine.Graphics.Blit(null, depthTexture, depthCopyMat, 0);
+		}
+	}
+
+	public void GenerateHiZMipChain()
+	{
+		if (HiZReady)
+		{
+			bool flag = true;
+			depthCopyMat.SetMatrix("_CameraReprojection", prevViewProjMatrix * invViewProjMatrix);
+			depthCopyMat.SetFloat("_FrustumNoDataDepth", flag ? 1f : 0f);
+			UnityEngine.Graphics.Blit(depthTexture, hiZLevels[0], depthCopyMat, 1);
+			for (int i = 1; i < hiZLevels.Length; i++)
+			{
+				RenderTexture renderTexture = hiZLevels[i - 1];
+				RenderTexture dest = hiZLevels[i];
+				int pass = (((renderTexture.width & 1) != 0 || (renderTexture.height & 1) != 0) ? 1 : 0);
+				downscaleMat.SetTexture("_MainTex", renderTexture);
+				UnityEngine.Graphics.Blit(renderTexture, dest, downscaleMat, pass);
+			}
+			for (int j = 0; j < hiZLevels.Length; j++)
+			{
+				UnityEngine.Graphics.SetRenderTarget(hiZTexture, j);
+				UnityEngine.Graphics.Blit(hiZLevels[j], blitCopyMat);
+			}
+		}
+	}
+
+	private void DebugDrawGizmos()
+	{
+		Camera component = GetComponent<Camera>();
+		Gizmos.color = new Color(0.75f, 0.75f, 0f, 0.5f);
+		Gizmos.matrix = Matrix4x4.TRS(base.transform.position, base.transform.rotation, Vector3.one);
+		Gizmos.DrawFrustum(Vector3.zero, component.fieldOfView, component.farClipPlane, component.nearClipPlane, component.aspect);
+		Gizmos.color = Color.red;
+		Gizmos.matrix = Matrix4x4.identity;
+		Matrix4x4 worldToCameraMatrix = component.worldToCameraMatrix;
+		Matrix4x4 matrix4x = GL.GetGPUProjectionMatrix(component.projectionMatrix, renderIntoTexture: false) * worldToCameraMatrix;
+		Vector4[] planes = new Vector4[6];
+		ExtractFrustum(matrix4x, ref planes);
+		for (int i = 0; i < planes.Length; i++)
+		{
+			Vector3 vector = new Vector3(planes[i].x, planes[i].y, planes[i].z);
+			float w = planes[i].w;
+			Vector3 vector2 = -vector * w;
+			Gizmos.DrawLine(vector2, vector2 * 2f);
+		}
+	}
+
+	private static int floor(float x)
+	{
+		int num = (int)x;
+		if (!(x < (float)num))
+		{
+			return num;
+		}
+		return num - 1;
+	}
+
+	public static Cell RegisterToGrid(OccludeeState occludee)
+	{
+		int num = floor(occludee.states.array[occludee.slot].sphereBounds.x * 0.01f);
+		int num2 = floor(occludee.states.array[occludee.slot].sphereBounds.y * 0.01f);
+		int num3 = floor(occludee.states.array[occludee.slot].sphereBounds.z * 0.01f);
+		int num4 = Mathf.Clamp(num, -1048575, 1048575);
+		int num5 = Mathf.Clamp(num2, -1048575, 1048575);
+		int num6 = Mathf.Clamp(num3, -1048575, 1048575);
+		long num7 = ((num4 >= 0) ? num4 : (num4 + 1048575));
+		ulong num8 = (ulong)((num5 >= 0) ? num5 : (num5 + 1048575));
+		ulong num9 = (ulong)((num6 >= 0) ? num6 : (num6 + 1048575));
+		ulong key = (ulong)(num7 << 42) | (num8 << 21) | num9;
+		Cell value;
+		bool num10 = grid.TryGetValue(key, out value);
+		if (!num10)
+		{
+			Vector3 center = new Vector3
+			{
+				x = (float)num * 100f + 50f,
+				y = (float)num2 * 100f + 50f,
+				z = (float)num3 * 100f + 50f
+			};
+			Vector3 size = new Vector3(100f, 100f, 100f);
+			value = grid.Add(key).Initialize(num, num2, num3, new Bounds(center, size));
+		}
+		SmartList smartList = (occludee.isStatic ? value.staticBucket : value.dynamicBucket);
+		if (!num10 || !smartList.Contains(occludee))
+		{
+			occludee.cell = value;
+			smartList.Add(occludee);
+			gridChanged.Enqueue(value);
+		}
+		return value;
+	}
+
+	public static void UpdateInGrid(OccludeeState occludee)
+	{
+		int num = floor(occludee.states.array[occludee.slot].sphereBounds.x * 0.01f);
+		int num2 = floor(occludee.states.array[occludee.slot].sphereBounds.y * 0.01f);
+		int num3 = floor(occludee.states.array[occludee.slot].sphereBounds.z * 0.01f);
+		if (num != occludee.cell.x || num2 != occludee.cell.y || num3 != occludee.cell.z)
+		{
+			UnregisterFromGrid(occludee);
+			RegisterToGrid(occludee);
+		}
+	}
+
+	public static void UnregisterFromGrid(OccludeeState occludee)
+	{
+		Cell cell = occludee.cell;
+		SmartList obj = (occludee.isStatic ? cell.staticBucket : cell.dynamicBucket);
+		gridChanged.Enqueue(cell);
+		obj.Remove(occludee);
+		if (cell.staticBucket.Count == 0 && cell.dynamicBucket.Count == 0)
+		{
+			grid.Remove(cell);
+			cell.Reset();
+		}
+		occludee.cell = null;
+	}
+
+	public void UpdateGridBuffers()
+	{
+		if (gridSet.CheckResize(grid.Size, 256))
+		{
+			if (debugSettings.log)
+			{
+				Debug.Log("[OcclusionCulling] Resized grid to " + grid.Size);
+			}
+			for (int i = 0; i < grid.Size; i++)
+			{
+				if (grid[i] != null)
+				{
+					gridChanged.Enqueue(grid[i]);
+				}
+			}
+		}
+		bool flag = gridChanged.Count > 0;
+		while (gridChanged.Count > 0)
+		{
+			Cell cell = gridChanged.Dequeue();
+			gridSet.inputData[cell.hashedPoolIndex] = cell.sphereBounds;
+		}
+		if (flag)
+		{
+			gridSet.UploadData();
 		}
 	}
 
@@ -1586,373 +1954,5 @@ public class OcclusionCulling : MonoBehaviour
 		}
 		ProcessCallbacks(staticOccludees, staticStates, staticVisibilityChanged);
 		ProcessCallbacks(dynamicOccludees, dynamicStates, dynamicVisibilityChanged);
-	}
-
-	public static bool DebugFilterIsDynamic(int filter)
-	{
-		if (filter != 1)
-		{
-			return filter == 4;
-		}
-		return true;
-	}
-
-	public static bool DebugFilterIsStatic(int filter)
-	{
-		if (filter != 2)
-		{
-			return filter == 4;
-		}
-		return true;
-	}
-
-	public static bool DebugFilterIsGrid(int filter)
-	{
-		if (filter != 3)
-		{
-			return filter == 4;
-		}
-		return true;
-	}
-
-	private void DebugInitialize()
-	{
-		debugMipMat = new Material(Shader.Find("Hidden/OcclusionCulling/DebugMip"))
-		{
-			hideFlags = HideFlags.HideAndDontSave
-		};
-	}
-
-	private void DebugShutdown()
-	{
-		if (debugMipMat != null)
-		{
-			UnityEngine.Object.DestroyImmediate(debugMipMat);
-			debugMipMat = null;
-		}
-	}
-
-	private void DebugUpdate()
-	{
-		if (HiZReady)
-		{
-			debugSettings.showMainLod = Mathf.Clamp(debugSettings.showMainLod, 0, hiZLevels.Length - 1);
-		}
-	}
-
-	private void DebugDraw()
-	{
-	}
-
-	public static void NormalizePlane(ref Vector4 plane)
-	{
-		float num = Mathf.Sqrt(plane.x * plane.x + plane.y * plane.y + plane.z * plane.z);
-		plane.x /= num;
-		plane.y /= num;
-		plane.z /= num;
-		plane.w /= num;
-	}
-
-	public static void ExtractFrustum(Matrix4x4 viewProjMatrix, ref Vector4[] planes)
-	{
-		planes[0].x = viewProjMatrix.m30 + viewProjMatrix.m00;
-		planes[0].y = viewProjMatrix.m31 + viewProjMatrix.m01;
-		planes[0].z = viewProjMatrix.m32 + viewProjMatrix.m02;
-		planes[0].w = viewProjMatrix.m33 + viewProjMatrix.m03;
-		NormalizePlane(ref planes[0]);
-		planes[1].x = viewProjMatrix.m30 - viewProjMatrix.m00;
-		planes[1].y = viewProjMatrix.m31 - viewProjMatrix.m01;
-		planes[1].z = viewProjMatrix.m32 - viewProjMatrix.m02;
-		planes[1].w = viewProjMatrix.m33 - viewProjMatrix.m03;
-		NormalizePlane(ref planes[1]);
-		planes[2].x = viewProjMatrix.m30 - viewProjMatrix.m10;
-		planes[2].y = viewProjMatrix.m31 - viewProjMatrix.m11;
-		planes[2].z = viewProjMatrix.m32 - viewProjMatrix.m12;
-		planes[2].w = viewProjMatrix.m33 - viewProjMatrix.m13;
-		NormalizePlane(ref planes[2]);
-		planes[3].x = viewProjMatrix.m30 + viewProjMatrix.m10;
-		planes[3].y = viewProjMatrix.m31 + viewProjMatrix.m11;
-		planes[3].z = viewProjMatrix.m32 + viewProjMatrix.m12;
-		planes[3].w = viewProjMatrix.m33 + viewProjMatrix.m13;
-		NormalizePlane(ref planes[3]);
-		planes[4].x = viewProjMatrix.m20;
-		planes[4].y = viewProjMatrix.m21;
-		planes[4].z = viewProjMatrix.m22;
-		planes[4].w = viewProjMatrix.m23;
-		NormalizePlane(ref planes[4]);
-		planes[5].x = viewProjMatrix.m30 - viewProjMatrix.m20;
-		planes[5].y = viewProjMatrix.m31 - viewProjMatrix.m21;
-		planes[5].z = viewProjMatrix.m32 - viewProjMatrix.m22;
-		planes[5].w = viewProjMatrix.m33 - viewProjMatrix.m23;
-		NormalizePlane(ref planes[5]);
-	}
-
-	public void CheckResizeHiZMap()
-	{
-		int pixelWidth = camera.pixelWidth;
-		int pixelHeight = camera.pixelHeight;
-		if (pixelWidth <= 0 || pixelHeight <= 0)
-		{
-			return;
-		}
-		int num = pixelWidth / 4;
-		int num2 = pixelHeight / 4;
-		if (hiZLevels == null || hiZWidth != num || hiZHeight != num2)
-		{
-			InitializeHiZMap(num, num2);
-			hiZWidth = num;
-			hiZHeight = num2;
-			if (debugSettings.log)
-			{
-				Debug.Log("[OcclusionCulling] Resized HiZ Map to " + hiZWidth + " x " + hiZHeight);
-			}
-		}
-	}
-
-	private void InitializeHiZMap()
-	{
-		Shader shader = Shader.Find("Hidden/OcclusionCulling/DepthDownscale");
-		Shader shader2 = Shader.Find("Hidden/OcclusionCulling/BlitCopy");
-		downscaleMat = new Material(shader)
-		{
-			hideFlags = HideFlags.HideAndDontSave
-		};
-		blitCopyMat = new Material(shader2)
-		{
-			hideFlags = HideFlags.HideAndDontSave
-		};
-		CheckResizeHiZMap();
-	}
-
-	private void FinalizeHiZMap()
-	{
-		DestroyHiZMap();
-		if (downscaleMat != null)
-		{
-			UnityEngine.Object.DestroyImmediate(downscaleMat);
-			downscaleMat = null;
-		}
-		if (blitCopyMat != null)
-		{
-			UnityEngine.Object.DestroyImmediate(blitCopyMat);
-			blitCopyMat = null;
-		}
-	}
-
-	private void InitializeHiZMap(int width, int height)
-	{
-		DestroyHiZMap();
-		width = Mathf.Clamp(width, 1, 65536);
-		height = Mathf.Clamp(height, 1, 65536);
-		int num = Mathf.Min(width, height);
-		hiZLevelCount = (int)(Mathf.Log(num, 2f) + 1f);
-		hiZLevels = new RenderTexture[hiZLevelCount];
-		depthTexture = CreateDepthTexture("DepthTex", width, height);
-		hiZTexture = CreateDepthTexture("HiZMapTex", width, height, mips: true);
-		for (int i = 0; i < hiZLevelCount; i++)
-		{
-			hiZLevels[i] = CreateDepthTextureMip("HiZMap" + i, width, height, i);
-		}
-	}
-
-	private void DestroyHiZMap()
-	{
-		if (depthTexture != null)
-		{
-			RenderTexture.active = null;
-			UnityEngine.Object.DestroyImmediate(depthTexture);
-			depthTexture = null;
-		}
-		if (hiZTexture != null)
-		{
-			RenderTexture.active = null;
-			UnityEngine.Object.DestroyImmediate(hiZTexture);
-			hiZTexture = null;
-		}
-		if (hiZLevels != null)
-		{
-			for (int i = 0; i < hiZLevels.Length; i++)
-			{
-				UnityEngine.Object.DestroyImmediate(hiZLevels[i]);
-			}
-			hiZLevels = null;
-		}
-	}
-
-	private RenderTexture CreateDepthTexture(string name, int width, int height, bool mips = false)
-	{
-		RenderTexture renderTexture = new RenderTexture(width, height, 0, RenderTextureFormat.RFloat, RenderTextureReadWrite.Linear);
-		renderTexture.name = name;
-		renderTexture.useMipMap = mips;
-		renderTexture.autoGenerateMips = false;
-		renderTexture.wrapMode = TextureWrapMode.Clamp;
-		renderTexture.filterMode = FilterMode.Point;
-		renderTexture.Create();
-		return renderTexture;
-	}
-
-	private RenderTexture CreateDepthTextureMip(string name, int width, int height, int mip)
-	{
-		int width2 = width >> mip;
-		int height2 = height >> mip;
-		RenderTexture renderTexture = new RenderTexture(width2, height2, 0, RenderTextureFormat.RFloat, RenderTextureReadWrite.Linear);
-		renderTexture.name = name;
-		renderTexture.useMipMap = false;
-		renderTexture.wrapMode = TextureWrapMode.Clamp;
-		renderTexture.filterMode = FilterMode.Point;
-		renderTexture.Create();
-		return renderTexture;
-	}
-
-	public void GrabDepthTexture()
-	{
-		if (depthTexture != null)
-		{
-			UnityEngine.Graphics.Blit(null, depthTexture, depthCopyMat, 0);
-		}
-	}
-
-	public void GenerateHiZMipChain()
-	{
-		if (HiZReady)
-		{
-			bool flag = true;
-			depthCopyMat.SetMatrix("_CameraReprojection", prevViewProjMatrix * invViewProjMatrix);
-			depthCopyMat.SetFloat("_FrustumNoDataDepth", flag ? 1f : 0f);
-			UnityEngine.Graphics.Blit(depthTexture, hiZLevels[0], depthCopyMat, 1);
-			for (int i = 1; i < hiZLevels.Length; i++)
-			{
-				RenderTexture renderTexture = hiZLevels[i - 1];
-				RenderTexture dest = hiZLevels[i];
-				int pass = (((renderTexture.width & 1) != 0 || (renderTexture.height & 1) != 0) ? 1 : 0);
-				downscaleMat.SetTexture("_MainTex", renderTexture);
-				UnityEngine.Graphics.Blit(renderTexture, dest, downscaleMat, pass);
-			}
-			for (int j = 0; j < hiZLevels.Length; j++)
-			{
-				UnityEngine.Graphics.SetRenderTarget(hiZTexture, j);
-				UnityEngine.Graphics.Blit(hiZLevels[j], blitCopyMat);
-			}
-		}
-	}
-
-	private void DebugDrawGizmos()
-	{
-		Camera component = GetComponent<Camera>();
-		Gizmos.color = new Color(0.75f, 0.75f, 0f, 0.5f);
-		Gizmos.matrix = Matrix4x4.TRS(base.transform.position, base.transform.rotation, Vector3.one);
-		Gizmos.DrawFrustum(Vector3.zero, component.fieldOfView, component.farClipPlane, component.nearClipPlane, component.aspect);
-		Gizmos.color = Color.red;
-		Gizmos.matrix = Matrix4x4.identity;
-		Matrix4x4 worldToCameraMatrix = component.worldToCameraMatrix;
-		Matrix4x4 matrix4x = GL.GetGPUProjectionMatrix(component.projectionMatrix, renderIntoTexture: false) * worldToCameraMatrix;
-		Vector4[] planes = new Vector4[6];
-		ExtractFrustum(matrix4x, ref planes);
-		for (int i = 0; i < planes.Length; i++)
-		{
-			Vector3 vector = new Vector3(planes[i].x, planes[i].y, planes[i].z);
-			float w = planes[i].w;
-			Vector3 vector2 = -vector * w;
-			Gizmos.DrawLine(vector2, vector2 * 2f);
-		}
-	}
-
-	private static int floor(float x)
-	{
-		int num = (int)x;
-		if (!(x < (float)num))
-		{
-			return num;
-		}
-		return num - 1;
-	}
-
-	public static Cell RegisterToGrid(OccludeeState occludee)
-	{
-		int num = floor(occludee.states.array[occludee.slot].sphereBounds.x * 0.01f);
-		int num2 = floor(occludee.states.array[occludee.slot].sphereBounds.y * 0.01f);
-		int num3 = floor(occludee.states.array[occludee.slot].sphereBounds.z * 0.01f);
-		int num4 = Mathf.Clamp(num, -1048575, 1048575);
-		int num5 = Mathf.Clamp(num2, -1048575, 1048575);
-		int num6 = Mathf.Clamp(num3, -1048575, 1048575);
-		long num7 = ((num4 >= 0) ? num4 : (num4 + 1048575));
-		ulong num8 = (ulong)((num5 >= 0) ? num5 : (num5 + 1048575));
-		ulong num9 = (ulong)((num6 >= 0) ? num6 : (num6 + 1048575));
-		ulong key = (ulong)(num7 << 42) | (num8 << 21) | num9;
-		Cell value;
-		bool num10 = grid.TryGetValue(key, out value);
-		if (!num10)
-		{
-			Vector3 center = new Vector3
-			{
-				x = (float)num * 100f + 50f,
-				y = (float)num2 * 100f + 50f,
-				z = (float)num3 * 100f + 50f
-			};
-			Vector3 size = new Vector3(100f, 100f, 100f);
-			value = grid.Add(key).Initialize(num, num2, num3, new Bounds(center, size));
-		}
-		SmartList smartList = (occludee.isStatic ? value.staticBucket : value.dynamicBucket);
-		if (!num10 || !smartList.Contains(occludee))
-		{
-			occludee.cell = value;
-			smartList.Add(occludee);
-			gridChanged.Enqueue(value);
-		}
-		return value;
-	}
-
-	public static void UpdateInGrid(OccludeeState occludee)
-	{
-		int num = floor(occludee.states.array[occludee.slot].sphereBounds.x * 0.01f);
-		int num2 = floor(occludee.states.array[occludee.slot].sphereBounds.y * 0.01f);
-		int num3 = floor(occludee.states.array[occludee.slot].sphereBounds.z * 0.01f);
-		if (num != occludee.cell.x || num2 != occludee.cell.y || num3 != occludee.cell.z)
-		{
-			UnregisterFromGrid(occludee);
-			RegisterToGrid(occludee);
-		}
-	}
-
-	public static void UnregisterFromGrid(OccludeeState occludee)
-	{
-		Cell cell = occludee.cell;
-		SmartList obj = (occludee.isStatic ? cell.staticBucket : cell.dynamicBucket);
-		gridChanged.Enqueue(cell);
-		obj.Remove(occludee);
-		if (cell.staticBucket.Count == 0 && cell.dynamicBucket.Count == 0)
-		{
-			grid.Remove(cell);
-			cell.Reset();
-		}
-		occludee.cell = null;
-	}
-
-	public void UpdateGridBuffers()
-	{
-		if (gridSet.CheckResize(grid.Size, 256))
-		{
-			if (debugSettings.log)
-			{
-				Debug.Log("[OcclusionCulling] Resized grid to " + grid.Size);
-			}
-			for (int i = 0; i < grid.Size; i++)
-			{
-				if (grid[i] != null)
-				{
-					gridChanged.Enqueue(grid[i]);
-				}
-			}
-		}
-		bool flag = gridChanged.Count > 0;
-		while (gridChanged.Count > 0)
-		{
-			Cell cell = gridChanged.Dequeue();
-			gridSet.inputData[cell.hashedPoolIndex] = cell.sphereBounds;
-		}
-		if (flag)
-		{
-			gridSet.UploadData();
-		}
 	}
 }

@@ -34,7 +34,7 @@ public class GenerateCliffTopology : ProceduralComponent
 		float normZ = topologyMap.Coordinate(z);
 		float normX = topologyMap.Coordinate(x);
 		int topology = topologyMap.GetTopology(x, z);
-		if ((topology & 0x800400) == 0)
+		if (!World.Procedural || (topology & 0x800400) == 0)
 		{
 			float slope = TerrainMeta.HeightMap.GetSlope(normX, normZ);
 			float splat = TerrainMeta.SplatMap.GetSplat(normX, normZ, 8);

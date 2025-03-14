@@ -24,6 +24,8 @@ public class UIMapVendingMachineMarker : MonoBehaviour
 
 	public void UpdateDisplayName(string newName, ProtoBuf.VendingMachine.SellOrderContainer sellOrderContainer)
 	{
+		newName = newName.Replace('>', ' ');
+		newName = newName.Replace('<', ' ');
 		displayName = newName;
 		toolTip.Text = displayName;
 		if (isInStock && sellOrderContainer != null && sellOrderContainer.sellOrders != null && sellOrderContainer.sellOrders.Count > 0)

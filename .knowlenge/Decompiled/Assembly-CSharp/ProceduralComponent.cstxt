@@ -9,7 +9,7 @@ public abstract class ProceduralComponent : MonoBehaviour
 	}
 
 	[InspectorFlags]
-	public Realm Mode = (Realm)3;
+	public Realm Mode = (Realm)(-1);
 
 	public string Description = "Procedural Component";
 

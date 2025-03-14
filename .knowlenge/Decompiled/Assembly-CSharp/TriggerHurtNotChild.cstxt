@@ -1,18 +1,44 @@
-using System.Linq;
+using System.Collections.Generic;
+using Facepunch;
 using Rust;
 using UnityEngine;
 
-public class TriggerHurtNotChild : TriggerBase
+public class TriggerHurtNotChild : TriggerBase, IServerComponent
 {
+	public interface IHurtTriggerUser
+	{
+		BasePlayer GetPlayerDamageInitiator();
+
+		float GetPlayerDamageMultiplier();
+
+		void OnHurtTriggerOccupant(BaseEntity hurtEntity, DamageType damageType, float damageTotal);
+	}
+
 	public float DamagePerSecond = 1f;
 
 	public float DamageTickRate = 4f;
 
+	public float DamageDelay;
+
 	public DamageType damageType;
+
+	public bool ignoreNPC = true;
+
+	public float npcMultiplier = 1f;
+
+	public float resourceMultiplier = 1f;
+
+	public bool triggerHitImpacts = true;
+
+	public bool RequireUpAxis;
 
 	public BaseEntity SourceEntity;
 
-	public bool ignoreNPC = true;
+	public bool UseSourceEntityDamageMultiplier = true;
+
+	public bool ignoreAllVehicleMounted;
+
+	private Dictionary<BaseEntity, float> entryTimes;
 
 	public override GameObject InterestedInObject(GameObject obj)
 	{
@@ -30,16 +56,7 @@ public class TriggerHurtNotChild : TriggerBase
 		{
 			return null;
 		}
-		if (baseEntity.parentEntity.Get(serverside: true) == SourceEntity)
-		{
-			return null;
-		}
 		if (ignoreNPC && baseEntity.IsNpc)
-		{
-			return null;
-		}
-		BasePlayer basePlayer = baseEntity.ToPlayer();
-		if (basePlayer != null && basePlayer.GetMountedVehicle() == SourceEntity)
 		{
 			return null;
 		}
@@ -49,6 +66,28 @@ public class TriggerHurtNotChild : TriggerBase
 	public override void OnObjects()
 	{
 		InvokeRepeating(OnTick, 0f, 1f / DamageTickRate);
+	}
+
+	internal override void OnEntityEnter(BaseEntity ent)
+	{
+		base.OnEntityEnter(ent);
+		if (ent != null && DamageDelay > 0f)
+		{
+			if (entryTimes == null)
+			{
+				entryTimes = new Dictionary<BaseEntity, float>();
+			}
+			entryTimes.Add(ent, Time.time);
+		}
+	}
+
+	internal override void OnEntityLeave(BaseEntity ent)
+	{
+		if (ent != null && entryTimes != null)
+		{
+			entryTimes.Remove(ent);
+		}
+		base.OnEntityLeave(ent);
 	}
 
 	public override void OnEmpty()
@@ -62,24 +101,79 @@ public class TriggerHurtNotChild : TriggerBase
 		base.OnDisable();
 	}
 
+	private bool IsInterested(BaseEntity ent)
+	{
+		BasePlayer basePlayer = ent.ToPlayer();
+		if (basePlayer != null)
+		{
+			if (basePlayer.isMounted)
+			{
+				BaseVehicle mountedVehicle = basePlayer.GetMountedVehicle();
+				if (SourceEntity != null && mountedVehicle == SourceEntity)
+				{
+					return false;
+				}
+				if (ignoreAllVehicleMounted && mountedVehicle != null)
+				{
+					return false;
+				}
+			}
+			if (SourceEntity != null && basePlayer.HasEntityInParents(SourceEntity))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
 	private void OnTick()
 	{
-		BaseEntity attacker = GameObjectEx.ToBaseEntity(base.gameObject);
-		if (entityContents == null)
+		if (CollectionEx.IsNullOrEmpty(entityContents))
 		{
 			return;
 		}
-		BaseEntity[] array = entityContents.ToArray();
-		foreach (BaseEntity baseEntity in array)
+		List<BaseEntity> obj = Pool.GetList<BaseEntity>();
+		obj.AddRange(entityContents);
+		IHurtTriggerUser hurtTriggerUser = SourceEntity as IHurtTriggerUser;
+		foreach (BaseEntity item in obj)
 		{
-			if (baseEntity.IsValid())
+			if (item.IsValid() && IsInterested(item) && (!(DamageDelay > 0f) || entryTimes == null || !entryTimes.TryGetValue(item, out var value) || !(value + DamageDelay > Time.time)) && (!RequireUpAxis || !(Vector3.Dot(item.transform.up, base.transform.up) < 0f)))
 			{
-				BaseCombatEntity baseCombatEntity = baseEntity as BaseCombatEntity;
-				if (!(baseCombatEntity == null))
+				float num = DamagePerSecond * 1f / DamageTickRate;
+				if (UseSourceEntityDamageMultiplier && hurtTriggerUser != null)
 				{
-					baseCombatEntity.Hurt(DamagePerSecond * (1f / DamageTickRate), damageType, attacker);
+					num *= hurtTriggerUser.GetPlayerDamageMultiplier();
+				}
+				if (item.IsNpc)
+				{
+					num *= npcMultiplier;
+				}
+				if (item is ResourceEntity)
+				{
+					num *= resourceMultiplier;
+				}
+				Vector3 vector = item.transform.position + Vector3.up * 1f;
+				HitInfo hitInfo = new HitInfo
+				{
+					DoHitEffects = true,
+					HitEntity = item,
+					HitPositionWorld = vector,
+					HitPositionLocal = item.transform.InverseTransformPoint(vector),
+					HitNormalWorld = Vector3.up,
+					HitMaterial = ((item is BaseCombatEntity) ? StringPool.Get("Flesh") : 0u),
+					Initiator = hurtTriggerUser?.GetPlayerDamageInitiator()
+				};
+				hitInfo.damageTypes = new DamageTypeList();
+				hitInfo.damageTypes.Set(damageType, num);
+				item.OnAttacked(hitInfo);
+				hurtTriggerUser?.OnHurtTriggerOccupant(item, damageType, num);
+				if (triggerHitImpacts)
+				{
+					Effect.server.ImpactEffect(hitInfo);
 				}
 			}
 		}
+		Pool.FreeList(ref obj);
+		RemoveInvalidEntities();
 	}
 }

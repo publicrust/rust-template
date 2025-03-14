@@ -1,0 +1,324 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Reflection.Emit;
+using Harmony;
+
+public class PatchProcessor
+{
+	private static object locker = new object();
+
+	private readonly HarmonyInstance instance;
+
+	private readonly Type container;
+
+	private readonly HarmonyMethod containerAttributes;
+
+	private List<MethodBase> originals = new List<MethodBase>();
+
+	private HarmonyMethod prefix;
+
+	private HarmonyMethod postfix;
+
+	private HarmonyMethod transpiler;
+
+	public PatchProcessor(HarmonyInstance instance, Type type, HarmonyMethod attributes)
+	{
+		this.instance = instance;
+		container = type;
+		containerAttributes = attributes ?? new HarmonyMethod(null);
+		prefix = containerAttributes.Clone();
+		postfix = containerAttributes.Clone();
+		transpiler = containerAttributes.Clone();
+		PrepareType();
+	}
+
+	public PatchProcessor(HarmonyInstance instance, List<MethodBase> originals, HarmonyMethod prefix = null, HarmonyMethod postfix = null, HarmonyMethod transpiler = null)
+	{
+		this.instance = instance;
+		this.originals = originals;
+		this.prefix = prefix ?? new HarmonyMethod(null);
+		this.postfix = postfix ?? new HarmonyMethod(null);
+		this.transpiler = transpiler ?? new HarmonyMethod(null);
+	}
+
+	public static Patches GetPatchInfo(MethodBase method)
+	{
+		lock (locker)
+		{
+			PatchInfo patchInfo = HarmonySharedState.GetPatchInfo(method);
+			if (patchInfo == null)
+			{
+				return null;
+			}
+			return new Patches(patchInfo.prefixes, patchInfo.postfixes, patchInfo.transpilers);
+		}
+	}
+
+	public static IEnumerable<MethodBase> AllPatchedMethods()
+	{
+		lock (locker)
+		{
+			return HarmonySharedState.GetPatchedMethods();
+		}
+	}
+
+	public List<DynamicMethod> Patch()
+	{
+		lock (locker)
+		{
+			List<DynamicMethod> list = new List<DynamicMethod>();
+			foreach (MethodBase original in originals)
+			{
+				if (original == null)
+				{
+					throw new NullReferenceException("original");
+				}
+				if (RunMethod<HarmonyPrepare, bool>(defaultIfNotExisting: true, new object[1] { original }))
+				{
+					PatchInfo patchInfo = HarmonySharedState.GetPatchInfo(original);
+					if (patchInfo == null)
+					{
+						patchInfo = new PatchInfo();
+					}
+					PatchFunctions.AddPrefix(patchInfo, instance.Id, prefix);
+					PatchFunctions.AddPostfix(patchInfo, instance.Id, postfix);
+					PatchFunctions.AddTranspiler(patchInfo, instance.Id, transpiler);
+					list.Add(PatchFunctions.UpdateWrapper(original, patchInfo, instance.Id));
+					HarmonySharedState.UpdatePatchInfo(original, patchInfo);
+					RunMethod<HarmonyCleanup>(new object[1] { original });
+				}
+			}
+			return list;
+		}
+	}
+
+	public void Unpatch(HarmonyPatchType type, string harmonyID)
+	{
+		lock (locker)
+		{
+			foreach (MethodBase original in originals)
+			{
+				PatchInfo patchInfo = HarmonySharedState.GetPatchInfo(original);
+				if (patchInfo == null)
+				{
+					patchInfo = new PatchInfo();
+				}
+				if (type == HarmonyPatchType.All || type == HarmonyPatchType.Prefix)
+				{
+					PatchFunctions.RemovePrefix(patchInfo, harmonyID);
+				}
+				if (type == HarmonyPatchType.All || type == HarmonyPatchType.Postfix)
+				{
+					PatchFunctions.RemovePostfix(patchInfo, harmonyID);
+				}
+				if (type == HarmonyPatchType.All || type == HarmonyPatchType.Transpiler)
+				{
+					PatchFunctions.RemoveTranspiler(patchInfo, harmonyID);
+				}
+				PatchFunctions.UpdateWrapper(original, patchInfo, instance.Id);
+				HarmonySharedState.UpdatePatchInfo(original, patchInfo);
+			}
+		}
+	}
+
+	public void Unpatch(MethodInfo patch)
+	{
+		lock (locker)
+		{
+			foreach (MethodBase original in originals)
+			{
+				PatchInfo patchInfo = HarmonySharedState.GetPatchInfo(original);
+				if (patchInfo == null)
+				{
+					patchInfo = new PatchInfo();
+				}
+				PatchFunctions.RemovePatch(patchInfo, patch);
+				PatchFunctions.UpdateWrapper(original, patchInfo, instance.Id);
+				HarmonySharedState.UpdatePatchInfo(original, patchInfo);
+			}
+		}
+	}
+
+	private void PrepareType()
+	{
+		if (!RunMethod<HarmonyPrepare, bool>(defaultIfNotExisting: true, new object[0]))
+		{
+			return;
+		}
+		IEnumerable<MethodBase> enumerable = RunMethod<HarmonyTargetMethods, IEnumerable<MethodBase>>(null, new object[0]);
+		if (enumerable != null)
+		{
+			originals = enumerable.ToList();
+		}
+		else
+		{
+			MethodType? methodType = containerAttributes.methodType;
+			if (!containerAttributes.methodType.HasValue)
+			{
+				containerAttributes.methodType = MethodType.Normal;
+			}
+			if (Attribute.GetCustomAttribute(container, typeof(HarmonyPatchAll)) != null)
+			{
+				Type declaringType = containerAttributes.declaringType;
+				originals.AddRange(AccessTools.GetDeclaredConstructors(declaringType).Cast<MethodBase>());
+				originals.AddRange(AccessTools.GetDeclaredMethods(declaringType).Cast<MethodBase>());
+			}
+			else
+			{
+				MethodBase methodBase = RunMethod<HarmonyTargetMethod, MethodBase>(null, new object[0]);
+				if (methodBase == null)
+				{
+					methodBase = GetOriginalMethod();
+				}
+				if (methodBase == null)
+				{
+					string text = "(";
+					text = string.Concat(text, "declaringType=", containerAttributes.declaringType, ", ");
+					text = text + "methodName =" + containerAttributes.methodName + ", ";
+					text = string.Concat(text, "methodType=", methodType, ", ");
+					text = text + "argumentTypes=" + containerAttributes.argumentTypes.Description();
+					text += ")";
+					throw new ArgumentException("No target method specified for class " + container.FullName + " " + text);
+				}
+				originals.Add(methodBase);
+			}
+		}
+		PatchTools.GetPatches(container, out prefix.method, out postfix.method, out transpiler.method);
+		if (prefix.method != null)
+		{
+			if (!prefix.method.IsStatic)
+			{
+				throw new ArgumentException("Patch method " + prefix.method.FullDescription() + " must be static");
+			}
+			List<HarmonyMethod> harmonyMethods = prefix.method.GetHarmonyMethods();
+			containerAttributes.Merge(HarmonyMethod.Merge(harmonyMethods)).CopyTo(prefix);
+		}
+		if (postfix.method != null)
+		{
+			if (!postfix.method.IsStatic)
+			{
+				throw new ArgumentException("Patch method " + postfix.method.FullDescription() + " must be static");
+			}
+			List<HarmonyMethod> harmonyMethods2 = postfix.method.GetHarmonyMethods();
+			containerAttributes.Merge(HarmonyMethod.Merge(harmonyMethods2)).CopyTo(postfix);
+		}
+		if (transpiler.method != null)
+		{
+			if (!transpiler.method.IsStatic)
+			{
+				throw new ArgumentException("Patch method " + transpiler.method.FullDescription() + " must be static");
+			}
+			List<HarmonyMethod> harmonyMethods3 = transpiler.method.GetHarmonyMethods();
+			containerAttributes.Merge(HarmonyMethod.Merge(harmonyMethods3)).CopyTo(transpiler);
+		}
+	}
+
+	private MethodBase GetOriginalMethod()
+	{
+		HarmonyMethod harmonyMethod = containerAttributes;
+		if (harmonyMethod.declaringType == null)
+		{
+			return null;
+		}
+		switch (harmonyMethod.methodType)
+		{
+		case MethodType.Normal:
+			if (harmonyMethod.methodName == null)
+			{
+				return null;
+			}
+			return AccessTools.DeclaredMethod(harmonyMethod.declaringType, harmonyMethod.methodName, harmonyMethod.argumentTypes);
+		case MethodType.Getter:
+			if (harmonyMethod.methodName == null)
+			{
+				return null;
+			}
+			return AccessTools.DeclaredProperty(harmonyMethod.declaringType, harmonyMethod.methodName).GetGetMethod(nonPublic: true);
+		case MethodType.Setter:
+			if (harmonyMethod.methodName == null)
+			{
+				return null;
+			}
+			return AccessTools.DeclaredProperty(harmonyMethod.declaringType, harmonyMethod.methodName).GetSetMethod(nonPublic: true);
+		case MethodType.Constructor:
+			return AccessTools.DeclaredConstructor(harmonyMethod.declaringType, harmonyMethod.argumentTypes);
+		case MethodType.StaticConstructor:
+			return (from c in AccessTools.GetDeclaredConstructors(harmonyMethod.declaringType)
+				where c.IsStatic
+				select c).FirstOrDefault();
+		default:
+			return null;
+		}
+	}
+
+	private T RunMethod<S, T>(T defaultIfNotExisting, params object[] parameters)
+	{
+		if (container == null)
+		{
+			return defaultIfNotExisting;
+		}
+		string name = typeof(S).Name.Replace("Harmony", "");
+		List<object> list = new List<object> { instance };
+		list.AddRange(parameters);
+		Type[] types = AccessTools.GetTypes(list.ToArray());
+		MethodInfo patchMethod = PatchTools.GetPatchMethod<S>(container, name, types);
+		if (patchMethod != null && typeof(T).IsAssignableFrom(patchMethod.ReturnType))
+		{
+			return (T)patchMethod.Invoke(null, list.ToArray());
+		}
+		patchMethod = PatchTools.GetPatchMethod<S>(container, name, new Type[1] { typeof(HarmonyInstance) });
+		if (patchMethod != null && typeof(T).IsAssignableFrom(patchMethod.ReturnType))
+		{
+			return (T)patchMethod.Invoke(null, new object[1] { instance });
+		}
+		patchMethod = PatchTools.GetPatchMethod<S>(container, name, Type.EmptyTypes);
+		if (patchMethod != null)
+		{
+			object[] emptyTypes;
+			if (typeof(T).IsAssignableFrom(patchMethod.ReturnType))
+			{
+				MethodInfo methodInfo = patchMethod;
+				emptyTypes = Type.EmptyTypes;
+				return (T)methodInfo.Invoke(null, emptyTypes);
+			}
+			MethodInfo methodInfo2 = patchMethod;
+			emptyTypes = Type.EmptyTypes;
+			methodInfo2.Invoke(null, emptyTypes);
+			return defaultIfNotExisting;
+		}
+		return defaultIfNotExisting;
+	}
+
+	private void RunMethod<S>(params object[] parameters)
+	{
+		if (container == null)
+		{
+			return;
+		}
+		string name = typeof(S).Name.Replace("Harmony", "");
+		List<object> list = new List<object> { instance };
+		list.AddRange(parameters);
+		Type[] types = AccessTools.GetTypes(list.ToArray());
+		MethodInfo patchMethod = PatchTools.GetPatchMethod<S>(container, name, types);
+		if (patchMethod != null)
+		{
+			patchMethod.Invoke(null, list.ToArray());
+			return;
+		}
+		patchMethod = PatchTools.GetPatchMethod<S>(container, name, new Type[1] { typeof(HarmonyInstance) });
+		if (patchMethod != null)
+		{
+			patchMethod.Invoke(null, new object[1] { instance });
+			return;
+		}
+		patchMethod = PatchTools.GetPatchMethod<S>(container, name, Type.EmptyTypes);
+		if (patchMethod != null)
+		{
+			MethodInfo methodInfo = patchMethod;
+			object[] emptyTypes = Type.EmptyTypes;
+			methodInfo.Invoke(null, emptyTypes);
+		}
+	}
+}

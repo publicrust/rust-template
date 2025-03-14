@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using ConVar;
 using Facepunch;
 using Network;
+using Oxide.Core;
 using ProtoBuf;
 using Rust;
 using Rust.Ai;
@@ -19,6 +20,13 @@ public class BaseMelee : AttackEntity
 
 		public GameObjectRef fx;
 	}
+
+	[Header("Throwing")]
+	public bool canThrowAsProjectile;
+
+	public bool canAiHearIt;
+
+	public bool onlyThrowAsProjectile;
 
 	[Header("Melee")]
 	public DamageProperties damageProperties;
@@ -45,18 +53,11 @@ public class BaseMelee : AttackEntity
 
 	public List<MaterialFX> materialStrikeFX = new List<MaterialFX>();
 
-	[Range(0f, 1f)]
 	[Header("Other")]
+	[Range(0f, 1f)]
 	public float heartStress = 0.5f;
 
 	public ResourceDispenser.GatherProperties gathering;
-
-	[Header("Throwing")]
-	public bool canThrowAsProjectile;
-
-	public bool canAiHearIt;
-
-	public bool onlyThrowAsProjectile;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -73,7 +74,11 @@ public class BaseMelee : AttackEntity
 				{
 					using (TimeWarning.New("Conditions"))
 					{
-						if (!RPC_Server.FromOwner.Test("CLProject", this, player))
+						if (!RPC_Server.FromOwner.Test(3168282921u, "CLProject", this, player))
+						{
+							return true;
+						}
+						if (!RPC_Server.IsActiveItem.Test(3168282921u, "CLProject", this, player))
 						{
 							return true;
 						}
@@ -92,8 +97,8 @@ public class BaseMelee : AttackEntity
 					}
 					catch (Exception exception)
 					{
-						player.Kick("RPC Error in CLProject");
 						Debug.LogException(exception);
+						player.Kick("RPC Error in CLProject");
 					}
 				}
 				return true;
@@ -109,7 +114,7 @@ public class BaseMelee : AttackEntity
 				{
 					using (TimeWarning.New("Conditions"))
 					{
-						if (!RPC_Server.IsActiveItem.Test("PlayerAttack", this, player))
+						if (!RPC_Server.IsActiveItem.Test(4088326849u, "PlayerAttack", this, player))
 						{
 							return true;
 						}
@@ -128,14 +133,118 @@ public class BaseMelee : AttackEntity
 					}
 					catch (Exception exception2)
 					{
-						player.Kick("RPC Error in PlayerAttack");
 						Debug.LogException(exception2);
+						player.Kick("RPC Error in PlayerAttack");
 					}
 				}
 				return true;
 			}
 		}
 		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public override Vector3 GetInheritedVelocity(BasePlayer player)
+	{
+		return player.GetInheritedThrowVelocity();
+	}
+
+	[RPC_Server]
+	[RPC_Server.FromOwner]
+	[RPC_Server.IsActiveItem]
+	private void CLProject(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (!VerifyClientAttack(player))
+		{
+			SendNetworkUpdate();
+		}
+		else
+		{
+			if (player == null || player.IsHeadUnderwater())
+			{
+				return;
+			}
+			if (!canThrowAsProjectile)
+			{
+				AntiHack.Log(player, AntiHackType.ProjectileHack, "Not throwable (" + base.ShortPrefabName + ")");
+				player.stats.combat.Log(this, "not_throwable");
+				return;
+			}
+			Item item = GetItem();
+			if (item == null)
+			{
+				AntiHack.Log(player, AntiHackType.ProjectileHack, "Item not found (" + base.ShortPrefabName + ")");
+				player.stats.combat.Log(this, "item_missing");
+				return;
+			}
+			ItemModProjectile component = item.info.GetComponent<ItemModProjectile>();
+			if (component == null)
+			{
+				AntiHack.Log(player, AntiHackType.ProjectileHack, "Item mod not found (" + base.ShortPrefabName + ")");
+				player.stats.combat.Log(this, "mod_missing");
+				return;
+			}
+			ProjectileShoot projectileShoot = ProjectileShoot.Deserialize(msg.read);
+			if (projectileShoot.projectiles.Count != 1)
+			{
+				AntiHack.Log(player, AntiHackType.ProjectileHack, "Projectile count mismatch (" + base.ShortPrefabName + ")");
+				player.stats.combat.Log(this, "count_mismatch");
+				return;
+			}
+			player.CleanupExpiredProjectiles();
+			foreach (ProjectileShoot.Projectile projectile in projectileShoot.projectiles)
+			{
+				if (player.HasFiredProjectile(projectile.projectileID))
+				{
+					AntiHack.Log(player, AntiHackType.ProjectileHack, "Duplicate ID (" + projectile.projectileID + ")");
+					player.stats.combat.Log(this, "duplicate_id");
+				}
+				else if (ValidateEyePos(player, projectile.startPos))
+				{
+					player.NoteFiredProjectile(projectile.projectileID, projectile.startPos, projectile.startVel, this, item.info, item);
+					Effect effect = new Effect();
+					effect.Init(Effect.Type.Projectile, projectile.startPos, projectile.startVel, msg.connection);
+					effect.scale = 1f;
+					effect.pooledString = component.projectileObject.resourcePath;
+					effect.number = projectile.seed;
+					EffectNetwork.Send(effect);
+				}
+			}
+			projectileShoot?.Dispose();
+			item.SetParent(null);
+			Interface.CallHook("OnMeleeThrown", player, item);
+			if (!canAiHearIt)
+			{
+				return;
+			}
+			float num = 0f;
+			if (component.projectileObject != null)
+			{
+				GameObject gameObject = component.projectileObject.Get();
+				if (gameObject != null)
+				{
+					Projectile component2 = gameObject.GetComponent<Projectile>();
+					if (component2 != null)
+					{
+						foreach (DamageTypeEntry damageType in component2.damageTypes)
+						{
+							num += damageType.amount;
+						}
+					}
+				}
+			}
+			if (player != null)
+			{
+				Sensation sensation = default(Sensation);
+				sensation.Type = SensationType.ThrownWeapon;
+				sensation.Position = player.transform.position;
+				sensation.Radius = 50f;
+				sensation.DamagePotential = num;
+				sensation.InitiatorPlayer = player;
+				sensation.Initiator = player;
+				Sense.Stimulate(sensation);
+			}
+		}
 	}
 
 	public override void GetAttackStats(HitInfo info)
@@ -146,10 +255,14 @@ public class BaseMelee : AttackEntity
 
 	public virtual void DoAttackShared(HitInfo info)
 	{
+		if (Interface.CallHook("OnPlayerAttack", GetOwnerPlayer(), info) != null)
+		{
+			return;
+		}
 		GetAttackStats(info);
 		if (info.HitEntity != null)
 		{
-			using (TimeWarning.New("OnAttacked", 50L))
+			using (TimeWarning.New("OnAttacked", 50))
 			{
 				info.HitEntity.OnAttacked(info);
 			}
@@ -158,14 +271,14 @@ public class BaseMelee : AttackEntity
 		{
 			if (base.isServer)
 			{
-				using (TimeWarning.New("ImpactEffect", 20L))
+				using (TimeWarning.New("ImpactEffect", 20))
 				{
 					Effect.server.ImpactEffect(info);
 				}
 			}
 			else
 			{
-				using (TimeWarning.New("ImpactEffect", 20L))
+				using (TimeWarning.New("ImpactEffect", 20))
 				{
 					Effect.client.ImpactEffect(info);
 				}
@@ -173,7 +286,7 @@ public class BaseMelee : AttackEntity
 		}
 		if (base.isServer && !base.IsDestroyed)
 		{
-			using (TimeWarning.New("UpdateItemCondition", 50L))
+			using (TimeWarning.New("UpdateItemCondition", 50))
 			{
 				UpdateItemCondition(info);
 			}
@@ -239,8 +352,8 @@ public class BaseMelee : AttackEntity
 		ownerItem.LoseCondition(conditionLoss);
 	}
 
-	[RPC_Server.IsActiveItem]
 	[RPC_Server]
+	[RPC_Server.IsActiveItem]
 	public void PlayerAttack(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
@@ -249,7 +362,7 @@ public class BaseMelee : AttackEntity
 			SendNetworkUpdate();
 			return;
 		}
-		using (TimeWarning.New("PlayerAttack", 50L))
+		using (TimeWarning.New("PlayerAttack", 50))
 		{
 			using PlayerAttack playerAttack = ProtoBuf.PlayerAttack.Deserialize(msg.read);
 			if (playerAttack == null)
@@ -263,6 +376,10 @@ public class BaseMelee : AttackEntity
 			hitInfo.WeaponPrefab = this;
 			hitInfo.Predicted = msg.connection;
 			hitInfo.damageProperties = damageProperties;
+			if (Interface.CallHook("OnMeleeAttack", player, hitInfo) != null)
+			{
+				return;
+			}
 			if (hitInfo.IsNaNOrInfinity())
 			{
 				string shortPrefabName = base.ShortPrefabName;
@@ -273,12 +390,22 @@ public class BaseMelee : AttackEntity
 			if (ConVar.AntiHack.melee_protection > 0 && (bool)hitInfo.HitEntity)
 			{
 				bool flag = true;
+				BasePlayer basePlayer = hitInfo.HitEntity as BasePlayer;
 				float num = 1f + ConVar.AntiHack.melee_forgiveness;
 				float melee_clientframes = ConVar.AntiHack.melee_clientframes;
 				float melee_serverframes = ConVar.AntiHack.melee_serverframes;
 				float num2 = melee_clientframes / 60f;
 				float num3 = melee_serverframes * Mathx.Max(UnityEngine.Time.deltaTime, UnityEngine.Time.smoothDeltaTime, UnityEngine.Time.fixedDeltaTime);
 				float num4 = (player.desyncTime + num2 + num3) * num;
+				int layerMask = (ConVar.AntiHack.melee_terraincheck ? 10551296 : 2162688);
+				if ((bool)basePlayer && hitInfo.boneArea == (HitArea)(-1))
+				{
+					string shortPrefabName2 = base.ShortPrefabName;
+					string shortPrefabName3 = hitInfo.HitEntity.ShortPrefabName;
+					AntiHack.Log(player, AntiHackType.MeleeHack, "Bone is invalid  (" + shortPrefabName2 + " on " + shortPrefabName3 + " bone " + hitInfo.HitBone + ")");
+					player.stats.combat.Log(hitInfo, "melee_bone");
+					flag = false;
+				}
 				if (ConVar.AntiHack.projectile_protection >= 2)
 				{
 					float num5 = hitInfo.HitEntity.MaxVelocity() + hitInfo.HitEntity.GetParentVelocity().magnitude;
@@ -286,10 +413,10 @@ public class BaseMelee : AttackEntity
 					float num7 = hitInfo.HitEntity.Distance(hitInfo.HitPositionWorld);
 					if (num7 > num6)
 					{
-						string shortPrefabName2 = base.ShortPrefabName;
-						string shortPrefabName3 = hitInfo.HitEntity.ShortPrefabName;
-						AntiHack.Log(player, AntiHackType.MeleeHack, "Entity too far away (" + shortPrefabName2 + " on " + shortPrefabName3 + " with " + num7 + "m > " + num6 + "m in " + num4 + "s)");
-						player.stats.combat.Log(hitInfo, "melee_distance");
+						string shortPrefabName4 = base.ShortPrefabName;
+						string shortPrefabName5 = hitInfo.HitEntity.ShortPrefabName;
+						AntiHack.Log(player, AntiHackType.MeleeHack, "Entity too far away (" + shortPrefabName4 + " on " + shortPrefabName5 + " with " + num7 + "m > " + num6 + "m in " + num4 + "s)");
+						player.stats.combat.Log(hitInfo, "melee_target");
 						flag = false;
 					}
 				}
@@ -300,10 +427,10 @@ public class BaseMelee : AttackEntity
 					float num10 = hitInfo.Initiator.Distance(hitInfo.HitPositionWorld);
 					if (num10 > num9)
 					{
-						string shortPrefabName4 = base.ShortPrefabName;
-						string shortPrefabName5 = hitInfo.HitEntity.ShortPrefabName;
-						AntiHack.Log(player, AntiHackType.MeleeHack, "Initiator too far away (" + shortPrefabName4 + " on " + shortPrefabName5 + " with " + num10 + "m > " + num9 + "m in " + num4 + "s)");
-						player.stats.combat.Log(hitInfo, "melee_distance");
+						string shortPrefabName6 = base.ShortPrefabName;
+						string shortPrefabName7 = hitInfo.HitEntity.ShortPrefabName;
+						AntiHack.Log(player, AntiHackType.MeleeHack, "Initiator too far away (" + shortPrefabName6 + " on " + shortPrefabName7 + " with " + num10 + "m > " + num9 + "m in " + num4 + "s)");
+						player.stats.combat.Log(hitInfo, "melee_initiator");
 						flag = false;
 					}
 				}
@@ -316,7 +443,7 @@ public class BaseMelee : AttackEntity
 					Vector3 vector2 = pointStart;
 					Vector3 vector3 = hitInfo.PositionOnRay(vector);
 					Vector3 vector4 = vector;
-					bool num11 = GamePhysics.LineOfSight(center, position, vector2, vector3, vector4, 2162688);
+					bool num11 = GamePhysics.LineOfSight(center, position, vector2, vector3, vector4, layerMask);
 					if (!num11)
 					{
 						player.stats.Add("hit_" + hitInfo.HitEntity.Categorize() + "_indirect_los", 1, Stats.Server);
@@ -327,11 +454,25 @@ public class BaseMelee : AttackEntity
 					}
 					if (!num11)
 					{
-						string shortPrefabName6 = base.ShortPrefabName;
-						string shortPrefabName7 = hitInfo.HitEntity.ShortPrefabName;
-						AntiHack.Log(player, AntiHackType.MeleeHack, string.Concat("Line of sight (", shortPrefabName6, " on ", shortPrefabName7, ") ", center, " ", position, " ", vector2, " ", vector3, " ", vector4));
+						string shortPrefabName8 = base.ShortPrefabName;
+						string shortPrefabName9 = hitInfo.HitEntity.ShortPrefabName;
+						AntiHack.Log(player, AntiHackType.MeleeHack, string.Concat("Line of sight (", shortPrefabName8, " on ", shortPrefabName9, ") ", center, " ", position, " ", vector2, " ", vector3, " ", vector4));
 						player.stats.combat.Log(hitInfo, "melee_los");
 						flag = false;
+					}
+					if ((bool)basePlayer)
+					{
+						Vector3 vector5 = hitInfo.HitPositionWorld + hitInfo.HitNormalWorld.normalized * 0.001f;
+						Vector3 position2 = basePlayer.eyes.position;
+						Vector3 vector6 = basePlayer.CenterPoint();
+						if (!GamePhysics.LineOfSight(vector5, position2, layerMask) && !GamePhysics.LineOfSight(vector5, vector6, layerMask))
+						{
+							string shortPrefabName10 = base.ShortPrefabName;
+							string shortPrefabName11 = hitInfo.HitEntity.ShortPrefabName;
+							AntiHack.Log(player, AntiHackType.MeleeHack, string.Concat("Line of sight (", shortPrefabName10, " on ", shortPrefabName11, ") ", vector5, " ", position2, " or ", vector5, " ", vector6));
+							player.stats.combat.Log(hitInfo, "melee_los");
+							flag = false;
+						}
 					}
 				}
 				if (!flag)
@@ -341,7 +482,7 @@ public class BaseMelee : AttackEntity
 				}
 			}
 			player.metabolism.UseHeart(heartStress * 0.2f);
-			using (TimeWarning.New("DoAttackShared", 50L))
+			using (TimeWarning.New("DoAttackShared", 50))
 			{
 				DoAttackShared(hitInfo);
 			}
@@ -445,102 +586,6 @@ public class BaseMelee : AttackEntity
 			if (flag)
 			{
 				break;
-			}
-		}
-	}
-
-	[RPC_Server]
-	[RPC_Server.FromOwner]
-	private void CLProject(RPCMessage msg)
-	{
-		BasePlayer player = msg.player;
-		if (!VerifyClientAttack(player))
-		{
-			SendNetworkUpdate();
-		}
-		else
-		{
-			if (player == null || player.IsHeadUnderwater())
-			{
-				return;
-			}
-			if (!canThrowAsProjectile)
-			{
-				AntiHack.Log(player, AntiHackType.ProjectileHack, "Not throwable (" + base.ShortPrefabName + ")");
-				player.stats.combat.Log(this, "not_throwable");
-				return;
-			}
-			Item item = GetItem();
-			if (item == null)
-			{
-				AntiHack.Log(player, AntiHackType.ProjectileHack, "Item not found (" + base.ShortPrefabName + ")");
-				player.stats.combat.Log(this, "item_missing");
-				return;
-			}
-			ItemModProjectile component = item.info.GetComponent<ItemModProjectile>();
-			if (component == null)
-			{
-				AntiHack.Log(player, AntiHackType.ProjectileHack, "Item mod not found (" + base.ShortPrefabName + ")");
-				player.stats.combat.Log(this, "mod_missing");
-				return;
-			}
-			ProjectileShoot projectileShoot = ProjectileShoot.Deserialize(msg.read);
-			if (projectileShoot.projectiles.Count != 1)
-			{
-				AntiHack.Log(player, AntiHackType.ProjectileHack, "Projectile count mismatch (" + base.ShortPrefabName + ")");
-				player.stats.combat.Log(this, "count_mismatch");
-				return;
-			}
-			player.CleanupExpiredProjectiles();
-			foreach (ProjectileShoot.Projectile projectile in projectileShoot.projectiles)
-			{
-				if (player.HasFiredProjectile(projectile.projectileID))
-				{
-					AntiHack.Log(player, AntiHackType.ProjectileHack, "Duplicate ID (" + projectile.projectileID + ")");
-					player.stats.combat.Log(this, "duplicate_id");
-				}
-				else if (ValidateEyePos(player, projectile.startPos))
-				{
-					player.NoteFiredProjectile(projectile.projectileID, projectile.startPos, projectile.startVel, this, item.info, item);
-					Effect effect = new Effect();
-					effect.Init(Effect.Type.Projectile, projectile.startPos, projectile.startVel, msg.connection);
-					effect.scale = 1f;
-					effect.pooledString = component.projectileObject.resourcePath;
-					effect.number = projectile.seed;
-					EffectNetwork.Send(effect);
-				}
-			}
-			item.SetParent(null);
-			if (!canAiHearIt)
-			{
-				return;
-			}
-			float num = 0f;
-			if (component.projectileObject != null)
-			{
-				GameObject gameObject = component.projectileObject.Get();
-				if (gameObject != null)
-				{
-					Projectile component2 = gameObject.GetComponent<Projectile>();
-					if (component2 != null)
-					{
-						foreach (DamageTypeEntry damageType in component2.damageTypes)
-						{
-							num += damageType.amount;
-						}
-					}
-				}
-			}
-			if (player != null)
-			{
-				Sensation sensation = default(Sensation);
-				sensation.Type = SensationType.ThrownWeapon;
-				sensation.Position = player.transform.position;
-				sensation.Radius = 50f;
-				sensation.DamagePotential = num;
-				sensation.InitiatorPlayer = player;
-				sensation.Initiator = player;
-				Sense.Stimulate(sensation);
 			}
 		}
 	}

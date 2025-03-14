@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using ConVar;
 using Facepunch;
 using Network;
+using Oxide.Core;
 using ProtoBuf;
 using Rust;
 using UnityEngine;
@@ -16,8 +17,27 @@ public class BaseRidableAnimal : BaseVehicle
 		stopped = 1,
 		walk,
 		run,
-		sprint
+		sprint,
+		LAST
 	}
+
+	public ItemDefinition onlyAllowedItem;
+
+	public ItemContainer.ContentsType allowedContents = ItemContainer.ContentsType.Generic;
+
+	public int maxStackSize = 1;
+
+	public int numSlots;
+
+	public string lootPanelName = "generic";
+
+	public bool needsBuildingPrivilegeToUse;
+
+	public bool isLootable = true;
+
+	public ItemContainer inventory;
+
+	public const Flags Flag_ForSale = Flags.Reserved2;
 
 	private Vector3 lastMoveDirection;
 
@@ -31,20 +51,31 @@ public class BaseRidableAnimal : BaseVehicle
 
 	public SoundPlayer largeWhinny;
 
-	public Transform animalFront;
-
 	public const Flags Flag_Lead = Flags.Reserved7;
 
 	public const Flags Flag_HasRider = Flags.On;
+
+	[Header("Purchase")]
+	public ItemDefinition purchaseToken;
 
 	public GameObjectRef eatEffect;
 
 	public GameObjectRef CorpsePrefab;
 
 	[Header("Obstacles")]
+	public Transform animalFront;
+
+	public float obstacleDetectionRadius = 0.25f;
+
 	public float maxWaterDepth = 1.5f;
 
 	public float roadSpeedBonus = 2f;
+
+	public float maxWallClimbSlope = 53f;
+
+	public float maxStepHeight = 1f;
+
+	public float maxStepDownHeight = 1.35f;
 
 	[Header("Movement")]
 	public RunState currentRunState = RunState.stopped;
@@ -60,6 +91,17 @@ public class BaseRidableAnimal : BaseVehicle
 	public float maxSpeed = 5f;
 
 	public Transform[] groundSampleOffsets;
+
+	[Header("Dung")]
+	public ItemDefinition Dung;
+
+	public float CaloriesToDigestPerHour = 100f;
+
+	public float DungProducedPerCalorie = 0.001f;
+
+	private float pendingDungCalories;
+
+	private float dungProduction;
 
 	[Header("Stamina")]
 	public float staminaSeconds = 10f;
@@ -84,14 +126,39 @@ public class BaseRidableAnimal : BaseVehicle
 
 	public bool debugMovement = true;
 
+	private const float normalOffsetDist = 0.15f;
+
+	private Vector3[] normalOffsets = new Vector3[7]
+	{
+		new Vector3(0.15f, 0f, 0f),
+		new Vector3(-0.15f, 0f, 0f),
+		new Vector3(0f, 0f, 0.15f),
+		new Vector3(0f, 0f, 0.3f),
+		new Vector3(0f, 0f, 0.6f),
+		new Vector3(0.15f, 0f, 0.3f),
+		new Vector3(-0.15f, 0f, 0.3f)
+	};
+
 	[ServerVar(Help = "How long before a horse dies unattended")]
 	public static float decayminutes = 180f;
+
+	public float currentSpeed;
+
+	public float desiredRotation;
+
+	public float animalPitchClamp = 90f;
+
+	public float animalRollClamp;
 
 	public static Queue<BaseRidableAnimal> _processQueue = new Queue<BaseRidableAnimal>();
 
 	[ServerVar]
 	[Help("How many miliseconds to budget for processing ridable animals per frame")]
 	public static float framebudgetms = 1f;
+
+	[ServerVar]
+	[Help("Scale all ridable animal dung production rates by this value. 0 will disable dung production.")]
+	public static float dungTimeScale = 1f;
 
 	private BaseEntity leadTarget;
 
@@ -104,10 +171,6 @@ public class BaseRidableAnimal : BaseVehicle
 	protected float nextEatTime;
 
 	public float lastEatTime = float.NegativeInfinity;
-
-	public float currentSpeed;
-
-	public float desiredRotation;
 
 	public float lastInputTime;
 
@@ -133,8 +196,6 @@ public class BaseRidableAnimal : BaseVehicle
 
 	private InputState aiInputState;
 
-	private float obstacleDetectionRadius = 0.25f;
-
 	public Vector3 currentVelocity;
 
 	private Vector3 averagedUp = Vector3.up;
@@ -143,48 +204,34 @@ public class BaseRidableAnimal : BaseVehicle
 
 	private Vector3 targetUp = Vector3.up;
 
-	public float animalPitchClamp = 90f;
-
-	public float animalRollClamp;
-
 	private float nextObstacleCheckTime;
 
 	private float cachedObstacleDistance = float.PositiveInfinity;
 
+	private const int maxObstacleCheckSpeed = 10;
+
 	private float timeAlive;
 
-	public ItemDefinition onlyAllowedItem;
+	private TimeUntil dropUntilTime;
 
-	public ItemContainer.ContentsType allowedContents = ItemContainer.ContentsType.Generic;
-
-	public int maxStackSize = 1;
-
-	public int numSlots;
-
-	public string lootPanelName = "generic";
-
-	public bool needsBuildingPrivilegeToUse;
-
-	public bool isLootable = true;
-
-	protected ItemContainer inventory;
+	public override bool IsNpc => true;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
 		using (TimeWarning.New("BaseRidableAnimal.OnRpcMessage"))
 		{
-			if (rpc == 3653170552u && player != null)
+			if (rpc == 2333451803u && player != null)
 			{
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
 				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_Lead "));
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_Claim "));
 				}
-				using (TimeWarning.New("RPC_Lead"))
+				using (TimeWarning.New("RPC_Claim"))
 				{
 					using (TimeWarning.New("Conditions"))
 					{
-						if (!RPC_Server.IsVisible.Test("RPC_Lead", this, player, 3f))
+						if (!RPC_Server.IsVisible.Test(2333451803u, "RPC_Claim", this, player, 3f))
 						{
 							return true;
 						}
@@ -198,13 +245,49 @@ public class BaseRidableAnimal : BaseVehicle
 							rPCMessage.player = player;
 							rPCMessage.read = msg.read;
 							RPCMessage msg2 = rPCMessage;
-							RPC_Lead(msg2);
+							RPC_Claim(msg2);
 						}
 					}
 					catch (Exception exception)
 					{
-						player.Kick("RPC Error in RPC_Lead");
 						Debug.LogException(exception);
+						player.Kick("RPC Error in RPC_Claim");
+					}
+				}
+				return true;
+			}
+			if (rpc == 3653170552u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_Lead "));
+				}
+				using (TimeWarning.New("RPC_Lead"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(3653170552u, "RPC_Lead", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg3 = rPCMessage;
+							RPC_Lead(msg3);
+						}
+					}
+					catch (Exception exception2)
+					{
+						Debug.LogException(exception2);
+						player.Kick("RPC Error in RPC_Lead");
 					}
 				}
 				return true;
@@ -220,7 +303,7 @@ public class BaseRidableAnimal : BaseVehicle
 				{
 					using (TimeWarning.New("Conditions"))
 					{
-						if (!RPC_Server.IsVisible.Test("RPC_OpenLoot", this, player, 3f))
+						if (!RPC_Server.IsVisible.Test(331989034u, "RPC_OpenLoot", this, player, 3f))
 						{
 							return true;
 						}
@@ -237,16 +320,135 @@ public class BaseRidableAnimal : BaseVehicle
 							RPC_OpenLoot(rpc2);
 						}
 					}
-					catch (Exception exception2)
+					catch (Exception exception3)
 					{
+						Debug.LogException(exception3);
 						player.Kick("RPC Error in RPC_OpenLoot");
-						Debug.LogException(exception2);
 					}
 				}
 				return true;
 			}
 		}
 		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public bool IsForSale()
+	{
+		return HasFlag(Flags.Reserved2);
+	}
+
+	public void ContainerServerInit()
+	{
+		if (inventory == null)
+		{
+			CreateInventory(giveUID: true);
+			OnInventoryFirstCreated(inventory);
+		}
+	}
+
+	public void CreateInventory(bool giveUID)
+	{
+		inventory = new ItemContainer();
+		inventory.entityOwner = this;
+		inventory.allowedContents = ((allowedContents == (ItemContainer.ContentsType)0) ? ItemContainer.ContentsType.Generic : allowedContents);
+		inventory.onlyAllowedItem = onlyAllowedItem;
+		inventory.maxStackSize = maxStackSize;
+		inventory.ServerInitialize(null, numSlots);
+		inventory.canAcceptItem = ItemFilter;
+		if (giveUID)
+		{
+			inventory.GiveUID();
+		}
+		inventory.onItemAddedRemoved = OnItemAddedOrRemoved;
+		inventory.onDirty += OnInventoryDirty;
+	}
+
+	public void SaveContainer(SaveInfo info)
+	{
+		if (info.forDisk)
+		{
+			if (inventory != null)
+			{
+				info.msg.storageBox = Facepunch.Pool.Get<StorageBox>();
+				info.msg.storageBox.contents = inventory.Save();
+			}
+			else
+			{
+				Debug.LogWarning("Storage container without inventory: " + ToString());
+			}
+		}
+	}
+
+	public virtual void OnInventoryFirstCreated(ItemContainer container)
+	{
+	}
+
+	public virtual void OnInventoryDirty()
+	{
+	}
+
+	public virtual void OnItemAddedOrRemoved(Item item, bool added)
+	{
+	}
+
+	public bool ItemFilter(Item item, int targetSlot)
+	{
+		return CanAnimalAcceptItem(item, targetSlot);
+	}
+
+	public virtual bool CanAnimalAcceptItem(Item item, int targetSlot)
+	{
+		return true;
+	}
+
+	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
+	private void RPC_OpenLoot(RPCMessage rpc)
+	{
+		if (inventory != null)
+		{
+			BasePlayer player = rpc.player;
+			if ((bool)player && player.CanInteract() && CanOpenStorage(player) && (!needsBuildingPrivilegeToUse || player.CanBuild()) && Interface.CallHook("CanLootEntity", player, this) == null && player.inventory.loot.StartLootingEntity(this))
+			{
+				player.inventory.loot.AddContainer(inventory);
+				player.inventory.loot.SendImmediate();
+				player.ClientRPCPlayer(null, player, "RPC_OpenLootPanel", lootPanelName);
+				SendNetworkUpdate();
+			}
+		}
+	}
+
+	public virtual void PlayerStoppedLooting(BasePlayer player)
+	{
+	}
+
+	public virtual bool CanOpenStorage(BasePlayer player)
+	{
+		if (!HasFlag(Flags.On))
+		{
+			return true;
+		}
+		if (player.GetMountedVehicle() == this)
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public void LoadContainer(LoadInfo info)
+	{
+		if (info.fromDisk && info.msg.storageBox != null)
+		{
+			if (inventory != null)
+			{
+				inventory.Load(info.msg.storageBox.contents);
+				inventory.capacity = numSlots;
+			}
+			else
+			{
+				Debug.LogWarning("Storage container without inventory: " + ToString());
+			}
+		}
 	}
 
 	public float GetBreathingDelay()
@@ -319,20 +521,46 @@ public class BaseRidableAnimal : BaseVehicle
 		LoadContainer(info);
 	}
 
+	public override void AttemptMount(BasePlayer player, bool doMountChecks = true)
+	{
+		if (!IsForSale())
+		{
+			base.AttemptMount(player, doMountChecks);
+		}
+	}
+
 	public virtual void LeadingChanged()
 	{
 	}
 
-	[RPC_Server.IsVisible(3f)]
 	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
+	public void RPC_Claim(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (!(player == null) && Interface.CallHook("OnRidableAnimalClaim", this, player) == null && IsForSale())
+		{
+			Item item = GetPurchaseToken(player);
+			if (item != null)
+			{
+				item.UseItem();
+				SetFlag(Flags.Reserved2, b: false);
+				AttemptMount(player, doMountChecks: false);
+				Interface.CallHook("OnRidableAnimalClaimed", this, player);
+			}
+		}
+	}
+
+	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
 	public void RPC_Lead(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
-		if (!(player == null) && !HasDriver())
+		if (!(player == null) && !HasDriver() && !IsForSale())
 		{
 			bool num = IsLeading();
 			bool flag = msg.read.Bit();
-			if (num != flag)
+			if (num != flag && Interface.CallHook("OnHorseLead", this, player) == null)
 			{
 				SetLeading(flag ? player : null);
 				LeadingChanged();
@@ -377,9 +605,17 @@ public class BaseRidableAnimal : BaseVehicle
 		}
 	}
 
+	public override void Hurt(HitInfo info)
+	{
+		if (!IsForSale())
+		{
+			base.Hurt(info);
+		}
+	}
+
 	public void AnimalDecay()
 	{
-		if (base.healthFraction == 0f || base.IsDestroyed || UnityEngine.Time.time < lastInputTime + 600f || UnityEngine.Time.time < lastEatTime + 600f)
+		if (base.healthFraction == 0f || base.IsDestroyed || UnityEngine.Time.time < lastInputTime + 600f || UnityEngine.Time.time < lastEatTime + 600f || IsForSale())
 		{
 			return;
 		}
@@ -496,6 +732,32 @@ public class BaseRidableAnimal : BaseVehicle
 		float delta = UnityEngine.Time.realtimeSinceStartup - lastMovementUpdateTime;
 		UpdateMovement(delta);
 		lastMovementUpdateTime = UnityEngine.Time.realtimeSinceStartup;
+		UpdateDung(delta);
+	}
+
+	public void ApplyDungCalories(float calories)
+	{
+		pendingDungCalories += calories;
+	}
+
+	private void UpdateDung(float delta)
+	{
+		if (!(Dung == null) && !Mathf.Approximately(dungTimeScale, 0f))
+		{
+			float num = Mathf.Min(pendingDungCalories * delta, CaloriesToDigestPerHour / 3600f * delta) * DungProducedPerCalorie;
+			dungProduction += num;
+			pendingDungCalories -= num;
+			if (dungProduction >= 1f)
+			{
+				DoDung();
+			}
+		}
+	}
+
+	private void DoDung()
+	{
+		dungProduction -= 1f;
+		ItemManager.Create(Dung, 1, 0uL).Drop(base.transform.position + -base.transform.forward + Vector3.up * 1.1f + UnityEngine.Random.insideUnitSphere * 0.1f, -base.transform.forward);
 	}
 
 	public new void FixedUpdate()
@@ -531,6 +793,7 @@ public class BaseRidableAnimal : BaseVehicle
 			float ifType = consumable.GetIfType(MetabolismAttribute.Type.Calories);
 			float ifType2 = consumable.GetIfType(MetabolismAttribute.Type.Hydration);
 			float num = consumable.GetIfType(MetabolismAttribute.Type.Health) + consumable.GetIfType(MetabolismAttribute.Type.HealthOverTime);
+			ApplyDungCalories(ifType);
 			ReplenishStaminaCore(ifType, ifType2);
 			Heal(num * 2f);
 		}
@@ -578,10 +841,10 @@ public class BaseRidableAnimal : BaseVehicle
 				collectibleEntity.DoPickup(null);
 				break;
 			}
-			PlantEntity plantEntity = item as PlantEntity;
-			if ((bool)plantEntity && plantEntity.CanPick())
+			GrowableEntity growableEntity = item as GrowableEntity;
+			if ((bool)growableEntity && growableEntity.CanPick())
 			{
-				plantEntity.PickFruit(null);
+				growableEntity.PickFruit(null);
 				break;
 			}
 		}
@@ -595,6 +858,7 @@ public class BaseRidableAnimal : BaseVehicle
 			currentRunState = newState;
 			timeInMoveState = 0f;
 			SetFlag(Flags.Reserved8, currentRunState == RunState.sprint, recursive: false, networkupdate: false);
+			MarkObstacleDistanceDirty();
 		}
 	}
 
@@ -611,16 +875,38 @@ public class BaseRidableAnimal : BaseVehicle
 		}
 	}
 
-	public float GetDesiredVelocity()
+	public float MoveStateToVelocity(RunState stateToCheck)
 	{
 		float num = 0f;
-		return currentRunState switch
+		return stateToCheck switch
 		{
 			RunState.walk => GetWalkSpeed(), 
 			RunState.run => GetTrotSpeed(), 
 			RunState.sprint => GetRunSpeed(), 
 			_ => 0f, 
 		};
+	}
+
+	public float GetDesiredVelocity()
+	{
+		return MoveStateToVelocity(currentRunState);
+	}
+
+	public RunState StateFromSpeed(float speedToUse)
+	{
+		if (speedToUse <= MoveStateToVelocity(RunState.stopped))
+		{
+			return RunState.stopped;
+		}
+		if (speedToUse <= MoveStateToVelocity(RunState.walk))
+		{
+			return RunState.walk;
+		}
+		if (speedToUse <= MoveStateToVelocity(RunState.run))
+		{
+			return RunState.run;
+		}
+		return RunState.sprint;
 	}
 
 	public void ModifyRunState(int dir)
@@ -776,17 +1062,6 @@ public class BaseRidableAnimal : BaseVehicle
 		}
 	}
 
-	public float ObstacleDistance()
-	{
-		float num = 10f;
-		Vector3 direction = QuaternionEx.LookRotationForcedUp(base.transform.forward, base.transform.up) * Vector3.forward;
-		if (UnityEngine.Physics.SphereCast(movementLOSOrigin.transform.position, obstacleDetectionRadius, direction, out var hitInfo, num, 1218519297))
-		{
-			num = hitInfo.distance;
-		}
-		return num;
-	}
-
 	public override float MaxVelocity()
 	{
 		return maxSpeed * 1.5f;
@@ -805,7 +1080,7 @@ public class BaseRidableAnimal : BaseVehicle
 	{
 		if (UnityEngine.Time.time >= nextGroundNormalUpdateTime || force)
 		{
-			nextGroundNormalUpdateTime = UnityEngine.Time.time + UnityEngine.Random.Range(0.2f, 0.35f);
+			nextGroundNormalUpdateTime = UnityEngine.Time.time + UnityEngine.Random.Range(0.2f, 0.3f);
 			targetUp = averagedUp;
 			Transform[] array = groundSampleOffsets;
 			for (int i = 0; i < array.Length; i++)
@@ -821,28 +1096,34 @@ public class BaseRidableAnimal : BaseVehicle
 			}
 			targetUp /= (float)(groundSampleOffsets.Length + 1);
 		}
-		averagedUp = Vector3.Lerp(averagedUp, targetUp, UnityEngine.Time.deltaTime * 4f);
+		averagedUp = Vector3.Lerp(averagedUp, targetUp, UnityEngine.Time.deltaTime * 2f);
+	}
+
+	public void MarkObstacleDistanceDirty()
+	{
+		nextObstacleCheckTime = 0f;
 	}
 
 	public float GetObstacleDistance()
 	{
 		if (UnityEngine.Time.time >= nextObstacleCheckTime)
 		{
-			if (currentSpeed > 0f || GetDesiredVelocity() > 0f)
+			float desiredVelocity = GetDesiredVelocity();
+			if (currentSpeed > 0f || desiredVelocity > 0f)
 			{
-				cachedObstacleDistance = ObstacleDistanceCheck(GetDesiredVelocity() + 2f);
+				cachedObstacleDistance = ObstacleDistanceCheck(Mathf.Max(desiredVelocity, 2f));
 			}
 			nextObstacleCheckTime = UnityEngine.Time.time + UnityEngine.Random.Range(0.25f, 0.35f);
 		}
 		return cachedObstacleDistance;
 	}
 
-	public float ObstacleDistanceCheck(float speed = 15f)
+	public float ObstacleDistanceCheck(float speed = 10f)
 	{
 		_ = base.transform.position;
-		int num = Mathf.Max(2, Mathf.CeilToInt(speed));
-		int num2 = 1;
-		int num3 = Mathf.CeilToInt(num / num2);
+		int num = Mathf.Max(2, Mathf.Min((int)speed, 10));
+		float num2 = 0.5f;
+		int num3 = Mathf.CeilToInt((float)num / num2);
 		float num4 = 0f;
 		Vector3 vector = QuaternionEx.LookRotationForcedUp(base.transform.forward, Vector3.up) * Vector3.forward;
 		Vector3 vector2 = movementLOSOrigin.transform.position;
@@ -850,42 +1131,67 @@ public class BaseRidableAnimal : BaseVehicle
 		Vector3 up = base.transform.up;
 		for (int i = 0; i < num3; i++)
 		{
-			float maxDistance = num2;
+			float num5 = num2;
 			bool flag = false;
-			float num5 = 0f;
+			float num6 = 0f;
 			Vector3 pos = Vector3.zero;
 			Vector3 normal = Vector3.up;
-			Vector3 vector3 = vector2 + Vector3.up * 0.5f;
-			if (UnityEngine.Physics.SphereCast(vector3, obstacleDetectionRadius, vector, out var hitInfo, maxDistance, 1486954753))
+			Vector3 vector3 = vector2;
+			Vector3 origin = vector3 + Vector3.up * (maxStepHeight + obstacleDetectionRadius);
+			Vector3 vector4 = vector3 + vector * num5;
+			float num7 = maxStepDownHeight + obstacleDetectionRadius;
+			if (UnityEngine.Physics.SphereCast(origin, obstacleDetectionRadius, vector, out var hitInfo, num5, 1486954753))
 			{
-				num5 = hitInfo.distance;
+				num6 = hitInfo.distance;
 				pos = hitInfo.point;
 				normal = hitInfo.normal;
 				flag = true;
 			}
 			if (!flag)
 			{
-				if (!TransformUtil.GetGroundInfo(vector3 + vector * 1f + Vector3.up * 2f, out pos, out normal, 4f, 278986753))
+				if (!TransformUtil.GetGroundInfo(vector4 + Vector3.up * 2f, out pos, out normal, 2f + num7, 278986753))
 				{
 					return num4;
 				}
-				num5 = Vector3.Distance(vector3, pos);
-				if (WaterLevel.Test(pos + Vector3.one * maxWaterDepth))
+				num6 = Vector3.Distance(vector3, pos);
+				if (WaterLevel.Test(pos + Vector3.one * maxWaterDepth, waves: true, this))
 				{
 					normal = -base.transform.forward;
+					return num4;
 				}
 				flag = true;
 			}
 			if (flag)
 			{
-				float num6 = Vector3.Angle(up, normal);
-				float num7 = Vector3.Angle(normal, Vector3.up);
-				if (num6 > 45f && num7 > 50f)
+				float num8 = Vector3.Angle(up, normal);
+				float num9 = Vector3.Angle(normal, Vector3.up);
+				if (num8 > maxWallClimbSlope || num9 > maxWallClimbSlope)
 				{
-					return num4;
+					Vector3 vector5 = normal;
+					float num10 = pos.y;
+					int num11 = 1;
+					for (int j = 0; j < normalOffsets.Length; j++)
+					{
+						Vector3 vector6 = vector4 + normalOffsets[j].x * base.transform.right;
+						float num12 = maxStepHeight * 2.5f;
+						if (TransformUtil.GetGroundInfo(vector6 + Vector3.up * num12 + normalOffsets[j].z * base.transform.forward, out var pos2, out var normal2, num7 + num12, 278986753))
+						{
+							num11++;
+							vector5 += normal2;
+							num10 += pos2.y;
+						}
+					}
+					num10 /= (float)num11;
+					vector5.Normalize();
+					float num13 = Vector3.Angle(up, vector5);
+					num9 = Vector3.Angle(vector5, Vector3.up);
+					if (num13 > maxWallClimbSlope || num9 > maxWallClimbSlope || Mathf.Abs(num10 - vector4.y) > maxStepHeight)
+					{
+						return num4;
+					}
 				}
 			}
-			num4 += num5;
+			num4 += num6;
 			vector = QuaternionEx.LookRotationForcedUp(base.transform.forward, normal) * Vector3.forward;
 			vector2 = pos;
 		}
@@ -903,6 +1209,10 @@ public class BaseRidableAnimal : BaseVehicle
 		{
 			Kill();
 			return;
+		}
+		if (desiredRotation != 0f)
+		{
+			MarkObstacleDistanceDirty();
 		}
 		if (num >= 0.3f && currentRunState > RunState.run)
 		{
@@ -962,12 +1272,17 @@ public class BaseRidableAnimal : BaseVehicle
 				SwitchMoveState(RunState.stopped);
 			}
 		}
+		float obstacleDistance = GetObstacleDistance();
+		RunState runState = StateFromSpeed(obstacleDistance * GetRunSpeed());
+		if (runState < currentRunState)
+		{
+			SwitchMoveState(runState);
+		}
 		float desiredVelocity = GetDesiredVelocity();
 		Vector3 direction = Vector3.forward * Mathf.Sign(desiredVelocity);
 		base.transform.hasChanged = true;
-		float obstacleDistance = GetObstacleDistance();
 		float num6 = Mathf.InverseLerp(0.85f, 1f, obstacleDistance);
-		float num7 = Mathf.InverseLerp(1f, 12f, obstacleDistance);
+		float num7 = Mathf.InverseLerp(1.25f, 10f, obstacleDistance);
 		float num8 = 1f - Mathf.InverseLerp(20f, 35f, Vector3.Angle(Vector3.up, averagedUp));
 		num7 = num6 * 0.1f + num7 * 0.9f;
 		float num9 = Mathf.Min(Mathf.Clamp01(Mathf.Min(num8 + 0.2f, num7)) * GetRunSpeed(), desiredVelocity);
@@ -986,20 +1301,33 @@ public class BaseRidableAnimal : BaseVehicle
 		}
 		float num11 = 1f - Mathf.InverseLerp(2f, 7f, currentSpeed);
 		num11 = (num11 + 1f) / 2f;
-		base.transform.Rotate(Vector3.up, desiredRotation * delta * turnSpeed * num11);
+		if (desiredRotation != 0f)
+		{
+			_ = animalFront.transform.position;
+			Quaternion rotation = base.transform.rotation;
+			base.transform.Rotate(Vector3.up, desiredRotation * delta * turnSpeed * num11);
+			if (!IsLeading() && Vis.AnyColliders(animalFront.transform.position, obstacleDetectionRadius * 0.25f, 1503731969))
+			{
+				base.transform.rotation = rotation;
+			}
+		}
 		Vector3 vector = base.transform.TransformDirection(direction);
 		Vector3 normalized = vector.normalized;
 		float num12 = currentSpeed * delta;
-		Vector3 vector2 = base.transform.position + vector * num12 * Mathf.Sign(currentSpeed);
+		Vector3 vector2 = base.transform.position + normalized * num12 * Mathf.Sign(currentSpeed);
 		currentVelocity = vector * currentSpeed;
 		UpdateGroundNormal();
-		if (!(currentSpeed > 0f) && !(timeAlive < 2f))
+		if (!(currentSpeed > 0f) && !(timeAlive < 2f) && !((float)dropUntilTime > 0f))
 		{
 			return;
 		}
-		if (!UnityEngine.Physics.SphereCast(animalFront.transform.position, obstacleDetectionRadius, normalized, out var _, num12, 1503731969))
+		_ = base.transform.position + base.transform.InverseTransformPoint(animalFront.transform.position).y * base.transform.up;
+		RaycastHit hitInfo;
+		bool flag2 = UnityEngine.Physics.SphereCast(animalFront.transform.position, obstacleDetectionRadius, normalized, out hitInfo, num12, 1503731969);
+		bool flag3 = UnityEngine.Physics.SphereCast(base.transform.position + base.transform.InverseTransformPoint(animalFront.transform.position).y * base.transform.up, obstacleDetectionRadius, normalized, out hitInfo, num12, 1503731969);
+		if (!Vis.AnyColliders(animalFront.transform.position + normalized * num12, obstacleDetectionRadius, 1503731969) && !flag2 && !flag3)
 		{
-			if (DropToGround(vector2 + Vector3.up * 1.25f))
+			if (DropToGround(vector2 + Vector3.up * maxStepHeight))
 			{
 				MarkDistanceTravelled(num12);
 			}
@@ -1016,9 +1344,13 @@ public class BaseRidableAnimal : BaseVehicle
 
 	public bool DropToGround(Vector3 targetPos, bool force = false)
 	{
-		float range = (force ? 10000f : 4f);
-		if (TransformUtil.GetGroundInfo(targetPos + Vector3.up * 1.25f, out var pos, out var _, range, 278986753))
+		float range = (force ? 10000f : (maxStepHeight + maxStepDownHeight));
+		if (TransformUtil.GetGroundInfo(targetPos, out var pos, out var _, range, 278986753))
 		{
+			if (UnityEngine.Physics.CheckSphere(pos + Vector3.up * 1f, 0.2f, 278986753))
+			{
+				return false;
+			}
 			base.transform.position = pos;
 			Vector3 eulerAngles = QuaternionEx.LookRotationForcedUp(base.transform.forward, averagedUp).eulerAngles;
 			if (eulerAngles.z > 180f)
@@ -1088,6 +1420,22 @@ public class BaseRidableAnimal : BaseVehicle
 		return currentVelocity;
 	}
 
+	public void UpdateDropToGroundForDuration(float duration)
+	{
+		dropUntilTime = duration;
+	}
+
+	public bool PlayerHasToken(BasePlayer player)
+	{
+		return GetPurchaseToken(player) != null;
+	}
+
+	public Item GetPurchaseToken(BasePlayer player)
+	{
+		int itemid = purchaseToken.itemid;
+		return player.inventory.FindItemID(itemid);
+	}
+
 	public virtual float GetWalkSpeed()
 	{
 		return walkSpeed;
@@ -1108,119 +1456,5 @@ public class BaseRidableAnimal : BaseVehicle
 			return runSpeed + num + num2;
 		}
 		return runSpeed;
-	}
-
-	public void ContainerServerInit()
-	{
-		if (inventory == null)
-		{
-			CreateInventory(giveUID: true);
-			OnInventoryFirstCreated(inventory);
-		}
-	}
-
-	public void CreateInventory(bool giveUID)
-	{
-		inventory = new ItemContainer();
-		inventory.entityOwner = this;
-		inventory.allowedContents = ((allowedContents == (ItemContainer.ContentsType)0) ? ItemContainer.ContentsType.Generic : allowedContents);
-		inventory.onlyAllowedItem = onlyAllowedItem;
-		inventory.maxStackSize = maxStackSize;
-		inventory.ServerInitialize(null, numSlots);
-		inventory.canAcceptItem = ItemFilter;
-		if (giveUID)
-		{
-			inventory.GiveUID();
-		}
-		inventory.onItemAddedRemoved = OnItemAddedOrRemoved;
-		inventory.onDirty += OnInventoryDirty;
-	}
-
-	public void SaveContainer(SaveInfo info)
-	{
-		if (info.forDisk)
-		{
-			if (inventory != null)
-			{
-				info.msg.storageBox = Facepunch.Pool.Get<StorageBox>();
-				info.msg.storageBox.contents = inventory.Save();
-			}
-			else
-			{
-				Debug.LogWarning("Storage container without inventory: " + ToString());
-			}
-		}
-	}
-
-	public virtual void OnInventoryFirstCreated(ItemContainer container)
-	{
-	}
-
-	public virtual void OnInventoryDirty()
-	{
-	}
-
-	public virtual void OnItemAddedOrRemoved(Item item, bool added)
-	{
-	}
-
-	public bool ItemFilter(Item item, int targetSlot)
-	{
-		return CanAnimalAcceptItem(item, targetSlot);
-	}
-
-	public virtual bool CanAnimalAcceptItem(Item item, int targetSlot)
-	{
-		return true;
-	}
-
-	[RPC_Server]
-	[RPC_Server.IsVisible(3f)]
-	private void RPC_OpenLoot(RPCMessage rpc)
-	{
-		if (inventory != null)
-		{
-			BasePlayer player = rpc.player;
-			if ((bool)player && player.CanInteract() && CanOpenStorage(player) && (!needsBuildingPrivilegeToUse || player.CanBuild()) && player.inventory.loot.StartLootingEntity(this))
-			{
-				player.inventory.loot.AddContainer(inventory);
-				player.inventory.loot.SendImmediate();
-				player.ClientRPCPlayer(null, player, "RPC_OpenLootPanel", lootPanelName);
-				SendNetworkUpdate();
-			}
-		}
-	}
-
-	public virtual void PlayerStoppedLooting(BasePlayer player)
-	{
-	}
-
-	public virtual bool CanOpenStorage(BasePlayer player)
-	{
-		if (!HasFlag(Flags.On))
-		{
-			return true;
-		}
-		if (player.GetMountedVehicle() == this)
-		{
-			return true;
-		}
-		return false;
-	}
-
-	public void LoadContainer(LoadInfo info)
-	{
-		if (info.fromDisk && info.msg.storageBox != null)
-		{
-			if (inventory != null)
-			{
-				inventory.Load(info.msg.storageBox.contents);
-				inventory.capacity = numSlots;
-			}
-			else
-			{
-				Debug.LogWarning("Storage container without inventory: " + ToString());
-			}
-		}
 	}
 }

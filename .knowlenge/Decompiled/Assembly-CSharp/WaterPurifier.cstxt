@@ -1,5 +1,3 @@
-using Facepunch;
-using ProtoBuf;
 using Rust;
 using UnityEngine;
 
@@ -20,32 +18,60 @@ public class WaterPurifier : LiquidContainer
 
 	public int freshWaterRatio = 4;
 
-	private LiquidContainer waterStorage;
+	public bool stopWhenOutputFull;
+
+	public LiquidContainer waterStorage;
 
 	public float dirtyWaterProcssed;
 
 	public float pendingFreshWater;
+
+	public bool IsBoiling()
+	{
+		return HasFlag(Flags.Reserved1);
+	}
 
 	public override void ServerInit()
 	{
 		base.ServerInit();
 		if (!Rust.Application.isLoadingSave)
 		{
-			SpawnStorageEnt();
+			SpawnStorageEnt(load: false);
 		}
 	}
 
 	public override void PostServerLoad()
 	{
 		base.PostServerLoad();
-		SpawnStorageEnt();
+		SpawnStorageEnt(load: true);
 	}
 
-	public void SpawnStorageEnt()
+	protected virtual void SpawnStorageEnt(bool load)
 	{
+		if (load)
+		{
+			BaseEntity baseEntity = GetParentEntity();
+			if ((bool)baseEntity)
+			{
+				foreach (BaseEntity child in baseEntity.children)
+				{
+					if (child != this && child is LiquidContainer liquidContainer)
+					{
+						waterStorage = liquidContainer;
+						break;
+					}
+				}
+			}
+		}
+		if (waterStorage != null)
+		{
+			waterStorage.SetConnectedTo(this);
+			return;
+		}
 		waterStorage = GameManager.server.CreateEntity(storagePrefab.resourcePath, storagePrefabAnchor.localPosition, storagePrefabAnchor.localRotation) as LiquidContainer;
 		waterStorage.SetParent(GetParentEntity());
 		waterStorage.Spawn();
+		waterStorage.SetConnectedTo(this);
 	}
 
 	internal override void OnParentRemoved()
@@ -56,7 +82,10 @@ public class WaterPurifier : LiquidContainer
 	public override void OnKilled(HitInfo info)
 	{
 		base.OnKilled(info);
-		waterStorage.Kill();
+		if (!waterStorage.IsDestroyed)
+		{
+			waterStorage.Kill();
+		}
 	}
 
 	public void ParentTemperatureUpdate(float temp)
@@ -74,7 +103,7 @@ public class WaterPurifier : LiquidContainer
 
 	public bool HasDirtyWater()
 	{
-		Item slot = inventory.GetSlot(0);
+		Item slot = base.inventory.GetSlot(0);
 		if (slot != null && slot.info.itemType == ItemContainer.ContentsType.Liquid)
 		{
 			return slot.amount > 0;
@@ -84,43 +113,56 @@ public class WaterPurifier : LiquidContainer
 
 	public void Cook(float timeCooked)
 	{
-		if (waterStorage == null)
+		if (!(waterStorage == null))
 		{
-			return;
+			bool flag = HasDirtyWater();
+			if (!IsBoiling() && flag)
+			{
+				InvokeRepeating(CheckCoolDown, 2f, 2f);
+				SetFlag(Flags.Reserved1, b: true);
+			}
+			if (IsBoiling() && flag)
+			{
+				ConvertWater(timeCooked);
+			}
 		}
-		bool flag = HasDirtyWater();
-		if (!IsBoiling() && flag)
+	}
+
+	protected void ConvertWater(float timeCooked)
+	{
+		if (stopWhenOutputFull)
 		{
-			InvokeRepeating(CheckCoolDown, 2f, 2f);
-			SetFlag(Flags.Reserved1, b: true);
-		}
-		if (!IsBoiling() || !flag)
-		{
-			return;
+			Item slot = waterStorage.inventory.GetSlot(0);
+			if (slot != null && slot.amount >= slot.MaxStackable())
+			{
+				return;
+			}
 		}
 		float num = timeCooked * ((float)waterToProcessPerMinute / 60f);
 		dirtyWaterProcssed += num;
-		pendingFreshWater += num / (float)freshWaterRatio;
 		if (dirtyWaterProcssed >= 1f)
 		{
-			int num2 = Mathf.FloorToInt(dirtyWaterProcssed);
-			inventory.GetSlot(0).UseItem(num2);
+			Item slot2 = base.inventory.GetSlot(0);
+			int num2 = Mathf.Min(Mathf.FloorToInt(dirtyWaterProcssed), slot2.amount);
+			num = num2;
+			slot2.UseItem(num2);
 			dirtyWaterProcssed -= num2;
 			SendNetworkUpdate();
 		}
+		pendingFreshWater += num / (float)freshWaterRatio;
 		if (!(pendingFreshWater >= 1f))
 		{
 			return;
 		}
 		int num3 = Mathf.FloorToInt(pendingFreshWater);
 		pendingFreshWater -= num3;
-		Item slot = waterStorage.inventory.GetSlot(0);
-		if (slot != null && slot.info != freshWater)
+		Item slot3 = waterStorage.inventory.GetSlot(0);
+		if (slot3 != null && slot3.info != freshWater)
 		{
-			slot.RemoveFromContainer();
-			slot.Remove();
+			slot3.RemoveFromContainer();
+			slot3.Remove();
 		}
-		if (slot == null)
+		if (slot3 == null)
 		{
 			Item item = ItemManager.Create(freshWater, num3, 0uL);
 			if (!item.MoveToContainer(waterStorage.inventory))
@@ -130,22 +172,11 @@ public class WaterPurifier : LiquidContainer
 		}
 		else
 		{
-			slot.amount += num3;
-			slot.amount = Mathf.Clamp(slot.amount, 0, waterStorage.maxStackSize);
+			slot3.amount += num3;
+			slot3.amount = Mathf.Clamp(slot3.amount, 0, waterStorage.maxStackSize);
 			waterStorage.inventory.MarkDirty();
 		}
 		waterStorage.SendNetworkUpdate();
-	}
-
-	public override void Save(SaveInfo info)
-	{
-		base.Save(info);
-		if (info.forDisk && waterStorage != null)
-		{
-			info.msg.miningQuarry = Pool.Get<ProtoBuf.MiningQuarry>();
-			info.msg.miningQuarry.extractor = Pool.Get<ResourceExtractor>();
-			info.msg.miningQuarry.extractor.outputContents = waterStorage.inventory.Save();
-		}
 	}
 
 	public override void Load(LoadInfo info)
@@ -154,15 +185,6 @@ public class WaterPurifier : LiquidContainer
 		if (info.fromDisk)
 		{
 			SetFlag(Flags.On, b: false);
-			if (info.msg.miningQuarry != null && waterStorage != null)
-			{
-				waterStorage.inventory.Load(info.msg.miningQuarry.extractor.outputContents);
-			}
 		}
-	}
-
-	public bool IsBoiling()
-	{
-		return HasFlag(Flags.Reserved1);
 	}
 }

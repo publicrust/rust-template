@@ -72,15 +72,21 @@ public class BradleyAPC : BaseCombatEntity
 	}
 
 	[Header("Sound")]
-	public EngineAudioClip engineAudioClip;
+	public BlendedLoopEngineSound engineSound;
 
-	public SlicedGranularAudioClip treadAudioClip;
+	public SoundDefinition treadLoopDef;
 
-	public float treadGrainFreqMin = 0.025f;
+	public AnimationCurve treadGainCurve;
 
-	public float treadGrainFreqMax = 0.5f;
+	public AnimationCurve treadPitchCurve;
 
 	public AnimationCurve treadFreqCurve;
+
+	private Sound treadLoop;
+
+	private SoundModulation.Modulator treadGain;
+
+	private SoundModulation.Modulator treadPitch;
 
 	public SoundDefinition chasisLurchSoundDef;
 
@@ -119,6 +125,52 @@ public class BradleyAPC : BaseCombatEntity
 	public float rpmMultiplier = 0.6f;
 
 	private TreadAnimator treadAnimator;
+
+	[Header("Pathing")]
+	public List<Vector3> currentPath;
+
+	public int currentPathIndex;
+
+	public bool pathLooping;
+
+	[Header("Targeting")]
+	public float viewDistance = 100f;
+
+	public float searchRange = 100f;
+
+	public float searchFrequency = 2f;
+
+	public float memoryDuration = 20f;
+
+	public static float sightUpdateRate = 0.5f;
+
+	public BaseCombatEntity mainGunTarget;
+
+	public List<TargetInfo> targetList = new List<TargetInfo>();
+
+	[Header("Coax")]
+	public float coaxFireRate = 0.06667f;
+
+	public int coaxBurstLength = 10;
+
+	public float coaxAimCone = 3f;
+
+	public float bulletDamage = 15f;
+
+	[Header("TopTurret")]
+	public float topTurretFireRate = 0.25f;
+
+	public float nextCoaxTime;
+
+	public int numCoaxBursted;
+
+	public float nextTopTurretTime = 0.3f;
+
+	public GameObjectRef gun_fire_effect;
+
+	public GameObjectRef bulletEffect;
+
+	public float lastLateUpdate;
 
 	[Header("Wheels")]
 	public WheelCollider[] leftWheels;
@@ -217,67 +269,21 @@ public class BradleyAPC : BaseCombatEntity
 
 	public GameObjectRef mainCannonProjectile;
 
-	public float nextFireTime = 10f;
-
-	public int numBursted;
-
 	public float recoilScale = 200f;
 
 	public NavMeshPath navMeshPath;
 
 	public int navMeshPathIndex;
 
+	public float nextFireTime = 10f;
+
+	public int numBursted;
+
 	public float nextPatrolTime;
 
 	public float nextEngagementPathTime;
 
 	public float currentSpeedZoneLimit;
-
-	[Header("Pathing")]
-	public List<Vector3> currentPath;
-
-	public int currentPathIndex;
-
-	public bool pathLooping;
-
-	[Header("Targeting")]
-	public float viewDistance = 100f;
-
-	public float searchRange = 100f;
-
-	public float searchFrequency = 2f;
-
-	public float memoryDuration = 20f;
-
-	public static float sightUpdateRate = 0.5f;
-
-	public BaseCombatEntity mainGunTarget;
-
-	public List<TargetInfo> targetList = new List<TargetInfo>();
-
-	public float nextCoaxTime;
-
-	public int numCoaxBursted;
-
-	[Header("Coax")]
-	public float coaxFireRate = 0.06667f;
-
-	public int coaxBurstLength = 10;
-
-	public float coaxAimCone = 3f;
-
-	public float bulletDamage = 15f;
-
-	[Header("TopTurret")]
-	public float topTurretFireRate = 0.25f;
-
-	private float nextTopTurretTime = 0.3f;
-
-	public GameObjectRef gun_fire_effect;
-
-	public GameObjectRef bulletEffect;
-
-	public float lastLateUpdate;
 
 	protected override float PositionTickRate => 0.1f;
 
@@ -287,6 +293,466 @@ public class BradleyAPC : BaseCombatEntity
 		{
 		}
 		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public bool HasPath()
+	{
+		if (currentPath != null)
+		{
+			return currentPath.Count > 0;
+		}
+		return false;
+	}
+
+	public void ClearPath()
+	{
+		currentPath.Clear();
+		currentPathIndex = -1;
+	}
+
+	public bool IndexValid(int index)
+	{
+		if (!HasPath())
+		{
+			return false;
+		}
+		if (index >= 0)
+		{
+			return index < currentPath.Count;
+		}
+		return false;
+	}
+
+	public Vector3 GetFinalDestination()
+	{
+		if (!HasPath())
+		{
+			return base.transform.position;
+		}
+		return finalDestination;
+	}
+
+	public Vector3 GetCurrentPathDestination()
+	{
+		if (!HasPath())
+		{
+			return base.transform.position;
+		}
+		return currentPath[currentPathIndex];
+	}
+
+	public bool PathComplete()
+	{
+		if (HasPath())
+		{
+			if (currentPathIndex == currentPath.Count - 1)
+			{
+				return AtCurrentPathNode();
+			}
+			return false;
+		}
+		return true;
+	}
+
+	public bool AtCurrentPathNode()
+	{
+		if (currentPathIndex < 0 || currentPathIndex >= currentPath.Count)
+		{
+			return false;
+		}
+		return Vector3.Distance(base.transform.position, currentPath[currentPathIndex]) <= stoppingDist;
+	}
+
+	public int GetLoopedIndex(int index)
+	{
+		if (!HasPath())
+		{
+			Debug.LogWarning("Warning, GetLoopedIndex called without a path");
+			return 0;
+		}
+		if (!pathLooping)
+		{
+			return Mathf.Clamp(index, 0, currentPath.Count - 1);
+		}
+		if (index >= currentPath.Count)
+		{
+			return index % currentPath.Count;
+		}
+		if (index < 0)
+		{
+			return currentPath.Count - Mathf.Abs(index % currentPath.Count);
+		}
+		return index;
+	}
+
+	public Vector3 PathDirection(int index)
+	{
+		if (!HasPath() || currentPath.Count <= 1)
+		{
+			return base.transform.forward;
+		}
+		index = GetLoopedIndex(index);
+		Vector3 zero = Vector3.zero;
+		Vector3 zero2 = Vector3.zero;
+		if (pathLooping)
+		{
+			int loopedIndex = GetLoopedIndex(index - 1);
+			zero = currentPath[loopedIndex];
+			zero2 = currentPath[GetLoopedIndex(index)];
+		}
+		else
+		{
+			zero = ((index - 1 >= 0) ? currentPath[index - 1] : base.transform.position);
+			zero2 = currentPath[index];
+		}
+		return (zero2 - zero).normalized;
+	}
+
+	public Vector3 IdealPathPosition()
+	{
+		if (!HasPath())
+		{
+			return base.transform.position;
+		}
+		int loopedIndex = GetLoopedIndex(currentPathIndex - 1);
+		if (loopedIndex == currentPathIndex)
+		{
+			return currentPath[currentPathIndex];
+		}
+		return ClosestPointAlongPath(currentPath[loopedIndex], currentPath[currentPathIndex], base.transform.position);
+	}
+
+	public void AdvancePathMovement()
+	{
+		if (HasPath())
+		{
+			if (AtCurrentPathNode() || currentPathIndex == -1)
+			{
+				currentPathIndex = GetLoopedIndex(currentPathIndex + 1);
+			}
+			if (PathComplete())
+			{
+				ClearPath();
+				return;
+			}
+			Vector3 vector = IdealPathPosition();
+			float a = Vector3.Distance(vector, currentPath[currentPathIndex]);
+			float value = Vector3.Distance(base.transform.position, vector);
+			float num = Mathf.InverseLerp(8f, 0f, value);
+			vector += Direction2D(currentPath[currentPathIndex], vector) * Mathf.Min(a, num * 20f);
+			SetDestination(vector);
+		}
+	}
+
+	public bool GetPathToClosestTurnableNode(BasePathNode start, Vector3 forward, ref List<BasePathNode> nodes)
+	{
+		float num = float.NegativeInfinity;
+		BasePathNode basePathNode = null;
+		foreach (BasePathNode item in start.linked)
+		{
+			float num2 = Vector3.Dot(forward, (item.transform.position - start.transform.position).normalized);
+			if (num2 > num)
+			{
+				num = num2;
+				basePathNode = item;
+			}
+		}
+		if (basePathNode != null)
+		{
+			nodes.Add(basePathNode);
+			if (!basePathNode.straightaway)
+			{
+				return true;
+			}
+			return GetPathToClosestTurnableNode(basePathNode, (basePathNode.transform.position - start.transform.position).normalized, ref nodes);
+		}
+		return false;
+	}
+
+	public bool GetEngagementPath(ref List<BasePathNode> nodes)
+	{
+		BasePathNode closestToPoint = patrolPath.GetClosestToPoint(base.transform.position);
+		Vector3 normalized = (closestToPoint.transform.position - base.transform.position).normalized;
+		if (Vector3.Dot(base.transform.forward, normalized) > 0f)
+		{
+			nodes.Add(closestToPoint);
+			if (!closestToPoint.straightaway)
+			{
+				return true;
+			}
+		}
+		return GetPathToClosestTurnableNode(closestToPoint, base.transform.forward, ref nodes);
+	}
+
+	public void AddOrUpdateTarget(BaseEntity ent, Vector3 pos, float damageFrom = 0f)
+	{
+		if (!(ent is BasePlayer))
+		{
+			return;
+		}
+		TargetInfo targetInfo = null;
+		foreach (TargetInfo target in targetList)
+		{
+			if (target.entity == ent)
+			{
+				targetInfo = target;
+				break;
+			}
+		}
+		if (targetInfo == null)
+		{
+			targetInfo = Facepunch.Pool.Get<TargetInfo>();
+			targetInfo.Setup(ent, UnityEngine.Time.time - 1f);
+			targetList.Add(targetInfo);
+		}
+		targetInfo.lastSeenPosition = pos;
+		targetInfo.damageReceivedFrom += damageFrom;
+	}
+
+	public void UpdateTargetList()
+	{
+		List<BaseEntity> obj = Facepunch.Pool.GetList<BaseEntity>();
+		Vis.Entities(base.transform.position, searchRange, obj, 133120);
+		foreach (BaseEntity item in obj)
+		{
+			if (!(item is BasePlayer))
+			{
+				continue;
+			}
+			BasePlayer basePlayer = item as BasePlayer;
+			if (basePlayer.IsDead() || basePlayer is Scientist || !VisibilityTest(item))
+			{
+				continue;
+			}
+			bool flag = false;
+			foreach (TargetInfo target in targetList)
+			{
+				if (target.entity == item)
+				{
+					target.lastSeenTime = UnityEngine.Time.time;
+					flag = true;
+					break;
+				}
+			}
+			if (!flag)
+			{
+				TargetInfo targetInfo = Facepunch.Pool.Get<TargetInfo>();
+				targetInfo.Setup(item, UnityEngine.Time.time);
+				targetList.Add(targetInfo);
+			}
+		}
+		for (int num = targetList.Count - 1; num >= 0; num--)
+		{
+			TargetInfo obj2 = targetList[num];
+			BasePlayer basePlayer2 = obj2.entity as BasePlayer;
+			if (obj2.entity == null || UnityEngine.Time.time - obj2.lastSeenTime > memoryDuration || basePlayer2.IsDead())
+			{
+				targetList.Remove(obj2);
+				Facepunch.Pool.Free(ref obj2);
+			}
+		}
+		Facepunch.Pool.FreeList(ref obj);
+		targetList.Sort(SortTargets);
+	}
+
+	public int SortTargets(TargetInfo t1, TargetInfo t2)
+	{
+		return t2.GetPriorityScore(this).CompareTo(t1.GetPriorityScore(this));
+	}
+
+	public Vector3 GetAimPoint(BaseEntity ent)
+	{
+		BasePlayer basePlayer = ent as BasePlayer;
+		if (basePlayer != null)
+		{
+			return basePlayer.eyes.position;
+		}
+		return ent.CenterPoint();
+	}
+
+	public bool VisibilityTest(BaseEntity ent)
+	{
+		if (ent == null)
+		{
+			return false;
+		}
+		if (!(Vector3.Distance(ent.transform.position, base.transform.position) < viewDistance))
+		{
+			return false;
+		}
+		bool flag = false;
+		if (ent is BasePlayer)
+		{
+			BasePlayer basePlayer = ent as BasePlayer;
+			Vector3 position = mainTurret.transform.position;
+			flag = IsVisible(basePlayer.eyes.position, position) || IsVisible(basePlayer.transform.position, position);
+		}
+		else
+		{
+			Debug.LogWarning("Standard vis test!");
+			flag = IsVisible(ent.CenterPoint());
+		}
+		object obj = Interface.CallHook("CanBradleyApcTarget", this, ent);
+		if (obj is bool)
+		{
+			return (bool)obj;
+		}
+		return flag;
+	}
+
+	public void UpdateTargetVisibilities()
+	{
+		foreach (TargetInfo target in targetList)
+		{
+			if (target.IsValid() && VisibilityTest(target.entity))
+			{
+				target.lastSeenTime = UnityEngine.Time.time;
+				target.lastSeenPosition = target.entity.transform.position;
+			}
+		}
+	}
+
+	public void DoWeaponAiming()
+	{
+		desiredAimVector = ((mainGunTarget != null) ? (GetAimPoint(mainGunTarget) - mainTurretEyePos.transform.position).normalized : desiredAimVector);
+		BaseEntity baseEntity = null;
+		if (targetList.Count > 0)
+		{
+			if (targetList.Count > 1 && targetList[1].IsValid() && targetList[1].IsVisible())
+			{
+				baseEntity = targetList[1].entity;
+			}
+			else if (targetList[0].IsValid() && targetList[0].IsVisible())
+			{
+				baseEntity = targetList[0].entity;
+			}
+		}
+		desiredTopTurretAimVector = ((baseEntity != null) ? (GetAimPoint(baseEntity) - topTurretEyePos.transform.position).normalized : base.transform.forward);
+	}
+
+	public void DoWeapons()
+	{
+		if (mainGunTarget != null && Vector3.Dot(turretAimVector, (GetAimPoint(mainGunTarget) - mainTurretEyePos.transform.position).normalized) >= 0.99f)
+		{
+			bool flag = VisibilityTest(mainGunTarget);
+			float num = Vector3.Distance(mainGunTarget.transform.position, base.transform.position);
+			if (UnityEngine.Time.time > nextCoaxTime && flag && num <= 40f)
+			{
+				numCoaxBursted++;
+				FireGun(GetAimPoint(mainGunTarget), 3f, isCoax: true);
+				nextCoaxTime = UnityEngine.Time.time + coaxFireRate;
+				if (numCoaxBursted >= coaxBurstLength)
+				{
+					nextCoaxTime = UnityEngine.Time.time + 1f;
+					numCoaxBursted = 0;
+				}
+			}
+			if (num >= 10f && flag)
+			{
+				FireGunTest();
+			}
+		}
+		if (targetList.Count > 1)
+		{
+			BaseEntity entity = targetList[1].entity;
+			if (entity != null && UnityEngine.Time.time > nextTopTurretTime && VisibilityTest(entity))
+			{
+				FireGun(GetAimPoint(targetList[1].entity), 3f, isCoax: false);
+				nextTopTurretTime = UnityEngine.Time.time + topTurretFireRate;
+			}
+		}
+	}
+
+	public void FireGun(Vector3 targetPos, float aimCone, bool isCoax)
+	{
+		Transform transform = (isCoax ? coaxMuzzle : topTurretMuzzle);
+		Vector3 vector = transform.transform.position - transform.forward * 0.25f;
+		Vector3 normalized = (targetPos - vector).normalized;
+		Vector3 modifiedAimConeDirection = AimConeUtil.GetModifiedAimConeDirection(aimCone, normalized);
+		targetPos = vector + modifiedAimConeDirection * 300f;
+		List<RaycastHit> obj = Facepunch.Pool.GetList<RaycastHit>();
+		GamePhysics.TraceAll(new Ray(vector, modifiedAimConeDirection), 0f, obj, 300f, 1219701521);
+		for (int i = 0; i < obj.Count; i++)
+		{
+			RaycastHit hit = obj[i];
+			BaseEntity entity = RaycastHitEx.GetEntity(hit);
+			if (!(entity != null) || (!(entity == this) && !entity.EqualNetID(this)))
+			{
+				BaseCombatEntity baseCombatEntity = entity as BaseCombatEntity;
+				if (baseCombatEntity != null)
+				{
+					ApplyDamage(baseCombatEntity, hit.point, modifiedAimConeDirection);
+				}
+				if (!(entity != null) || entity.ShouldBlockProjectiles())
+				{
+					targetPos = hit.point;
+					break;
+				}
+			}
+		}
+		ClientRPC(null, "CLIENT_FireGun", isCoax, targetPos);
+		Facepunch.Pool.FreeList(ref obj);
+	}
+
+	public void ApplyDamage(BaseCombatEntity entity, Vector3 point, Vector3 normal)
+	{
+		float damageAmount = bulletDamage * UnityEngine.Random.Range(0.9f, 1.1f);
+		HitInfo info = new HitInfo(this, entity, DamageType.Bullet, damageAmount, point);
+		entity.OnAttacked(info);
+		if (entity is BasePlayer || entity is BaseNpc)
+		{
+			Effect.server.ImpactEffect(new HitInfo
+			{
+				HitPositionWorld = point,
+				HitNormalWorld = -normal,
+				HitMaterial = StringPool.Get("Flesh")
+			});
+		}
+	}
+
+	public void AimWeaponAt(Transform weaponYaw, Transform weaponPitch, Vector3 direction, float minPitch = -360f, float maxPitch = 360f, float maxYaw = 360f, Transform parentOverride = null)
+	{
+		Vector3 direction2 = direction;
+		direction2 = weaponYaw.parent.InverseTransformDirection(direction2);
+		Quaternion localRotation = Quaternion.LookRotation(direction2);
+		Vector3 eulerAngles = localRotation.eulerAngles;
+		for (int i = 0; i < 3; i++)
+		{
+			eulerAngles[i] -= ((eulerAngles[i] > 180f) ? 360f : 0f);
+		}
+		Quaternion localRotation2 = Quaternion.Euler(0f, Mathf.Clamp(eulerAngles.y, 0f - maxYaw, maxYaw), 0f);
+		Quaternion localRotation3 = Quaternion.Euler(Mathf.Clamp(eulerAngles.x, minPitch, maxPitch), 0f, 0f);
+		if (weaponYaw == null && weaponPitch != null)
+		{
+			weaponPitch.transform.localRotation = localRotation3;
+			return;
+		}
+		if (weaponPitch == null && weaponYaw != null)
+		{
+			weaponYaw.transform.localRotation = localRotation;
+			return;
+		}
+		weaponYaw.transform.localRotation = localRotation2;
+		weaponPitch.transform.localRotation = localRotation3;
+	}
+
+	public void LateUpdate()
+	{
+		float num = UnityEngine.Time.time - lastLateUpdate;
+		lastLateUpdate = UnityEngine.Time.time;
+		if (base.isServer)
+		{
+			float num2 = (float)Math.PI * 2f / 3f;
+			turretAimVector = Vector3.RotateTowards(turretAimVector, desiredAimVector, num2 * num, 0f);
+		}
+		else
+		{
+			turretAimVector = Vector3.Lerp(turretAimVector, desiredAimVector, UnityEngine.Time.deltaTime * 10f);
+		}
+		AimWeaponAt(mainTurret, coaxPitch, turretAimVector, -90f, 90f);
+		AimWeaponAt(mainTurret, CannonPitch, turretAimVector, -90f, 7f);
+		topTurretAimVector = Vector3.Lerp(topTurretAimVector, desiredTopTurretAimVector, UnityEngine.Time.deltaTime * 5f);
+		AimWeaponAt(topTurretYaw, topTurretPitch, topTurretAimVector, -360f, 360f, 360f, mainTurret);
 	}
 
 	public override void Load(LoadInfo info)
@@ -479,7 +945,7 @@ public class BradleyAPC : BaseCombatEntity
 
 	public void UpdateMovement_Hunt()
 	{
-		if (patrolPath == null)
+		if (Interface.CallHook("OnBradleyApcHunt", this) != null || patrolPath == null)
 		{
 			return;
 		}
@@ -774,7 +1240,7 @@ public class BradleyAPC : BaseCombatEntity
 
 	public override void OnKilled(HitInfo info)
 	{
-		if (base.isClient)
+		if (base.isClient || Interface.CallHook("OnEntityDestroy", this) != null)
 		{
 			return;
 		}
@@ -855,8 +1321,11 @@ public class BradleyAPC : BaseCombatEntity
 	public override void OnHealthChanged(float oldvalue, float newvalue)
 	{
 		base.OnHealthChanged(oldvalue, newvalue);
-		SetFlag(Flags.Reserved2, base.healthFraction <= 0.75f);
-		SetFlag(Flags.Reserved3, base.healthFraction < 0.4f);
+		if (base.isServer)
+		{
+			SetFlag(Flags.Reserved2, base.healthFraction <= 0.75f);
+			SetFlag(Flags.Reserved3, base.healthFraction < 0.4f);
+		}
 	}
 
 	public void DoHealing()
@@ -866,456 +1335,5 @@ public class BradleyAPC : BaseCombatEntity
 			float amount = MaxHealth() / 300f * UnityEngine.Time.fixedDeltaTime;
 			Heal(amount);
 		}
-	}
-
-	public bool HasPath()
-	{
-		if (currentPath != null)
-		{
-			return currentPath.Count > 0;
-		}
-		return false;
-	}
-
-	public void ClearPath()
-	{
-		currentPath.Clear();
-		currentPathIndex = -1;
-	}
-
-	public bool IndexValid(int index)
-	{
-		if (!HasPath())
-		{
-			return false;
-		}
-		if (index >= 0)
-		{
-			return index < currentPath.Count;
-		}
-		return false;
-	}
-
-	public Vector3 GetFinalDestination()
-	{
-		if (!HasPath())
-		{
-			return base.transform.position;
-		}
-		return finalDestination;
-	}
-
-	public Vector3 GetCurrentPathDestination()
-	{
-		if (!HasPath())
-		{
-			return base.transform.position;
-		}
-		return currentPath[currentPathIndex];
-	}
-
-	public bool PathComplete()
-	{
-		if (HasPath())
-		{
-			if (currentPathIndex == currentPath.Count - 1)
-			{
-				return AtCurrentPathNode();
-			}
-			return false;
-		}
-		return true;
-	}
-
-	public bool AtCurrentPathNode()
-	{
-		if (currentPathIndex < 0 || currentPathIndex >= currentPath.Count)
-		{
-			return false;
-		}
-		return Vector3.Distance(base.transform.position, currentPath[currentPathIndex]) <= stoppingDist;
-	}
-
-	public int GetLoopedIndex(int index)
-	{
-		if (!HasPath())
-		{
-			Debug.LogWarning("Warning, GetLoopedIndex called without a path");
-			return 0;
-		}
-		if (!pathLooping)
-		{
-			return Mathf.Clamp(index, 0, currentPath.Count - 1);
-		}
-		if (index >= currentPath.Count)
-		{
-			return index % currentPath.Count;
-		}
-		if (index < 0)
-		{
-			return currentPath.Count - Mathf.Abs(index % currentPath.Count);
-		}
-		return index;
-	}
-
-	public Vector3 PathDirection(int index)
-	{
-		if (!HasPath() || currentPath.Count <= 1)
-		{
-			return base.transform.forward;
-		}
-		index = GetLoopedIndex(index);
-		Vector3 zero = Vector3.zero;
-		Vector3 zero2 = Vector3.zero;
-		if (pathLooping)
-		{
-			int loopedIndex = GetLoopedIndex(index - 1);
-			zero = currentPath[loopedIndex];
-			zero2 = currentPath[GetLoopedIndex(index)];
-		}
-		else
-		{
-			zero = ((index - 1 >= 0) ? currentPath[index - 1] : base.transform.position);
-			zero2 = currentPath[index];
-		}
-		return (zero2 - zero).normalized;
-	}
-
-	public Vector3 IdealPathPosition()
-	{
-		if (!HasPath())
-		{
-			return base.transform.position;
-		}
-		int loopedIndex = GetLoopedIndex(currentPathIndex - 1);
-		if (loopedIndex == currentPathIndex)
-		{
-			return currentPath[currentPathIndex];
-		}
-		return ClosestPointAlongPath(currentPath[loopedIndex], currentPath[currentPathIndex], base.transform.position);
-	}
-
-	public void AdvancePathMovement()
-	{
-		if (HasPath())
-		{
-			if (AtCurrentPathNode() || currentPathIndex == -1)
-			{
-				currentPathIndex = GetLoopedIndex(currentPathIndex + 1);
-			}
-			if (PathComplete())
-			{
-				ClearPath();
-				return;
-			}
-			Vector3 vector = IdealPathPosition();
-			float a = Vector3.Distance(vector, currentPath[currentPathIndex]);
-			float value = Vector3.Distance(base.transform.position, vector);
-			float num = Mathf.InverseLerp(8f, 0f, value);
-			vector += Direction2D(currentPath[currentPathIndex], vector) * Mathf.Min(a, num * 20f);
-			SetDestination(vector);
-		}
-	}
-
-	public bool GetPathToClosestTurnableNode(BasePathNode start, Vector3 forward, ref List<BasePathNode> nodes)
-	{
-		float num = float.NegativeInfinity;
-		BasePathNode basePathNode = null;
-		foreach (BasePathNode item in start.linked)
-		{
-			float num2 = Vector3.Dot(forward, (item.transform.position - start.transform.position).normalized);
-			if (num2 > num)
-			{
-				num = num2;
-				basePathNode = item;
-			}
-		}
-		if (basePathNode != null)
-		{
-			nodes.Add(basePathNode);
-			if (!basePathNode.straightaway)
-			{
-				return true;
-			}
-			return GetPathToClosestTurnableNode(basePathNode, (basePathNode.transform.position - start.transform.position).normalized, ref nodes);
-		}
-		return false;
-	}
-
-	public bool GetEngagementPath(ref List<BasePathNode> nodes)
-	{
-		BasePathNode closestToPoint = patrolPath.GetClosestToPoint(base.transform.position);
-		Vector3 normalized = (closestToPoint.transform.position - base.transform.position).normalized;
-		if (Vector3.Dot(base.transform.forward, normalized) > 0f)
-		{
-			nodes.Add(closestToPoint);
-			if (!closestToPoint.straightaway)
-			{
-				return true;
-			}
-		}
-		return GetPathToClosestTurnableNode(closestToPoint, base.transform.forward, ref nodes);
-	}
-
-	public void AddOrUpdateTarget(BaseEntity ent, Vector3 pos, float damageFrom = 0f)
-	{
-		if (!(ent is BasePlayer))
-		{
-			return;
-		}
-		TargetInfo targetInfo = null;
-		foreach (TargetInfo target in targetList)
-		{
-			if (target.entity == ent)
-			{
-				targetInfo = target;
-				break;
-			}
-		}
-		if (targetInfo == null)
-		{
-			targetInfo = Facepunch.Pool.Get<TargetInfo>();
-			targetInfo.Setup(ent, UnityEngine.Time.time - 1f);
-			targetList.Add(targetInfo);
-		}
-		targetInfo.lastSeenPosition = pos;
-		targetInfo.damageReceivedFrom += damageFrom;
-	}
-
-	public void UpdateTargetList()
-	{
-		List<BaseEntity> obj = Facepunch.Pool.GetList<BaseEntity>();
-		Vis.Entities(base.transform.position, searchRange, obj, 133120);
-		foreach (BaseEntity item in obj)
-		{
-			if (!(item is BasePlayer))
-			{
-				continue;
-			}
-			BasePlayer basePlayer = item as BasePlayer;
-			if (basePlayer.IsDead() || basePlayer is Scientist || !VisibilityTest(item))
-			{
-				continue;
-			}
-			bool flag = false;
-			foreach (TargetInfo target in targetList)
-			{
-				if (target.entity == item)
-				{
-					target.lastSeenTime = UnityEngine.Time.time;
-					flag = true;
-					break;
-				}
-			}
-			if (!flag)
-			{
-				TargetInfo targetInfo = Facepunch.Pool.Get<TargetInfo>();
-				targetInfo.Setup(item, UnityEngine.Time.time);
-				targetList.Add(targetInfo);
-			}
-		}
-		for (int num = targetList.Count - 1; num >= 0; num--)
-		{
-			TargetInfo obj2 = targetList[num];
-			BasePlayer basePlayer2 = obj2.entity as BasePlayer;
-			if (obj2.entity == null || UnityEngine.Time.time - obj2.lastSeenTime > memoryDuration || basePlayer2.IsDead())
-			{
-				targetList.Remove(obj2);
-				Facepunch.Pool.Free(ref obj2);
-			}
-		}
-		Facepunch.Pool.FreeList(ref obj);
-		targetList.Sort(SortTargets);
-	}
-
-	public int SortTargets(TargetInfo t1, TargetInfo t2)
-	{
-		return t2.GetPriorityScore(this).CompareTo(t1.GetPriorityScore(this));
-	}
-
-	public Vector3 GetAimPoint(BaseEntity ent)
-	{
-		BasePlayer basePlayer = ent as BasePlayer;
-		if (basePlayer != null)
-		{
-			return basePlayer.eyes.position;
-		}
-		return ent.CenterPoint();
-	}
-
-	public bool VisibilityTest(BaseEntity ent)
-	{
-		if (ent == null)
-		{
-			return false;
-		}
-		if (!(Vector3.Distance(ent.transform.position, base.transform.position) < viewDistance))
-		{
-			return false;
-		}
-		bool flag = false;
-		if (ent is BasePlayer)
-		{
-			BasePlayer basePlayer = ent as BasePlayer;
-			Vector3 position = mainTurret.transform.position;
-			return IsVisible(basePlayer.eyes.position, position) || IsVisible(basePlayer.transform.position, position);
-		}
-		Debug.LogWarning("Standard vis test!");
-		return IsVisible(ent.CenterPoint());
-	}
-
-	public void UpdateTargetVisibilities()
-	{
-		foreach (TargetInfo target in targetList)
-		{
-			if (target.IsValid() && VisibilityTest(target.entity))
-			{
-				target.lastSeenTime = UnityEngine.Time.time;
-				target.lastSeenPosition = target.entity.transform.position;
-			}
-		}
-	}
-
-	public void DoWeaponAiming()
-	{
-		desiredAimVector = ((mainGunTarget != null) ? (GetAimPoint(mainGunTarget) - mainTurretEyePos.transform.position).normalized : desiredAimVector);
-		BaseEntity baseEntity = null;
-		if (targetList.Count > 0)
-		{
-			if (targetList.Count > 1 && targetList[1].IsValid() && targetList[1].IsVisible())
-			{
-				baseEntity = targetList[1].entity;
-			}
-			else if (targetList[0].IsValid() && targetList[0].IsVisible())
-			{
-				baseEntity = targetList[0].entity;
-			}
-		}
-		desiredTopTurretAimVector = ((baseEntity != null) ? (GetAimPoint(baseEntity) - topTurretEyePos.transform.position).normalized : base.transform.forward);
-	}
-
-	public void DoWeapons()
-	{
-		if (mainGunTarget != null && Vector3.Dot(turretAimVector, (GetAimPoint(mainGunTarget) - mainTurretEyePos.transform.position).normalized) >= 0.99f)
-		{
-			bool flag = VisibilityTest(mainGunTarget);
-			float num = Vector3.Distance(mainGunTarget.transform.position, base.transform.position);
-			if (UnityEngine.Time.time > nextCoaxTime && flag && num <= 40f)
-			{
-				numCoaxBursted++;
-				FireGun(GetAimPoint(mainGunTarget), 3f, isCoax: true);
-				nextCoaxTime = UnityEngine.Time.time + coaxFireRate;
-				if (numCoaxBursted >= coaxBurstLength)
-				{
-					nextCoaxTime = UnityEngine.Time.time + 1f;
-					numCoaxBursted = 0;
-				}
-			}
-			if (num >= 10f && flag)
-			{
-				FireGunTest();
-			}
-		}
-		if (targetList.Count > 1)
-		{
-			BaseEntity entity = targetList[1].entity;
-			if (entity != null && UnityEngine.Time.time > nextTopTurretTime && VisibilityTest(entity))
-			{
-				FireGun(GetAimPoint(targetList[1].entity), 3f, isCoax: false);
-				nextTopTurretTime = UnityEngine.Time.time + topTurretFireRate;
-			}
-		}
-	}
-
-	public void FireGun(Vector3 targetPos, float aimCone, bool isCoax)
-	{
-		Transform transform = (isCoax ? coaxMuzzle : topTurretMuzzle);
-		Vector3 vector = transform.transform.position - transform.forward * 0.25f;
-		Vector3 normalized = (targetPos - vector).normalized;
-		Vector3 modifiedAimConeDirection = AimConeUtil.GetModifiedAimConeDirection(aimCone, normalized);
-		targetPos = vector + modifiedAimConeDirection * 300f;
-		List<RaycastHit> obj = Facepunch.Pool.GetList<RaycastHit>();
-		GamePhysics.TraceAll(new Ray(vector, modifiedAimConeDirection), 0f, obj, 300f, 1219701521);
-		for (int i = 0; i < obj.Count; i++)
-		{
-			RaycastHit hit = obj[i];
-			BaseEntity entity = RaycastHitEx.GetEntity(hit);
-			if (!(entity != null) || (!(entity == this) && !entity.EqualNetID(this)))
-			{
-				BaseCombatEntity baseCombatEntity = entity as BaseCombatEntity;
-				if (baseCombatEntity != null)
-				{
-					ApplyDamage(baseCombatEntity, hit.point, modifiedAimConeDirection);
-				}
-				if (!(entity != null) || entity.ShouldBlockProjectiles())
-				{
-					targetPos = hit.point;
-					break;
-				}
-			}
-		}
-		ClientRPC(null, "CLIENT_FireGun", isCoax, targetPos);
-		Facepunch.Pool.FreeList(ref obj);
-	}
-
-	public void ApplyDamage(BaseCombatEntity entity, Vector3 point, Vector3 normal)
-	{
-		float damageAmount = bulletDamage * UnityEngine.Random.Range(0.9f, 1.1f);
-		HitInfo info = new HitInfo(this, entity, DamageType.Bullet, damageAmount, point);
-		entity.OnAttacked(info);
-		if (entity is BasePlayer || entity is BaseNpc)
-		{
-			Effect.server.ImpactEffect(new HitInfo
-			{
-				HitPositionWorld = point,
-				HitNormalWorld = -normal,
-				HitMaterial = StringPool.Get("Flesh")
-			});
-		}
-	}
-
-	public void AimWeaponAt(Transform weaponYaw, Transform weaponPitch, Vector3 direction, float minPitch = -360f, float maxPitch = 360f, float maxYaw = 360f, Transform parentOverride = null)
-	{
-		Vector3 direction2 = direction;
-		direction2 = weaponYaw.parent.InverseTransformDirection(direction2);
-		Quaternion localRotation = Quaternion.LookRotation(direction2);
-		Vector3 eulerAngles = localRotation.eulerAngles;
-		for (int i = 0; i < 3; i++)
-		{
-			eulerAngles[i] -= ((eulerAngles[i] > 180f) ? 360f : 0f);
-		}
-		Quaternion localRotation2 = Quaternion.Euler(0f, Mathf.Clamp(eulerAngles.y, 0f - maxYaw, maxYaw), 0f);
-		Quaternion localRotation3 = Quaternion.Euler(Mathf.Clamp(eulerAngles.x, minPitch, maxPitch), 0f, 0f);
-		if (weaponYaw == null && weaponPitch != null)
-		{
-			weaponPitch.transform.localRotation = localRotation3;
-			return;
-		}
-		if (weaponPitch == null && weaponYaw != null)
-		{
-			weaponYaw.transform.localRotation = localRotation;
-			return;
-		}
-		weaponYaw.transform.localRotation = localRotation2;
-		weaponPitch.transform.localRotation = localRotation3;
-	}
-
-	public void LateUpdate()
-	{
-		float num = UnityEngine.Time.time - lastLateUpdate;
-		lastLateUpdate = UnityEngine.Time.time;
-		if (base.isServer)
-		{
-			float num2 = (float)Math.PI * 2f / 3f;
-			turretAimVector = Vector3.RotateTowards(turretAimVector, desiredAimVector, num2 * num, 0f);
-		}
-		else
-		{
-			turretAimVector = Vector3.Lerp(turretAimVector, desiredAimVector, UnityEngine.Time.deltaTime * 10f);
-		}
-		AimWeaponAt(mainTurret, coaxPitch, turretAimVector, -90f, 90f);
-		AimWeaponAt(mainTurret, CannonPitch, turretAimVector, -90f, 7f);
-		topTurretAimVector = Vector3.Lerp(topTurretAimVector, desiredTopTurretAimVector, UnityEngine.Time.deltaTime * 5f);
-		AimWeaponAt(topTurretYaw, topTurretPitch, topTurretAimVector, -360f, 360f, 360f, mainTurret);
 	}
 }

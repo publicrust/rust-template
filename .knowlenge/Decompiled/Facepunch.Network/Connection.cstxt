@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
 using Network;
+using SilentOrbit.ProtocolBuffers;
 using UnityEngine;
 
 public class Connection
@@ -54,7 +57,16 @@ public class Connection
 
 		public int GetInt(string k, int def = 0)
 		{
-			return (int)GetFloat(k, def);
+			string @string = GetString(k, null);
+			if (@string == null)
+			{
+				return def;
+			}
+			if (int.TryParse(@string, out var result))
+			{
+				return result;
+			}
+			return def;
 		}
 
 		public bool GetBool(string k, bool def = false)
@@ -72,45 +84,17 @@ public class Connection
 		}
 	}
 
-	public struct TimeAverageValue
-	{
-		private double refreshTime;
+	private static MemoryStream reusableStream = new MemoryStream(1048576);
 
-		private ulong counterPrev;
+	protected MemoryStream recordStream;
 
-		private ulong counterNext;
+	protected BinaryWriter recordWriter;
 
-		public ulong Calculate()
-		{
-			double realtimeSinceStartup = TimeEx.realtimeSinceStartup;
-			double num = realtimeSinceStartup - refreshTime;
-			if (num < 0.0)
-			{
-				num = 0.0;
-				refreshTime = realtimeSinceStartup;
-				counterNext = 0uL;
-			}
-			if (num >= 1.0)
-			{
-				num = 0.0;
-				refreshTime = realtimeSinceStartup;
-				counterPrev = counterNext;
-				counterNext = 0uL;
-			}
-			return (ulong)((double)counterPrev * (1.0 - num)) + counterNext;
-		}
+	protected Stopwatch recordTime;
 
-		public void Increment()
-		{
-			counterNext++;
-		}
+	protected string recordFilename;
 
-		public void Reset()
-		{
-			counterPrev = 0uL;
-			counterNext = 0uL;
-		}
-	}
+	protected IDemoHeader recordHeader;
 
 	public State state;
 
@@ -132,6 +116,8 @@ public class Connection
 
 	public byte[] token;
 
+	public bool hasRequestedWorld;
+
 	public ulong guid;
 
 	public ulong userid;
@@ -144,7 +130,7 @@ public class Connection
 
 	public uint protocol;
 
-	private TimeAverageValue[] packetsPerSecond = new TimeAverageValue[26];
+	private TimeAverageValueData[] packetsPerSecond = new TimeAverageValueData[26];
 
 	public double connectionTime;
 
@@ -156,13 +142,107 @@ public class Connection
 
 	public ClientInfo info = new ClientInfo();
 
+	public TimeSpan RecordTimeElapsed
+	{
+		get
+		{
+			if (recordTime == null)
+			{
+				return TimeSpan.Zero;
+			}
+			return recordTime.Elapsed;
+		}
+	}
+
+	public string RecordFilename => recordFilename;
+
+	public int RecordFilesize => (int)recordStream.Length;
+
+	public bool IsRecording => recordStream != null;
+
 	public bool isAuthenticated => authStatus == "ok";
+
+	public bool StartRecording(string targetFilename, IDemoHeader header)
+	{
+		if (recordStream != null)
+		{
+			return false;
+		}
+		recordFilename = targetFilename;
+		recordHeader = header;
+		recordStream = new MemoryStream();
+		recordWriter = new BinaryWriter(recordStream);
+		recordTime = Stopwatch.StartNew();
+		return true;
+	}
+
+	public void StopRecording()
+	{
+		if (recordStream == null)
+		{
+			return;
+		}
+		if (recordHeader != null)
+		{
+			Directory.CreateDirectory(Path.GetDirectoryName(recordFilename));
+			using (FileStream fileStream = new FileStream(recordFilename, FileMode.Create))
+			{
+				using BinaryWriter writer = new BinaryWriter(fileStream);
+				recordHeader.Length = (long)recordTime.Elapsed.TotalMilliseconds;
+				recordHeader.Write(writer);
+				recordStream.WriteTo(fileStream);
+			}
+			recordHeader = null;
+		}
+		recordTime = null;
+		recordWriter.Close();
+		recordWriter = null;
+		recordStream.Dispose();
+		recordStream = null;
+		recordFilename = null;
+	}
+
+	public void RecordPacket(byte packetId, IProto proto)
+	{
+		if (IsRecording)
+		{
+			reusableStream.SetLength(0L);
+			proto.WriteToStream(reusableStream);
+			byte[] buffer = reusableStream.GetBuffer();
+			int num = (int)reusableStream.Length;
+			recordWriter.Write(num + 1);
+			recordWriter.Write((long)recordTime.Elapsed.TotalMilliseconds);
+			recordWriter.Write((byte)(packetId + 140));
+			recordWriter.Write(buffer, 0, num);
+			recordWriter.Write('\0');
+			recordWriter.Write('\0');
+		}
+	}
+
+	public void RecordPacket(Stream stream)
+	{
+		if (IsRecording)
+		{
+			byte[] buffer = reusableStream.GetBuffer();
+			int num = (int)stream.Length;
+			long position = stream.Position;
+			stream.Position = 0L;
+			stream.Read(buffer, 0, num);
+			stream.Position = position;
+			recordWriter.Write(num);
+			recordWriter.Write((long)recordTime.Elapsed.TotalMilliseconds);
+			recordWriter.Write(buffer, 0, num);
+			recordWriter.Write('\0');
+			recordWriter.Write('\0');
+		}
+	}
 
 	public virtual void OnDisconnected()
 	{
 		player = null;
 		guid = 0uL;
 		ResetPacketsPerSecond();
+		hasRequestedWorld = false;
 	}
 
 	public void ResetPacketsPerSecond()

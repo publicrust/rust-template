@@ -4,7 +4,7 @@ public class TerrainPathConnect : MonoBehaviour
 {
 	public InfrastructureType Type;
 
-	public PathFinder.Point GetPoint(int res)
+	public PathFinder.Point GetPathFinderPoint(int res)
 	{
 		Vector3 position = base.transform.position;
 		float num = TerrainMeta.NormalizeX(position.x);

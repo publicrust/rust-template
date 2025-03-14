@@ -7,7 +7,6 @@ public class MonumentMarker : MonoBehaviour
 
 	public void Setup(MonumentInfo info)
 	{
-		string translated = info.displayPhrase.translated;
-		text.text = (string.IsNullOrEmpty(translated) ? "Monument" : translated);
+		text.text = (info.displayPhrase.IsValid() ? info.displayPhrase.translated : info.transform.root.name);
 	}
 }

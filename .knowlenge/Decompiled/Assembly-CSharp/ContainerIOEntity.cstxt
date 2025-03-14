@@ -3,11 +3,12 @@ using System;
 using ConVar;
 using Facepunch;
 using Network;
+using Oxide.Core;
 using ProtoBuf;
 using UnityEngine;
 using UnityEngine.Assertions;
 
-public class ContainerIOEntity : IOEntity
+public class ContainerIOEntity : IOEntity, IItemContainerEntity
 {
 	public ItemDefinition onlyAllowedItem;
 
@@ -23,7 +24,11 @@ public class ContainerIOEntity : IOEntity
 
 	public bool isLootable = true;
 
-	protected ItemContainer inventory;
+	public float dropChance;
+
+	public bool onlyOneUser;
+
+	public ItemContainer inventory { get; private set; }
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -40,7 +45,7 @@ public class ContainerIOEntity : IOEntity
 				{
 					using (TimeWarning.New("Conditions"))
 					{
-						if (!RPC_Server.IsVisible.Test("RPC_OpenLoot", this, player, 3f))
+						if (!RPC_Server.IsVisible.Test(331989034u, "RPC_OpenLoot", this, player, 3f))
 						{
 							return true;
 						}
@@ -59,14 +64,23 @@ public class ContainerIOEntity : IOEntity
 					}
 					catch (Exception exception)
 					{
-						player.Kick("RPC Error in RPC_OpenLoot");
 						Debug.LogException(exception);
+						player.Kick("RPC Error in RPC_OpenLoot");
 					}
 				}
 				return true;
 			}
 		}
 		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public override bool CanPickup(BasePlayer player)
+	{
+		if (!pickup.requireEmptyInv || inventory == null || inventory.itemList.Count == 0)
+		{
+			return base.CanPickup(player);
+		}
+		return false;
 	}
 
 	public override void ServerInit()
@@ -85,6 +99,16 @@ public class ContainerIOEntity : IOEntity
 		CreateInventory(giveUID: false);
 	}
 
+	public override void PostServerLoad()
+	{
+		base.PostServerLoad();
+		if (inventory != null && inventory.uid == 0)
+		{
+			inventory.GiveUID();
+		}
+		SetFlag(Flags.Open, b: false);
+	}
+
 	public void CreateInventory(bool giveUID)
 	{
 		inventory = new ItemContainer();
@@ -98,6 +122,7 @@ public class ContainerIOEntity : IOEntity
 			inventory.GiveUID();
 		}
 		inventory.onItemAddedRemoved = OnItemAddedOrRemoved;
+		inventory.onDirty += OnInventoryDirty;
 	}
 
 	public override void Save(SaveInfo info)
@@ -125,6 +150,24 @@ public class ContainerIOEntity : IOEntity
 	{
 	}
 
+	protected virtual void OnInventoryDirty()
+	{
+	}
+
+	public override void OnKilled(HitInfo info)
+	{
+		DropItems();
+		base.OnKilled(info);
+	}
+
+	public void DropItems(BaseEntity initiator = null)
+	{
+		if (inventory != null && inventory.itemList != null && inventory.itemList.Count != 0 && dropChance != 0f)
+		{
+			DropUtil.DropItems(inventory, GetDropPosition(), dropChance);
+		}
+	}
+
 	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
 	private void RPC_OpenLoot(RPCMessage rpc)
@@ -132,19 +175,62 @@ public class ContainerIOEntity : IOEntity
 		if (inventory != null)
 		{
 			BasePlayer player = rpc.player;
-			if ((bool)player && player.CanInteract() && (!needsBuildingPrivilegeToUse || player.CanBuild()) && player.inventory.loot.StartLootingEntity(this))
+			if ((bool)player && player.CanInteract())
 			{
-				SetFlag(Flags.Open, b: true);
-				player.inventory.loot.AddContainer(inventory);
-				player.inventory.loot.SendImmediate();
-				player.ClientRPCPlayer(null, player, "RPC_OpenLootPanel", lootPanelName);
-				SendNetworkUpdate();
+				PlayerOpenLoot(player, lootPanelName);
 			}
 		}
 	}
 
+	public virtual bool PlayerOpenLoot(BasePlayer player, string panelToOpen = "", bool doPositionChecks = true)
+	{
+		if (Interface.CallHook("CanLootEntity", player, this) != null)
+		{
+			return false;
+		}
+		if (needsBuildingPrivilegeToUse && !player.CanBuild())
+		{
+			return false;
+		}
+		if (onlyOneUser && IsOpen())
+		{
+			player.ChatMessage("Already in use");
+			return false;
+		}
+		if (panelToOpen == "")
+		{
+			panelToOpen = lootPanelName;
+		}
+		if (player.inventory.loot.StartLootingEntity(this, doPositionChecks))
+		{
+			SetFlag(Flags.Open, b: true);
+			player.inventory.loot.AddContainer(inventory);
+			player.inventory.loot.SendImmediate();
+			player.ClientRPCPlayer(null, player, "RPC_OpenLootPanel", lootPanelName);
+			SendNetworkUpdate();
+			return true;
+		}
+		return false;
+	}
+
 	public virtual void PlayerStoppedLooting(BasePlayer player)
 	{
+		Interface.CallHook("OnLootEntityEnd", player, this);
+		SetFlag(Flags.Open, b: false);
+		SendNetworkUpdate();
+	}
+
+	public bool OccupiedCheck(BasePlayer player = null)
+	{
+		if (player != null && player.inventory.loot.entitySource == this)
+		{
+			return true;
+		}
+		if (onlyOneUser)
+		{
+			return !IsOpen();
+		}
+		return true;
 	}
 
 	public override void Load(LoadInfo info)

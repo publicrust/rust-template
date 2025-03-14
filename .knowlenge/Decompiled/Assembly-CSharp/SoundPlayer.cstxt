@@ -6,6 +6,10 @@ public class SoundPlayer : BaseMonoBehaviour, IClientComponent
 
 	public bool playImmediately = true;
 
+	public float minStartDelay;
+
+	public float maxStartDelay;
+
 	public bool debugRepeat;
 
 	public bool pending;

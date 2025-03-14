@@ -1,0 +1,458 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Reflection.Emit;
+using Harmony;
+using Harmony.ILCopying;
+
+public static class MethodPatcher
+{
+	public static string INSTANCE_PARAM = "__instance";
+
+	public static string ORIGINAL_METHOD_PARAM = "__originalMethod";
+
+	public static string RESULT_VAR = "__result";
+
+	public static string STATE_VAR = "__state";
+
+	public static string PARAM_INDEX_PREFIX = "__";
+
+	public static string INSTANCE_FIELD_PREFIX = "___";
+
+	private static readonly bool DEBUG_METHOD_GENERATION_BY_DLL_CREATION = false;
+
+	private static MethodInfo getMethodMethod = typeof(MethodBase).GetMethod("GetMethodFromHandle", new Type[1] { typeof(RuntimeMethodHandle) });
+
+	[UpgradeToLatestVersion(1)]
+	public static DynamicMethod CreatePatchedMethod(MethodBase original, List<MethodInfo> prefixes, List<MethodInfo> postfixes, List<MethodInfo> transpilers)
+	{
+		return CreatePatchedMethod(original, "HARMONY_PATCH_1.1.1", prefixes, postfixes, transpilers);
+	}
+
+	public static DynamicMethod CreatePatchedMethod(MethodBase original, string harmonyInstanceID, List<MethodInfo> prefixes, List<MethodInfo> postfixes, List<MethodInfo> transpilers)
+	{
+		try
+		{
+			if (HarmonyInstance.DEBUG)
+			{
+				FileLog.LogBuffered(string.Concat("### Patch ", original.DeclaringType, ", ", original));
+			}
+			int num = prefixes.Count() + postfixes.Count();
+			DynamicMethod dynamicMethod = DynamicTools.CreateDynamicMethod(original, "_Patch" + num);
+			if (dynamicMethod == null)
+			{
+				return null;
+			}
+			ILGenerator il = dynamicMethod.GetILGenerator();
+			AssemblyBuilder assemblyBuilder = null;
+			TypeBuilder typeBuilder = null;
+			if (DEBUG_METHOD_GENERATION_BY_DLL_CREATION)
+			{
+				il = DynamicTools.CreateSaveableMethod(original, "_Patch" + num, out assemblyBuilder, out typeBuilder);
+			}
+			LocalBuilder[] existingVariables = DynamicTools.DeclareLocalVariables(original, il);
+			Dictionary<string, LocalBuilder> privateVars = new Dictionary<string, LocalBuilder>();
+			LocalBuilder localBuilder = null;
+			if (num > 0)
+			{
+				localBuilder = DynamicTools.DeclareLocalVariable(il, AccessTools.GetReturnedType(original));
+				privateVars[RESULT_VAR] = localBuilder;
+			}
+			prefixes.ForEach(delegate(MethodInfo prefix)
+			{
+				(from patchParam in prefix.GetParameters()
+					where patchParam.Name == STATE_VAR
+					select patchParam).Do(delegate(ParameterInfo patchParam)
+				{
+					LocalBuilder value = DynamicTools.DeclareLocalVariable(il, patchParam.ParameterType);
+					privateVars[prefix.DeclaringType.FullName] = value;
+				});
+			});
+			Label label = il.DefineLabel();
+			bool flag = AddPrefixes(il, original, prefixes, privateVars, label);
+			MethodCopier methodCopier = new MethodCopier(original, il, existingVariables);
+			foreach (MethodInfo transpiler in transpilers)
+			{
+				methodCopier.AddTranspiler(transpiler);
+			}
+			List<Label> list = new List<Label>();
+			List<ExceptionBlock> list2 = new List<ExceptionBlock>();
+			methodCopier.Finalize(list, list2);
+			foreach (Label item in list)
+			{
+				Emitter.MarkLabel(il, item);
+			}
+			foreach (ExceptionBlock item2 in list2)
+			{
+				Emitter.MarkBlockAfter(il, item2);
+			}
+			if (localBuilder != null)
+			{
+				Emitter.Emit(il, OpCodes.Stloc, localBuilder);
+			}
+			if (flag)
+			{
+				Emitter.MarkLabel(il, label);
+			}
+			AddPostfixes(il, original, postfixes, privateVars, passthroughPatches: false);
+			if (localBuilder != null)
+			{
+				Emitter.Emit(il, OpCodes.Ldloc, localBuilder);
+			}
+			AddPostfixes(il, original, postfixes, privateVars, passthroughPatches: true);
+			Emitter.Emit(il, OpCodes.Ret);
+			if (HarmonyInstance.DEBUG)
+			{
+				FileLog.LogBuffered("DONE");
+				FileLog.LogBuffered("");
+				FileLog.FlushBuffer();
+			}
+			if (DEBUG_METHOD_GENERATION_BY_DLL_CREATION)
+			{
+				DynamicTools.SaveMethod(assemblyBuilder, typeBuilder);
+				return null;
+			}
+			DynamicTools.PrepareDynamicMethod(dynamicMethod);
+			return dynamicMethod;
+		}
+		catch (Exception innerException)
+		{
+			throw new Exception("Exception from HarmonyInstance \"" + harmonyInstanceID + "\"", innerException);
+		}
+		finally
+		{
+			if (HarmonyInstance.DEBUG)
+			{
+				FileLog.FlushBuffer();
+			}
+		}
+	}
+
+	private static OpCode LoadIndOpCodeFor(Type type)
+	{
+		if (type.IsEnum)
+		{
+			return OpCodes.Ldind_I4;
+		}
+		if (type == typeof(float))
+		{
+			return OpCodes.Ldind_R4;
+		}
+		if (type == typeof(double))
+		{
+			return OpCodes.Ldind_R8;
+		}
+		if (type == typeof(byte))
+		{
+			return OpCodes.Ldind_U1;
+		}
+		if (type == typeof(ushort))
+		{
+			return OpCodes.Ldind_U2;
+		}
+		if (type == typeof(uint))
+		{
+			return OpCodes.Ldind_U4;
+		}
+		if (type == typeof(ulong))
+		{
+			return OpCodes.Ldind_I8;
+		}
+		if (type == typeof(sbyte))
+		{
+			return OpCodes.Ldind_I1;
+		}
+		if (type == typeof(short))
+		{
+			return OpCodes.Ldind_I2;
+		}
+		if (type == typeof(int))
+		{
+			return OpCodes.Ldind_I4;
+		}
+		if (type == typeof(long))
+		{
+			return OpCodes.Ldind_I8;
+		}
+		return OpCodes.Ldind_Ref;
+	}
+
+	private static HarmonyArgument GetArgumentAttribute(this ParameterInfo parameter)
+	{
+		return parameter.GetCustomAttributes(inherit: false).FirstOrDefault((object attr) => attr is HarmonyArgument) as HarmonyArgument;
+	}
+
+	private static HarmonyArgument[] GetArgumentAttributes(this MethodInfo method)
+	{
+		return (from attr in method.GetCustomAttributes(inherit: false)
+			where attr is HarmonyArgument
+			select attr).Cast<HarmonyArgument>().ToArray();
+	}
+
+	private static HarmonyArgument[] GetArgumentAttributes(this Type type)
+	{
+		return (from attr in type.GetCustomAttributes(inherit: false)
+			where attr is HarmonyArgument
+			select attr).Cast<HarmonyArgument>().ToArray();
+	}
+
+	private static string GetOriginalArgumentName(this ParameterInfo parameter, string[] originalParameterNames)
+	{
+		HarmonyArgument argumentAttribute = parameter.GetArgumentAttribute();
+		if (argumentAttribute == null)
+		{
+			return null;
+		}
+		if (!string.IsNullOrEmpty(argumentAttribute.OriginalName))
+		{
+			return argumentAttribute.OriginalName;
+		}
+		if (argumentAttribute.Index >= 0 && argumentAttribute.Index < originalParameterNames.Length)
+		{
+			return originalParameterNames[argumentAttribute.Index];
+		}
+		return null;
+	}
+
+	private static string GetOriginalArgumentName(HarmonyArgument[] attributes, string name, string[] originalParameterNames)
+	{
+		if (attributes.Length == 0)
+		{
+			return null;
+		}
+		HarmonyArgument harmonyArgument = attributes.SingleOrDefault((HarmonyArgument p) => p.NewName == name);
+		if (harmonyArgument == null)
+		{
+			return null;
+		}
+		if (!string.IsNullOrEmpty(harmonyArgument.OriginalName))
+		{
+			return harmonyArgument.OriginalName;
+		}
+		if (harmonyArgument.Index >= 0 && harmonyArgument.Index < originalParameterNames.Length)
+		{
+			return originalParameterNames[harmonyArgument.Index];
+		}
+		return null;
+	}
+
+	private static string GetOriginalArgumentName(this MethodInfo method, string[] originalParameterNames, string name)
+	{
+		string originalArgumentName = GetOriginalArgumentName(method.GetArgumentAttributes(), name, originalParameterNames);
+		if (originalArgumentName != null)
+		{
+			return originalArgumentName;
+		}
+		originalArgumentName = GetOriginalArgumentName(method.DeclaringType.GetArgumentAttributes(), name, originalParameterNames);
+		if (originalArgumentName != null)
+		{
+			return originalArgumentName;
+		}
+		return name;
+	}
+
+	private static int GetArgumentIndex(MethodInfo patch, string[] originalParameterNames, ParameterInfo patchParam)
+	{
+		string originalArgumentName = patchParam.GetOriginalArgumentName(originalParameterNames);
+		if (originalArgumentName != null)
+		{
+			return Array.IndexOf(originalParameterNames, originalArgumentName);
+		}
+		string name = patchParam.Name;
+		originalArgumentName = patch.GetOriginalArgumentName(originalParameterNames, name);
+		if (originalArgumentName != null)
+		{
+			return Array.IndexOf(originalParameterNames, originalArgumentName);
+		}
+		return -1;
+	}
+
+	private static void EmitCallParameter(ILGenerator il, MethodBase original, MethodInfo patch, Dictionary<string, LocalBuilder> variables, bool allowFirsParamPassthrough)
+	{
+		bool flag = !original.IsStatic;
+		ParameterInfo[] parameters = original.GetParameters();
+		string[] originalParameterNames = parameters.Select((ParameterInfo p) => p.Name).ToArray();
+		List<ParameterInfo> list = patch.GetParameters().ToList();
+		if (allowFirsParamPassthrough && patch.ReturnType != typeof(void) && list.Count > 0 && list[0].ParameterType == patch.ReturnType)
+		{
+			list.RemoveRange(0, 1);
+		}
+		foreach (ParameterInfo item in list)
+		{
+			if (item.Name == ORIGINAL_METHOD_PARAM)
+			{
+				ConstructorInfo constructorInfo = original as ConstructorInfo;
+				if (constructorInfo != null)
+				{
+					Emitter.Emit(il, OpCodes.Ldtoken, constructorInfo);
+					Emitter.Emit(il, OpCodes.Call, getMethodMethod);
+					continue;
+				}
+				MethodInfo methodInfo = original as MethodInfo;
+				if (methodInfo != null)
+				{
+					Emitter.Emit(il, OpCodes.Ldtoken, methodInfo);
+					Emitter.Emit(il, OpCodes.Call, getMethodMethod);
+				}
+				else
+				{
+					Emitter.Emit(il, OpCodes.Ldnull);
+				}
+				continue;
+			}
+			if (item.Name == INSTANCE_PARAM)
+			{
+				if (original.IsStatic)
+				{
+					Emitter.Emit(il, OpCodes.Ldnull);
+				}
+				else if (item.ParameterType.IsByRef)
+				{
+					Emitter.Emit(il, OpCodes.Ldarga, 0);
+				}
+				else
+				{
+					Emitter.Emit(il, OpCodes.Ldarg_0);
+				}
+				continue;
+			}
+			if (item.Name.StartsWith(INSTANCE_FIELD_PREFIX))
+			{
+				string text = item.Name.Substring(INSTANCE_FIELD_PREFIX.Length);
+				FieldInfo fieldInfo;
+				if (text.All(char.IsDigit))
+				{
+					fieldInfo = AccessTools.Field(original.DeclaringType, int.Parse(text));
+					if (fieldInfo == null)
+					{
+						throw new ArgumentException("No field found at given index in class " + original.DeclaringType.FullName, text);
+					}
+				}
+				else
+				{
+					fieldInfo = AccessTools.Field(original.DeclaringType, text);
+					if (fieldInfo == null)
+					{
+						throw new ArgumentException("No such field defined in class " + original.DeclaringType.FullName, text);
+					}
+				}
+				if (fieldInfo.IsStatic)
+				{
+					if (item.ParameterType.IsByRef)
+					{
+						Emitter.Emit(il, OpCodes.Ldsflda, fieldInfo);
+					}
+					else
+					{
+						Emitter.Emit(il, OpCodes.Ldsfld, fieldInfo);
+					}
+				}
+				else if (item.ParameterType.IsByRef)
+				{
+					Emitter.Emit(il, OpCodes.Ldarg_0);
+					Emitter.Emit(il, OpCodes.Ldflda, fieldInfo);
+				}
+				else
+				{
+					Emitter.Emit(il, OpCodes.Ldarg_0);
+					Emitter.Emit(il, OpCodes.Ldfld, fieldInfo);
+				}
+				continue;
+			}
+			if (item.Name == STATE_VAR)
+			{
+				OpCode opcode = (item.ParameterType.IsByRef ? OpCodes.Ldloca : OpCodes.Ldloc);
+				Emitter.Emit(il, opcode, variables[patch.DeclaringType.FullName]);
+				continue;
+			}
+			if (item.Name == RESULT_VAR)
+			{
+				if (AccessTools.GetReturnedType(original) == typeof(void))
+				{
+					throw new Exception("Cannot get result from void method " + original.FullDescription());
+				}
+				OpCode opcode2 = (item.ParameterType.IsByRef ? OpCodes.Ldloca : OpCodes.Ldloc);
+				Emitter.Emit(il, opcode2, variables[RESULT_VAR]);
+				continue;
+			}
+			int result;
+			if (item.Name.StartsWith(PARAM_INDEX_PREFIX))
+			{
+				string s = item.Name.Substring(PARAM_INDEX_PREFIX.Length);
+				if (!int.TryParse(s, out result))
+				{
+					throw new Exception("Parameter " + item.Name + " does not contain a valid index");
+				}
+				if (result < 0 || result >= parameters.Length)
+				{
+					throw new Exception("No parameter found at index " + result);
+				}
+			}
+			else
+			{
+				result = GetArgumentIndex(patch, originalParameterNames, item);
+				if (result == -1)
+				{
+					throw new Exception("Parameter \"" + item.Name + "\" not found in method " + original.FullDescription());
+				}
+			}
+			bool flag2 = !parameters[result].IsOut && !parameters[result].ParameterType.IsByRef;
+			bool flag3 = !item.IsOut && !item.ParameterType.IsByRef;
+			int arg = result + (flag ? 1 : 0);
+			if (flag2 == flag3)
+			{
+				Emitter.Emit(il, OpCodes.Ldarg, arg);
+				continue;
+			}
+			if (flag2 && !flag3)
+			{
+				Emitter.Emit(il, OpCodes.Ldarga, arg);
+				continue;
+			}
+			Emitter.Emit(il, OpCodes.Ldarg, arg);
+			Emitter.Emit(il, LoadIndOpCodeFor(parameters[result].ParameterType));
+		}
+	}
+
+	private static bool AddPrefixes(ILGenerator il, MethodBase original, List<MethodInfo> prefixes, Dictionary<string, LocalBuilder> variables, Label label)
+	{
+		bool canHaveJump = false;
+		prefixes.ForEach(delegate(MethodInfo fix)
+		{
+			EmitCallParameter(il, original, fix, variables, allowFirsParamPassthrough: false);
+			Emitter.Emit(il, OpCodes.Call, fix);
+			if (fix.ReturnType != typeof(void))
+			{
+				if (fix.ReturnType != typeof(bool))
+				{
+					throw new Exception(string.Concat("Prefix patch ", fix, " has not \"bool\" or \"void\" return type: ", fix.ReturnType));
+				}
+				Emitter.Emit(il, OpCodes.Brfalse, label);
+				canHaveJump = true;
+			}
+		});
+		return canHaveJump;
+	}
+
+	private static void AddPostfixes(ILGenerator il, MethodBase original, List<MethodInfo> postfixes, Dictionary<string, LocalBuilder> variables, bool passthroughPatches)
+	{
+		postfixes.Where((MethodInfo fix) => passthroughPatches == (fix.ReturnType != typeof(void))).Do(delegate(MethodInfo fix)
+		{
+			EmitCallParameter(il, original, fix, variables, allowFirsParamPassthrough: true);
+			Emitter.Emit(il, OpCodes.Call, fix);
+			if (fix.ReturnType != typeof(void))
+			{
+				ParameterInfo parameterInfo = fix.GetParameters().FirstOrDefault();
+				if (parameterInfo == null || !(fix.ReturnType == parameterInfo.ParameterType))
+				{
+					if (parameterInfo != null)
+					{
+						throw new Exception(string.Concat("Return type of postfix patch ", fix, " does match type of its first parameter"));
+					}
+					throw new Exception(string.Concat("Postfix patch ", fix, " must have a \"void\" return type"));
+				}
+			}
+		});
+	}
+}

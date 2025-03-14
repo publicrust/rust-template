@@ -8,8 +8,12 @@ using ProtoBuf;
 using UnityEngine;
 using UnityEngine.Assertions;
 
-public class StorageContainer : DecayEntity
+public class StorageContainer : DecayEntity, IItemContainerEntity, PlayerInventory.ICanMoveFrom
 {
+	public static readonly Translate.Phrase LockedMessage = new Translate.Phrase("storage.locked", "Can't loot right now");
+
+	public static readonly Translate.Phrase InUseMessage = new Translate.Phrase("storage.in_use", "Already in use");
+
 	public int inventorySlots = 6;
 
 	public float dropChance = 0.75f;
@@ -17,6 +21,8 @@ public class StorageContainer : DecayEntity
 	public bool isLootable = true;
 
 	public bool isLockable = true;
+
+	public bool isMonitorable;
 
 	public string panelName = "generic";
 
@@ -41,8 +47,7 @@ public class StorageContainer : DecayEntity
 
 	public bool onlyOneUser;
 
-	[NonSerialized]
-	public ItemContainer inventory;
+	public ItemContainer inventory { get; set; }
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -59,7 +64,7 @@ public class StorageContainer : DecayEntity
 				{
 					using (TimeWarning.New("Conditions"))
 					{
-						if (!RPC_Server.IsVisible.Test("RPC_OpenLoot", this, player, 3f))
+						if (!RPC_Server.IsVisible.Test(331989034u, "RPC_OpenLoot", this, player, 3f))
 						{
 							return true;
 						}
@@ -78,14 +83,24 @@ public class StorageContainer : DecayEntity
 					}
 					catch (Exception exception)
 					{
-						player.Kick("RPC Error in RPC_OpenLoot");
 						Debug.LogException(exception);
+						player.Kick("RPC Error in RPC_OpenLoot");
 					}
 				}
 				return true;
 			}
 		}
 		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public override void ResetState()
+	{
+		base.ResetState();
+		if (base.isServer && inventory != null)
+		{
+			inventory.Clear();
+			inventory = null;
+		}
 	}
 
 	public void OnDrawGizmos()
@@ -150,16 +165,6 @@ public class StorageContainer : DecayEntity
 		}
 	}
 
-	public override void ResetState()
-	{
-		base.ResetState();
-		if (inventory != null)
-		{
-			inventory.Clear();
-		}
-		inventory = null;
-	}
-
 	public override void ServerInit()
 	{
 		if (inventory == null)
@@ -201,10 +206,7 @@ public class StorageContainer : DecayEntity
 		}
 		inventory.onDirty += OnInventoryDirty;
 		inventory.onItemAddedRemoved = OnItemAddedOrRemoved;
-		if (onlyAcceptCategory != ItemCategory.All)
-		{
-			inventory.canAcceptItem = ItemFilter;
-		}
+		inventory.canAcceptItem = ItemFilter;
 	}
 
 	public override void PreServerLoad()
@@ -238,17 +240,8 @@ public class StorageContainer : DecayEntity
 		}
 	}
 
-	public override bool HasSlot(Slot slot)
-	{
-		if (isLockable && slot == Slot.Lock)
-		{
-			return true;
-		}
-		return base.HasSlot(slot);
-	}
-
-	[RPC_Server.IsVisible(3f)]
 	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
 	private void RPC_OpenLoot(RPCMessage rpc)
 	{
 		if (isLootable)
@@ -283,16 +276,25 @@ public class StorageContainer : DecayEntity
 		return true;
 	}
 
+	public virtual void AddContainers(PlayerLoot loot)
+	{
+		loot.AddContainer(inventory);
+	}
+
 	public virtual bool PlayerOpenLoot(BasePlayer player, string panelToOpen = "", bool doPositionChecks = true)
 	{
+		if (Interface.CallHook("CanLootEntity", player, this) != null)
+		{
+			return false;
+		}
 		if (IsLocked())
 		{
-			player.ChatMessage("Can't loot right now");
+			player.ShowToast(1, LockedMessage);
 			return false;
 		}
 		if (onlyOneUser && IsOpen())
 		{
-			player.ChatMessage("Already in use");
+			player.ShowToast(1, InUseMessage);
 			return false;
 		}
 		if (panelToOpen == "")
@@ -306,7 +308,7 @@ public class StorageContainer : DecayEntity
 		if (player.inventory.loot.StartLootingEntity(this, doPositionChecks))
 		{
 			SetFlag(Flags.Open, b: true);
-			player.inventory.loot.AddContainer(inventory);
+			AddContainers(player.inventory.loot);
 			player.inventory.loot.SendImmediate();
 			player.ClientRPCPlayer(null, player, "RPC_OpenLootPanel", panelToOpen);
 			SendNetworkUpdate();
@@ -341,23 +343,32 @@ public class StorageContainer : DecayEntity
 
 	public override void OnKilled(HitInfo info)
 	{
-		DropItems();
+		DropItems(info?.Initiator);
 		base.OnKilled(info);
 	}
 
-	public void DropItems()
+	public void DropItems(BaseEntity initiator = null)
 	{
-		if (inventory != null && inventory.itemList != null && inventory.itemList.Count != 0 && dropChance != 0f)
+		if (inventory == null || inventory.itemList == null || inventory.itemList.Count == 0 || dropChance == 0f)
 		{
-			if (ShouldDropItemsIndividually() || inventory.itemList.Count == 1)
-			{
-				DropUtil.DropItems(inventory, GetDropPosition());
-			}
-			else
-			{
-				_ = inventory.Drop("assets/prefabs/misc/item drop/item_drop.prefab", GetDropPosition(), base.transform.rotation) != null;
-			}
+			return;
 		}
+		if (ShouldDropItemsIndividually() || inventory.itemList.Count == 1)
+		{
+			if (initiator != null)
+			{
+				DropBonusItems(initiator, inventory);
+			}
+			DropUtil.DropItems(inventory, GetDropPosition());
+		}
+		else
+		{
+			_ = inventory.Drop("assets/prefabs/misc/item drop/item_drop.prefab", GetDropPosition(), base.transform.rotation) != null;
+		}
+	}
+
+	public virtual void DropBonusItems(BaseEntity initiator, ItemContainer container)
+	{
 	}
 
 	public override Vector3 GetDropPosition()
@@ -390,6 +401,19 @@ public class StorageContainer : DecayEntity
 				Debug.LogWarning("Storage container without inventory: " + ToString());
 			}
 		}
+	}
+
+	public override bool HasSlot(Slot slot)
+	{
+		if (isLockable && slot == Slot.Lock)
+		{
+			return true;
+		}
+		if (isMonitorable && slot == Slot.StorageMonitor)
+		{
+			return true;
+		}
+		return base.HasSlot(slot);
 	}
 
 	public bool OccupiedCheck(BasePlayer player = null)

@@ -47,8 +47,6 @@ public class HotAirBalloon : BaseCombatEntity
 
 	public Transform fuelStoragePoint;
 
-	public EntityRef fuelStorageInstance;
-
 	public float fuelPerSec = 0.25f;
 
 	[Header("Storage")]
@@ -58,9 +56,14 @@ public class HotAirBalloon : BaseCombatEntity
 
 	public EntityRef storageUnitInstance;
 
+	[Header("Damage")]
+	public DamageRenderer damageRenderer;
+
 	public Transform engineHeight;
 
 	public GameObject[] killTriggers;
+
+	public EntityFuelSystem fuelSystem;
 
 	[ServerVar(Help = "Population active on the server")]
 	public static float population = 1f;
@@ -68,32 +71,26 @@ public class HotAirBalloon : BaseCombatEntity
 	[ServerVar(Help = "How long before a HAB is killed while outside")]
 	public static float outsidedecayminutes = 180f;
 
-	[ServerVar]
-	public static float serviceCeiling = 200f;
-
-	public float currentBuoyancy;
-
 	public float windForce = 30000f;
 
 	public Vector3 currentWindVec = Vector3.zero;
-
-	public float lastBlastTime;
-
-	public float avgTerrainHeight;
 
 	public Bounds collapsedBounds;
 
 	public Bounds raisedBounds;
 
-	public GameObject balloonCollider;
+	public GameObject[] balloonColliders;
+
+	[ServerVar]
+	public static float serviceCeiling = 200f;
+
+	public float currentBuoyancy;
+
+	public float lastBlastTime;
+
+	public float avgTerrainHeight;
 
 	public bool grounded;
-
-	private float nextFuelCheckTime;
-
-	private bool cachedHasFuel;
-
-	private float pendingFuel;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -108,6 +105,13 @@ public class HotAirBalloon : BaseCombatEntity
 				}
 				using (TimeWarning.New("EngineSwitch"))
 				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(578721460u, "EngineSwitch", this, player, 3f))
+						{
+							return true;
+						}
+					}
 					try
 					{
 						using (TimeWarning.New("Call"))
@@ -122,8 +126,8 @@ public class HotAirBalloon : BaseCombatEntity
 					}
 					catch (Exception exception)
 					{
-						player.Kick("RPC Error in EngineSwitch");
 						Debug.LogException(exception);
+						player.Kick("RPC Error in EngineSwitch");
 					}
 				}
 				return true;
@@ -151,14 +155,19 @@ public class HotAirBalloon : BaseCombatEntity
 					}
 					catch (Exception exception2)
 					{
-						player.Kick("RPC Error in RPC_OpenFuel");
 						Debug.LogException(exception2);
+						player.Kick("RPC Error in RPC_OpenFuel");
 					}
 				}
 				return true;
 			}
 		}
 		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public override void InitShared()
+	{
+		fuelSystem = new EntityFuelSystem(this, base.isServer);
 	}
 
 	public override void Load(LoadInfo info)
@@ -174,14 +183,14 @@ public class HotAirBalloon : BaseCombatEntity
 		}
 		if (info.msg.motorBoat != null)
 		{
-			fuelStorageInstance.uid = info.msg.motorBoat.fuelStorageID;
+			fuelSystem.fuelStorageInstance.uid = info.msg.motorBoat.fuelStorageID;
 			storageUnitInstance.uid = info.msg.motorBoat.storageid;
 		}
 	}
 
 	public bool WaterLogged()
 	{
-		return WaterLevel.Test(engineHeight.position);
+		return WaterLevel.Test(engineHeight.position, waves: true, this);
 	}
 
 	public override float GetNetworkTime()
@@ -203,10 +212,7 @@ public class HotAirBalloon : BaseCombatEntity
 			baseEntity.Spawn();
 			baseEntity.SetParent(this);
 			storageUnitInstance.Set(baseEntity);
-			BaseEntity baseEntity2 = GameManager.server.CreateEntity(fuelStoragePrefab.resourcePath, fuelStoragePoint.localPosition, fuelStoragePoint.localRotation);
-			baseEntity2.Spawn();
-			baseEntity2.SetParent(this);
-			fuelStorageInstance.Set(baseEntity2);
+			fuelSystem.SpawnFuelStorage(fuelStoragePrefab, fuelStoragePoint);
 		}
 	}
 
@@ -214,9 +220,9 @@ public class HotAirBalloon : BaseCombatEntity
 	public void RPC_OpenFuel(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
-		if (!(player == null) && fuelStorageInstance.IsValid(base.isServer))
+		if (!(player == null))
 		{
-			fuelStorageInstance.Get(base.isServer).GetComponent<StorageContainer>().PlayerOpenLoot(player);
+			fuelSystem.LootFuel(player);
 		}
 	}
 
@@ -237,7 +243,7 @@ public class HotAirBalloon : BaseCombatEntity
 		}
 		info.msg.motorBoat = Facepunch.Pool.Get<Motorboat>();
 		info.msg.motorBoat.storageid = storageUnitInstance.uid;
-		info.msg.motorBoat.fuelStorageID = fuelStorageInstance.uid;
+		info.msg.motorBoat.fuelStorageID = fuelSystem.fuelStorageInstance.uid;
 	}
 
 	public override void ServerInit()
@@ -264,6 +270,7 @@ public class HotAirBalloon : BaseCombatEntity
 	}
 
 	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
 	public void EngineSwitch(RPCMessage msg)
 	{
 		if (Interface.CallHook("OnHotAirBalloonToggle", this, msg.player) == null)
@@ -301,19 +308,19 @@ public class HotAirBalloon : BaseCombatEntity
 
 	protected void FixedUpdate()
 	{
-		if (base.isClient)
+		if (!isSpawned || base.isClient)
 		{
 			return;
 		}
-		if (!HasFuel() || WaterLogged())
+		if (!fuelSystem.HasFuel() || WaterLogged())
 		{
 			SetFlag(Flags.On, b: false);
 		}
 		if (IsOn())
 		{
-			UseFuel(UnityEngine.Time.fixedDeltaTime);
+			fuelSystem.TryUseFuel(UnityEngine.Time.fixedDeltaTime, fuelPerSec);
 		}
-		SetFlag(Flags.Reserved6, HasFuel());
+		SetFlag(Flags.Reserved6, fuelSystem.HasFuel());
 		GameObject[] array = killTriggers;
 		foreach (GameObject obj in array)
 		{
@@ -334,19 +341,21 @@ public class HotAirBalloon : BaseCombatEntity
 			if (inflationLevel == 1f)
 			{
 				bounds = raisedBounds;
-				balloonCollider.SetActive(value: true);
 			}
 			else if (inflationLevel == 0f)
 			{
 				bounds = collapsedBounds;
-				balloonCollider.SetActive(value: false);
 			}
 			SetFlag(Flags.Reserved1, inflationLevel > 0.3f);
 			SetFlag(Flags.Reserved2, inflationLevel >= 1f);
 			SendNetworkUpdate();
 			_ = inflationLevel;
 		}
-		balloonCollider.SetActive(!myRigidbody.IsSleeping() || inflationLevel > 0f);
+		array = balloonColliders;
+		for (int i = 0; i < array.Length; i++)
+		{
+			array[i].SetActive(!myRigidbody.IsSleeping() || inflationLevel > 0f);
+		}
 		if (IsOn())
 		{
 			if (inflationLevel >= 1f)
@@ -392,62 +401,11 @@ public class HotAirBalloon : BaseCombatEntity
 
 	public override Quaternion GetAngularVelocityServer()
 	{
+		if (myRigidbody.angularVelocity.sqrMagnitude < 0.1f)
+		{
+			return Quaternion.identity;
+		}
 		return Quaternion.LookRotation(myRigidbody.angularVelocity, base.transform.up);
-	}
-
-	public int GetFuelAmount()
-	{
-		if (!fuelStorageInstance.IsValid(base.isServer))
-		{
-			return 0;
-		}
-		StorageContainer component = fuelStorageInstance.Get(base.isServer).GetComponent<StorageContainer>();
-		if (component == null)
-		{
-			return 0;
-		}
-		Item slot = component.inventory.GetSlot(0);
-		if (slot == null || slot.amount < 1)
-		{
-			return 0;
-		}
-		return slot.amount;
-	}
-
-	public virtual bool HasFuel(bool forceCheck = false)
-	{
-		if (UnityEngine.Time.time > nextFuelCheckTime || forceCheck)
-		{
-			cachedHasFuel = (float)GetFuelAmount() > 0f;
-			nextFuelCheckTime = UnityEngine.Time.time + UnityEngine.Random.Range(1f, 2f);
-		}
-		return cachedHasFuel;
-	}
-
-	public virtual bool UseFuel(float seconds)
-	{
-		if (!fuelStorageInstance.IsValid(base.isServer))
-		{
-			return false;
-		}
-		StorageContainer component = fuelStorageInstance.Get(base.isServer).GetComponent<StorageContainer>();
-		if (component == null)
-		{
-			return false;
-		}
-		Item slot = component.inventory.GetSlot(0);
-		if (slot == null || slot.amount < 1)
-		{
-			return false;
-		}
-		pendingFuel += seconds * fuelPerSec;
-		if (pendingFuel >= 1f)
-		{
-			int num = Mathf.FloorToInt(pendingFuel);
-			slot.UseItem(num);
-			pendingFuel -= num;
-		}
-		return true;
 	}
 
 	public Vector3 GetWindAtPos(Vector3 pos)

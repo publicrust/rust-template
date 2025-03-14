@@ -6,17 +6,16 @@ using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Threading;
 using ObjectStream.Data;
-using Oxide;
 using Oxide.Core;
 using Oxide.Core.Extensions;
-using Oxide.Core.Logging;
 using Oxide.Core.Plugins;
-using Oxide.Logging;
 using Oxide.Plugins;
 
 internal class Compilation
 {
 	public static Compilation Current;
+
+	private static readonly Regex SymbolEscapeRegex = new Regex("[^\\w\\d]", RegexOptions.Compiled);
 
 	internal int id;
 
@@ -42,6 +41,12 @@ internal class Compilation
 
 	private string[] extensionNames;
 
+	private string gameExtensionNamespace;
+
+	private readonly string gameExtensionName;
+
+	private readonly string gameExtensionBranch;
+
 	internal float duration => endedAt - startedAt;
 
 	internal Compilation(int id, Action<Compilation> callback, CompilablePlugin[] plugins)
@@ -61,19 +66,24 @@ internal class Compilation
 		includePath = Path.Combine(Interface.Oxide.PluginDirectory, "include");
 		extensionNames = (from ext in Interface.Oxide.GetAllExtensions()
 			select ext.Name).ToArray();
+		Extension extension = Interface.Oxide.GetAllExtensions().SingleOrDefault((Extension ext) => ext.IsGameExtension);
+		gameExtensionName = extension?.Name.ToUpper();
+		gameExtensionNamespace = extension?.GetType().Namespace;
+		gameExtensionBranch = extension?.Branch?.ToUpper();
 	}
 
 	internal void Started()
 	{
+		startedAt = Interface.Oxide.Now;
 		name = ((plugins.Count < 2) ? plugins.First().Name : "plugins_") + Math.Round(Interface.Oxide.Now * 10000000f) + ".dll";
 	}
 
-	internal void Completed(byte[] rawAssembly = null, byte[] symbols = null)
+	internal void Completed(byte[] rawAssembly = null)
 	{
 		endedAt = Interface.Oxide.Now;
 		if (plugins.Count > 0 && rawAssembly != null)
 		{
-			compiledAssembly = new CompiledAssembly(name, plugins.ToArray(), rawAssembly, duration, symbols);
+			compiledAssembly = new CompiledAssembly(name, plugins.ToArray(), rawAssembly, duration);
 		}
 		Interface.Oxide.NextTick(delegate
 		{
@@ -126,30 +136,15 @@ internal class Compilation
 				references.Clear();
 				foreach (string pluginReference in CSharpPluginLoader.PluginReferences)
 				{
-					bool flag = true;
 					if (File.Exists(Path.Combine(Interface.Oxide.ExtensionDirectory, pluginReference + ".dll")))
 					{
-						references[pluginReference + ".dll"] = CompilerFile.CachedReadFile(Interface.Oxide.ExtensionDirectory, pluginReference + ".dll");
+						references[pluginReference + ".dll"] = new CompilerFile(Interface.Oxide.ExtensionDirectory, pluginReference + ".dll");
 					}
-					else if (File.Exists(Path.Combine(Interface.Oxide.ExtensionDirectory, pluginReference + ".exe")))
+					if (File.Exists(Path.Combine(Interface.Oxide.ExtensionDirectory, pluginReference + ".exe")))
 					{
-						references[pluginReference + ".exe"] = CompilerFile.CachedReadFile(Interface.Oxide.ExtensionDirectory, pluginReference + ".exe");
-					}
-					else if (File.Exists(Path.Combine(Interface.Oxide.RootDirectory, pluginReference + ".exe")))
-					{
-						references[pluginReference + ".exe"] = CompilerFile.CachedReadFile(Interface.Oxide.RootDirectory, pluginReference + ".exe");
-					}
-					else
-					{
-						flag = false;
-					}
-					if (!flag)
-					{
-						Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.Compile, "CSharp", "Failed to add default reference: " + pluginReference + " - Not found!");
+						references[pluginReference + ".exe"] = new CompilerFile(Interface.Oxide.RootDirectory, pluginReference + ".exe");
 					}
 				}
-				Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Compile, "CSharp", "Preparing compilation");
-				List<CompilablePlugin> list = new List<CompilablePlugin>();
 				CompilablePlugin value;
 				while (queuedPlugins.TryDequeue(out value))
 				{
@@ -162,18 +157,13 @@ internal class Compilation
 						value.References.Clear();
 						value.IncludePaths.Clear();
 						value.Requires.Clear();
-						Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.Compile, "CSharp", "Script file is empty: " + value.Name);
+						Interface.Oxide.LogWarning("Plugin script is empty: " + value.Name);
 						RemovePlugin(value);
 					}
-					if (!list.Contains(value))
+					else if (plugins.Add(value))
 					{
-						list.Add(value);
 						PreparseScript(value);
 						ResolveReferences(value);
-					}
-					else
-					{
-						Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.Compile, "CSharp", "Plugin is already part of the compilation: " + value.Name);
 					}
 					CacheModifiedScripts();
 					if (queuedPlugins.Count == 0 && Current == this)
@@ -181,19 +171,6 @@ internal class Compilation
 						Current = null;
 					}
 				}
-				list.Sort((CompilablePlugin x, CompilablePlugin y) => string.Compare(x.Name, y.Name, StringComparison.Ordinal));
-				foreach (CompilablePlugin item in list)
-				{
-					if (!plugins.Add(item))
-					{
-						Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.Compile, "CSharp", "Failed to add plugin to compilation: " + item.Name);
-					}
-					else
-					{
-						Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Compile, "CSharp", "Added plugin to compilation: " + item.Name);
-					}
-				}
-				Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Compile, "CSharp", "Done preparing compilation: " + Oxide.Plugins.ExtensionMethods.ToSentence(plugins.Select((CompilablePlugin p) => p.Name)));
 				callback();
 			}
 			catch (Exception ex)
@@ -269,7 +246,7 @@ internal class Compilation
 			if (match.Success)
 			{
 				string value3 = match.Groups[1].Value;
-				if (!value3.StartsWith("Oxide.") && !value3.Contains("Newtonsoft.Json") && !value3.Contains("protobuf-net"))
+				if ((!value3.StartsWith("Oxide.") && !value3.Contains("Newtonsoft.Json") && !value3.Contains("protobuf-net")) || (!CSharpExtension.SandboxEnabled && !value3.Contains("Harmony")))
 				{
 					AddReference(plugin, value3);
 					Interface.Oxide.LogInfo("Added '// Reference: {0}' in plugin '{1}'", value3, plugin.Name);
@@ -403,16 +380,12 @@ internal class Compilation
 
 	private void AddReference(CompilablePlugin plugin, AssemblyName reference)
 	{
-		string text = reference.Name + ".dll";
-		if (!references.ContainsKey(text))
+		string key = reference.Name + ".dll";
+		if (!references.ContainsKey(key))
 		{
-			Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Compile, "CSharp", reference.Name + " has been added as a reference");
-			references[text] = CompilerFile.CachedReadFile(Interface.Oxide.ExtensionDirectory, text);
+			references[key] = new CompilerFile(Interface.Oxide.ExtensionDirectory, key);
 		}
-		if (!plugin.References.Contains(reference.Name))
-		{
-			plugin.References.Add(reference.Name);
-		}
+		plugin.References.Add(reference.Name);
 	}
 
 	private bool CacheScriptLines(CompilablePlugin plugin)
@@ -438,6 +411,16 @@ internal class Compilation
 						while (!streamReader.EndOfStream)
 						{
 							list.Add(streamReader.ReadLine());
+						}
+						if (!string.IsNullOrEmpty(gameExtensionName))
+						{
+							string text = EscapeSymbolName(gameExtensionName);
+							list.Insert(0, "#define " + text);
+							if (!string.IsNullOrEmpty(gameExtensionBranch) && gameExtensionBranch != "public")
+							{
+								string text2 = EscapeSymbolName(gameExtensionBranch);
+								list.Insert(0, "#define " + text + text2);
+							}
 						}
 						plugin.ScriptLines = list.ToArray();
 						plugin.ScriptEncoding = streamReader.CurrentEncoding;
@@ -494,5 +477,10 @@ internal class Compilation
 				RemovePlugin(requiredPlugin);
 			}
 		}
+	}
+
+	private string EscapeSymbolName(string name)
+	{
+		return SymbolEscapeRegex.Replace(name, "_");
 	}
 }

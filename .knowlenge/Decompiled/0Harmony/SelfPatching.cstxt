@@ -1,0 +1,141 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
+using Harmony;
+using Harmony.ILCopying;
+using Harmony.Tools;
+
+internal class SelfPatching
+{
+	private static readonly int upgradeToLatestVersionFullNameHash = typeof(UpgradeToLatestVersion).FullName.GetHashCode();
+
+	[UpgradeToLatestVersion(1)]
+	private static int GetVersion(MethodBase method)
+	{
+		object obj = (from attr in method.GetCustomAttributes(inherit: false)
+			where attr.GetType().FullName.GetHashCode() == upgradeToLatestVersionFullNameHash
+			select attr).FirstOrDefault();
+		if (obj == null)
+		{
+			return -1;
+		}
+		return Traverse.Create(obj).Field("version").GetValue<int>();
+	}
+
+	[UpgradeToLatestVersion(1)]
+	private static string MethodKey(MethodBase method)
+	{
+		return method.FullDescription();
+	}
+
+	[UpgradeToLatestVersion(1)]
+	private static bool IsHarmonyAssembly(Assembly assembly)
+	{
+		try
+		{
+			return !assembly.ReflectionOnly && assembly.GetType(typeof(HarmonyInstance).FullName) != null;
+		}
+		catch (Exception)
+		{
+			return false;
+		}
+	}
+
+	private static List<MethodBase> GetAllMethods(Assembly assembly)
+	{
+		Type[] types = assembly.GetTypes();
+		return (from method in types.SelectMany((Type type) => type.GetMethods(AccessTools.all).Cast<MethodBase>()).Concat(types.SelectMany((Type type) => type.GetConstructors(AccessTools.all)).Cast<MethodBase>()).Concat((from prop in types.SelectMany((Type type) => type.GetProperties(AccessTools.all))
+				select prop.GetGetMethod()).Cast<MethodBase>())
+				.Concat((from prop in types.SelectMany((Type type) => type.GetProperties(AccessTools.all))
+					select prop.GetSetMethod()).Cast<MethodBase>())
+			where method != null && method.DeclaringType.Assembly == assembly
+			orderby method.FullDescription()
+			select method).ToList();
+	}
+
+	private static string AssemblyInfo(Assembly assembly)
+	{
+		Version version = assembly.GetName().Version;
+		string text = assembly.Location;
+		if (text == null || text == "")
+		{
+			text = new Uri(assembly.CodeBase).LocalPath;
+		}
+		return string.Concat(text, "(v", version, assembly.GlobalAssemblyCache ? ", cached" : "", ")");
+	}
+
+	[UpgradeToLatestVersion(1)]
+	public static void PatchOldHarmonyMethods()
+	{
+		Stopwatch stopwatch = new Stopwatch();
+		stopwatch.Start();
+		Assembly ourAssembly = new StackTrace(fNeedFileInfo: true).GetFrame(1).GetMethod().DeclaringType.Assembly;
+		if (HarmonyInstance.DEBUG)
+		{
+			Version version = ourAssembly.GetName().Version;
+			Version version2 = typeof(SelfPatching).Assembly.GetName().Version;
+			if (version2 > version)
+			{
+				FileLog.Log(string.Concat("### Harmony v", version, " started"));
+				FileLog.Log("### Self-patching unnecessary because we are already patched by v" + version2);
+				FileLog.Log("### At " + DateTime.Now.ToString("yyyy-MM-dd hh.mm.ss"));
+				return;
+			}
+			FileLog.Log(string.Concat("Self-patching started (v", version, ")"));
+		}
+		Dictionary<string, MethodBase> potentialMethodsToUpgrade = new Dictionary<string, MethodBase>();
+		(from method in GetAllMethods(ourAssembly)
+			where method != null && method.GetCustomAttributes(inherit: false).Any((object attr) => attr is UpgradeToLatestVersion)
+			select method).Do(delegate(MethodBase method)
+		{
+			potentialMethodsToUpgrade.Add(MethodKey(method), method);
+		});
+		List<Assembly> list = (from assembly in AppDomain.CurrentDomain.GetAssemblies()
+			where IsHarmonyAssembly(assembly) && assembly != ourAssembly
+			select assembly).ToList();
+		if (HarmonyInstance.DEBUG)
+		{
+			list.Do(delegate(Assembly assembly)
+			{
+				FileLog.Log("Found Harmony " + AssemblyInfo(assembly));
+			});
+			FileLog.Log("Potential methods to upgrade:");
+			potentialMethodsToUpgrade.Values.OrderBy((MethodBase method) => method.FullDescription()).Do(delegate(MethodBase method)
+			{
+				FileLog.Log("- " + method.FullDescription());
+			});
+		}
+		int num = 0;
+		int num2 = 0;
+		int num3 = 0;
+		foreach (Assembly item in list)
+		{
+			foreach (MethodBase allMethod in GetAllMethods(item))
+			{
+				num++;
+				if (!potentialMethodsToUpgrade.TryGetValue(MethodKey(allMethod), out var value))
+				{
+					continue;
+				}
+				int version3 = GetVersion(value);
+				num2++;
+				int version4 = GetVersion(allMethod);
+				if (version4 < version3)
+				{
+					if (HarmonyInstance.DEBUG)
+					{
+						FileLog.Log("Self-patching " + allMethod.FullDescription() + " in " + AssemblyInfo(item));
+					}
+					num3++;
+					Memory.DetourMethod(allMethod, value);
+				}
+			}
+		}
+		if (HarmonyInstance.DEBUG)
+		{
+			FileLog.Log("Self-patched " + num3 + " out of " + num + " methods (" + (num2 - num3) + " skipped) in " + stopwatch.ElapsedMilliseconds + "ms");
+		}
+	}
+}

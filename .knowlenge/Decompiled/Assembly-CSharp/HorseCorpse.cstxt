@@ -5,6 +5,10 @@ public class HorseCorpse : LootableCorpse
 {
 	public int breedIndex;
 
+	public Translate.Phrase lootPanelTitle;
+
+	public override string playerName => lootPanelTitle.translated;
+
 	public override void Save(SaveInfo info)
 	{
 		base.Save(info);

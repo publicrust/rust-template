@@ -3,6 +3,7 @@ using System;
 using ConVar;
 using Facepunch;
 using Network;
+using Oxide.Core;
 using ProtoBuf;
 using Rust;
 using UnityEngine;
@@ -10,6 +11,19 @@ using UnityEngine.Assertions;
 
 public class MiniCopter : BaseHelicopterVehicle
 {
+	[Header("Fuel")]
+	public GameObjectRef fuelStoragePrefab;
+
+	public Transform fuelStoragePoint;
+
+	public float fuelPerSec = 0.25f;
+
+	public float fuelGaugeMax = 100f;
+
+	public EntityFuelSystem fuelSystem;
+
+	public float cachedFuelFraction;
+
 	public Transform waterSample;
 
 	public WheelCollider leftWheel;
@@ -66,12 +80,17 @@ public class MiniCopter : BaseHelicopterVehicle
 	public GameObject preventBuildingObject;
 
 	[ServerVar(Help = "Population active on the server")]
-	public static float population = 1f;
+	public static float population = 0f;
 
 	[ServerVar(Help = "How long before a minicopter is killed while outside")]
-	public static float outsidedecayminutes = 240f;
+	public static float outsidedecayminutes = 480f;
 
-	private float lastEngineTime;
+	[ServerVar(Help = "How long before a minicopter is killed while indoors")]
+	public static float insidedecayminutes = 2880f;
+
+	public bool isPushing;
+
+	public float lastEngineTime;
 
 	public float cachedPitch;
 
@@ -79,30 +98,43 @@ public class MiniCopter : BaseHelicopterVehicle
 
 	public float cachedRoll;
 
-	[Header("Fuel")]
-	public GameObjectRef fuelStoragePrefab;
+	public float GetFuelFraction()
+	{
+		if (base.isServer)
+		{
+			cachedFuelFraction = Mathf.Clamp01((float)fuelSystem.GetFuelAmount() / fuelGaugeMax);
+		}
+		return cachedFuelFraction;
+	}
 
-	public Transform fuelStoragePoint;
+	public override EntityFuelSystem GetFuelSystem()
+	{
+		return fuelSystem;
+	}
 
-	public EntityRef fuelStorageInstance;
-
-	public float fuelPerSec = 0.25f;
-
-	public float fuelGaugeMax = 100f;
-
-	public float maxFuelLootDistance = 2.1f;
-
-	public float cachedFuelFraction;
-
-	private float nextFuelCheckTime;
-
-	private bool cachedHasFuel;
-
-	private float pendingFuel;
+	[RPC_Server]
+	[RPC_Server.IsVisible(6f)]
+	public void RPC_OpenFuel(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (!(player == null))
+		{
+			BasePlayer driver = GetDriver();
+			if ((!(driver != null) || !(driver != player)) && (!IsSafe() || !(player != creatorEntity)))
+			{
+				fuelSystem.LootFuel(player);
+			}
+		}
+	}
 
 	public bool IsStartingUp()
 	{
 		return HasFlag(Flags.Reserved4);
+	}
+
+	public override void InitShared()
+	{
+		fuelSystem = new EntityFuelSystem(this, base.isServer);
 	}
 
 	public override float GetServiceCeiling()
@@ -113,7 +145,7 @@ public class MiniCopter : BaseHelicopterVehicle
 	public override void PilotInput(InputState inputState, BasePlayer player)
 	{
 		base.PilotInput(inputState, player);
-		if (!IsOn() && !IsStartingUp() && HasDriver() && inputState.IsDown(BUTTON.FORWARD) && HasFuel())
+		if (!IsOn() && !IsStartingUp() && HasDriver() && inputState.IsDown(BUTTON.FORWARD) && fuelSystem.HasFuel())
 		{
 			EngineStartup();
 		}
@@ -189,6 +221,12 @@ public class MiniCopter : BaseHelicopterVehicle
 				num2 = 0f;
 			}
 			num2 *= (IsOn() ? 1f : 0f);
+			if (isPushing)
+			{
+				num = 0f;
+				num2 = 0.1f;
+				num3 = 0f;
+			}
 			ApplyWheelForce(frontWheel, num2, num, num3);
 			ApplyWheelForce(leftWheel, num2, num, 0f);
 			ApplyWheelForce(rightWheel, num2, num, 0f);
@@ -231,7 +269,7 @@ public class MiniCopter : BaseHelicopterVehicle
 
 	public void EngineStartup()
 	{
-		if (!Waterlogged())
+		if (!Waterlogged() && Interface.CallHook("OnEngineStart", this, GetDriver()) == null)
 		{
 			Invoke(EngineOn, 5f);
 			SetFlag(Flags.Reserved4, b: true);
@@ -242,13 +280,14 @@ public class MiniCopter : BaseHelicopterVehicle
 	{
 		SetFlag(Flags.On, b: true);
 		SetFlag(Flags.Reserved4, b: false);
-		lastEngineTime = UnityEngine.Time.time;
+		Interface.CallHook("OnEngineStarted", this, GetDriver());
 	}
 
 	public void EngineOff()
 	{
 		if (IsOn() || IsStartingUp())
 		{
+			CancelInvoke(EngineOn);
 			SetFlag(Flags.On, b: false);
 			SetFlag(Flags.Reserved4, b: false);
 			lastEngineTime = UnityEngine.Time.time;
@@ -266,22 +305,22 @@ public class MiniCopter : BaseHelicopterVehicle
 
 	public void DecayTick()
 	{
-		if (base.healthFraction != 0f && !(UnityEngine.Time.time < lastEngineTime + 600f))
+		if (base.healthFraction != 0f && !IsOn() && !(UnityEngine.Time.time < lastEngineTime + 600f))
 		{
-			float num = 1f / HotAirBalloon.outsidedecayminutes;
-			Hurt(MaxHealth() * num * (IsOutside() ? 1f : 0.5f), DamageType.Decay, this, useProtection: false);
+			float num = 1f / (IsOutside() ? outsidedecayminutes : insidedecayminutes);
+			Hurt(MaxHealth() * num, DamageType.Decay, this, useProtection: false);
 		}
 	}
 
 	public override void SpawnSubEntities()
 	{
 		base.SpawnSubEntities();
-		SpawnFuelObject();
+		fuelSystem.SpawnFuelStorage(fuelStoragePrefab, fuelStoragePoint);
 	}
 
 	public bool Waterlogged()
 	{
-		return WaterLevel.Test(waterSample.transform.position);
+		return WaterLevel.Test(waterSample.transform.position, waves: true, this);
 	}
 
 	public override bool ShouldApplyHoverForce()
@@ -297,21 +336,24 @@ public class MiniCopter : BaseHelicopterVehicle
 	public override void VehicleFixedUpdate()
 	{
 		base.VehicleFixedUpdate();
-		if (IsOn())
+		if (isSpawned)
 		{
-			UseFuel(UnityEngine.Time.fixedDeltaTime);
-			if ((UnityEngine.Time.time > lastPlayerInputTime + 1f && !HasDriver()) || !HasFuel() || Waterlogged())
+			if ((IsOn() || IsStartingUp()) && ((UnityEngine.Time.time > lastPlayerInputTime + 1f && !HasDriver()) || !fuelSystem.HasFuel() || Waterlogged()))
 			{
 				EngineOff();
 			}
+			if (IsOn())
+			{
+				fuelSystem.TryUseFuel(UnityEngine.Time.fixedDeltaTime, fuelPerSec);
+			}
+			if (!HasDriver())
+			{
+				_ = currentInputState.throttle <= 0f;
+			}
+			else
+				_ = 0;
+			_ = leftWheel.forwardFriction;
 		}
-		if (!HasDriver())
-		{
-			_ = currentInputState.throttle <= 0f;
-		}
-		else
-			_ = 0;
-		_ = leftWheel.forwardFriction;
 	}
 
 	public void UpdateNetwork()
@@ -339,7 +381,7 @@ public class MiniCopter : BaseHelicopterVehicle
 	{
 		base.Save(info);
 		info.msg.miniCopter = Facepunch.Pool.Get<Minicopter>();
-		info.msg.miniCopter.fuelStorageID = fuelStorageInstance.uid;
+		info.msg.miniCopter.fuelStorageID = fuelSystem.fuelStorageInstance.uid;
 		info.msg.miniCopter.fuelFraction = GetFuelFraction();
 		info.msg.miniCopter.pitch = currentInputState.pitch;
 		info.msg.miniCopter.roll = currentInputState.roll;
@@ -348,18 +390,41 @@ public class MiniCopter : BaseHelicopterVehicle
 
 	public override void DismountAllPlayers()
 	{
-		MountPointInfo[] array = mountPoints;
-		foreach (MountPointInfo mountPointInfo in array)
+		foreach (MountPointInfo mountPoint in mountPoints)
 		{
-			if (mountPointInfo.mountable != null)
+			if (mountPoint.mountable != null)
 			{
-				BasePlayer mounted = mountPointInfo.mountable.GetMounted();
+				BasePlayer mounted = mountPoint.mountable.GetMounted();
 				if ((bool)mounted)
 				{
 					mounted.Hurt(10000f, DamageType.Explosion, this, useProtection: false);
 				}
 			}
 		}
+	}
+
+	public override void DoPushAction(BasePlayer player)
+	{
+		player.metabolism.calories.Subtract(3f);
+		player.metabolism.SendChangesToClient();
+		Vector3 vector = Vector3Ex.Direction2D(player.transform.position, base.transform.position);
+		Vector3 vector2 = player.eyes.BodyForward();
+		vector2.y = 0.25f;
+		Vector3 position = base.transform.position + vector * 2f;
+		float num = rigidBody.mass * 2f;
+		rigidBody.AddForceAtPosition(vector2 * num, position, ForceMode.Impulse);
+		rigidBody.AddForce(Vector3.up * 3f, ForceMode.Impulse);
+		if (rigidBody.IsSleeping())
+		{
+			rigidBody.WakeUp();
+		}
+		isPushing = true;
+		Invoke(DisablePushing, 0.5f);
+	}
+
+	private void DisablePushing()
+	{
+		isPushing = false;
 	}
 
 	public float RemapValue(float toUse, float maxRemap)
@@ -372,7 +437,7 @@ public class MiniCopter : BaseHelicopterVehicle
 		base.Load(info);
 		if (info.msg.miniCopter != null)
 		{
-			fuelStorageInstance.uid = info.msg.miniCopter.fuelStorageID;
+			fuelSystem.fuelStorageInstance.uid = info.msg.miniCopter.fuelStorageID;
 			cachedFuelFraction = info.msg.miniCopter.fuelFraction;
 			cachedPitch = RemapValue(info.msg.miniCopter.pitch, 0.5f);
 			cachedRoll = RemapValue(info.msg.miniCopter.roll, 0.2f);
@@ -380,98 +445,13 @@ public class MiniCopter : BaseHelicopterVehicle
 		}
 	}
 
-	public float GetFuelFraction()
+	protected override bool CanPushNow(BasePlayer pusher)
 	{
-		if (base.isServer)
+		if (base.CanPushNow(pusher))
 		{
-			cachedFuelFraction = (float)GetFuelAmount() / fuelGaugeMax;
+			return pusher.IsOnGround();
 		}
-		return cachedFuelFraction;
-	}
-
-	public void SpawnFuelObject()
-	{
-		if (!Rust.Application.isLoadingSave)
-		{
-			BaseEntity baseEntity = GameManager.server.CreateEntity(fuelStoragePrefab.resourcePath, fuelStoragePoint.localPosition, fuelStoragePoint.localRotation);
-			baseEntity.Spawn();
-			baseEntity.SetParent(this);
-			fuelStorageInstance.Set(baseEntity);
-		}
-	}
-
-	public int GetFuelAmount()
-	{
-		if (!fuelStorageInstance.IsValid(base.isServer))
-		{
-			return 0;
-		}
-		StorageContainer component = fuelStorageInstance.Get(base.isServer).GetComponent<StorageContainer>();
-		if (component == null)
-		{
-			return 0;
-		}
-		Item slot = component.inventory.GetSlot(0);
-		if (slot == null || slot.amount < 1)
-		{
-			return 0;
-		}
-		return slot.amount;
-	}
-
-	public virtual bool HasFuel(bool forceCheck = false)
-	{
-		if (UnityEngine.Time.time > nextFuelCheckTime || forceCheck)
-		{
-			cachedHasFuel = (float)GetFuelAmount() > 0f;
-			nextFuelCheckTime = UnityEngine.Time.time + UnityEngine.Random.Range(1f, 2f);
-		}
-		return cachedHasFuel;
-	}
-
-	public virtual bool UseFuel(float seconds)
-	{
-		if (!fuelStorageInstance.IsValid(base.isServer))
-		{
-			return false;
-		}
-		StorageContainer component = fuelStorageInstance.Get(base.isServer).GetComponent<StorageContainer>();
-		if (component == null)
-		{
-			return false;
-		}
-		Item slot = component.inventory.GetSlot(0);
-		if (slot == null || slot.amount < 1)
-		{
-			return false;
-		}
-		pendingFuel += seconds * fuelPerSec;
-		if (pendingFuel >= 1f)
-		{
-			int num = Mathf.FloorToInt(pendingFuel);
-			slot.UseItem(num);
-			pendingFuel -= num;
-		}
-		return true;
-	}
-
-	[RPC_Server]
-	public void RPC_OpenFuel(RPCMessage msg)
-	{
-		BasePlayer player = msg.player;
-		if (player == null)
-		{
-			return;
-		}
-		BasePlayer driver = GetDriver();
-		if ((!(driver != null) || !(driver != player)) && fuelStorageInstance.IsValid(base.isServer))
-		{
-			StorageContainer component = fuelStorageInstance.Get(base.isServer).GetComponent<StorageContainer>();
-			if (component.Distance(player.eyes.position) <= maxFuelLootDistance)
-			{
-				component.PlayerOpenLoot(player, "", doPositionChecks: false);
-			}
-		}
+		return false;
 	}
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
@@ -487,6 +467,13 @@ public class MiniCopter : BaseHelicopterVehicle
 				}
 				using (TimeWarning.New("RPC_OpenFuel"))
 				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(1851540757u, "RPC_OpenFuel", this, player, 6f))
+						{
+							return true;
+						}
+					}
 					try
 					{
 						using (TimeWarning.New("Call"))
@@ -501,8 +488,8 @@ public class MiniCopter : BaseHelicopterVehicle
 					}
 					catch (Exception exception)
 					{
-						player.Kick("RPC Error in RPC_OpenFuel");
 						Debug.LogException(exception);
+						player.Kick("RPC Error in RPC_OpenFuel");
 					}
 				}
 				return true;

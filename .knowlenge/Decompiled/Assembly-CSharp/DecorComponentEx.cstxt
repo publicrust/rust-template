@@ -4,9 +4,13 @@ public static class DecorComponentEx
 {
 	public static void ApplyDecorComponents(this Transform transform, DecorComponent[] components, ref Vector3 pos, ref Quaternion rot, ref Vector3 scale)
 	{
-		for (int i = 0; i < components.Length; i++)
+		foreach (DecorComponent decorComponent in components)
 		{
-			components[i].Apply(ref pos, ref rot, ref scale);
+			if (!decorComponent.isRoot)
+			{
+				break;
+			}
+			decorComponent.Apply(ref pos, ref rot, ref scale);
 		}
 	}
 

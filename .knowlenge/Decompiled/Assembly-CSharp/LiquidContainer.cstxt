@@ -1,15 +1,61 @@
 #define UNITY_ASSERTIONS
 using System;
+using System.Collections.Generic;
 using ConVar;
+using Facepunch;
 using Network;
 using UnityEngine;
 using UnityEngine.Assertions;
 
-public class LiquidContainer : StorageContainer, ISplashable
+public class LiquidContainer : ContainerIOEntity
 {
 	public ItemDefinition defaultLiquid;
 
 	public int startingAmount;
+
+	public bool autofillOutputs;
+
+	public float autofillTickRate = 2f;
+
+	public int autofillTickAmount = 2;
+
+	public int maxOutputFlow = 6;
+
+	public ItemDefinition[] ValidItems;
+
+	private int currentDrainAmount;
+
+	private HashSet<IOEntity> connectedList = new HashSet<IOEntity>();
+
+	private HashSet<ContainerIOEntity> pushTargets = new HashSet<ContainerIOEntity>();
+
+	private const int maxPushTargets = 3;
+
+	private IOEntity considerConnectedTo;
+
+	private Action updateDrainAmountAction;
+
+	private Action pushLiquidAction;
+
+	private Action deductFuelAction;
+
+	private float lastOutputDrainUpdate;
+
+	public override bool IsGravitySource => true;
+
+	protected override bool DisregardGravityRestrictionsOnLiquid
+	{
+		get
+		{
+			if (!HasFlag(Flags.Reserved8))
+			{
+				return base.DisregardGravityRestrictionsOnLiquid;
+			}
+			return true;
+		}
+	}
+
+	public override bool BlockFluidDraining => true;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -26,7 +72,7 @@ public class LiquidContainer : StorageContainer, ISplashable
 				{
 					using (TimeWarning.New("Conditions"))
 					{
-						if (!RPC_Server.MaxDistance.Test("SVDrink", this, player, 3f))
+						if (!RPC_Server.MaxDistance.Test(2002733690u, "SVDrink", this, player, 3f))
 						{
 							return true;
 						}
@@ -45,8 +91,8 @@ public class LiquidContainer : StorageContainer, ISplashable
 					}
 					catch (Exception exception)
 					{
-						player.Kick("RPC Error in SVDrink");
 						Debug.LogException(exception);
+						player.Kick("RPC Error in SVDrink");
 					}
 				}
 				return true;
@@ -55,23 +101,196 @@ public class LiquidContainer : StorageContainer, ISplashable
 		return base.OnRpcMessage(player, rpc, msg);
 	}
 
+	public override bool IsRootEntity()
+	{
+		return true;
+	}
+
+	private bool CanAcceptItem(Item item, int count)
+	{
+		if (ValidItems == null || ValidItems.Length == 0)
+		{
+			return true;
+		}
+		ItemDefinition[] validItems = ValidItems;
+		for (int i = 0; i < validItems.Length; i++)
+		{
+			if (validItems[i] == item.info)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	public override void ServerInit()
 	{
+		updateDrainAmountAction = UpdateDrainAmount;
+		pushLiquidAction = PushLiquidThroughOutputs;
+		deductFuelAction = DeductFuel;
 		base.ServerInit();
 		if (startingAmount > 0)
 		{
-			inventory.AddItem(defaultLiquid, startingAmount, 0uL);
+			base.inventory.AddItem(defaultLiquid, startingAmount, 0uL);
+		}
+		if (autofillOutputs && HasLiquidItem())
+		{
+			UpdatePushLiquidTargets();
+		}
+		ItemContainer itemContainer = base.inventory;
+		itemContainer.canAcceptItem = (Func<Item, int, bool>)Delegate.Combine(itemContainer.canAcceptItem, new Func<Item, int, bool>(CanAcceptItem));
+	}
+
+	public override void OnCircuitChanged(bool forceUpdate)
+	{
+		base.OnCircuitChanged(forceUpdate);
+		ClearDrains();
+		Invoke(updateDrainAmountAction, 0.1f);
+		if (autofillOutputs && HasLiquidItem())
+		{
+			UpdatePushLiquidTargets();
+		}
+	}
+
+	public override void OnItemAddedOrRemoved(Item item, bool added)
+	{
+		base.OnItemAddedOrRemoved(item, added);
+		UpdateOnFlag();
+		MarkDirtyForceUpdateOutputs();
+		Invoke(updateDrainAmountAction, 0.1f);
+		if (connectedList.Count > 0)
+		{
+			List<IOEntity> obj = Facepunch.Pool.GetList<IOEntity>();
+			foreach (IOEntity connected in connectedList)
+			{
+				if (connected != null)
+				{
+					obj.Add(connected);
+				}
+			}
+			foreach (IOEntity item2 in obj)
+			{
+				item2.SendChangedToRoot(forceUpdate: true);
+			}
+			Facepunch.Pool.FreeList(ref obj);
+		}
+		if (HasLiquidItem() && autofillOutputs)
+		{
+			UpdatePushLiquidTargets();
+		}
+	}
+
+	private void ClearDrains()
+	{
+		foreach (IOEntity connected in connectedList)
+		{
+			if (connected != null)
+			{
+				connected.SetFuelType(null, null);
+			}
+		}
+		connectedList.Clear();
+	}
+
+	public override int GetCurrentEnergy()
+	{
+		return Mathf.Clamp(GetLiquidCount(), 0, maxOutputFlow);
+	}
+
+	public override int CalculateCurrentEnergy(int inputAmount, int inputSlot)
+	{
+		if (!HasLiquidItem())
+		{
+			return base.CalculateCurrentEnergy(inputAmount, inputSlot);
+		}
+		return GetCurrentEnergy();
+	}
+
+	private void UpdateDrainAmount()
+	{
+		int amount = 0;
+		Item liquidItem = GetLiquidItem();
+		if (liquidItem != null)
+		{
+			IOSlot[] array = outputs;
+			foreach (IOSlot iOSlot in array)
+			{
+				if (iOSlot.connectedTo.Get() != null)
+				{
+					CalculateDrain(iOSlot.connectedTo.Get(), base.transform.TransformPoint(iOSlot.handlePosition), IOEntity.backtracking, ref amount, this, liquidItem?.info);
+				}
+			}
+		}
+		currentDrainAmount = Mathf.Clamp(amount, 0, maxOutputFlow);
+		if (currentDrainAmount <= 0 && IsInvoking(deductFuelAction))
+		{
+			CancelInvoke(deductFuelAction);
+		}
+		else if (currentDrainAmount > 0 && !IsInvoking(deductFuelAction))
+		{
+			InvokeRepeating(deductFuelAction, 0f, 1f);
+		}
+	}
+
+	private void CalculateDrain(IOEntity ent, Vector3 fromSlotWorld, int depth, ref int amount, IOEntity lastEntity, ItemDefinition waterType)
+	{
+		if (ent == this || depth <= 0 || ent == null || lastEntity == null || ent is LiquidContainer)
+		{
+			return;
+		}
+		if (!ent.BlockFluidDraining && ent.HasFlag(Flags.On))
+		{
+			int num = ent.DesiredPower();
+			amount += num;
+			ent.SetFuelType(waterType, this);
+			connectedList.Add(ent);
+		}
+		if (!ent.AllowLiquidPassthrough(lastEntity, fromSlotWorld))
+		{
+			return;
+		}
+		IOSlot[] array = ent.outputs;
+		foreach (IOSlot iOSlot in array)
+		{
+			if (iOSlot.connectedTo.Get() != null && iOSlot.connectedTo.Get() != ent)
+			{
+				CalculateDrain(iOSlot.connectedTo.Get(), ent.transform.TransformPoint(iOSlot.handlePosition), depth - 1, ref amount, ent, waterType);
+			}
+		}
+	}
+
+	public override void UpdateOutputs()
+	{
+		base.UpdateOutputs();
+		if (!(UnityEngine.Time.realtimeSinceStartup - lastOutputDrainUpdate < 0.2f))
+		{
+			lastOutputDrainUpdate = UnityEngine.Time.realtimeSinceStartup;
+			if (HasLiquidItem() && autofillOutputs)
+			{
+				UpdatePushLiquidTargets();
+			}
+			ClearDrains();
+			Invoke(updateDrainAmountAction, 0.1f);
+		}
+	}
+
+	private void DeductFuel()
+	{
+		if (HasLiquidItem())
+		{
+			Item liquidItem = GetLiquidItem();
+			liquidItem.amount -= currentDrainAmount;
+			liquidItem.MarkDirty();
+			if (liquidItem.amount <= 0)
+			{
+				liquidItem.Remove();
+			}
 		}
 	}
 
 	protected void UpdateOnFlag()
 	{
-		SetFlag(Flags.On, inventory.itemList.Count > 0 && inventory.itemList[0].amount > 0);
-	}
-
-	protected override void OnInventoryDirty()
-	{
-		UpdateOnFlag();
+		SetFlag(Flags.On, base.inventory.itemList.Count > 0 && base.inventory.itemList[0].amount > 0);
 	}
 
 	public virtual void OpenTap(float duration)
@@ -97,57 +316,20 @@ public class LiquidContainer : StorageContainer, ISplashable
 
 	public Item GetLiquidItem()
 	{
-		if (inventory.itemList.Count != 0)
+		if (base.inventory.itemList.Count == 0)
 		{
-			return inventory.itemList[0];
+			return null;
 		}
-		return null;
+		return base.inventory.itemList[0];
 	}
 
-	public bool wantsSplash(ItemDefinition splashType, int amount)
+	public int GetLiquidCount()
 	{
-		if (HasLiquidItem())
+		if (!HasLiquidItem())
 		{
-			if (GetLiquidItem().info == splashType)
-			{
-				return GetLiquidItem().amount < maxStackSize;
-			}
-			return false;
+			return 0;
 		}
-		return true;
-	}
-
-	public int DoSplash(ItemDefinition splashType, int amount)
-	{
-		int num = 0;
-		if (HasLiquidItem())
-		{
-			Item item = GetLiquidItem();
-			int amount2 = item.amount;
-			ItemDefinition itemDefinition = WaterResource.Merge(splashType, item.info);
-			if (item.info != itemDefinition)
-			{
-				item.Remove();
-				item = ItemManager.Create(itemDefinition, amount2, 0uL);
-				if (!item.MoveToContainer(inventory))
-				{
-					item.Remove();
-					return 0;
-				}
-			}
-			num = Mathf.Min(maxStackSize - amount2, amount);
-			item.amount += num;
-		}
-		else
-		{
-			num = Mathf.Min(amount, maxStackSize);
-			Item item2 = ItemManager.Create(splashType, num, 0uL);
-			if (item2 != null && !item2.MoveToContainer(inventory))
-			{
-				item2.Remove();
-			}
-		}
-		return num;
+		return GetLiquidItem().amount;
 	}
 
 	[RPC_Server]
@@ -158,7 +340,7 @@ public class LiquidContainer : StorageContainer, ISplashable
 		{
 			return;
 		}
-		foreach (Item item in inventory.itemList)
+		foreach (Item item in base.inventory.itemList)
 		{
 			ItemModConsume component = item.info.GetComponent<ItemModConsume>();
 			if (!(component == null) && component.CanDoAction(item, rpc.player))
@@ -167,5 +349,117 @@ public class LiquidContainer : StorageContainer, ISplashable
 				break;
 			}
 		}
+	}
+
+	private void UpdatePushLiquidTargets()
+	{
+		pushTargets.Clear();
+		if (!HasLiquidItem() || IsConnectedTo(this, IOEntity.backtracking * 2))
+		{
+			return;
+		}
+		Item liquidItem = GetLiquidItem();
+		using (TimeWarning.New("UpdatePushTargets"))
+		{
+			IOSlot[] array = outputs;
+			foreach (IOSlot iOSlot in array)
+			{
+				if (iOSlot.type == IOType.Fluidic)
+				{
+					IOEntity iOEntity = iOSlot.connectedTo.Get();
+					if (iOEntity != null)
+					{
+						CheckPushLiquid(iOEntity, liquidItem, this, IOEntity.backtracking * 4);
+					}
+				}
+			}
+		}
+		if (pushTargets.Count > 0)
+		{
+			InvokeRandomized(pushLiquidAction, 0f, autofillTickRate, autofillTickRate * 0.2f);
+		}
+	}
+
+	private void PushLiquidThroughOutputs()
+	{
+		if (!HasLiquidItem())
+		{
+			CancelInvoke(pushLiquidAction);
+			return;
+		}
+		Item liquidItem = GetLiquidItem();
+		if (pushTargets.Count > 0)
+		{
+			int num = Mathf.Clamp(autofillTickAmount, 0, liquidItem.amount) / pushTargets.Count;
+			if (num == 0 && liquidItem.amount > 0)
+			{
+				num = liquidItem.amount;
+			}
+			foreach (ContainerIOEntity pushTarget in pushTargets)
+			{
+				if (pushTarget.inventory.CanAcceptItem(liquidItem, 0) == ItemContainer.CanAcceptResult.CanAccept && (pushTarget.inventory.CanTake(liquidItem) || pushTarget.inventory.FindItemByItemID(liquidItem.info.itemid) != null))
+				{
+					int num2 = Mathf.Clamp(num, 0, pushTarget.inventory.GetMaxTransferAmount(liquidItem.info));
+					pushTarget.inventory.AddItem(liquidItem.info, num2, 0uL);
+					liquidItem.amount -= num2;
+					liquidItem.MarkDirty();
+					if (liquidItem.amount <= 0)
+					{
+						break;
+					}
+				}
+			}
+		}
+		if (liquidItem.amount <= 0 || pushTargets.Count == 0)
+		{
+			if (liquidItem.amount <= 0)
+			{
+				liquidItem.Remove();
+			}
+			CancelInvoke(pushLiquidAction);
+		}
+	}
+
+	private void CheckPushLiquid(IOEntity connected, Item ourFuel, IOEntity fromSource, int depth)
+	{
+		if (depth <= 0 || ourFuel.amount <= 0)
+		{
+			return;
+		}
+		Vector3 worldHandlePosition = Vector3.zero;
+		IOEntity iOEntity = connected.FindGravitySource(ref worldHandlePosition, IOEntity.backtracking, ignoreSelf: true);
+		if ((iOEntity != null && !connected.AllowLiquidPassthrough(iOEntity, worldHandlePosition)) || connected == this || ConsiderConnectedTo(connected))
+		{
+			return;
+		}
+		if (connected is ContainerIOEntity containerIOEntity && !pushTargets.Contains(containerIOEntity) && containerIOEntity.inventory.CanAcceptItem(ourFuel, 0) == ItemContainer.CanAcceptResult.CanAccept)
+		{
+			pushTargets.Add(containerIOEntity);
+			return;
+		}
+		IOSlot[] array = connected.outputs;
+		foreach (IOSlot iOSlot in array)
+		{
+			IOEntity iOEntity2 = iOSlot.connectedTo.Get();
+			Vector3 sourceWorldPosition = connected.transform.TransformPoint(iOSlot.handlePosition);
+			if (iOEntity2 != null && iOEntity2 != fromSource && iOEntity2.AllowLiquidPassthrough(connected, sourceWorldPosition))
+			{
+				CheckPushLiquid(iOEntity2, ourFuel, fromSource, depth - 1);
+				if (pushTargets.Count >= 3)
+				{
+					break;
+				}
+			}
+		}
+	}
+
+	public void SetConnectedTo(IOEntity entity)
+	{
+		considerConnectedTo = entity;
+	}
+
+	protected override bool ConsiderConnectedTo(IOEntity entity)
+	{
+		return entity == considerConnectedTo;
 	}
 }

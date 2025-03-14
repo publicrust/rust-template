@@ -7,10 +7,15 @@ public class HumanBodyResourceDispenser : ResourceDispenser
 			PlayerCorpse component = GetComponent<PlayerCorpse>();
 			if ((bool)component)
 			{
-				item.name = "Skull of \"" + component.playerName + "\"";
+				item.name = CreateSkullName(component.playerName);
 				return true;
 			}
 		}
 		return false;
+	}
+
+	public static string CreateSkullName(string playerName)
+	{
+		return "Skull of \"" + playerName + "\"";
 	}
 }

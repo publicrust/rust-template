@@ -1,9 +1,11 @@
 #define UNITY_ASSERTIONS
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using ConVar;
 using Facepunch;
 using Network;
+using Oxide.Core;
 using UnityEngine;
 using UnityEngine.Assertions;
 
@@ -12,6 +14,8 @@ public class RepairBench : StorageContainer
 	public float maxConditionLostOnRepair = 0.2f;
 
 	public GameObjectRef skinchangeEffect;
+
+	public const float REPAIR_COST_FRACTION = 0.2f;
 
 	private float nextSkinChangeTime;
 
@@ -28,6 +32,13 @@ public class RepairBench : StorageContainer
 				}
 				using (TimeWarning.New("ChangeSkin"))
 				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(1942825351u, "ChangeSkin", this, player, 3f))
+						{
+							return true;
+						}
+					}
 					try
 					{
 						using (TimeWarning.New("Call"))
@@ -42,8 +53,8 @@ public class RepairBench : StorageContainer
 					}
 					catch (Exception exception)
 					{
-						player.Kick("RPC Error in ChangeSkin");
 						Debug.LogException(exception);
+						player.Kick("RPC Error in ChangeSkin");
 					}
 				}
 				return true;
@@ -57,6 +68,13 @@ public class RepairBench : StorageContainer
 				}
 				using (TimeWarning.New("RepairItem"))
 				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(1178348163u, "RepairItem", this, player, 3f))
+						{
+							return true;
+						}
+					}
 					try
 					{
 						using (TimeWarning.New("Call"))
@@ -71,8 +89,8 @@ public class RepairBench : StorageContainer
 					}
 					catch (Exception exception2)
 					{
-						player.Kick("RPC Error in RepairItem");
 						Debug.LogException(exception2);
+						player.Kick("RPC Error in RepairItem");
 					}
 				}
 				return true;
@@ -81,17 +99,17 @@ public class RepairBench : StorageContainer
 		return base.OnRpcMessage(player, rpc, msg);
 	}
 
-	public float GetRepairFraction(Item itemToRepair)
+	public static float GetRepairFraction(Item itemToRepair)
 	{
 		return 1f - itemToRepair.condition / itemToRepair.maxCondition;
 	}
 
-	public float RepairCostFraction(Item itemToRepair)
+	public static float RepairCostFraction(Item itemToRepair)
 	{
 		return GetRepairFraction(itemToRepair) * 0.2f;
 	}
 
-	public void GetRepairCostList(ItemBlueprint bp, List<ItemAmount> allIngredients)
+	public static void GetRepairCostList(ItemBlueprint bp, List<ItemAmount> allIngredients)
 	{
 		foreach (ItemAmount ingredient in bp.ingredients)
 		{
@@ -130,6 +148,7 @@ public class RepairBench : StorageContainer
 	}
 
 	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
 	public void ChangeSkin(RPCMessage msg)
 	{
 		if (UnityEngine.Time.realtimeSinceStartup < nextSkinChangeTime)
@@ -138,30 +157,68 @@ public class RepairBench : StorageContainer
 		}
 		BasePlayer player = msg.player;
 		int num = msg.read.Int32();
-		Item slot = inventory.GetSlot(0);
-		if (slot == null)
+		Item slot = base.inventory.GetSlot(0);
+		if (slot == null || Interface.CallHook("OnItemSkinChange", num, slot, this, msg.player) != null)
 		{
 			return;
 		}
-		if (num != 0 && !player.blueprints.steamInventory.HasItem(num))
+		bool flag = false;
+		if (num != 0 && !flag && !player.blueprints.CheckSkinOwnership(num, player.userID))
 		{
 			debugprint("RepairBench.ChangeSkin player does not have item :" + num + ":");
 			return;
 		}
-		ulong num2 = ItemDefinition.FindSkin(slot.info.itemid, num);
-		if (num2 == slot.skin)
+		ulong Skin = ItemDefinition.FindSkin(slot.info.itemid, num);
+		if (Skin == slot.skin && slot.info.isRedirectOf == null)
 		{
-			debugprint("RepairBench.ChangeSkin cannot apply same skin twice : " + num2 + ": " + slot.skin);
+			debugprint("RepairBench.ChangeSkin cannot apply same skin twice : " + Skin + ": " + slot.skin);
 			return;
 		}
 		nextSkinChangeTime = UnityEngine.Time.realtimeSinceStartup + 0.75f;
-		slot.skin = num2;
-		slot.MarkDirty();
-		BaseEntity heldEntity = slot.GetHeldEntity();
-		if (heldEntity != null)
+		ItemSkinDirectory.Skin skin = slot.info.skins.FirstOrDefault((ItemSkinDirectory.Skin x) => (ulong)x.id == Skin);
+		if (slot.info.isRedirectOf != null)
 		{
-			heldEntity.skinID = num2;
-			heldEntity.SendNetworkUpdate();
+			Skin = ItemDefinition.FindSkin(slot.info.isRedirectOf.itemid, num);
+			skin = slot.info.isRedirectOf.skins.FirstOrDefault((ItemSkinDirectory.Skin x) => (ulong)x.id == Skin);
+		}
+		ItemSkin itemSkin = ((skin.id == 0) ? null : (skin.invItem as ItemSkin));
+		if ((bool)itemSkin && (itemSkin.Redirect != null || slot.info.isRedirectOf != null))
+		{
+			ItemDefinition template = itemSkin.Redirect;
+			bool flag2 = false;
+			if (itemSkin.Redirect == null && slot.info.isRedirectOf != null)
+			{
+				template = slot.info.isRedirectOf;
+				flag2 = num != 0;
+			}
+			float condition = slot.condition;
+			float maxCondition = slot.maxCondition;
+			slot.Remove();
+			ItemManager.DoRemoves();
+			Item item = ItemManager.Create(template, 1, 0uL);
+			item.MoveToContainer(base.inventory, 0, allowStack: false);
+			item.maxCondition = maxCondition;
+			item.condition = condition;
+			if (flag2)
+			{
+				ApplySkinToItem(item, Skin);
+			}
+		}
+		else if (!itemSkin && slot.info.isRedirectOf != null)
+		{
+			ItemDefinition isRedirectOf = slot.info.isRedirectOf;
+			float condition2 = slot.condition;
+			float maxCondition2 = slot.maxCondition;
+			slot.Remove();
+			ItemManager.DoRemoves();
+			Item item2 = ItemManager.Create(isRedirectOf, 1, Skin);
+			item2.MoveToContainer(base.inventory, 0, allowStack: false);
+			item2.maxCondition = maxCondition2;
+			item2.condition = condition2;
+		}
+		else
+		{
+			ApplySkinToItem(slot, Skin);
 		}
 		if (skinchangeEffect.isValid)
 		{
@@ -169,26 +226,52 @@ public class RepairBench : StorageContainer
 		}
 	}
 
+	private void ApplySkinToItem(Item item, ulong Skin)
+	{
+		item.skin = Skin;
+		item.MarkDirty();
+		BaseEntity heldEntity = item.GetHeldEntity();
+		if (heldEntity != null)
+		{
+			heldEntity.skinID = Skin;
+			heldEntity.SendNetworkUpdate();
+		}
+	}
+
 	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
 	public void RepairItem(RPCMessage msg)
 	{
-		Item slot = inventory.GetSlot(0);
-		if (slot == null)
-		{
-			return;
-		}
-		ItemDefinition info = slot.info;
-		ItemBlueprint component = info.GetComponent<ItemBlueprint>();
-		if (!component || !info.condition.repairable || slot.condition == slot.maxCondition)
-		{
-			return;
-		}
+		Item slot = base.inventory.GetSlot(0);
 		BasePlayer player = msg.player;
-		if (!player.blueprints.HasUnlocked(info) && (!(info.Blueprint != null) || info.Blueprint.isResearchable))
+		RepairAnItem(slot, player, this, maxConditionLostOnRepair, mustKnowBlueprint: true);
+	}
+
+	public static void RepairAnItem(Item itemToRepair, BasePlayer player, BaseEntity repairBenchEntity, float maxConditionLostOnRepair, bool mustKnowBlueprint)
+	{
+		if (itemToRepair == null)
 		{
 			return;
 		}
-		float num = RepairCostFraction(slot);
+		ItemDefinition info = itemToRepair.info;
+		ItemBlueprint component = info.GetComponent<ItemBlueprint>();
+		if (!component || !info.condition.repairable || itemToRepair.condition == itemToRepair.maxCondition)
+		{
+			return;
+		}
+		if (mustKnowBlueprint)
+		{
+			ItemDefinition itemDefinition = ((info.isRedirectOf != null) ? info.isRedirectOf : info);
+			if (!player.blueprints.HasUnlocked(itemDefinition) && (!(itemDefinition.Blueprint != null) || itemDefinition.Blueprint.isResearchable))
+			{
+				return;
+			}
+		}
+		if (Interface.CallHook("OnItemRepair", player, itemToRepair) != null)
+		{
+			return;
+		}
+		float num = RepairCostFraction(itemToRepair);
 		bool flag = false;
 		List<ItemAmount> obj = Facepunch.Pool.GetList<ItemAmount>();
 		GetRepairCostList(component, obj);
@@ -218,11 +301,11 @@ public class RepairBench : StorageContainer
 			}
 		}
 		Facepunch.Pool.FreeList(ref obj);
-		slot.DoRepair(maxConditionLostOnRepair);
+		itemToRepair.DoRepair(maxConditionLostOnRepair);
 		if (Global.developer > 0)
 		{
-			Debug.Log("Item repaired! condition : " + slot.condition + "/" + slot.maxCondition);
+			Debug.Log("Item repaired! condition : " + itemToRepair.condition + "/" + itemToRepair.maxCondition);
 		}
-		Effect.server.Run("assets/bundled/prefabs/fx/repairbench/itemrepair.prefab", this, 0u, Vector3.zero, Vector3.zero);
+		Effect.server.Run("assets/bundled/prefabs/fx/repairbench/itemrepair.prefab", repairBenchEntity, 0u, Vector3.zero, Vector3.zero);
 	}
 }

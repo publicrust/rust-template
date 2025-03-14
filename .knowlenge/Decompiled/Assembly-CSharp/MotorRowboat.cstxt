@@ -4,13 +4,41 @@ using System.Collections.Generic;
 using ConVar;
 using Facepunch;
 using Network;
+using Oxide.Core;
 using ProtoBuf;
 using Rust;
 using UnityEngine;
 using UnityEngine.Assertions;
 
-public class MotorRowboat : MotorBoat
+public class MotorRowboat : BaseBoat
 {
+	[Header("Audio")]
+	public BlendedSoundLoops engineLoops;
+
+	public BlendedSoundLoops waterLoops;
+
+	public SoundDefinition engineStartSoundDef;
+
+	public SoundDefinition engineStopSoundDef;
+
+	public SoundDefinition movementSplashAccentSoundDef;
+
+	public SoundDefinition engineSteerSoundDef;
+
+	public GameObjectRef pushLandEffect;
+
+	public GameObjectRef pushWaterEffect;
+
+	public float waterSpeedDivisor = 10f;
+
+	public float turnPitchModScale = -0.25f;
+
+	public float tiltPitchModScale = 0.3f;
+
+	public float splashAccentFrequencyMin = 1f;
+
+	public float splashAccentFrequencyMax = 10f;
+
 	protected const Flags Flag_EngineOn = Flags.Reserved1;
 
 	protected const Flags Flag_ThrottleOn = Flags.Reserved2;
@@ -31,8 +59,6 @@ public class MotorRowboat : MotorBoat
 	public GameObjectRef fuelStoragePrefab;
 
 	public Transform fuelStoragePoint;
-
-	public EntityRef fuelStorageInstance;
 
 	public float fuelPerSec;
 
@@ -63,26 +89,21 @@ public class MotorRowboat : MotorBoat
 	public Transform propellerRotate;
 
 	[ServerVar(Help = "Population active on the server")]
-	public static float population = 4f;
+	public static float population = 1f;
 
-	[ServerVar(Help = "How long before a boat is killed while outside")]
+	[ServerVar(Help = "How long before a boat is killed while outside.  If it's in deep water as well, the minimum of the two is used")]
 	public static float outsidedecayminutes = 180f;
+
+	[ServerVar(Help = "How long before a boat is killed while in deep water. If it's outside as well, the minimum of the two is used")]
+	public static float deepwaterdecayminutes = 120f;
+
+	public EntityFuelSystem fuelSystem;
+
+	public TimeSince timeSinceLastUsedFuel;
 
 	public Transform[] stationaryDismounts;
 
 	public Collider mainCollider;
-
-	private float nextFuelCheckTime;
-
-	private bool cachedHasFuel;
-
-	private float pendingFuel;
-
-	private float lastUsedFuelTime;
-
-	private float nextPushTime;
-
-	public float lastHadDriverTime;
 
 	public float angularDragBase = 0.5f;
 
@@ -96,36 +117,13 @@ public class MotorRowboat : MotorBoat
 
 	public float offAxisDot = 0.25f;
 
+	private const float DECAY_TICK_TIME = 60f;
+
+	public float lastHadDriverTime;
+
 	public bool dying;
 
 	public const float maxVelForStationaryDismount = 4f;
-
-	[Header("Audio")]
-	public BlendedSoundLoops engineLoops;
-
-	public BlendedSoundLoops waterLoops;
-
-	public SoundDefinition engineStartSoundDef;
-
-	public SoundDefinition engineStopSoundDef;
-
-	public SoundDefinition movementSplashAccentSoundDef;
-
-	public SoundDefinition engineSteerSoundDef;
-
-	public GameObjectRef pushLandEffect;
-
-	public GameObjectRef pushWaterEffect;
-
-	public float waterSpeedDivisor = 10f;
-
-	public float turnPitchModScale = -0.25f;
-
-	public float tiltPitchModScale = 0.3f;
-
-	public float splashAccentFrequencyMin = 1f;
-
-	public float splashAccentFrequencyMax = 10f;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -154,8 +152,8 @@ public class MotorRowboat : MotorBoat
 					}
 					catch (Exception exception)
 					{
-						player.Kick("RPC Error in RPC_EngineToggle");
 						Debug.LogException(exception);
+						player.Kick("RPC Error in RPC_EngineToggle");
 					}
 				}
 				return true;
@@ -183,37 +181,8 @@ public class MotorRowboat : MotorBoat
 					}
 					catch (Exception exception2)
 					{
-						player.Kick("RPC Error in RPC_OpenFuel");
 						Debug.LogException(exception2);
-					}
-				}
-				return true;
-			}
-			if (rpc == 2115395408 && player != null)
-			{
-				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
-				if (ConVar.Global.developer > 2)
-				{
-					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_WantsPush "));
-				}
-				using (TimeWarning.New("RPC_WantsPush"))
-				{
-					try
-					{
-						using (TimeWarning.New("Call"))
-						{
-							RPCMessage rPCMessage = default(RPCMessage);
-							rPCMessage.connection = msg.connection;
-							rPCMessage.player = player;
-							rPCMessage.read = msg.read;
-							RPCMessage msg4 = rPCMessage;
-							RPC_WantsPush(msg4);
-						}
-					}
-					catch (Exception exception3)
-					{
-						player.Kick("RPC Error in RPC_WantsPush");
-						Debug.LogException(exception3);
+						player.Kick("RPC Error in RPC_OpenFuel");
 					}
 				}
 				return true;
@@ -222,10 +191,26 @@ public class MotorRowboat : MotorBoat
 		return base.OnRpcMessage(player, rpc, msg);
 	}
 
+	public override void InitShared()
+	{
+		fuelSystem = new EntityFuelSystem(this, base.isServer);
+	}
+
 	public override void ServerInit()
 	{
 		base.ServerInit();
+		timeSinceLastUsedFuel = 0f;
 		InvokeRandomized(BoatDecay, UnityEngine.Random.Range(30f, 60f), 60f, 6f);
+	}
+
+	public override EntityFuelSystem GetFuelSystem()
+	{
+		return fuelSystem;
+	}
+
+	public override int StartingFuelUnits()
+	{
+		return 50;
 	}
 
 	public override void SpawnSubEntities()
@@ -234,95 +219,25 @@ public class MotorRowboat : MotorBoat
 		if (!Rust.Application.isLoadingSave)
 		{
 			BaseEntity baseEntity = GameManager.server.CreateEntity(storageUnitPrefab.resourcePath, storageUnitPoint.localPosition, storageUnitPoint.localRotation);
-			baseEntity.Spawn();
 			baseEntity.SetParent(this);
+			baseEntity.Spawn();
 			storageUnitInstance.Set(baseEntity);
 			UnityEngine.Physics.IgnoreCollision(baseEntity.GetComponent<Collider>(), mainCollider, ignore: true);
-			BaseEntity baseEntity2 = GameManager.server.CreateEntity(fuelStoragePrefab.resourcePath, fuelStoragePoint.localPosition, fuelStoragePoint.localRotation);
-			baseEntity2.Spawn();
-			baseEntity2.SetParent(this);
-			fuelStorageInstance.Set(baseEntity2);
-			UnityEngine.Physics.IgnoreCollision(baseEntity2.GetComponent<Collider>(), mainCollider, ignore: true);
+			fuelSystem.SpawnFuelStorage(fuelStoragePrefab, fuelStoragePoint, mainCollider);
 		}
 	}
 
 	public void BoatDecay()
 	{
-		if (!dying && base.healthFraction != 0f && !(UnityEngine.Time.time < lastUsedFuelTime + 600f))
+		if (!dying && base.healthFraction != 0f)
 		{
-			float num = 1f / outsidedecayminutes;
-			if (IsOutside())
-			{
-				Hurt(MaxHealth() * num, DamageType.Decay, this, useProtection: false);
-			}
+			BaseBoatDecay(60f, timeSinceLastUsedFuel, outsidedecayminutes, deepwaterdecayminutes);
 		}
 	}
 
-	public int GetFuelAmount()
+	public override void DoPushAction(BasePlayer player)
 	{
-		if (!fuelStorageInstance.IsValid(base.isServer))
-		{
-			return 0;
-		}
-		StorageContainer component = fuelStorageInstance.Get(base.isServer).GetComponent<StorageContainer>();
-		if (component == null)
-		{
-			return 0;
-		}
-		Item slot = component.inventory.GetSlot(0);
-		if (slot == null || slot.amount < 1)
-		{
-			return 0;
-		}
-		return slot.amount;
-	}
-
-	public virtual bool HasFuel(bool forceCheck = false)
-	{
-		if (UnityEngine.Time.time > nextFuelCheckTime || forceCheck)
-		{
-			cachedHasFuel = (float)GetFuelAmount() > 0f;
-			nextFuelCheckTime = UnityEngine.Time.time + UnityEngine.Random.Range(1f, 2f);
-		}
-		return cachedHasFuel;
-	}
-
-	public virtual bool UseFuel(float seconds)
-	{
-		if (!fuelStorageInstance.IsValid(base.isServer))
-		{
-			return false;
-		}
-		StorageContainer component = fuelStorageInstance.Get(base.isServer).GetComponent<StorageContainer>();
-		if (component == null)
-		{
-			return false;
-		}
-		Item slot = component.inventory.GetSlot(0);
-		if (slot == null || slot.amount < 1)
-		{
-			return false;
-		}
-		pendingFuel += seconds * fuelPerSec;
-		if (pendingFuel >= 1f)
-		{
-			int num = Mathf.FloorToInt(pendingFuel);
-			slot.UseItem(num);
-			pendingFuel -= num;
-		}
-		return true;
-	}
-
-	public bool RecentlyPushed()
-	{
-		return UnityEngine.Time.realtimeSinceStartup < nextPushTime;
-	}
-
-	[RPC_Server]
-	public void RPC_WantsPush(RPCMessage msg)
-	{
-		BasePlayer player = msg.player;
-		if (player.isMounted || RecentlyPushed() || !HasFlag(Flags.Reserved7) || (!(player.WaterFactor() <= 0.6f) && !IsFlipped()) || Vector3.Distance(player.transform.position, base.transform.position) > 5f || dying)
+		if (player.isMounted || !IsStationary() || (!(player.WaterFactor() <= 0.6f) && !IsFlipped()) || (!IsFlipped() && player.IsStandingOnEntity(this, 8192)) || Vector3.Distance(player.transform.position, base.transform.position) > 5f || dying)
 		{
 			return;
 		}
@@ -343,7 +258,6 @@ public class MotorRowboat : MotorBoat
 			num += Mathf.InverseLerp(0.8f, 1f, value) * 3f;
 			rigidBody.AddForceAtPosition(vector2 * num, position, ForceMode.VelocityChange);
 		}
-		nextPushTime = UnityEngine.Time.realtimeSinceStartup + 1f;
 		if (HasFlag(Flags.Reserved5))
 		{
 			if (pushWaterEffect.isValid)
@@ -361,15 +275,10 @@ public class MotorRowboat : MotorBoat
 	public void RPC_OpenFuel(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
-		if (!(player == null) && IsDriver(player) && fuelStorageInstance.IsValid(base.isServer))
+		if (!(player == null) && IsDriver(player))
 		{
-			fuelStorageInstance.Get(base.isServer).GetComponent<StorageContainer>().PlayerOpenLoot(player);
+			fuelSystem.LootFuel(player);
 		}
-	}
-
-	public bool IsDriver(BasePlayer player)
-	{
-		return GetPlayerSeat(player) == 0;
 	}
 
 	[RPC_Server]
@@ -392,9 +301,18 @@ public class MotorRowboat : MotorBoat
 
 	public void EngineToggle(bool wantsOn)
 	{
-		if (HasFuel(forceCheck: true))
+		if (!fuelSystem.HasFuel(forceCheck: true))
+		{
+			return;
+		}
+		BasePlayer driver = GetDriver();
+		if (!wantsOn || Interface.CallHook("OnEngineStart", this, driver) == null)
 		{
 			SetFlag(Flags.Reserved1, wantsOn);
+			if (wantsOn)
+			{
+				Interface.CallHook("OnEngineStarted", this, driver);
+			}
 		}
 	}
 
@@ -412,18 +330,10 @@ public class MotorRowboat : MotorBoat
 
 	public void CheckInvalidBoat()
 	{
-		if (!fuelStorageInstance.IsValid(base.isServer) || !storageUnitInstance.IsValid(base.isServer))
+		if (!fuelSystem.fuelStorageInstance.IsValid(base.isServer) || !storageUnitInstance.IsValid(base.isServer))
 		{
 			Debug.Log("Destroying invalid boat ");
 			Invoke(ActualDeath, 1f);
-		}
-	}
-
-	public override void AttemptMount(BasePlayer player)
-	{
-		if (!dying)
-		{
-			base.AttemptMount(player);
 		}
 	}
 
@@ -456,8 +366,12 @@ public class MotorRowboat : MotorBoat
 	public override void VehicleFixedUpdate()
 	{
 		base.VehicleFixedUpdate();
+		if (!isSpawned)
+		{
+			return;
+		}
 		float num = TimeSinceDriver();
-		bool b = EngineOn() && !IsFlipped() && base.healthFraction > 0f && HasFuel() && num < 75f;
+		bool b = EngineOn() && !IsFlipped() && base.healthFraction > 0f && fuelSystem.HasFuel() && num < 75f;
 		if (num > 15f)
 		{
 			steering += Mathf.InverseLerp(15f, 30f, num);
@@ -472,9 +386,9 @@ public class MotorRowboat : MotorBoat
 		SetFlag(Flags.Reserved1, b, recursive: false, networkupdate: false);
 		SetFlag(Flags.Reserved2, EngineOn() && gasPedal != 0f, recursive: false, networkupdate: false);
 		SetFlag(Flags.Reserved5, buoyancy.submergedFraction > 0.85f, recursive: false, networkupdate: false);
-		SetFlag(Flags.Reserved6, HasFuel(), recursive: false, networkupdate: false);
+		SetFlag(Flags.Reserved6, fuelSystem.HasFuel(), recursive: false, networkupdate: false);
 		SetFlag(Flags.Reserved7, rigidBody.velocity.magnitude < 1f, recursive: false, networkupdate: false);
-		SetFlag(Flags.Reserved8, RecentlyPushed(), recursive: false, networkupdate: false);
+		SetFlag(Flags.Reserved8, base.RecentlyPushed, recursive: false, networkupdate: false);
 		SendNetworkUpdate_Flags();
 		UpdateDrag();
 		if (dying)
@@ -496,8 +410,8 @@ public class MotorRowboat : MotorBoat
 		if (EngineOn())
 		{
 			float num5 = (HasFlag(Flags.Reserved2) ? 1f : 0.0333f);
-			UseFuel(UnityEngine.Time.fixedDeltaTime * num5);
-			lastUsedFuelTime = UnityEngine.Time.time;
+			fuelSystem.TryUseFuel(UnityEngine.Time.fixedDeltaTime * num5, fuelPerSec);
+			timeSinceLastUsedFuel = 0f;
 		}
 	}
 
@@ -550,26 +464,31 @@ public class MotorRowboat : MotorBoat
 
 	public void ActualDeath()
 	{
-		Kill();
+		Kill(DestroyMode.Gib);
 	}
 
-	public override bool MountEligable()
+	public override bool MountEligable(BasePlayer player)
 	{
+		if (dying)
+		{
+			return false;
+		}
 		if (rigidBody.velocity.magnitude >= 5f && HasDriver())
 		{
 			return false;
 		}
-		return base.MountEligable();
+		return base.MountEligable(player);
 	}
 
 	public override bool HasValidDismountPosition(BasePlayer player)
 	{
 		if (rigidBody.velocity.magnitude <= 4f)
 		{
+			Vector3 visualCheckOrigin = player.TriggerPoint();
 			Transform[] array = stationaryDismounts;
 			foreach (Transform transform in array)
 			{
-				if (ValidDismountPosition(transform.transform.position))
+				if (ValidDismountPosition(transform.transform.position, visualCheckOrigin))
 				{
 					return true;
 				}
@@ -583,10 +502,11 @@ public class MotorRowboat : MotorBoat
 		if (rigidBody.velocity.magnitude <= 4f)
 		{
 			List<Vector3> obj = Facepunch.Pool.GetList<Vector3>();
+			Vector3 visualCheckOrigin = player.TriggerPoint();
 			Transform[] array = stationaryDismounts;
 			foreach (Transform transform in array)
 			{
-				if (ValidDismountPosition(transform.transform.position))
+				if (ValidDismountPosition(transform.transform.position, visualCheckOrigin))
 				{
 					obj.Add(transform.transform.position);
 				}
@@ -609,7 +529,37 @@ public class MotorRowboat : MotorBoat
 		base.Save(info);
 		info.msg.motorBoat = Facepunch.Pool.Get<Motorboat>();
 		info.msg.motorBoat.storageid = storageUnitInstance.uid;
-		info.msg.motorBoat.fuelStorageID = fuelStorageInstance.uid;
+		info.msg.motorBoat.fuelStorageID = fuelSystem.fuelStorageInstance.uid;
+	}
+
+	public override bool CanPushNow(BasePlayer pusher)
+	{
+		if (!base.CanPushNow(pusher))
+		{
+			return false;
+		}
+		if (!pusher.isMounted && pusher.IsOnGround() && base.healthFraction > 0f)
+		{
+			return ShowPushMenu(pusher);
+		}
+		return false;
+	}
+
+	private bool ShowPushMenu(BasePlayer player)
+	{
+		if (!IsFlipped() && player.IsStandingOnEntity(this, 8192))
+		{
+			return false;
+		}
+		if (IsStationary())
+		{
+			if (!(player.WaterFactor() <= 0.6f))
+			{
+				return IsFlipped();
+			}
+			return true;
+		}
+		return false;
 	}
 
 	public override void Load(LoadInfo info)
@@ -617,7 +567,7 @@ public class MotorRowboat : MotorBoat
 		base.Load(info);
 		if (info.msg.motorBoat != null)
 		{
-			fuelStorageInstance.uid = info.msg.motorBoat.fuelStorageID;
+			fuelSystem.fuelStorageInstance.uid = info.msg.motorBoat.fuelStorageID;
 			storageUnitInstance.uid = info.msg.motorBoat.storageid;
 		}
 	}

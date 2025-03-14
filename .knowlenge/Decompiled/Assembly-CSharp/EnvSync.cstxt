@@ -28,13 +28,6 @@ public class EnvSync : PointEntity
 		{
 			info.msg.environment.dateTime = TOD_Sky.Instance.Cycle.DateTime.ToBinary();
 		}
-		if ((bool)SingletonComponent<Climate>.Instance)
-		{
-			info.msg.environment.clouds = SingletonComponent<Climate>.Instance.Overrides.Clouds;
-			info.msg.environment.fog = SingletonComponent<Climate>.Instance.Overrides.Fog;
-			info.msg.environment.wind = SingletonComponent<Climate>.Instance.Overrides.Wind;
-			info.msg.environment.rain = SingletonComponent<Climate>.Instance.Overrides.Rain;
-		}
 		info.msg.environment.engineTime = Time.realtimeSinceStartup;
 	}
 

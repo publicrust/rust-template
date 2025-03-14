@@ -1,10 +1,14 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using ConVar;
 using Facepunch;
 using Facepunch.Extend;
+using Facepunch.Math;
 using Network;
+using ProtoBuf;
+using Rust;
 using UnityEngine;
 
 [Factory("global")]
@@ -76,7 +80,7 @@ public class Admin : ConsoleSystem
 		if (@string.Length == 0)
 		{
 			text = text + "hostname: " + ConVar.Server.hostname + "\n";
-			text = text + "version : " + 2201 + " secure (secure mode enabled, connected to Steam3)\n";
+			text = text + "version : " + 2271 + " secure (secure mode enabled, connected to Steam3)\n";
 			text = text + "map     : " + ConVar.Server.level + "\n";
 			text += $"players : {BasePlayer.activePlayerList.Count()} ({ConVar.Server.maxplayers} max) ({SingletonComponent<ServerMgr>.Instance.connectionQueue.Queued} queued) ({SingletonComponent<ServerMgr>.Instance.connectionQueue.Joining} joining)\n\n";
 		}
@@ -155,8 +159,8 @@ public class Admin : ConsoleSystem
 			string text10 = storage.Get("hit_entity_indirect_los").ToString();
 			table.AddRow(id.ToString(), name, text, text2, text3, text4, text5 + " / " + text6, text7 + " / " + text8, text9 + " / " + text10);
 		};
-		ulong filterID = arg.GetUInt64(0, 0uL);
-		if (filterID == 0L)
+		ulong uInt = arg.GetUInt64(0, 0uL);
+		if (uInt == 0L)
 		{
 			string @string = arg.GetString(0);
 			foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
@@ -181,14 +185,32 @@ public class Admin : ConsoleSystem
 		else
 		{
 			string arg2 = "N/A";
-			BasePlayer basePlayer = BasePlayer.activePlayerList.Find((BasePlayer p) => p.userID == filterID);
+			BasePlayer basePlayer = BasePlayer.FindByID(uInt);
 			if ((bool)basePlayer)
 			{
 				arg2 = basePlayer.displayName.QuoteSafe();
 			}
-			action(filterID, arg2);
+			action(uInt, arg2);
 		}
 		arg.ReplyWith(table.ToString());
+	}
+
+	[ServerVar]
+	public static void killplayer(Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.GetPlayerOrSleeper(arg, 0);
+		if (!basePlayer)
+		{
+			basePlayer = BasePlayer.FindBotClosestMatch(arg.GetString(0));
+		}
+		if (!basePlayer)
+		{
+			arg.ReplyWith("Player not found");
+		}
+		else
+		{
+			basePlayer.Hurt(1000f, DamageType.Suicide, basePlayer, useProtection: false);
+		}
 	}
 
 	[ServerVar]
@@ -216,7 +238,7 @@ public class Admin : ConsoleSystem
 		}
 	}
 
-	[ServerVar]
+	[ServerVar(Help = "ban <player> <reason> [optional duration]")]
 	public static void ban(Arg arg)
 	{
 		BasePlayer player = ArgEx.GetPlayer(arg, 0);
@@ -232,17 +254,20 @@ public class Admin : ConsoleSystem
 			return;
 		}
 		string @string = arg.GetString(1, "No Reason Given");
-		ServerUsers.Set(player.userID, ServerUsers.UserGroup.Banned, player.displayName, @string);
-		string text = "";
-		if (player.IsConnected && player.net.connection.ownerid != player.net.connection.userid)
+		if (TryGetBanExpiry(arg, 2, out var expiry, out var durationSuffix))
 		{
-			text += $" and also banned ownerid {player.net.connection.ownerid}";
-			ServerUsers.Set(player.net.connection.ownerid, ServerUsers.UserGroup.Banned, player.displayName, arg.GetString(1, $"Family share owner of {player.net.connection.userid}"));
+			ServerUsers.Set(player.userID, ServerUsers.UserGroup.Banned, player.displayName, @string, expiry);
+			string text = "";
+			if (player.IsConnected && player.net.connection.ownerid != 0L && player.net.connection.ownerid != player.net.connection.userid)
+			{
+				text += $" and also banned ownerid {player.net.connection.ownerid}";
+				ServerUsers.Set(player.net.connection.ownerid, ServerUsers.UserGroup.Banned, player.displayName, arg.GetString(1, $"Family share owner of {player.net.connection.userid}"), -1L);
+			}
+			ServerUsers.Save();
+			arg.ReplyWith($"Kickbanned User{durationSuffix}: {player.userID} - {player.displayName}{text}");
+			Chat.Broadcast("Kickbanning " + player.displayName + durationSuffix + " (" + @string + ")", "SERVER", "#eee", 0uL);
+			Network.Net.sv.Kick(player.net.connection, "Banned" + durationSuffix + ": " + @string);
 		}
-		ServerUsers.Save();
-		arg.ReplyWith($"Kickbanned User: {player.userID} - {player.displayName}{text}");
-		Chat.Broadcast("Kickbanning " + player.displayName + " (" + @string + ")", "SERVER", "#eee", 0uL);
-		Network.Net.sv.Kick(player.net.connection, "Banned: " + @string);
 	}
 
 	[ServerVar]
@@ -262,7 +287,7 @@ public class Admin : ConsoleSystem
 			arg.ReplyWith("User " + uInt + " is already a Moderator");
 			return;
 		}
-		ServerUsers.Set(uInt, ServerUsers.UserGroup.Moderator, @string, string2);
+		ServerUsers.Set(uInt, ServerUsers.UserGroup.Moderator, @string, string2, -1L);
 		arg.ReplyWith("Added moderator " + @string + ", steamid " + uInt);
 	}
 
@@ -283,7 +308,7 @@ public class Admin : ConsoleSystem
 			arg.ReplyWith("User " + uInt + " is already an Owner");
 			return;
 		}
-		ServerUsers.Set(uInt, ServerUsers.UserGroup.Owner, @string, string2);
+		ServerUsers.Set(uInt, ServerUsers.UserGroup.Owner, @string, string2, -1L);
 		arg.ReplyWith("Added owner " + @string + ", steamid " + uInt);
 	}
 
@@ -325,7 +350,7 @@ public class Admin : ConsoleSystem
 		arg.ReplyWith("Removed Owner: " + uInt);
 	}
 
-	[ServerVar(Help = "banid <steamid> <username> <reason>")]
+	[ServerVar(Help = "banid <steamid> <username> <reason> [optional duration]")]
 	public static void banid(Arg arg)
 	{
 		ulong uInt = arg.GetUInt64(0, 0uL);
@@ -340,23 +365,43 @@ public class Admin : ConsoleSystem
 		if (user != null && user.group == ServerUsers.UserGroup.Banned)
 		{
 			arg.ReplyWith("User " + uInt + " is already banned");
-			return;
 		}
-		string text2 = "";
-		BasePlayer basePlayer = BasePlayer.FindByID(uInt);
-		if (basePlayer != null && basePlayer.IsConnected)
+		else
 		{
-			text = basePlayer.displayName;
-			if (basePlayer.IsConnected && basePlayer.net.connection.ownerid != basePlayer.net.connection.userid)
+			if (!TryGetBanExpiry(arg, 3, out var expiry, out var durationSuffix))
 			{
-				text2 += $" and also banned ownerid {basePlayer.net.connection.ownerid}";
-				ServerUsers.Set(basePlayer.net.connection.ownerid, ServerUsers.UserGroup.Banned, basePlayer.displayName, arg.GetString(1, $"Family share owner of {basePlayer.net.connection.userid}"));
+				return;
 			}
-			Chat.Broadcast("Kickbanning " + basePlayer.displayName + " (" + @string + ")", "SERVER", "#eee", 0uL);
-			Network.Net.sv.Kick(basePlayer.net.connection, "Banned: " + @string);
+			string text2 = "";
+			BasePlayer basePlayer = BasePlayer.FindByID(uInt);
+			if (basePlayer != null && basePlayer.IsConnected)
+			{
+				text = basePlayer.displayName;
+				if (basePlayer.IsConnected && basePlayer.net.connection.ownerid != 0L && basePlayer.net.connection.ownerid != basePlayer.net.connection.userid)
+				{
+					text2 += $" and also banned ownerid {basePlayer.net.connection.ownerid}";
+					ServerUsers.Set(basePlayer.net.connection.ownerid, ServerUsers.UserGroup.Banned, basePlayer.displayName, arg.GetString(1, $"Family share owner of {basePlayer.net.connection.userid}"), expiry);
+				}
+				Chat.Broadcast("Kickbanning " + basePlayer.displayName + durationSuffix + " (" + @string + ")", "SERVER", "#eee", 0uL);
+				Network.Net.sv.Kick(basePlayer.net.connection, "Banned" + durationSuffix + ": " + @string);
+			}
+			ServerUsers.Set(uInt, ServerUsers.UserGroup.Banned, text, @string, expiry);
+			arg.ReplyWith($"Banned User{durationSuffix}: {uInt} - \"{text}\" for \"{@string}\"{text2}");
 		}
-		ServerUsers.Set(uInt, ServerUsers.UserGroup.Banned, text, @string);
-		arg.ReplyWith($"Banned User: {uInt} - \"{text}\" for \"{@string}\"{text2}");
+	}
+
+	private static bool TryGetBanExpiry(Arg arg, int n, out long expiry, out string durationSuffix)
+	{
+		expiry = arg.GetTimestamp(n, -1L);
+		durationSuffix = null;
+		int current = Epoch.Current;
+		if (expiry > 0 && expiry <= current)
+		{
+			arg.ReplyWith("Expiry time is in the past");
+			return false;
+		}
+		durationSuffix = ((expiry > 0) ? (" for " + (expiry - current).FormatSecondsLong()) : "");
+		return true;
 	}
 
 	[ServerVar]
@@ -440,6 +485,48 @@ public class Admin : ConsoleSystem
 		arg.ReplyWith(text);
 	}
 
+	[ServerVar(Help = "Show user info for players on server.")]
+	public static void sleepingusers(Arg arg)
+	{
+		string text = "<slot:userid:\"name\">\n";
+		int num = 0;
+		foreach (BasePlayer sleepingPlayer in BasePlayer.sleepingPlayerList)
+		{
+			text += $"{sleepingPlayer.userID}:{sleepingPlayer.displayName}\n";
+			num++;
+		}
+		text += $"{num} sleeping users\n";
+		arg.ReplyWith(text);
+	}
+
+	[ServerVar(Help = "Show user info for players on server in range of the player.")]
+	public static void sleepingusersinrange(Arg arg)
+	{
+		BasePlayer fromPlayer = ArgEx.Player(arg);
+		if (fromPlayer == null)
+		{
+			return;
+		}
+		float range = arg.GetFloat(0);
+		string text = "<slot:userid:\"name\">\n";
+		int num = 0;
+		List<BasePlayer> obj = Facepunch.Pool.GetList<BasePlayer>();
+		foreach (BasePlayer sleepingPlayer in BasePlayer.sleepingPlayerList)
+		{
+			obj.Add(sleepingPlayer);
+		}
+		obj.RemoveAll((BasePlayer p) => p.Distance2D(fromPlayer) > range);
+		obj.Sort((BasePlayer player, BasePlayer basePlayer) => (!(player.Distance2D(fromPlayer) < basePlayer.Distance2D(fromPlayer))) ? 1 : (-1));
+		foreach (BasePlayer item in obj)
+		{
+			text += $"{item.userID}:{item.displayName}:{item.Distance2D(fromPlayer)}m\n";
+			num++;
+		}
+		Facepunch.Pool.FreeList(ref obj);
+		text += $"{num} sleeping users within {range}m\n";
+		arg.ReplyWith(text);
+	}
+
 	[ServerVar(Help = "List of banned users (sourceds compat)")]
 	public static void banlist(Arg arg)
 	{
@@ -459,59 +546,44 @@ public class Admin : ConsoleSystem
 	}
 
 	[ServerVar]
-	public static void mutevoice(Arg arg)
+	public static void mute(Arg arg)
 	{
-		BasePlayer player = ArgEx.GetPlayer(arg, 0);
-		if (!player || player.net == null || player.net.connection == null)
+		BasePlayer playerOrSleeper = ArgEx.GetPlayerOrSleeper(arg, 0);
+		if (!playerOrSleeper || playerOrSleeper.net == null || playerOrSleeper.net.connection == null)
 		{
 			arg.ReplyWith("Player not found");
 		}
 		else
 		{
-			player.SetPlayerFlag(BasePlayer.PlayerFlags.VoiceMuted, b: true);
+			playerOrSleeper.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, b: true);
 		}
 	}
 
 	[ServerVar]
-	public static void unmutevoice(Arg arg)
+	public static void unmute(Arg arg)
 	{
-		BasePlayer player = ArgEx.GetPlayer(arg, 0);
-		if (!player || player.net == null || player.net.connection == null)
+		BasePlayer playerOrSleeper = ArgEx.GetPlayerOrSleeper(arg, 0);
+		if (!playerOrSleeper || playerOrSleeper.net == null || playerOrSleeper.net.connection == null)
 		{
 			arg.ReplyWith("Player not found");
 		}
 		else
 		{
-			player.SetPlayerFlag(BasePlayer.PlayerFlags.VoiceMuted, b: false);
+			playerOrSleeper.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, b: false);
 		}
 	}
 
-	[ServerVar]
-	public static void mutechat(Arg arg)
+	[ServerVar(Help = "Print a list of currently muted players")]
+	public static void mutelist(Arg arg)
 	{
-		BasePlayer player = ArgEx.GetPlayer(arg, 0);
-		if (!player || player.net == null || player.net.connection == null)
-		{
-			arg.ReplyWith("Player not found");
-		}
-		else
-		{
-			player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, b: true);
-		}
-	}
-
-	[ServerVar]
-	public static void unmutechat(Arg arg)
-	{
-		BasePlayer player = ArgEx.GetPlayer(arg, 0);
-		if (!player || player.net == null || player.net.connection == null)
-		{
-			arg.ReplyWith("Player not found");
-		}
-		else
-		{
-			player.SetPlayerFlag(BasePlayer.PlayerFlags.ChatMute, b: false);
-		}
+		var obj = from x in BasePlayer.allPlayerList
+			where x.HasPlayerFlag(BasePlayer.PlayerFlags.ChatMute)
+			select new
+			{
+				SteamId = x.UserIDString,
+				Name = x.displayName
+			};
+		arg.ReplyWith(obj);
 	}
 
 	[ServerVar]
@@ -521,6 +593,98 @@ public class Admin : ConsoleSystem
 		{
 			activePlayer.ClientRPCPlayer(null, activePlayer, "GetPerformanceReport");
 		}
+	}
+
+	[ServerVar(Help = "Get information about all the cars in the world")]
+	public static void carstats(Arg arg)
+	{
+		HashSet<ModularCar> allCarsList = ModularCar.allCarsList;
+		TextTable textTable = new TextTable();
+		textTable.AddColumn("id");
+		textTable.AddColumn("sockets");
+		textTable.AddColumn("modules");
+		textTable.AddColumn("complete");
+		textTable.AddColumn("engine");
+		textTable.AddColumn("health");
+		textTable.AddColumn("location");
+		int count = allCarsList.Count;
+		int num = 0;
+		int num2 = 0;
+		int num3 = 0;
+		foreach (ModularCar item in allCarsList)
+		{
+			string text = item.net.ID.ToString();
+			string text2 = item.TotalSockets.ToString();
+			string text3 = item.NumAttachedModules.ToString();
+			string text4;
+			if (item.IsComplete())
+			{
+				text4 = "Complete";
+				num++;
+			}
+			else
+			{
+				text4 = "Partial";
+			}
+			string text5;
+			if (item.HasAnyWorkingEngines())
+			{
+				text5 = "Working";
+				num2++;
+			}
+			else
+			{
+				text5 = "Broken";
+			}
+			string text6 = ((item.TotalMaxHealth() != 0f) ? $"{item.TotalHealth() / item.TotalMaxHealth():0%}" : "0");
+			string text7;
+			if (item.IsOutside())
+			{
+				text7 = "Outside";
+			}
+			else
+			{
+				text7 = "Inside";
+				num3++;
+			}
+			textTable.AddRow(text, text2, text3, text4, text5, text6, text7);
+		}
+		string text8 = "";
+		text8 = ((count != 1) ? (text8 + $"\nThe world contains {count} modular cars.") : (text8 + "\nThe world contains 1 modular car."));
+		text8 = ((num != 1) ? (text8 + $"\n{num} ({(float)num / (float)count:0%}) are in a completed state.") : (text8 + $"\n1 ({1f / (float)count:0%}) is in a completed state."));
+		text8 = ((num2 != 1) ? (text8 + $"\n{num2} ({(float)num2 / (float)count:0%}) are driveable.") : (text8 + $"\n1 ({1f / (float)count:0%}) is driveable."));
+		arg.ReplyWith(string.Concat(str1: (num3 != 1) ? (text8 + $"\n{num3} ({(float)num3 / (float)count:0%}) are sheltered indoors.") : (text8 + $"\n1 ({1f / (float)count:0%}) is sheltered indoors."), str0: textTable.ToString()));
+	}
+
+	[ServerVar]
+	public static string teaminfo(Arg arg)
+	{
+		ulong num = arg.GetUInt64(0, 0uL);
+		if (num == 0L)
+		{
+			BasePlayer player = ArgEx.GetPlayer(arg, 0);
+			if (player == null)
+			{
+				return "Player not found";
+			}
+			num = player.userID;
+		}
+		RelationshipManager.PlayerTeam playerTeam = RelationshipManager.Instance.FindPlayersTeam(num);
+		if (playerTeam == null)
+		{
+			return "Player is not in a team";
+		}
+		TextTable textTable = new TextTable();
+		textTable.AddColumn("steamID");
+		textTable.AddColumn("username");
+		textTable.AddColumn("online");
+		textTable.AddColumn("leader");
+		foreach (ulong memberId in playerTeam.members)
+		{
+			bool flag = Network.Net.sv.connections.FirstOrDefault((Connection c) => c.connected && c.userid == memberId) != null;
+			textTable.AddRow(memberId.ToString(), GetPlayerName(memberId), flag ? "x" : "", (memberId == playerTeam.teamLeader) ? "x" : "");
+		}
+		return textTable.ToString();
 	}
 
 	[ServerVar]
@@ -537,7 +701,7 @@ public class Admin : ConsoleSystem
 			switch (@string)
 			{
 			case "kill":
-				baseEntity.Kill(BaseNetworkable.DestroyMode.Gib);
+				baseEntity.AdminKill();
 				break;
 			case "lock":
 				baseEntity.SetFlag(BaseEntity.Flags.Locked, b: true);
@@ -554,11 +718,93 @@ public class Admin : ConsoleSystem
 			case "who":
 				arg.ReplyWith("Owner ID: " + baseEntity.OwnerID);
 				break;
+			case "auth":
+				arg.ReplyWith(AuthList(baseEntity));
+				break;
 			default:
 				arg.ReplyWith("Unknown command");
 				break;
 			}
 		}
+	}
+
+	private static string AuthList(BaseEntity ent)
+	{
+		if ((object)ent != null)
+		{
+			List<PlayerNameID> authorizedPlayers;
+			if (!(ent is BuildingPrivlidge buildingPrivlidge))
+			{
+				if (!(ent is AutoTurret autoTurret))
+				{
+					if (ent is CodeLock codeLock)
+					{
+						return CodeLockAuthList(codeLock);
+					}
+					goto IL_0042;
+				}
+				authorizedPlayers = autoTurret.authorizedPlayers;
+			}
+			else
+			{
+				authorizedPlayers = buildingPrivlidge.authorizedPlayers;
+			}
+			if (authorizedPlayers == null || authorizedPlayers.Count == 0)
+			{
+				return "Nobody is authed to this entity";
+			}
+			TextTable textTable = new TextTable();
+			textTable.AddColumn("steamID");
+			textTable.AddColumn("username");
+			foreach (PlayerNameID item in authorizedPlayers)
+			{
+				textTable.AddRow(item.userid.ToString(), GetPlayerName(item.userid));
+			}
+			return textTable.ToString();
+		}
+		goto IL_0042;
+		IL_0042:
+		return "Entity has no auth list";
+	}
+
+	private static string CodeLockAuthList(CodeLock codeLock)
+	{
+		if (codeLock.whitelistPlayers.Count == 0 && codeLock.guestPlayers.Count == 0)
+		{
+			return "Nobody is authed to this entity";
+		}
+		TextTable textTable = new TextTable();
+		textTable.AddColumn("steamID");
+		textTable.AddColumn("username");
+		textTable.AddColumn("isGuest");
+		foreach (ulong whitelistPlayer in codeLock.whitelistPlayers)
+		{
+			textTable.AddRow(whitelistPlayer.ToString(), GetPlayerName(whitelistPlayer), "");
+		}
+		foreach (ulong guestPlayer in codeLock.guestPlayers)
+		{
+			textTable.AddRow(guestPlayer.ToString(), GetPlayerName(guestPlayer), "x");
+		}
+		return textTable.ToString();
+	}
+
+	private static string GetPlayerName(ulong steamId)
+	{
+		BasePlayer basePlayer = BasePlayer.allPlayerList.FirstOrDefault((BasePlayer p) => p.userID == steamId);
+		string text;
+		if (!(basePlayer != null))
+		{
+			text = SingletonComponent<ServerMgr>.Instance.persistance.GetPlayerName(steamId);
+			if (text == null)
+			{
+				return "[unknown]";
+			}
+		}
+		else
+		{
+			text = basePlayer.displayName;
+		}
+		return text;
 	}
 
 	[ServerVar(Help = "Get a list of players")]
@@ -601,8 +847,8 @@ public class Admin : ConsoleSystem
 		result.Framerate = Performance.report.frameRate;
 		result.Memory = (int)Performance.report.memoryAllocations;
 		result.Collections = (int)Performance.report.memoryCollections;
-		result.NetworkIn = (int)((Network.Net.sv != null) ? Network.Net.sv.GetStat(null, NetworkPeer.StatTypeLong.BytesReceived_LastSecond) : 0);
-		result.NetworkOut = (int)((Network.Net.sv != null) ? Network.Net.sv.GetStat(null, NetworkPeer.StatTypeLong.BytesSent_LastSecond) : 0);
+		result.NetworkIn = (int)((Network.Net.sv != null) ? Network.Net.sv.GetStat(null, BaseNetwork.StatTypeLong.BytesReceived_LastSecond) : 0);
+		result.NetworkOut = (int)((Network.Net.sv != null) ? Network.Net.sv.GetStat(null, BaseNetwork.StatTypeLong.BytesSent_LastSecond) : 0);
 		result.Restarting = SingletonComponent<ServerMgr>.Instance.Restarting;
 		result.SaveCreatedTime = SaveRestore.SaveCreatedTime.ToString();
 		return result;

@@ -1,0 +1,258 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using Network;
+using Steamworks;
+using Steamworks.Data;
+using UnityEngine;
+
+public class Server : global::Network.Server, ISocketManager
+{
+	private SocketManager manager;
+
+	private bool relay;
+
+	public override string ProtocolId
+	{
+		get
+		{
+			if (!relay)
+			{
+				return "sw";
+			}
+			return "sdr";
+		}
+	}
+
+	public Server(bool enableSteamDatagramRelay)
+	{
+		relay = enableSteamDatagramRelay;
+	}
+
+	public override bool IsConnected()
+	{
+		return manager != null;
+	}
+
+	public override bool Start()
+	{
+		if (manager != null)
+		{
+			throw new Exception("socket not null");
+		}
+		SteamNetworkingUtils.AllowWithoutAuth = 2;
+		SteamNetworkingUtils.Unencrypted = 2;
+		SteamNetworkingUtils.SendBufferSize = 2097152;
+		if (relay)
+		{
+			UnityEngine.Debug.Log($"Server Creating: {port}");
+			manager = SteamNetworkingSockets.CreateRelaySocket(port, this);
+		}
+		else
+		{
+			NetAddress netAddress = (string.IsNullOrEmpty(ip) ? NetAddress.AnyIp((ushort)port) : NetAddress.From(ip, (ushort)port));
+			UnityEngine.Debug.Log($"Server Creating: {netAddress}");
+			manager = SteamNetworkingSockets.CreateNormalSocket(netAddress, this);
+		}
+		UnityEngine.Debug.Log($"Created Socket: {manager.Socket}");
+		if (manager == null)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public override void Stop(string shutdownMsg)
+	{
+		if (manager != null)
+		{
+			Console.WriteLine("[SteamNetworking] Server Shutting Down (" + shutdownMsg + ")");
+			manager.Close();
+			manager = null;
+			base.Stop(shutdownMsg);
+		}
+	}
+
+	public override void Disconnect(global::Network.Connection cn)
+	{
+		if (manager != null)
+		{
+			((Steamworks.Data.Connection)(uint)cn.guid).Close();
+			OnDisconnected("Disconnected", cn);
+		}
+	}
+
+	public override void Kick(global::Network.Connection cn, string message, bool logfile)
+	{
+		if (manager != null)
+		{
+			if (base.write.Start())
+			{
+				base.write.PacketID(Message.Type.DisconnectReason);
+				base.write.String(message);
+				base.write.Send(new SendInfo(cn)
+				{
+					method = SendMethod.ReliableUnordered,
+					priority = Priority.Immediate
+				});
+			}
+			string text = cn.ToString() + " kicked: " + message;
+			if (logfile)
+			{
+				DebugEx.LogWarning(text);
+			}
+			else
+			{
+				Console.WriteLine(text);
+			}
+			((Steamworks.Data.Connection)(uint)cn.guid).Close(linger: true, 0, message);
+			OnDisconnected("Kicked: " + message, cn);
+		}
+	}
+
+	public override void Cycle()
+	{
+		base.Cycle();
+		Stopwatch obj = Pool.Get<Stopwatch>();
+		obj.Reset();
+		obj.Start();
+		while (manager.Receive(32, receiveToEnd: false) == 32 && !(obj.Elapsed.TotalMilliseconds > (double)global::Network.Server.MaxReceiveTime))
+		{
+		}
+		Pool.Free(ref obj);
+	}
+
+	public override void SendUnconnected(uint netAddr, ushort netPort, byte[] data, int size)
+	{
+	}
+
+	public override void Send(SendInfo sendinfo, MemoryStream data)
+	{
+		if (sendinfo.connections != null)
+		{
+			foreach (global::Network.Connection connection in sendinfo.connections)
+			{
+				Send(sendinfo, data, connection);
+			}
+		}
+		if (sendinfo.connection != null)
+		{
+			Send(sendinfo, data, sendinfo.connection);
+		}
+	}
+
+	private unsafe void Send(SendInfo sendinfo, MemoryStream data, global::Network.Connection connection)
+	{
+		Record(connection, data);
+		Encrypt(connection, ref data);
+		fixed (byte* buffer = data.GetBuffer())
+		{
+			Result result = ((Steamworks.Data.Connection)(uint)connection.guid).SendMessage((IntPtr)buffer, (int)data.Length, ToSteamSendType(sendinfo.method, sendinfo.priority));
+			if (steamsendverify && result != Result.OK)
+			{
+				DebugEx.LogWarning(string.Concat(connection, " SendMessage failed: ", result));
+			}
+		}
+	}
+
+	public void OnConnecting(Steamworks.Data.Connection cn, ConnectionInfo info)
+	{
+		cn.Accept();
+	}
+
+	public void OnConnected(Steamworks.Data.Connection cn, ConnectionInfo info)
+	{
+		uint id = cn.Id;
+		string ipaddress = info.Address.ToString();
+		global::Network.Connection connection = new global::Network.Connection();
+		connection.guid = id;
+		connection.ipaddress = ipaddress;
+		connection.active = true;
+		OnNewConnection(connection);
+	}
+
+	public void OnDisconnected(Steamworks.Data.Connection cn, ConnectionInfo info)
+	{
+		cn.Close();
+		global::Network.Connection connection = FindConnection((uint)cn);
+		if (connection != null)
+		{
+			OnDisconnected("Disconnected", connection);
+		}
+	}
+
+	public void OnMessage(Steamworks.Data.Connection cn, NetIdentity identity, IntPtr data, int size, long messageNum, long recvTime, int channel)
+	{
+		global::Network.Connection connection = FindConnection((uint)cn);
+		if (connection == null)
+		{
+			return;
+		}
+		if (size > global::Network.Server.MaxPacketSize)
+		{
+			Kick(connection, "Packet Size", connection.connected);
+			return;
+		}
+		if (connection.GetPacketsPerSecond() >= global::Network.Server.MaxPacketsPerSecond)
+		{
+			Kick(connection, "Packet Flooding", connection.connected);
+			return;
+		}
+		connection.AddPacketsPerSecond();
+		base.read.Start(data, size);
+		Decrypt(connection, base.read);
+		byte b = base.read.PacketID();
+		b -= 140;
+		Message obj = StartMessage((Message.Type)b, connection);
+		if (callbackHandler != null)
+		{
+			callbackHandler.OnNetworkMessage(obj);
+		}
+		obj.Clear();
+		Pool.Free(ref obj);
+	}
+
+	public override string GetDebug(global::Network.Connection connection)
+	{
+		if (connection == null)
+		{
+			return string.Empty;
+		}
+		return ((Steamworks.Data.Connection)(uint)connection.guid).DetailedStatus();
+	}
+
+	public override int GetAveragePing(global::Network.Connection connection)
+	{
+		if (connection == null)
+		{
+			return 0;
+		}
+		return ((Steamworks.Data.Connection)(uint)connection.guid).QuickStatus().Ping;
+	}
+
+	public override ulong GetStat(global::Network.Connection connection, StatTypeLong type)
+	{
+		if (connection == null)
+		{
+			return 0uL;
+		}
+		ConnectionStatus connectionStatus = ((Steamworks.Data.Connection)(uint)connection.guid).QuickStatus();
+		int num = 0;
+		switch (type)
+		{
+		case StatTypeLong.BytesSent_LastSecond:
+			num = Mathf.RoundToInt(connectionStatus.OutBytesPerSec);
+			break;
+		case StatTypeLong.BytesReceived_LastSecond:
+			num = Mathf.RoundToInt(connectionStatus.InBytesPerSec);
+			break;
+		case StatTypeLong.BytesInSendBuffer:
+			num = connectionStatus.PendingUnreliable + connectionStatus.PendingReliable;
+			break;
+		case StatTypeLong.PacketLossLastSecond:
+			num = Mathf.RoundToInt(connectionStatus.ConnectionQualityLocal * 100f);
+			break;
+		}
+		return (ulong)num;
+	}
+}

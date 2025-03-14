@@ -58,10 +58,8 @@ public class IOEntity : BaseCombatEntity
 
 		public void Clear()
 		{
-			IOEntity obj = ioEnt;
 			ioEnt = null;
 			entityRef.Set(null);
-			Interface.CallHook("OnIORefCleared", this, obj);
 		}
 
 		public void Set(IOEntity newIOEnt)
@@ -133,15 +131,27 @@ public class IOEntity : BaseCombatEntity
 
 	public int cachedOutputsUsed;
 
-	private int lastPassthroughEnergy;
+	public int lastPassthroughEnergy;
 
 	public int lastEnergy;
 
 	public int currentEnergy;
 
-	private float lastUpdateTime;
+	public float lastUpdateTime;
+
+	public int lastUpdateBlockedFrame;
 
 	public bool ensureOutputsUpdated;
+
+	public virtual bool IsGravitySource => false;
+
+	private bool HasBlockedUpdatedOutputsThisFrame => UnityEngine.Time.frameCount == lastUpdateBlockedFrame;
+
+	public virtual bool BlockFluidDraining => false;
+
+	protected virtual float LiquidPassthroughGravityThreshold => 1f;
+
+	protected virtual bool DisregardGravityRestrictionsOnLiquid => false;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -158,7 +168,11 @@ public class IOEntity : BaseCombatEntity
 				{
 					using (TimeWarning.New("Conditions"))
 					{
-						if (!RPC_Server.IsVisible.Test("Server_RequestData", this, player, 6f))
+						if (!RPC_Server.CallsPerSecond.Test(4161541566u, "Server_RequestData", this, player, 10uL))
+						{
+							return true;
+						}
+						if (!RPC_Server.IsVisible.Test(4161541566u, "Server_RequestData", this, player, 6f))
 						{
 							return true;
 						}
@@ -177,8 +191,8 @@ public class IOEntity : BaseCombatEntity
 					}
 					catch (Exception exception)
 					{
-						player.Kick("RPC Error in Server_RequestData");
 						Debug.LogException(exception);
+						player.Kick("RPC Error in Server_RequestData");
 					}
 				}
 				return true;
@@ -189,13 +203,17 @@ public class IOEntity : BaseCombatEntity
 
 	public override void ResetState()
 	{
-		lastResetIndex = 0;
-		cachedOutputsUsed = 0;
-		lastPassthroughEnergy = 0;
-		lastEnergy = 0;
-		currentEnergy = 0;
-		lastUpdateTime = 0f;
-		ensureOutputsUpdated = false;
+		base.ResetState();
+		if (base.isServer)
+		{
+			lastResetIndex = 0;
+			cachedOutputsUsed = 0;
+			lastPassthroughEnergy = 0;
+			lastEnergy = 0;
+			currentEnergy = 0;
+			lastUpdateTime = 0f;
+			ensureOutputsUpdated = false;
+		}
 	}
 
 	public string GetDisplayName()
@@ -212,6 +230,43 @@ public class IOEntity : BaseCombatEntity
 		return false;
 	}
 
+	public IOEntity FindGravitySource(ref Vector3 worldHandlePosition, int depth, bool ignoreSelf)
+	{
+		if (depth <= 0)
+		{
+			return null;
+		}
+		if (!ignoreSelf && IsGravitySource)
+		{
+			worldHandlePosition = base.transform.TransformPoint(outputs[0].handlePosition);
+			return this;
+		}
+		IOSlot[] array = inputs;
+		for (int i = 0; i < array.Length; i++)
+		{
+			IOEntity iOEntity = array[i].connectedTo.Get(base.isServer);
+			if (iOEntity != null)
+			{
+				if (iOEntity.IsGravitySource)
+				{
+					worldHandlePosition = iOEntity.transform.TransformPoint(iOEntity.outputs[0].handlePosition);
+					return iOEntity;
+				}
+				iOEntity = iOEntity.FindGravitySource(ref worldHandlePosition, depth - 1, ignoreSelf: false);
+				if (iOEntity != null)
+				{
+					worldHandlePosition = iOEntity.transform.TransformPoint(iOEntity.outputs[0].handlePosition);
+					return iOEntity;
+				}
+			}
+		}
+		return null;
+	}
+
+	public virtual void SetFuelType(ItemDefinition def, IOEntity source)
+	{
+	}
+
 	public virtual bool WantsPower()
 	{
 		return true;
@@ -220,6 +275,16 @@ public class IOEntity : BaseCombatEntity
 	public virtual bool WantsPassthroughPower()
 	{
 		return WantsPower();
+	}
+
+	public virtual int ConsumptionAmount()
+	{
+		return 1;
+	}
+
+	public virtual int MaximalPowerOutput()
+	{
+		return 0;
 	}
 
 	public virtual bool AllowDrainFrom(int outputSlot)
@@ -243,6 +308,10 @@ public class IOEntity : BaseCombatEntity
 				if (iOEntity != null)
 				{
 					if (iOEntity == entity)
+					{
+						return true;
+					}
+					if (ConsiderConnectedTo(entity))
 					{
 						return true;
 					}
@@ -274,6 +343,10 @@ public class IOEntity : BaseCombatEntity
 					{
 						return true;
 					}
+					if (ConsiderConnectedTo(entity))
+					{
+						return true;
+					}
 					if (iOEntity.IsConnectedTo(entity, depth - 1, defaultReturn))
 					{
 						return true;
@@ -285,29 +358,58 @@ public class IOEntity : BaseCombatEntity
 		return defaultReturn;
 	}
 
-	[RPC_Server.IsVisible(6f)]
+	protected virtual bool ConsiderConnectedTo(IOEntity entity)
+	{
+		return false;
+	}
+
 	[RPC_Server]
+	[RPC_Server.IsVisible(6f)]
+	[RPC_Server.CallsPerSecond(10uL)]
 	private void Server_RequestData(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
-		SendAdditionalData(player);
+		int slot = msg.read.Int32();
+		bool input = msg.read.Int32() == 1;
+		SendAdditionalData(player, slot, input);
 	}
 
-	public virtual void SendAdditionalData(BasePlayer player)
+	public virtual void SendAdditionalData(BasePlayer player, int slot, bool input)
 	{
-		float arg = 0f;
-		float arg2 = 0f;
-		ClientRPCPlayer(null, player, "Client_ReceiveAdditionalData", currentEnergy, GetPassthroughAmount(), arg, arg2);
+		int passthroughAmountForAnySlot = GetPassthroughAmountForAnySlot(slot, input);
+		ClientRPCPlayer(null, player, "Client_ReceiveAdditionalData", currentEnergy, passthroughAmountForAnySlot, 0f, 0f);
+	}
+
+	protected int GetPassthroughAmountForAnySlot(int slot, bool isInputSlot)
+	{
+		int result = 0;
+		if (isInputSlot)
+		{
+			if (slot >= 0 && slot < inputs.Length)
+			{
+				IOSlot iOSlot = inputs[slot];
+				IOEntity iOEntity = iOSlot.connectedTo.Get();
+				if (iOEntity != null && iOSlot.connectedToSlot >= 0 && iOSlot.connectedToSlot < iOEntity.outputs.Length)
+				{
+					result = iOEntity.GetPassthroughAmount(inputs[slot].connectedToSlot);
+				}
+			}
+		}
+		else if (slot >= 0 && slot < outputs.Length)
+		{
+			result = GetPassthroughAmount(slot);
+		}
+		return result;
 	}
 
 	public static void ProcessQueue()
 	{
 		float realtimeSinceStartup = UnityEngine.Time.realtimeSinceStartup;
 		float num = framebudgetms / 1000f;
-		while (_processQueue.Count > 0 && UnityEngine.Time.realtimeSinceStartup < realtimeSinceStartup + num)
+		while (_processQueue.Count > 0 && UnityEngine.Time.realtimeSinceStartup < realtimeSinceStartup + num && !_processQueue.Peek().HasBlockedUpdatedOutputsThisFrame)
 		{
 			IOEntity iOEntity = _processQueue.Dequeue();
-			if (iOEntity != null)
+			if (iOEntity.IsValid())
 			{
 				iOEntity.UpdateOutputs();
 			}
@@ -455,11 +557,6 @@ public class IOEntity : BaseCombatEntity
 		return ConsumptionAmount();
 	}
 
-	public virtual int ConsumptionAmount()
-	{
-		return 1;
-	}
-
 	public virtual int CalculateCurrentEnergy(int inputAmount, int inputSlot)
 	{
 		return inputAmount;
@@ -472,12 +569,21 @@ public class IOEntity : BaseCombatEntity
 
 	public virtual int GetPassthroughAmount(int outputSlot = 0)
 	{
-		return Mathf.Clamp(GetCurrentEnergy(), 0, GetCurrentEnergy());
+		if (outputSlot < 0 || outputSlot >= outputs.Length)
+		{
+			return 0;
+		}
+		if (outputs[outputSlot].connectedTo.Get() == null)
+		{
+			return 0;
+		}
+		int num = ((cachedOutputsUsed == 0) ? 1 : cachedOutputsUsed);
+		return GetCurrentEnergy() / num;
 	}
 
 	public virtual void UpdateHasPower(int inputAmount, int inputSlot)
 	{
-		SetFlag(Flags.Reserved8, inputAmount >= ConsumptionAmount(), recursive: false, networkupdate: false);
+		SetFlag(Flags.Reserved8, inputAmount >= ConsumptionAmount() && inputAmount > 0, recursive: false, networkupdate: false);
 	}
 
 	public void TouchInternal()
@@ -495,6 +601,15 @@ public class IOEntity : BaseCombatEntity
 
 	public virtual void UpdateFromInput(int inputAmount, int inputSlot)
 	{
+		if (Interface.CallHook("OnInputUpdate", this, inputAmount, inputSlot) != null)
+		{
+			return;
+		}
+		if (inputs[inputSlot].type != ioType)
+		{
+			IOStateChanged(inputAmount, inputSlot);
+			return;
+		}
 		UpdateHasPower(inputAmount, inputSlot);
 		lastEnergy = currentEnergy;
 		currentEnergy = CalculateCurrentEnergy(inputAmount, inputSlot);
@@ -575,35 +690,54 @@ public class IOEntity : BaseCombatEntity
 		}
 	}
 
-	public virtual void UpdateOutputs()
+	public bool ShouldUpdateOutputs()
 	{
 		if (UnityEngine.Time.realtimeSinceStartup - lastUpdateTime < responsetime)
 		{
+			lastUpdateBlockedFrame = UnityEngine.Time.frameCount;
 			_processQueue.Enqueue(this);
-			return;
+			return false;
 		}
 		lastUpdateTime = UnityEngine.Time.realtimeSinceStartup;
 		SendIONetworkUpdate();
 		if (outputs.Length == 0)
 		{
 			ensureOutputsUpdated = false;
+			return false;
 		}
-		else
+		return true;
+	}
+
+	public virtual void UpdateOutputs()
+	{
+		if (Interface.CallHook("OnOutputUpdate", this) != null || !ShouldUpdateOutputs() || !ensureOutputsUpdated)
 		{
-			if (!ensureOutputsUpdated)
+			return;
+		}
+		ensureOutputsUpdated = false;
+		using (TimeWarning.New("ProcessIOOutputs"))
+		{
+			for (int i = 0; i < outputs.Length; i++)
 			{
-				return;
-			}
-			int num = ((cachedOutputsUsed == 0) ? 1 : cachedOutputsUsed);
-			int inputAmount = Mathf.FloorToInt((float)GetPassthroughAmount() / (float)num);
-			ensureOutputsUpdated = false;
-			IOSlot[] array = outputs;
-			foreach (IOSlot iOSlot in array)
-			{
-				if (iOSlot.connectedTo.Get() != null)
+				IOSlot iOSlot = outputs[i];
+				bool flag = true;
+				IOEntity iOEntity = iOSlot.connectedTo.Get();
+				if (!(iOEntity != null))
 				{
-					iOSlot.connectedTo.Get().UpdateFromInput(inputAmount, iOSlot.connectedToSlot);
+					continue;
 				}
+				if (ioType == IOType.Fluidic && !DisregardGravityRestrictionsOnLiquid && !iOEntity.DisregardGravityRestrictionsOnLiquid)
+				{
+					using (TimeWarning.New("FluidOutputProcessing"))
+					{
+						if (!iOEntity.AllowLiquidPassthrough(this, base.transform.TransformPoint(iOSlot.handlePosition)))
+						{
+							flag = false;
+						}
+					}
+				}
+				int passthroughAmount = GetPassthroughAmount(i);
+				iOEntity.UpdateFromInput(flag ? passthroughAmount : 0, iOSlot.connectedToSlot);
 			}
 		}
 	}
@@ -686,6 +820,29 @@ public class IOEntity : BaseCombatEntity
 			}
 		}
 		return inputAmount;
+	}
+
+	public virtual bool AllowLiquidPassthrough(IOEntity fromSource, Vector3 sourceWorldPosition, bool forPlacement = false)
+	{
+		if (fromSource.DisregardGravityRestrictionsOnLiquid || DisregardGravityRestrictionsOnLiquid)
+		{
+			return true;
+		}
+		if (inputs.Length == 0)
+		{
+			return false;
+		}
+		Vector3 vector = base.transform.TransformPoint(inputs[0].handlePosition);
+		float num = sourceWorldPosition.y - vector.y;
+		if (num > 0f)
+		{
+			return true;
+		}
+		if (Mathf.Abs(num) < LiquidPassthroughGravityThreshold)
+		{
+			return true;
+		}
+		return false;
 	}
 
 	public override void Load(LoadInfo info)

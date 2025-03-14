@@ -15,6 +15,8 @@ public class ItemModContainer : ItemMod
 
 	public List<ItemSlot> availableSlots = new List<ItemSlot>();
 
+	public ItemDefinition[] validItemWhitelist = new ItemDefinition[0];
+
 	public bool openInDeployed = true;
 
 	public bool openInInventory = true;
@@ -30,10 +32,27 @@ public class ItemModContainer : ItemMod
 			item.contents.allowedContents = ((onlyAllowedContents == (ItemContainer.ContentsType)0) ? ItemContainer.ContentsType.Generic : onlyAllowedContents);
 			item.contents.onlyAllowedItem = onlyAllowedItemType;
 			item.contents.availableSlots = availableSlots;
+			if (validItemWhitelist != null && validItemWhitelist.Length != 0)
+			{
+				item.contents.canAcceptItem = CanAcceptItem;
+			}
 			item.contents.ServerInitialize(item, capacity);
 			item.contents.maxStackSize = maxStackSize;
 			item.contents.GiveUID();
 		}
+	}
+
+	private bool CanAcceptItem(Item item, int count)
+	{
+		ItemDefinition[] array = validItemWhitelist;
+		for (int i = 0; i < array.Length; i++)
+		{
+			if (array[i].itemid == item.info.itemid)
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	public override void OnVirginItem(Item item)

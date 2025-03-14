@@ -18,4 +18,6 @@ public class WorkbenchPanel : LootPanel, IInventoryChanged
 	public GameObject informationParent;
 
 	public GameObject cycleIcon;
+
+	public TechTreeDialog techTreeDialog;
 }

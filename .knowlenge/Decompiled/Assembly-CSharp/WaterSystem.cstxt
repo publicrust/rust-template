@@ -128,6 +128,8 @@ public class WaterSystem : MonoBehaviour
 
 	private Vector4 global1;
 
+	private static float oceanLevel = 0f;
+
 	private static WaterSystem instance;
 
 	private static Vector3[] emptyShoreMap = new Vector3[1] { Vector3.one };
@@ -160,7 +162,22 @@ public class WaterSystem : MonoBehaviour
 
 	public static HashSet<WaterBody> WaterBodies { get; private set; } = new HashSet<WaterBody>();
 
-	public static float OceanLevel { get; private set; } = 0f;
+	public static float OceanLevel
+	{
+		get
+		{
+			return oceanLevel;
+		}
+		set
+		{
+			value = Mathf.Max(value, 0f);
+			if (!Mathf.Approximately(oceanLevel, value))
+			{
+				oceanLevel = value;
+				UpdateOceanLevel();
+			}
+		}
+	}
 
 	public static float WaveTime { get; private set; } = 0f;
 
@@ -186,6 +203,9 @@ public class WaterSystem : MonoBehaviour
 
 	[DllImport("RustNative", EntryPoint = "Water_SetGerstnerConstants")]
 	private static extern void SetGerstnerConstants_Native(Vector4 globalParams0, Vector4 globalParams1, ref Vector4 openWaves, ref Vector4 shoreWaves);
+
+	[DllImport("RustNative", EntryPoint = "Water_UpdateOceanLevel")]
+	private static extern void UpdateOceanLevel_Native(float oceanWaterLevel);
 
 	[DllImport("RustNative", EntryPoint = "Water_GetHeightArray")]
 	private static extern float GetHeightArray_Native(int sampleCount, ref Vector2 pos, ref Vector2 posUV, ref Vector3 shore, ref float terrainHeight, ref float waterHeight);
@@ -257,16 +277,16 @@ public class WaterSystem : MonoBehaviour
 		Vector2 uv = default(Vector2);
 		uv.x = (pos.x - TerrainMeta.Position.x) * TerrainMeta.OneOverSize.x;
 		uv.y = (pos.z - TerrainMeta.Position.z) * TerrainMeta.OneOverSize.z;
-		float oceanLevel = OceanLevel;
-		float num = ((TerrainMeta.WaterMap != null) ? TerrainMeta.WaterMap.GetHeightFast(uv) : 0f);
-		float num2 = ((TerrainMeta.HeightMap != null) ? TerrainMeta.HeightMap.GetHeightFast(uv) : 0f);
-		if (instance != null && (double)num <= (double)oceanLevel + 0.01)
+		float num = OceanLevel;
+		float num2 = ((TerrainMeta.WaterMap != null) ? TerrainMeta.WaterMap.GetHeightFast(uv) : 0f);
+		float num3 = ((TerrainMeta.HeightMap != null) ? TerrainMeta.HeightMap.GetHeightFast(uv) : 0f);
+		if (instance != null && (double)num2 <= (double)num + 0.01)
 		{
 			Vector3 shore = ((TerrainTexturing.Instance != null) ? TerrainTexturing.Instance.GetCoarseVectorToShore(uv) : Vector3.zero);
-			float num3 = Mathf.Clamp01(Mathf.Abs(oceanLevel - num2) * 0.1f);
-			num = WaterGerstner.SampleHeight(instance, pos, shore) * num3;
+			float num4 = Mathf.Clamp01(Mathf.Abs(num - num3) * 0.1f);
+			num2 = WaterGerstner.SampleHeight(instance, pos, shore) * num4;
 		}
-		return num;
+		return num2;
 	}
 
 	public static void GetHeightArray_Managed(Vector2[] pos, Vector2[] posUV, Vector3[] shore, float[] terrainHeight, float[] waterHeight)
@@ -282,31 +302,28 @@ public class WaterSystem : MonoBehaviour
 		{
 			WaterGerstner.SampleHeightArray(instance, pos, shore, waterHeight);
 		}
-		float oceanLevel = OceanLevel;
+		float num = OceanLevel;
 		for (int j = 0; j < posUV.Length; j++)
 		{
 			Vector2 uv = posUV[j];
 			terrainHeight[j] = ((TerrainMeta.HeightMap != null) ? TerrainMeta.HeightMap.GetHeightFast(uv) : 0f);
-			float num = ((TerrainMeta.WaterMap != null) ? TerrainMeta.WaterMap.GetHeightFast(uv) : 0f);
-			if (instance != null && (double)num <= (double)oceanLevel + 0.01)
+			float num2 = ((TerrainMeta.WaterMap != null) ? TerrainMeta.WaterMap.GetHeightFast(uv) : 0f);
+			if (instance != null && (double)num2 <= (double)num + 0.01)
 			{
-				float num2 = Mathf.Clamp01(Mathf.Abs(oceanLevel - terrainHeight[j]) * 0.1f);
-				waterHeight[j] *= num2;
+				float num3 = Mathf.Clamp01(Mathf.Abs(num - terrainHeight[j]) * 0.1f);
+				waterHeight[j] = num + waterHeight[j] * num3;
 			}
 			else
 			{
-				waterHeight[j] = num;
+				waterHeight[j] = num2;
 			}
 		}
 	}
 
 	public static float GetHeight(Vector3 pos)
 	{
-		if (nativePathState == NativePathState.Ready)
-		{
-			return GetHeight_Native(pos);
-		}
-		return GetHeight_Managed(pos);
+		float val = ((nativePathState != NativePathState.Ready) ? GetHeight_Managed(pos) : GetHeight_Native(pos));
+		return Math.Max(val, OceanLevel);
 	}
 
 	public static void GetHeightArray(Vector2[] pos, Vector2[] posUV, Vector3[] shore, float[] terrainHeight, float[] waterHeight)
@@ -337,7 +354,7 @@ public class WaterSystem : MonoBehaviour
 			if (Ocean == null)
 			{
 				Ocean = body;
-				OceanLevel = body.Transform.position.y;
+				body.Transform.position = body.Transform.position.WithY(OceanLevel);
 			}
 			else if (Ocean != body)
 			{
@@ -356,8 +373,30 @@ public class WaterSystem : MonoBehaviour
 	private void UpdateWaves()
 	{
 		WaveTime = (ProgressTime ? Time.realtimeSinceStartup : WaveTime);
-		WaterGerstner.UpdatePrecomputedWaves(Simulation.OpenSeaWaves, ref precomputedWaves);
-		WaterGerstner.UpdatePrecomputedShoreWaves(Simulation.ShoreWaves, ref precomputedShoreWaves);
+		using (TimeWarning.New("WaterGerstner.UpdatePrecomputedWaves"))
+		{
+			WaterGerstner.UpdatePrecomputedWaves(Simulation.OpenSeaWaves, ref precomputedWaves);
+		}
+		using (TimeWarning.New("WaterGerstner.UpdatePrecomputedShoreWaves"))
+		{
+			WaterGerstner.UpdatePrecomputedShoreWaves(Simulation.ShoreWaves, ref precomputedShoreWaves);
+		}
+	}
+
+	private static void UpdateOceanLevel()
+	{
+		if (Ocean != null)
+		{
+			Ocean.Transform.position = Ocean.Transform.position.WithY(OceanLevel);
+		}
+		if (nativePathState == NativePathState.Ready)
+		{
+			UpdateOceanLevel_Native(OceanLevel);
+		}
+		foreach (WaterBody waterBody in WaterBodies)
+		{
+			waterBody.OnOceanLevelChanged(OceanLevel);
+		}
 	}
 
 	public void UpdateWaveData()
@@ -372,14 +411,29 @@ public class WaterSystem : MonoBehaviour
 		global1.y = precomputedShoreWaves.Amplitude;
 		global1.z = precomputedShoreWaves.K;
 		global1.w = precomputedShoreWaves.C;
-		WaterGerstner.UpdateWaveArray(precomputedWaves, ref waveArray);
-		WaterGerstner.UpdateShoreWaveArray(precomputedShoreWaves, ref shoreWaveArray);
-		SetNativeConstants(TerrainTexturing.Instance, TerrainMeta.WaterMap, TerrainMeta.HeightMap, global0, global1, waveArray, shoreWaveArray);
+		using (TimeWarning.New("WaterGerstner.UpdateWaveArray"))
+		{
+			WaterGerstner.UpdateWaveArray(precomputedWaves, ref waveArray);
+		}
+		using (TimeWarning.New("WaterGerstner.UpdateShoreWaveArray"))
+		{
+			WaterGerstner.UpdateShoreWaveArray(precomputedShoreWaves, ref shoreWaveArray);
+		}
+		using (TimeWarning.New("WaterSystem.SetNativeConstants"))
+		{
+			SetNativeConstants(TerrainTexturing.Instance, TerrainMeta.WaterMap, TerrainMeta.HeightMap, global0, global1, waveArray, shoreWaveArray);
+		}
 	}
 
 	private void Update()
 	{
-		UpdateWaves();
-		UpdateWaveData();
+		using (TimeWarning.New("UpdateWaves"))
+		{
+			UpdateWaves();
+		}
+		using (TimeWarning.New("UpdateWaveData"))
+		{
+			UpdateWaveData();
+		}
 	}
 }

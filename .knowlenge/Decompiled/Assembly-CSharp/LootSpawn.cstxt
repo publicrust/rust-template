@@ -8,6 +8,9 @@ public class LootSpawn : ScriptableObject
 	[Serializable]
 	public struct Entry
 	{
+		[Tooltip("If this category is chosen, we will spawn 1+ this amount")]
+		public int extraSpawns;
+
 		[Tooltip("If a subcategory exists we'll choose from there instead of any items specified")]
 		public LootSpawn category;
 
@@ -85,14 +88,18 @@ public class LootSpawn : ScriptableObject
 		int num2 = UnityEngine.Random.Range(0, num);
 		for (int i = 0; i < subSpawn.Length; i++)
 		{
-			if (!(subSpawn[i].category == null))
+			if (subSpawn[i].category == null)
 			{
-				num -= subSpawn[i].weight;
-				if (num2 >= num)
+				continue;
+			}
+			num -= subSpawn[i].weight;
+			if (num2 >= num)
+			{
+				for (int j = 0; j < 1 + subSpawn[i].extraSpawns; j++)
 				{
 					subSpawn[i].category.SpawnIntoContainer(container);
-					return;
 				}
+				return;
 			}
 		}
 		Debug.LogWarning("SubCategoryIntoContainer: This should never happen!", this);

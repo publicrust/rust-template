@@ -5,7 +5,7 @@ using UnityEngine;
 public class NPCVendingOrder : ScriptableObject
 {
 	[Serializable]
-	public struct Entry
+	public class Entry
 	{
 		public ItemDefinition sellItem;
 
@@ -21,6 +21,10 @@ public class NPCVendingOrder : ScriptableObject
 
 		[Tooltip("The higher this number, the more likely this will be chosen")]
 		public int weight;
+
+		public int refillAmount = 1;
+
+		public float refillDelay = 10f;
 	}
 
 	public Entry[] orders;

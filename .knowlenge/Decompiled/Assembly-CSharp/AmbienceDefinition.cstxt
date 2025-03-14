@@ -25,8 +25,8 @@ public class AmbienceDefinition : ScriptableObject
 	[Horizontal(2, -1)]
 	public ValueRange stingFrequency = new ValueRange(15f, 30f);
 
-	[InspectorFlags]
 	[Header("Environment")]
+	[InspectorFlags]
 	public TerrainBiome.Enum biomes = (TerrainBiome.Enum)(-1);
 
 	[InspectorFlags]

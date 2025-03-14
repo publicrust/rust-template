@@ -1,6 +1,6 @@
 using UnityEngine;
 
-public abstract class WeatherEffect : MonoBehaviour, IClientComponent
+public abstract class WeatherEffect : BaseMonoBehaviour, IClientComponent
 {
 	public ParticleSystem[] emitOnStart;
 
