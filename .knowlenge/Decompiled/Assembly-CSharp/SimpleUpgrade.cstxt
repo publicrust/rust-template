@@ -163,6 +163,14 @@ internal static class SimpleUpgrade
 
 	public static bool IsUpgradeBlocked(BaseEntity entity, ItemDefinition upgradeItem, BasePlayer player)
 	{
+		if (upgradeItem == null)
+		{
+			return true;
+		}
+		if (entity == null)
+		{
+			return true;
+		}
 		ItemModDeployable component = upgradeItem.GetComponent<ItemModDeployable>();
 		DeployVolume[] volumes = PrefabAttribute.server.FindAll<DeployVolume>(component.entityPrefab.resourceID);
 		if (DeployVolume.Check(entity.transform.position, entity.transform.rotation, volumes, ~((1 << entity.gameObject.layer) | 0x20000000)))

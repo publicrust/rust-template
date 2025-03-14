@@ -73,7 +73,7 @@ public class OreResourceEntity : StagedResourceEntity
 					{
 						spawnBonusHitRay = new Ray(info.PointStart, info.attackNormal);
 						lastNodeDir = (info.PointStart - (base.transform.position + new Vector3(0f, 0.5f, 0f))).normalized;
-						float num3 = 0.6f;
+						float num3 = 0.5f;
 						if (lastNodeDir.y > num3)
 						{
 							float num4 = lastNodeDir.y - num3;
@@ -81,6 +81,7 @@ public class OreResourceEntity : StagedResourceEntity
 							lastNodeDir.x += num4;
 							lastNodeDir.z += num4;
 						}
+						lastNodeDir = base.transform.InverseTransformDirection(lastNodeDir);
 					}
 					DelayedBonusSpawn();
 				}
@@ -199,8 +200,7 @@ public class OreResourceEntity : StagedResourceEntity
 				num = heightOffset;
 			}
 			Vector3 vector2 = RandomCircle();
-			lastNodeDir = vector2.normalized;
-			Vector3 vector3 = base.transform.TransformDirection(vector2.normalized);
+			Vector3 vector3 = (lastNodeDir = base.transform.TransformDirection(vector2.normalized));
 			vector2 = base.transform.position + base.transform.up * (vector.y + num) + vector3.normalized * 5f;
 			zero = vector2;
 		}

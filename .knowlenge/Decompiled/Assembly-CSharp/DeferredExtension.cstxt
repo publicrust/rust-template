@@ -1,8 +1,8 @@
 using UnityEngine;
 
-[RequireComponent(typeof(CommandBufferManager))]
 [ExecuteInEditMode]
 [RequireComponent(typeof(Camera))]
+[RequireComponent(typeof(CommandBufferManager))]
 public class DeferredExtension : MonoBehaviour
 {
 	public ExtendGBufferParams extendGBuffer = ExtendGBufferParams.Default;

@@ -2,8 +2,8 @@ using System;
 using UnityEngine;
 using UnityStandardAssets.ImageEffects;
 
-[ExecuteInEditMode]
 [AddComponentMenu("Image Effects/NVG Effect")]
+[ExecuteInEditMode]
 public class NVGEffect : PostEffectsBase, IImageEffect
 {
 	[Serializable]

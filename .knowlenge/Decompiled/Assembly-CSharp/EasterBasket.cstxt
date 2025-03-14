@@ -85,8 +85,8 @@ public class EasterBasket : AttackEntity
 		GetAmmo()?.UseItem();
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsActiveItem]
+	[RPC_Server]
 	public void ThrowEgg(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;

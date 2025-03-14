@@ -3,8 +3,8 @@ using UnityEngine.UI;
 
 public class HomingLauncherUIDialog : UIDialog
 {
-	[Header("Homing Launcher")]
 	[SerializeField]
+	[Header("Homing Launcher")]
 	private Canvas canvas;
 
 	[SerializeField]

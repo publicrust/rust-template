@@ -13,8 +13,8 @@ public sealed class MotionBlur : PostProcessEffectSettings
 		value = 270f
 	};
 
-	[Tooltip("The amount of sample points. This affects quality and performance.")]
 	[Range(4f, 32f)]
+	[Tooltip("The amount of sample points. This affects quality and performance.")]
 	public IntParameter sampleCount = new IntParameter
 	{
 		value = 10

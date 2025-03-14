@@ -50,8 +50,8 @@ public sealed class AmbientOcclusion : PostProcessEffectSettings
 		value = -12f
 	};
 
-	[Range(1f, 10f)]
 	[Tooltip("This modifies the thickness of occluders. It increases the size of dark areas and also introduces a dark halo around objects.")]
+	[Range(1f, 10f)]
 	public FloatParameter thicknessModifier = new FloatParameter
 	{
 		value = 1f

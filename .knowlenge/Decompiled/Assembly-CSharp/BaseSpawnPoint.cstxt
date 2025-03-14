@@ -13,8 +13,8 @@ public abstract class BaseSpawnPoint : MonoBehaviour, IServerComponent
 
 	public SpawnPointType spawnPointType;
 
-	[SerializeField]
 	[Range(1f, 25f)]
+	[SerializeField]
 	[Tooltip("Min distance between the spawn area and any human players")]
 	protected float playerCheckMargin = 2f;
 
