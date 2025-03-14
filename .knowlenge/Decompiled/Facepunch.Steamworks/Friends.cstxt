@@ -1,10 +1,16 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Text;
 using Facepunch.Steamworks;
 using SteamNative;
 
 public class Friends
 {
+	public delegate void ChatMessageDelegate(SteamFriend friend, string type, string message);
+
+	public delegate void JoinRequestedDelegate(SteamFriend friend, string connect);
+
 	public enum AvatarSize
 	{
 		Small,
@@ -16,14 +22,35 @@ public class Friends
 	{
 		public ulong SteamId;
 
-		public Action Callback;
+		public AvatarSize Size;
+
+		public Action<Image> Callback;
+
+		public DateTime Time;
 	}
 
 	internal Client client;
 
+	private byte[] buffer = new byte[131072];
+
+	private bool _listenForFriendsMessages;
+
 	private List<SteamFriend> _allFriends;
 
 	private List<PersonaCallback> PersonaCallbacks = new List<PersonaCallback>();
+
+	public bool ListenForFriendsMessages
+	{
+		get
+		{
+			return _listenForFriendsMessages;
+		}
+		set
+		{
+			_listenForFriendsMessages = value;
+			client.native.friends.SetListenForFriendsMessages(value);
+		}
+	}
 
 	public IEnumerable<SteamFriend> All
 	{
@@ -42,11 +69,11 @@ public class Friends
 	{
 		get
 		{
-			foreach (SteamFriend friend in All)
+			foreach (SteamFriend item in All)
 			{
-				if (friend.IsFriend)
+				if (item.IsFriend)
 				{
-					yield return friend;
+					yield return item;
 				}
 			}
 		}
@@ -56,20 +83,56 @@ public class Friends
 	{
 		get
 		{
-			foreach (SteamFriend friend in All)
+			foreach (SteamFriend item in All)
 			{
-				if (friend.IsBlocked)
+				if (item.IsBlocked)
 				{
-					yield return friend;
+					yield return item;
 				}
 			}
 		}
 	}
 
+	public event ChatMessageDelegate OnChatMessage;
+
+	public event JoinRequestedDelegate OnInvitedToGame;
+
 	internal Friends(Client c)
 	{
 		client = c;
-		PersonaStateChange_t.RegisterCallback(client, OnPersonaStateChange);
+		client.RegisterCallback<AvatarImageLoaded_t>(OnAvatarImageLoaded);
+		client.RegisterCallback<PersonaStateChange_t>(OnPersonaStateChange);
+		client.RegisterCallback<GameRichPresenceJoinRequested_t>(OnGameJoinRequested);
+		client.RegisterCallback<GameConnectedFriendChatMsg_t>(OnFriendChatMessage);
+	}
+
+	private unsafe void OnFriendChatMessage(GameConnectedFriendChatMsg_t data)
+	{
+		if (this.OnChatMessage == null)
+		{
+			return;
+		}
+		SteamFriend friend = Get(data.SteamIDUser);
+		ChatEntryType peChatEntryType = ChatEntryType.ChatMsg;
+		fixed (byte* ptr = buffer)
+		{
+			int friendMessage = client.native.friends.GetFriendMessage(data.SteamIDUser, data.MessageID, (IntPtr)ptr, buffer.Length, out peChatEntryType);
+			if (friendMessage == 0 && peChatEntryType == ChatEntryType.Invalid)
+			{
+				return;
+			}
+			string type = peChatEntryType.ToString();
+			string @string = Encoding.UTF8.GetString(buffer, 0, friendMessage);
+			this.OnChatMessage(friend, type, @string);
+		}
+	}
+
+	private void OnGameJoinRequested(GameRichPresenceJoinRequested_t data)
+	{
+		if (this.OnInvitedToGame != null)
+		{
+			this.OnInvitedToGame(Get(data.SteamIDFriend), data.Connect);
+		}
 	}
 
 	public bool UpdateInformation(ulong steamid)
@@ -114,15 +177,27 @@ public class Friends
 			num = client.native.friends.GetLargeFriendAvatar(steamid);
 			break;
 		}
-		Image image = new Image
+		switch (num)
 		{
-			Id = num
-		};
-		if (num != 0 && image.TryLoad(client.native.utils))
+		case 1:
+			return null;
+		case 2:
+			return null;
+		case 3:
+			return null;
+		default:
 		{
+			Image image = new Image
+			{
+				Id = num
+			};
+			if (!image.TryLoad(client.native.utils))
+			{
+				return null;
+			}
 			return image;
 		}
-		return null;
+		}
 	}
 
 	public void GetAvatar(AvatarSize size, ulong steamid, Action<Image> callback)
@@ -141,25 +216,84 @@ public class Friends
 		PersonaCallbacks.Add(new PersonaCallback
 		{
 			SteamId = steamid,
-			Callback = delegate
-			{
-				callback(GetCachedAvatar(size, steamid));
-			}
+			Size = size,
+			Callback = callback,
+			Time = DateTime.Now
 		});
 	}
 
 	public SteamFriend Get(ulong steamid)
 	{
-		SteamFriend steamFriend = new SteamFriend
+		SteamFriend steamFriend = All.Where((SteamFriend x) => x.Id == steamid).FirstOrDefault();
+		if (steamFriend != null)
 		{
-			Id = steamid,
-			Client = client
-		};
-		steamFriend.Refresh();
-		return steamFriend;
+			return steamFriend;
+		}
+		SteamFriend steamFriend2 = new SteamFriend();
+		steamFriend2.Id = steamid;
+		steamFriend2.Client = client;
+		steamFriend2.Refresh();
+		return steamFriend2;
 	}
 
-	private void OnPersonaStateChange(PersonaStateChange_t data, bool error)
+	internal void Cycle()
 	{
+		if (PersonaCallbacks.Count == 0)
+		{
+			return;
+		}
+		DateTime dateTime = DateTime.Now.AddSeconds(-10.0);
+		for (int num = PersonaCallbacks.Count - 1; num >= 0; num--)
+		{
+			PersonaCallback personaCallback = PersonaCallbacks[num];
+			if (personaCallback.Time < dateTime)
+			{
+				if (personaCallback.Callback != null)
+				{
+					personaCallback.Callback(null);
+				}
+				PersonaCallbacks.Remove(personaCallback);
+			}
+		}
+	}
+
+	private void OnPersonaStateChange(PersonaStateChange_t data)
+	{
+		if ((data.ChangeFlags & 0x40) == 64)
+		{
+			LoadAvatarForSteamId(data.SteamID);
+		}
+		foreach (SteamFriend item in All)
+		{
+			if (item.Id == data.SteamID)
+			{
+				item.Refresh();
+			}
+		}
+	}
+
+	private void LoadAvatarForSteamId(ulong Steamid)
+	{
+		for (int num = PersonaCallbacks.Count - 1; num >= 0; num--)
+		{
+			PersonaCallback personaCallback = PersonaCallbacks[num];
+			if (personaCallback.SteamId == Steamid)
+			{
+				Image cachedAvatar = GetCachedAvatar(personaCallback.Size, personaCallback.SteamId);
+				if (cachedAvatar != null)
+				{
+					PersonaCallbacks.Remove(personaCallback);
+					if (personaCallback.Callback != null)
+					{
+						personaCallback.Callback(cachedAvatar);
+					}
+				}
+			}
+		}
+	}
+
+	private void OnAvatarImageLoaded(AvatarImageLoaded_t data)
+	{
+		LoadAvatarForSteamId(data.SteamID);
 	}
 }

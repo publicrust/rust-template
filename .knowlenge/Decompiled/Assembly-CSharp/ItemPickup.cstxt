@@ -1,0 +1,32 @@
+using Rust;
+
+public class ItemPickup : DroppedItem
+{
+	public ItemDefinition itemDef;
+
+	public int amount = 1;
+
+	public ulong skinOverride;
+
+	public override float GetDespawnDuration()
+	{
+		return float.PositiveInfinity;
+	}
+
+	public override void Spawn()
+	{
+		base.Spawn();
+		if (!Application.isLoadingSave)
+		{
+			Item item = ItemManager.Create(itemDef, amount, skinOverride);
+			InitializeItem(item);
+			item.SetWorldEntity(this);
+		}
+	}
+
+	public override void PostServerLoad()
+	{
+		base.PostServerLoad();
+		IdleDestroy();
+	}
+}

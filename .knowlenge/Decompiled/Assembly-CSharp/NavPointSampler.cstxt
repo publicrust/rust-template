@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using ConVar;
 using Rust.Ai;
 using UnityEngine;
 using UnityEngine.AI;
@@ -22,7 +23,9 @@ public static class NavPointSampler
 		ApproachTarget = 4,
 		FlankTarget = 8,
 		RetreatFromDirection = 0x10,
-		RetreatFromExplosive = 0x20
+		RetreatFromExplosive = 0x20,
+		TopologyPreference = 0x40,
+		RangeFromSpawn = 0x80
 	}
 
 	public struct SampleScoreParams
@@ -38,7 +41,7 @@ public static class NavPointSampler
 
 	private static readonly NavPointSampleComparer NavPointSampleComparer = new NavPointSampleComparer();
 
-	public static bool SampleCircle(SampleCount sampleCount, Vector3 center, float radius, SampleScoreParams scoreParams, ref List<NavPointSample> samples)
+	public static bool SampleCircleWaterDepthOnly(SampleCount sampleCount, Vector3 center, float radius, SampleScoreParams scoreParams, ref List<NavPointSample> samples)
 	{
 		if (scoreParams.Agent == null || scoreParams.Agent.GetNavAgent == null)
 		{
@@ -56,14 +59,77 @@ public static class NavPointSampler
 		}
 		for (float num2 = 0f; num2 < 360f; num2 += num)
 		{
-			NavPointSample item = SamplePoint(GetPointOnCircle(center, radius, num2), scoreParams);
+			Vector3 pointOnCircle = GetPointOnCircle(center, radius, num2);
+			NavPointSample item = SamplePointWaterDepthOnly(pointOnCircle, 2f);
 			if (item.Score > 0f)
 			{
 				samples.Add(item);
 			}
 		}
-		samples.Sort(NavPointSampleComparer);
+		if (samples.Count > 0)
+		{
+			samples.Sort(NavPointSampleComparer);
+		}
 		return samples.Count > 0;
+	}
+
+	public static bool SampleCircle(SampleCount sampleCount, Vector3 center, float radius, SampleScoreParams scoreParams, ref List<NavPointSample> samples)
+	{
+		if (scoreParams.Agent == null || scoreParams.Agent.GetNavAgent == null)
+		{
+			return false;
+		}
+		float num = 90f;
+		switch (sampleCount)
+		{
+		case SampleCount.Eight:
+			num = 45f;
+			break;
+		case SampleCount.Sixteen:
+			num = 22.5f;
+			break;
+		}
+		float num2 = 2f + (float)GetFeatureCount((int)scoreParams.Features);
+		for (float num3 = 0f; num3 < 360f; num3 += num)
+		{
+			NavPointSample item = SamplePoint(GetPointOnCircle(center, radius, num3), scoreParams);
+			if (item.Score > 0f)
+			{
+				samples.Add(item);
+				if (item.Score >= num2)
+				{
+					break;
+				}
+			}
+		}
+		if (samples.Count == 0)
+		{
+			for (float num4 = 0f; num4 < 360f; num4 += num)
+			{
+				Vector3 pointOnCircle = GetPointOnCircle(center, radius, num4);
+				NavPointSample item2 = SamplePointWaterDepthOnly(pointOnCircle, 2f);
+				if (item2.Score > 0f)
+				{
+					samples.Add(item2);
+				}
+			}
+		}
+		if (samples.Count > 0)
+		{
+			samples.Sort(NavPointSampleComparer);
+		}
+		return samples.Count > 0;
+	}
+
+	public static int GetFeatureCount(int features)
+	{
+		int num = 0;
+		while (features != 0)
+		{
+			features &= features - 1;
+			num++;
+		}
+		return num;
 	}
 
 	public static Vector3 GetPointOnCircle(Vector3 center, float radius, float degrees)
@@ -73,12 +139,28 @@ public static class NavPointSampler
 		return new Vector3(x, center.y, z);
 	}
 
+	public static NavPointSample SamplePointWaterDepthOnly(Vector3 pos, float depth)
+	{
+		if (TerrainMeta.HeightMap != null)
+		{
+			pos.y = TerrainMeta.HeightMap.GetHeight(pos);
+		}
+		float score = _WaterDepth(pos, 2f) * 2f;
+		NavPointSample result = default(NavPointSample);
+		result.Position = pos;
+		result.Score = score;
+		return result;
+	}
+
 	public static NavPointSample SamplePoint(Vector3 pos, SampleScoreParams scoreParams)
 	{
-		float num = 0f;
-		if (_SampleNavMesh(ref pos, scoreParams.Agent) && _WaterDepth(pos, scoreParams.WaterMaxDepth) > 0f)
+		if (TerrainMeta.HeightMap != null)
 		{
-			num = 1f;
+			pos.y = TerrainMeta.HeightMap.GetHeight(pos);
+		}
+		float num = _WaterDepth(pos, scoreParams.WaterMaxDepth) * 2f;
+		if (num > 0f && _SampleNavMesh(ref pos, scoreParams.Agent))
+		{
 			if ((scoreParams.Features & SampleFeatures.DiscourageSharpTurns) > SampleFeatures.None)
 			{
 				num += _DiscourageSharpTurns(pos, scoreParams.Agent);
@@ -102,6 +184,14 @@ public static class NavPointSampler
 			if ((scoreParams.Features & SampleFeatures.RetreatFromExplosive) > SampleFeatures.None)
 			{
 				num += RetreatPointValue(pos, scoreParams.Agent);
+			}
+			if ((scoreParams.Features & SampleFeatures.TopologyPreference) > SampleFeatures.None)
+			{
+				num += TopologyPreference(pos, scoreParams.Agent);
+			}
+			if ((scoreParams.Features & SampleFeatures.RangeFromSpawn) > SampleFeatures.None)
+			{
+				num *= RangeFromHome(pos, scoreParams.Agent);
 			}
 		}
 		NavPointSample result = default(NavPointSample);
@@ -151,19 +241,24 @@ public static class NavPointSampler
 		Vector3 vector = pos - targetPos;
 		Vector3 vector2 = pos - point;
 		float num = Vector3.Dot(vector.normalized, vector2.normalized);
-		if (num > 0f && vector2.sqrMagnitude > vector.sqrMagnitude)
+		if (num > 0.5f && vector2.sqrMagnitude > vector.sqrMagnitude)
 		{
 			return false;
 		}
 		return true;
 	}
 
-	public static float PointDirectnessToTarget(Vector3 point, Vector3 pos, Vector3 targetPos)
+	public static bool PointDirectnessToTarget(Vector3 point, Vector3 pos, Vector3 targetPos, out float value)
 	{
-		float num = Vector3.Distance(pos, targetPos);
-		float num2 = Vector3.Distance(point, targetPos);
-		float num3 = Vector3.Distance(pos, point);
-		return (num - num2) / num3;
+		Vector3 vector = point - pos;
+		Vector3 vector2 = targetPos - pos;
+		value = Vector3.Dot(vector.normalized, vector2.normalized);
+		if (value > 0.5f && vector.sqrMagnitude > vector2.sqrMagnitude)
+		{
+			value = 0f;
+			return false;
+		}
+		return true;
 	}
 
 	public static float RetreatPointValue(Vector3 point, IAIAgent agent)
@@ -172,10 +267,14 @@ public static class NavPointSampler
 		{
 			return 0f;
 		}
-		float num = PointDirectnessToTarget(point, agent.Entity.ServerPosition, agent.AttackTarget.ServerPosition);
-		if (num <= -0.5f)
+		float value = 0f;
+		if (!PointDirectnessToTarget(point, agent.Entity.ServerPosition, agent.AttackTarget.ServerPosition, out value))
 		{
-			return num * -1f;
+			return 0f;
+		}
+		if (value <= -0.5f)
+		{
+			return value * -1f;
 		}
 		return 0f;
 	}
@@ -186,10 +285,14 @@ public static class NavPointSampler
 		{
 			return 0f;
 		}
-		float num = PointDirectnessToTarget(point, agent.Entity.ServerPosition, baseContext.DeployedExplosives[0].ServerPosition);
-		if (num <= -0.5f)
+		float value = 0f;
+		if (!PointDirectnessToTarget(point, agent.Entity.ServerPosition, baseContext.DeployedExplosives[0].ServerPosition, out value))
 		{
-			return num * -1f;
+			return 0f;
+		}
+		if (value <= -0.5f)
+		{
+			return value * -1f;
 		}
 		return 0f;
 	}
@@ -200,10 +303,14 @@ public static class NavPointSampler
 		{
 			return 0f;
 		}
-		float num = PointDirectnessToTarget(point, agent.Entity.ServerPosition, agent.AttackTarget.ServerPosition);
-		if (num >= 0.5f)
+		float value = 0f;
+		if (!PointDirectnessToTarget(point, agent.Entity.ServerPosition, agent.AttackTarget.ServerPosition, out value))
 		{
-			return num;
+			return 0f;
+		}
+		if (value >= 0.5f)
+		{
+			return value;
 		}
 		return 0f;
 	}
@@ -214,8 +321,12 @@ public static class NavPointSampler
 		{
 			return 0f;
 		}
-		float num = PointDirectnessToTarget(point, agent.Entity.ServerPosition, agent.AttackTarget.ServerPosition);
-		if (num >= -0.1f && num <= 0.1f)
+		float value = 0f;
+		if (!PointDirectnessToTarget(point, agent.Entity.ServerPosition, agent.AttackTarget.ServerPosition, out value))
+		{
+			return 0f;
+		}
+		if (value >= -0.1f && value <= 0.1f)
 		{
 			return 1f;
 		}
@@ -231,6 +342,30 @@ public static class NavPointSampler
 		Vector3 normalized = (point - agent.Entity.ServerPosition).normalized;
 		float num = Vector3.Dot(agent.Entity.LastAttackedDir, normalized);
 		if (num > -0.5f)
+		{
+			return 0f;
+		}
+		return 1f;
+	}
+
+	public static float TopologyPreference(Vector3 point, IAIAgent agent)
+	{
+		if (TerrainMeta.TopologyMap != null)
+		{
+			int topology = TerrainMeta.TopologyMap.GetTopology(point);
+			if ((agent.TopologyPreference() & topology) > 0)
+			{
+				return 1f;
+			}
+		}
+		return 0f;
+	}
+
+	public static float RangeFromHome(Vector3 point, IAIAgent agent)
+	{
+		float sqrMagnitude = (point - agent.SpawnPosition).sqrMagnitude;
+		float num = agent.GetStats.MaxRoamRange * AI.npc_max_roam_multiplier;
+		if (sqrMagnitude > num)
 		{
 			return 0f;
 		}

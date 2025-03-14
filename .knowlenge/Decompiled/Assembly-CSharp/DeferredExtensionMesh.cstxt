@@ -1,7 +1,7 @@
 using UnityEngine;
 
-[RequireComponent(typeof(Renderer))]
 [ExecuteInEditMode]
+[RequireComponent(typeof(Renderer))]
 public class DeferredExtensionMesh : MonoBehaviour
 {
 	public SubsurfaceProfile subsurfaceProfile;

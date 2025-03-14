@@ -1,0 +1,682 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using ConVar;
+using Facepunch;
+using Network;
+using ProtoBuf;
+using Rust;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class IOEntity : BaseCombatEntity
+{
+	public enum IOType
+	{
+		Electric,
+		Fluidic,
+		Kinetic,
+		Generic
+	}
+
+	[Serializable]
+	public class IORef
+	{
+		public EntityRef entityRef;
+
+		public IOEntity ioEnt;
+
+		public void Init()
+		{
+			if (ioEnt != null && !entityRef.IsValid(serverside: true))
+			{
+				entityRef.Set(ioEnt);
+			}
+			if (entityRef.IsValid(serverside: true))
+			{
+				ioEnt = entityRef.Get(serverside: true).GetComponent<IOEntity>();
+			}
+		}
+
+		public void InitClient()
+		{
+			if (entityRef.IsValid(serverside: false) && ioEnt == null)
+			{
+				ioEnt = entityRef.Get(serverside: false).GetComponent<IOEntity>();
+			}
+		}
+
+		public IOEntity Get(bool isServer = true)
+		{
+			if (ioEnt == null && entityRef.IsValid(isServer))
+			{
+				ioEnt = entityRef.Get(isServer).GetComponent<IOEntity>();
+			}
+			return ioEnt;
+		}
+
+		public void Clear()
+		{
+			ioEnt = null;
+			entityRef.Set(null);
+		}
+
+		public void Set(IOEntity newIOEnt)
+		{
+			entityRef.Set(newIOEnt);
+		}
+	}
+
+	[Serializable]
+	public class IOSlot
+	{
+		public string niceName;
+
+		public IOType type;
+
+		public IORef connectedTo;
+
+		public int connectedToSlot;
+
+		public Vector3[] linePoints;
+
+		public ClientIOLine line;
+
+		public Vector3 handlePosition;
+
+		public bool rootConnectionsOnly;
+
+		public bool mainPowerSlot;
+
+		public void Clear()
+		{
+			connectedTo.Clear();
+			connectedToSlot = 0;
+			linePoints = null;
+		}
+	}
+
+	[Header("IOEntity")]
+	public Transform debugOrigin;
+
+	public ItemDefinition sourceItem;
+
+	[NonSerialized]
+	public int lastResetIndex;
+
+	[ServerVar]
+	[Help("How many miliseconds to budget for processing io entities per server frame")]
+	public static float framebudgetms = 1f;
+
+	[ServerVar]
+	public static float responsetime = 0.1f;
+
+	[ServerVar]
+	public static int backtracking = 8;
+
+	public const Flags Flag_HasPower = Flags.Reserved8;
+
+	public IOSlot[] inputs;
+
+	public IOSlot[] outputs;
+
+	public IOType ioType;
+
+	public static Queue<IOEntity> _processQueue = new Queue<IOEntity>();
+
+	private int cachedOutputsUsed;
+
+	private int lastPassthroughEnergy;
+
+	private int lastEnergy;
+
+	protected int currentEnergy;
+
+	private float lastUpdateTime;
+
+	protected bool ensureOutputsUpdated;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("IOEntity.OnRpcMessage"))
+		{
+			if (rpc == 4161541566u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - Server_RequestData "));
+				}
+				using (TimeWarning.New("Server_RequestData"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test("Server_RequestData", this, player, 6f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							Server_RequestData(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						player.Kick("RPC Error in Server_RequestData");
+						Debug.LogException(exception);
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public string GetDisplayName()
+	{
+		if (sourceItem != null)
+		{
+			return sourceItem.displayName.translated;
+		}
+		return base.ShortPrefabName;
+	}
+
+	public virtual bool IsRootEntity()
+	{
+		return false;
+	}
+
+	public virtual bool WantsPower()
+	{
+		return true;
+	}
+
+	public bool IsPowered()
+	{
+		return HasFlag(Flags.Reserved8);
+	}
+
+	public bool IsConnectedTo(IOEntity entity, int slot, int depth)
+	{
+		if (depth > 0 && slot < inputs.Length)
+		{
+			IOSlot iOSlot = inputs[slot];
+			if (iOSlot.mainPowerSlot)
+			{
+				IOEntity iOEntity = iOSlot.connectedTo.Get();
+				if (iOEntity != null)
+				{
+					if (iOEntity == entity)
+					{
+						return true;
+					}
+					if (iOEntity.IsConnectedTo(entity, depth - 1))
+					{
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	public bool IsConnectedTo(IOEntity entity, int depth)
+	{
+		if (depth > 0)
+		{
+			for (int i = 0; i < inputs.Length; i++)
+			{
+				IOSlot iOSlot = inputs[i];
+				if (!iOSlot.mainPowerSlot)
+				{
+					continue;
+				}
+				IOEntity iOEntity = iOSlot.connectedTo.Get();
+				if (iOEntity != null)
+				{
+					if (iOEntity == entity)
+					{
+						return true;
+					}
+					if (iOEntity.IsConnectedTo(entity, depth - 1))
+					{
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	[RPC_Server]
+	[RPC_Server.IsVisible(6f)]
+	private void Server_RequestData(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		SendAdditionalData(player);
+	}
+
+	public virtual void SendAdditionalData(BasePlayer player)
+	{
+		float arg = 0f;
+		float arg2 = 0f;
+		ClientRPCPlayer(null, player, "Client_ReceiveAdditionalData", currentEnergy, GetPassthroughAmount(), arg, arg2);
+	}
+
+	public static void ProcessQueue()
+	{
+		float realtimeSinceStartup = UnityEngine.Time.realtimeSinceStartup;
+		float num = framebudgetms / 1000f;
+		while (_processQueue.Count > 0 && UnityEngine.Time.realtimeSinceStartup < realtimeSinceStartup + num)
+		{
+			IOEntity iOEntity = _processQueue.Dequeue();
+			if (iOEntity != null)
+			{
+				iOEntity.UpdateOutputs();
+			}
+		}
+	}
+
+	public virtual void ResetIOState()
+	{
+	}
+
+	public virtual void Init()
+	{
+		for (int i = 0; i < outputs.Length; i++)
+		{
+			IOSlot iOSlot = outputs[i];
+			iOSlot.connectedTo.Init();
+			if (iOSlot.connectedTo.Get() != null)
+			{
+				int connectedToSlot = iOSlot.connectedToSlot;
+				if (connectedToSlot < 0 || connectedToSlot >= iOSlot.connectedTo.Get().inputs.Length)
+				{
+					Debug.LogError("Slot IOR Error: " + base.name + " setting up inputs for " + iOSlot.connectedTo.Get().name + " slot : " + iOSlot.connectedToSlot);
+				}
+				else
+				{
+					iOSlot.connectedTo.Get().inputs[iOSlot.connectedToSlot].connectedTo.Set(this);
+					iOSlot.connectedTo.Get().inputs[iOSlot.connectedToSlot].connectedToSlot = i;
+					iOSlot.connectedTo.Get().inputs[iOSlot.connectedToSlot].connectedTo.Init();
+				}
+			}
+		}
+		if (IsRootEntity())
+		{
+			Invoke(MarkDirtyForceUpdateOutputs, UnityEngine.Random.Range(1f, 1f));
+		}
+	}
+
+	internal override void DoServerDestroy()
+	{
+		if (base.isServer)
+		{
+			Shutdown();
+		}
+		base.DoServerDestroy();
+	}
+
+	public void ClearConnections()
+	{
+		List<IOEntity> list = new List<IOEntity>();
+		IOSlot[] array = inputs;
+		foreach (IOSlot iOSlot in array)
+		{
+			IOEntity iOEntity = null;
+			if (iOSlot.connectedTo.Get() != null)
+			{
+				iOEntity = iOSlot.connectedTo.Get();
+				IOSlot[] array2 = iOSlot.connectedTo.Get().outputs;
+				foreach (IOSlot iOSlot2 in array2)
+				{
+					if (iOSlot2.connectedTo.Get() != null && iOSlot2.connectedTo.Get().EqualNetID(this))
+					{
+						iOSlot2.Clear();
+					}
+				}
+			}
+			iOSlot.Clear();
+			if ((bool)iOEntity)
+			{
+				iOEntity.SendNetworkUpdate();
+			}
+		}
+		IOSlot[] array3 = outputs;
+		foreach (IOSlot iOSlot3 in array3)
+		{
+			if (iOSlot3.connectedTo.Get() != null)
+			{
+				list.Add(iOSlot3.connectedTo.Get());
+				IOSlot[] array4 = iOSlot3.connectedTo.Get().inputs;
+				foreach (IOSlot iOSlot4 in array4)
+				{
+					if (iOSlot4.connectedTo.Get() != null && iOSlot4.connectedTo.Get().EqualNetID(this))
+					{
+						iOSlot4.Clear();
+					}
+				}
+			}
+			if ((bool)iOSlot3.connectedTo.Get())
+			{
+				iOSlot3.connectedTo.Get().UpdateFromInput(0, iOSlot3.connectedToSlot);
+			}
+			iOSlot3.Clear();
+		}
+		SendNetworkUpdate();
+		foreach (IOEntity item in list)
+		{
+			if (item != null)
+			{
+				item.MarkDirty();
+				item.SendNetworkUpdate();
+			}
+		}
+		for (int m = 0; m < inputs.Length; m++)
+		{
+			UpdateFromInput(0, m);
+		}
+	}
+
+	public void Shutdown()
+	{
+		ClearConnections();
+	}
+
+	public void MarkDirtyForceUpdateOutputs()
+	{
+		ensureOutputsUpdated = true;
+		MarkDirty();
+	}
+
+	public virtual void MarkDirty()
+	{
+		if (base.isClient)
+		{
+			return;
+		}
+		cachedOutputsUsed = 0;
+		IOSlot[] array = outputs;
+		foreach (IOSlot iOSlot in array)
+		{
+			if (iOSlot.connectedTo.Get() != null)
+			{
+				cachedOutputsUsed++;
+			}
+		}
+		TouchIOState();
+	}
+
+	public virtual int ConsumptionAmount()
+	{
+		return 1;
+	}
+
+	public virtual int GetCurrentEnergy()
+	{
+		return Mathf.Clamp(currentEnergy - ConsumptionAmount(), 0, currentEnergy);
+	}
+
+	public virtual int GetPassthroughAmount(int outputSlot = 0)
+	{
+		return Mathf.Clamp(GetCurrentEnergy(), 0, GetCurrentEnergy());
+	}
+
+	public virtual void UpdateHasPower(int inputAmount, int inputSlot)
+	{
+		SetFlag(Flags.Reserved8, inputAmount >= ConsumptionAmount(), recursive: false, networkupdate: false);
+	}
+
+	public void TouchInternal()
+	{
+		int passthroughAmount = GetPassthroughAmount();
+		bool flag = lastPassthroughEnergy != passthroughAmount;
+		lastPassthroughEnergy = passthroughAmount;
+		if (flag)
+		{
+			IOStateChanged(currentEnergy, 0);
+			ensureOutputsUpdated = true;
+		}
+		_processQueue.Enqueue(this);
+	}
+
+	public virtual void UpdateFromInput(int inputAmount, int inputSlot)
+	{
+		UpdateHasPower(inputAmount, inputSlot);
+		lastEnergy = currentEnergy;
+		currentEnergy = inputAmount;
+		int passthroughAmount = GetPassthroughAmount();
+		bool flag = lastPassthroughEnergy != passthroughAmount;
+		lastPassthroughEnergy = passthroughAmount;
+		if (currentEnergy != lastEnergy || flag)
+		{
+			IOStateChanged(inputAmount, inputSlot);
+			ensureOutputsUpdated = true;
+		}
+		_processQueue.Enqueue(this);
+	}
+
+	public virtual void TouchIOState()
+	{
+		if (!base.isClient)
+		{
+			TouchInternal();
+		}
+	}
+
+	public virtual void SendIONetworkUpdate()
+	{
+		SendNetworkUpdate_Flags();
+	}
+
+	public virtual void IOStateChanged(int inputAmount, int inputSlot)
+	{
+	}
+
+	public virtual void UpdateOutputs()
+	{
+		if (UnityEngine.Time.realtimeSinceStartup - lastUpdateTime < responsetime)
+		{
+			_processQueue.Enqueue(this);
+			return;
+		}
+		lastUpdateTime = UnityEngine.Time.realtimeSinceStartup;
+		SendIONetworkUpdate();
+		if (outputs.Length == 0)
+		{
+			ensureOutputsUpdated = false;
+		}
+		else
+		{
+			if (!ensureOutputsUpdated)
+			{
+				return;
+			}
+			int num = ((cachedOutputsUsed == 0) ? 1 : cachedOutputsUsed);
+			int inputAmount = Mathf.FloorToInt((float)GetPassthroughAmount() / (float)num);
+			ensureOutputsUpdated = false;
+			IOSlot[] array = outputs;
+			foreach (IOSlot iOSlot in array)
+			{
+				if (iOSlot.connectedTo.Get() != null)
+				{
+					iOSlot.connectedTo.Get().UpdateFromInput(inputAmount, iOSlot.connectedToSlot);
+				}
+			}
+		}
+	}
+
+	public override void Spawn()
+	{
+		base.Spawn();
+		if (!Rust.Application.isLoadingSave)
+		{
+			Init();
+		}
+	}
+
+	public override void PostServerLoad()
+	{
+		base.PostServerLoad();
+		Init();
+	}
+
+	public override void PostMapEntitySpawn()
+	{
+		base.PostMapEntitySpawn();
+		Init();
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		info.msg.ioEntity = Facepunch.Pool.Get<ProtoBuf.IOEntity>();
+		info.msg.ioEntity.inputs = Facepunch.Pool.GetList<ProtoBuf.IOEntity.IOConnection>();
+		info.msg.ioEntity.outputs = Facepunch.Pool.GetList<ProtoBuf.IOEntity.IOConnection>();
+		IOSlot[] array = inputs;
+		foreach (IOSlot iOSlot in array)
+		{
+			ProtoBuf.IOEntity.IOConnection iOConnection = Facepunch.Pool.Get<ProtoBuf.IOEntity.IOConnection>();
+			iOConnection.connectedID = iOSlot.connectedTo.entityRef.uid;
+			iOConnection.connectedToSlot = iOSlot.connectedToSlot;
+			iOConnection.niceName = iOSlot.niceName;
+			iOConnection.type = (int)iOSlot.type;
+			iOConnection.inUse = iOConnection.connectedID != 0;
+			info.msg.ioEntity.inputs.Add(iOConnection);
+		}
+		IOSlot[] array2 = outputs;
+		foreach (IOSlot iOSlot2 in array2)
+		{
+			ProtoBuf.IOEntity.IOConnection iOConnection2 = Facepunch.Pool.Get<ProtoBuf.IOEntity.IOConnection>();
+			iOConnection2.connectedID = iOSlot2.connectedTo.entityRef.uid;
+			iOConnection2.connectedToSlot = iOSlot2.connectedToSlot;
+			iOConnection2.niceName = iOSlot2.niceName;
+			iOConnection2.type = (int)iOSlot2.type;
+			iOConnection2.inUse = iOConnection2.connectedID != 0;
+			if (iOSlot2.linePoints != null)
+			{
+				iOConnection2.linePointList = Facepunch.Pool.GetList<ProtoBuf.IOEntity.IOConnection.LineVec>();
+				iOConnection2.linePointList.Clear();
+				Vector3[] linePoints = iOSlot2.linePoints;
+				foreach (Vector3 vec in linePoints)
+				{
+					ProtoBuf.IOEntity.IOConnection.LineVec lineVec = Facepunch.Pool.Get<ProtoBuf.IOEntity.IOConnection.LineVec>();
+					lineVec.vec = vec;
+					iOConnection2.linePointList.Add(lineVec);
+				}
+			}
+			info.msg.ioEntity.outputs.Add(iOConnection2);
+		}
+	}
+
+	public virtual float IOInput(IOEntity from, IOType inputType, float inputAmount, int slot = 0)
+	{
+		IOSlot[] array = outputs;
+		foreach (IOSlot iOSlot in array)
+		{
+			if (iOSlot.connectedTo.Get() != null)
+			{
+				inputAmount = iOSlot.connectedTo.Get().IOInput(this, iOSlot.type, inputAmount, iOSlot.connectedToSlot);
+			}
+		}
+		return inputAmount;
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (info.msg.ioEntity == null)
+		{
+			return;
+		}
+		if (!info.fromDisk && info.msg.ioEntity.inputs != null)
+		{
+			int count = info.msg.ioEntity.inputs.Count;
+			if (inputs.Length != count)
+			{
+				inputs = new IOSlot[count];
+			}
+			for (int i = 0; i < count; i++)
+			{
+				if (inputs[i] == null)
+				{
+					inputs[i] = new IOSlot();
+				}
+				ProtoBuf.IOEntity.IOConnection iOConnection = info.msg.ioEntity.inputs[i];
+				inputs[i].connectedTo = new IORef();
+				inputs[i].connectedTo.entityRef.uid = iOConnection.connectedID;
+				if (base.isClient)
+				{
+					inputs[i].connectedTo.InitClient();
+				}
+				inputs[i].connectedToSlot = iOConnection.connectedToSlot;
+				inputs[i].niceName = iOConnection.niceName;
+				inputs[i].type = (IOType)iOConnection.type;
+			}
+		}
+		if (info.msg.ioEntity.outputs == null)
+		{
+			return;
+		}
+		if (!info.fromDisk && base.isClient)
+		{
+			IOSlot[] array = outputs;
+			foreach (IOSlot iOSlot in array)
+			{
+				iOSlot.Clear();
+			}
+		}
+		int count2 = info.msg.ioEntity.outputs.Count;
+		IOSlot[] array2 = null;
+		if (outputs.Length != count2 && count2 > 0)
+		{
+			array2 = outputs;
+			outputs = new IOSlot[count2];
+			for (int k = 0; k < array2.Length; k++)
+			{
+				if (k < count2)
+				{
+					outputs[k] = array2[k];
+				}
+			}
+		}
+		for (int l = 0; l < count2; l++)
+		{
+			if (outputs[l] == null)
+			{
+				outputs[l] = new IOSlot();
+			}
+			ProtoBuf.IOEntity.IOConnection iOConnection2 = info.msg.ioEntity.outputs[l];
+			outputs[l].connectedTo = new IORef();
+			outputs[l].connectedTo.entityRef.uid = iOConnection2.connectedID;
+			if (base.isClient)
+			{
+				outputs[l].connectedTo.InitClient();
+			}
+			outputs[l].connectedToSlot = iOConnection2.connectedToSlot;
+			outputs[l].niceName = iOConnection2.niceName;
+			outputs[l].type = (IOType)iOConnection2.type;
+			if (info.fromDisk || base.isClient)
+			{
+				List<ProtoBuf.IOEntity.IOConnection.LineVec> linePointList = iOConnection2.linePointList;
+				if (outputs[l].linePoints == null || outputs[l].linePoints.Length != linePointList.Count)
+				{
+					outputs[l].linePoints = new Vector3[linePointList.Count];
+				}
+				for (int m = 0; m < linePointList.Count; m++)
+				{
+					ref Vector3 reference = ref outputs[l].linePoints[m];
+					reference = linePointList[m].vec;
+				}
+			}
+		}
+	}
+}

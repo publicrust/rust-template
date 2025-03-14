@@ -1,0 +1,1240 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.Rendering;
+
+[ExecuteInEditMode]
+public class ReflectionProbeEx : MonoBehaviour
+{
+	[Serializable]
+	public enum ConvolutionQuality
+	{
+		Lowest,
+		Low,
+		Medium,
+		High,
+		VeryHigh
+	}
+
+	[Serializable]
+	public struct RenderListEntry
+	{
+		public Renderer renderer;
+
+		public bool alwaysEnabled;
+
+		public RenderListEntry(Renderer renderer, bool alwaysEnabled)
+		{
+			this.renderer = renderer;
+			this.alwaysEnabled = alwaysEnabled;
+		}
+	}
+
+	private enum TimeSlicingState
+	{
+		Shadow,
+		Render,
+		GenerateMips,
+		Convolution,
+		Finished
+	}
+
+	private struct CubemapSkyboxVertex
+	{
+		public float x;
+
+		public float y;
+
+		public float z;
+
+		public Color color;
+
+		public float tu;
+
+		public float tv;
+
+		public float tw;
+	}
+
+	private struct CubemapFaceMatrices
+	{
+		public Matrix4x4 worldToView;
+
+		public Matrix4x4 viewToWorld;
+
+		public CubemapFaceMatrices(Vector3 x, Vector3 y, Vector3 z)
+		{
+			worldToView = Matrix4x4.identity;
+			worldToView[0, 0] = x[0];
+			worldToView[0, 1] = x[1];
+			worldToView[0, 2] = x[2];
+			worldToView[1, 0] = y[0];
+			worldToView[1, 1] = y[1];
+			worldToView[1, 2] = y[2];
+			worldToView[2, 0] = z[0];
+			worldToView[2, 1] = z[1];
+			worldToView[2, 2] = z[2];
+			viewToWorld = worldToView.inverse;
+		}
+	}
+
+	private static readonly uint[,] qualitySamples = new uint[5, 4]
+	{
+		{ 6u, 12u, 16u, 16u },
+		{ 8u, 16u, 24u, 32u },
+		{ 16u, 16u, 32u, 64u },
+		{ 32u, 32u, 64u, 128u },
+		{ 64u, 64u, 128u, 128u }
+	};
+
+	private static Vector4[] sampleData = new Vector4[128];
+
+	public ReflectionProbeRefreshMode refreshMode = ReflectionProbeRefreshMode.EveryFrame;
+
+	public bool timeSlicing;
+
+	public int resolution = 128;
+
+	[InspectorName("HDR")]
+	public bool hdr = true;
+
+	public float shadowDistance;
+
+	public ReflectionProbeClearFlags clearFlags = ReflectionProbeClearFlags.Skybox;
+
+	public Color background = new Color(0.192f, 0.301f, 0.474f);
+
+	public float nearClip = 0.3f;
+
+	public float farClip = 1000f;
+
+	public Transform attachToTarget;
+
+	public Light directionalLight;
+
+	public float textureMipBias = 2f;
+
+	public bool highPrecision;
+
+	public ConvolutionQuality convolutionQuality;
+
+	public List<RenderListEntry> staticRenderList = new List<RenderListEntry>();
+
+	public Cubemap reflectionCubemap;
+
+	public float reflectionIntensity = 1f;
+
+	private List<RenderListEntry> dynamicRenderList = new List<RenderListEntry>();
+
+	private ReflectionProbe probe;
+
+	private RenderTexture probeTexture;
+
+	private int probeResolution = 256;
+
+	private bool probeHdr;
+
+	private float probeShadowDistance;
+
+	private float probeNearClip = 1f;
+
+	private float probeFarClip = 1000f;
+
+	private const int probeDepth = 24;
+
+	private bool probeHighPrecision;
+
+	private TimeSlicingState timeSlicedRenderState = TimeSlicingState.Finished;
+
+	private bool scriptingRenderQueued;
+
+	private Matrix4x4 faceProjMatrix = Matrix4x4.identity;
+
+	private Matrix4x4 faceProjInvMatrix = Matrix4x4.identity;
+
+	private int prevFrame;
+
+	private ReflectionProbeRefreshMode savedProbeRefresh;
+
+	private ReflectionProbeMode savedProbeMode;
+
+	private Texture savedProbeCustomTexture;
+
+	private Mesh blitMesh;
+
+	private Mesh skyboxMesh;
+
+	private static float[] octaVerts = new float[72]
+	{
+		0f, 1f, 0f, 0f, 0f, -1f, 1f, 0f, 0f, 0f,
+		1f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f, 1f,
+		0f, 0f, 0f, 1f, -1f, 0f, 0f, 0f, 1f, 0f,
+		-1f, 0f, 0f, 0f, 0f, -1f, 0f, -1f, 0f, 1f,
+		0f, 0f, 0f, 0f, -1f, 0f, -1f, 0f, 0f, 0f,
+		1f, 1f, 0f, 0f, 0f, -1f, 0f, -1f, 0f, 0f,
+		0f, 0f, 1f, 0f, -1f, 0f, 0f, 0f, -1f, -1f,
+		0f, 0f
+	};
+
+	private static readonly CubemapFaceMatrices[] cubemapFaceMatrices = new CubemapFaceMatrices[6]
+	{
+		new CubemapFaceMatrices(new Vector3(0f, 0f, -1f), new Vector3(0f, -1f, 0f), new Vector3(-1f, 0f, 0f)),
+		new CubemapFaceMatrices(new Vector3(0f, 0f, 1f), new Vector3(0f, -1f, 0f), new Vector3(1f, 0f, 0f)),
+		new CubemapFaceMatrices(new Vector3(1f, 0f, 0f), new Vector3(0f, 0f, 1f), new Vector3(0f, -1f, 0f)),
+		new CubemapFaceMatrices(new Vector3(1f, 0f, 0f), new Vector3(0f, 0f, -1f), new Vector3(0f, 1f, 0f)),
+		new CubemapFaceMatrices(new Vector3(1f, 0f, 0f), new Vector3(0f, -1f, 0f), new Vector3(0f, 0f, -1f)),
+		new CubemapFaceMatrices(new Vector3(-1f, 0f, 0f), new Vector3(0f, -1f, 0f), new Vector3(0f, 0f, 1f))
+	};
+
+	private static readonly CubemapFaceMatrices[] cubemapFaceMatricesD3D11 = new CubemapFaceMatrices[6]
+	{
+		new CubemapFaceMatrices(new Vector3(0f, 0f, -1f), new Vector3(0f, 1f, 0f), new Vector3(-1f, 0f, 0f)),
+		new CubemapFaceMatrices(new Vector3(0f, 0f, 1f), new Vector3(0f, 1f, 0f), new Vector3(1f, 0f, 0f)),
+		new CubemapFaceMatrices(new Vector3(1f, 0f, 0f), new Vector3(0f, 0f, -1f), new Vector3(0f, -1f, 0f)),
+		new CubemapFaceMatrices(new Vector3(1f, 0f, 0f), new Vector3(0f, 0f, 1f), new Vector3(0f, 1f, 0f)),
+		new CubemapFaceMatrices(new Vector3(1f, 0f, 0f), new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, -1f)),
+		new CubemapFaceMatrices(new Vector3(-1f, 0f, 0f), new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, 1f))
+	};
+
+	private static readonly CubemapFaceMatrices[] shadowCubemapFaceMatrices = new CubemapFaceMatrices[6]
+	{
+		new CubemapFaceMatrices(new Vector3(0f, 0f, 1f), new Vector3(0f, -1f, 0f), new Vector3(-1f, 0f, 0f)),
+		new CubemapFaceMatrices(new Vector3(0f, 0f, -1f), new Vector3(0f, -1f, 0f), new Vector3(1f, 0f, 0f)),
+		new CubemapFaceMatrices(new Vector3(1f, 0f, 0f), new Vector3(0f, 0f, 1f), new Vector3(0f, 1f, 0f)),
+		new CubemapFaceMatrices(new Vector3(1f, 0f, 0f), new Vector3(0f, 0f, -1f), new Vector3(0f, -1f, 0f)),
+		new CubemapFaceMatrices(new Vector3(1f, 0f, 0f), new Vector3(0f, -1f, 0f), new Vector3(0f, 0f, 1f)),
+		new CubemapFaceMatrices(new Vector3(-1f, 0f, 0f), new Vector3(0f, -1f, 0f), new Vector3(0f, 0f, -1f))
+	};
+
+	private CubemapFaceMatrices[] platformCubemapFaceMatrices;
+
+	private static readonly HashSet<string> supportedShaderNames = new HashSet<string> { "Skybox/Procedural", "Time of Day/Atmosphere", "Time of Day/Cloud Billboard Far", "Time of Day/Cloud Layer", "Time of Day/Moon", "Time of Day/Skybox", "Time of Day/Stars", "Time of Day/Sun", "Standard" };
+
+	private static Dictionary<Shader, Shader> supportedShaders = new Dictionary<Shader, Shader>();
+
+	private static Dictionary<Material, Material> matchingMaterials = new Dictionary<Material, Material>();
+
+	private RenderTexture probeTempTexture;
+
+	private RenderTexture probeShadowTexture;
+
+	private RenderTexture arrayTexture;
+
+	private RenderTexture arrayTempTexture;
+
+	private RenderTexture arrayDepthTexture;
+
+	private int mipmapCount;
+
+	private Material blitMaterial;
+
+	private Material filterMaterial;
+
+	private Material shadowMaterial;
+
+	private CommandBuffer forwardCB;
+
+	private CommandBuffer shadowCB;
+
+	private Matrix4x4[] viewProjMatrixArray = new Matrix4x4[6];
+
+	private Matrix4x4[] objectToWorldArray = new Matrix4x4[6];
+
+	private Matrix4x4[] cameraToWorldArray = new Matrix4x4[6];
+
+	private bool useGeometryShader = true;
+
+	private int PassCount = 1;
+
+	private static readonly int[] tab32 = new int[32]
+	{
+		0, 9, 1, 10, 13, 21, 2, 29, 11, 14,
+		16, 18, 22, 25, 3, 30, 8, 12, 20, 28,
+		15, 17, 24, 7, 19, 27, 23, 6, 26, 5,
+		4, 31
+	};
+
+	public RenderTexture Texture => probeTexture;
+
+	private Vector2 Hammersley(uint index, uint numSamples)
+	{
+		float x = (float)index / (float)numSamples;
+		float y = (float)ReverseBits(index) * 2.3283064E-10f;
+		return new Vector2(x, y);
+	}
+
+	private float D_GGX(float roughness, float NdotH)
+	{
+		float num = roughness * roughness;
+		float num2 = num * num;
+		float num3 = (NdotH * num2 - NdotH) * NdotH + 1f;
+		return num2 / ((float)Math.PI * num3 * num3);
+	}
+
+	private Vector3 ImportanceSampleGGX(Vector2 Xi, float roughness)
+	{
+		float num = roughness * roughness;
+		float num2 = num * num;
+		float f = (float)Math.PI * 2f * Xi.x;
+		float num3 = Mathf.Sqrt((1f - Xi.y) / (1f + (num2 - 1f) * Xi.y));
+		float num4 = Mathf.Sqrt(1f - num3 * num3);
+		Vector3 result = default(Vector3);
+		result.x = num4 * Mathf.Cos(f);
+		result.y = num4 * Mathf.Sin(f);
+		result.z = num3;
+		return result;
+	}
+
+	private void ApplyConvolution(Texture target)
+	{
+		float num = probeResolution * probeResolution;
+		for (int i = 1; i < mipmapCount; i++)
+		{
+			uint num2 = qualitySamples[(int)convolutionQuality, Mathf.Min(i - 1, 3)];
+			int num3 = 0;
+			float roughness = (float)i / (float)mipmapCount;
+			Vector3 vector = new Vector3(0f, 0f, 1f);
+			for (uint num4 = 0u; num4 < num2; num4++)
+			{
+				Vector2 xi = Hammersley(num4, num2);
+				Vector3 vector2 = ImportanceSampleGGX(xi, roughness);
+				Vector3 rhs = 2f * Vector3.Dot(vector, vector2) * vector2 - vector;
+				float num5 = Mathf.Clamp01(Vector3.Dot(vector, rhs));
+				if (num5 > 0.001f)
+				{
+					float num6 = Mathf.Clamp01(Vector3.Dot(vector, vector2));
+					float num7 = D_GGX(roughness, num6) * num6 / (4f * num6);
+					float num8 = 1f / ((float)num2 * num7);
+					float num9 = (float)Math.PI * 4f / (6f * num);
+					float num10 = 1f;
+					float w = Mathf.Max(0.5f * Mathf.Log(num8 / num9, 2f) + num10, 0f);
+					float num11 = num5 - Mathf.Floor(num5);
+					rhs = rhs.normalized * num11;
+					ref Vector4 reference = ref sampleData[num3];
+					reference = new Vector4(rhs.x, rhs.y, rhs.z, w);
+					num3++;
+				}
+			}
+			forwardCB.SetGlobalVectorArray("_SampleData", sampleData);
+			forwardCB.SetGlobalFloat("_SampleCount", num3);
+			forwardCB.SetRenderTarget(target, i, CubemapFace.PositiveX, -1);
+			for (int j = 0; j < PassCount; j++)
+			{
+				int slice = ((!useGeometryShader) ? j : (-1));
+				CommandBufferEx.BlitArray(forwardCB, blitMesh, probeTempTexture, filterMaterial, slice);
+			}
+		}
+	}
+
+	public void ClearRenderList()
+	{
+		dynamicRenderList.Clear();
+	}
+
+	public void AddToRenderList(Renderer renderer, bool alwaysEnabled = false)
+	{
+		dynamicRenderList.Add(new RenderListEntry(renderer, alwaysEnabled));
+		RegisterMaterialReplacement(renderer.sharedMaterial);
+	}
+
+	private void Awake()
+	{
+		probe = GetComponent<ReflectionProbe>();
+	}
+
+	private void OnEnable()
+	{
+		if (!InitializeCubemapFaceMatrices())
+		{
+			base.enabled = false;
+			return;
+		}
+		UpdateProperties();
+		CreateMeshes();
+		CreateTextures();
+		CreateMaterials();
+		CreateCommandBuffers();
+		AttachToLight();
+		ModifyProbeProperties();
+		if (refreshMode == ReflectionProbeRefreshMode.OnAwake)
+		{
+			RenderProbe();
+		}
+		Camera.onPreRender = (Camera.CameraCallback)Delegate.Remove(Camera.onPreRender, new Camera.CameraCallback(OnCameraPreRender));
+		Camera.onPreRender = (Camera.CameraCallback)Delegate.Combine(Camera.onPreRender, new Camera.CameraCallback(OnCameraPreRender));
+	}
+
+	private void OnDisable()
+	{
+		Camera.onPreRender = (Camera.CameraCallback)Delegate.Remove(Camera.onPreRender, new Camera.CameraCallback(OnCameraPreRender));
+		DetachFromLight();
+		DestroyMeshes();
+		DestroyTextures();
+		DestroyMaterials();
+		DestroyCommandBuffers();
+		RestoreProbeSettings();
+	}
+
+	private void OnCameraPreRender(Camera cam)
+	{
+		if (!(cam == MainCamera.mainCamera) || prevFrame == Time.frameCount)
+		{
+			return;
+		}
+		prevFrame = Time.frameCount;
+		if (attachToTarget != null)
+		{
+			base.transform.position = attachToTarget.transform.position;
+		}
+		if (UpdateProperties())
+		{
+			DestroyTextures();
+			CreateTextures();
+			if (probe != null)
+			{
+				probe.customBakedTexture = probeTexture;
+			}
+		}
+		ClearCommandBuffers();
+		if (refreshMode == ReflectionProbeRefreshMode.EveryFrame && (!timeSlicing || (timeSlicing && timeSlicedRenderState == TimeSlicingState.Finished)))
+		{
+			scriptingRenderQueued = true;
+			timeSlicedRenderState = ((!timeSlicing) ? TimeSlicingState.Finished : TimeSlicingState.Shadow);
+		}
+		if (!scriptingRenderQueued)
+		{
+			return;
+		}
+		if (timeSlicing || timeSlicedRenderState != TimeSlicingState.Finished)
+		{
+			if (timeSlicedRenderState != TimeSlicingState.Finished)
+			{
+				PrepareTimeSlicedRender(timeSlicedRenderState);
+				timeSlicedRenderState++;
+				ExecuteRender();
+			}
+			if (timeSlicedRenderState == TimeSlicingState.Finished)
+			{
+				scriptingRenderQueued = false;
+			}
+		}
+		else
+		{
+			PrepareFullRender();
+			ExecuteRender();
+			scriptingRenderQueued = false;
+		}
+	}
+
+	public void RenderProbe()
+	{
+		scriptingRenderQueued = true;
+		timeSlicedRenderState = ((!timeSlicing) ? TimeSlicingState.Finished : TimeSlicingState.Shadow);
+	}
+
+	public bool IsFinishedRendering()
+	{
+		if (timeSlicing)
+		{
+			return timeSlicedRenderState == TimeSlicingState.Finished;
+		}
+		return true;
+	}
+
+	private void ModifyProbeProperties()
+	{
+		if (probe != null)
+		{
+			savedProbeRefresh = probe.refreshMode;
+			savedProbeMode = probe.mode;
+			savedProbeCustomTexture = probe.customBakedTexture;
+			probe.refreshMode = ReflectionProbeRefreshMode.ViaScripting;
+			probe.mode = ReflectionProbeMode.Custom;
+			probe.customBakedTexture = probeTexture;
+		}
+	}
+
+	private void RestoreProbeSettings()
+	{
+		if (probe != null)
+		{
+			probe.refreshMode = savedProbeRefresh;
+			probe.mode = savedProbeMode;
+			probe.customBakedTexture = savedProbeCustomTexture;
+		}
+	}
+
+	private bool UpdateProperties()
+	{
+		if (probe != null)
+		{
+			resolution = probe.resolution;
+			hdr = probe.hdr;
+			shadowDistance = probe.shadowDistance;
+			clearFlags = probe.clearFlags;
+			background = probe.backgroundColor;
+			nearClip = probe.nearClipPlane;
+			farClip = probe.farClipPlane;
+		}
+		if (resolution != probeResolution || hdr != probeHdr || nearClip != probeNearClip || farClip != probeFarClip || highPrecision != probeHighPrecision || shadowDistance != probeShadowDistance)
+		{
+			probeResolution = resolution;
+			probeHdr = hdr;
+			probeShadowDistance = shadowDistance;
+			probeNearClip = nearClip;
+			probeFarClip = farClip;
+			probeHighPrecision = highPrecision;
+			faceProjMatrix = Matrix4x4.Perspective(90f, 1f, probeNearClip, probeFarClip);
+			faceProjInvMatrix = faceProjMatrix.inverse;
+			return true;
+		}
+		return false;
+	}
+
+	private void CreateMeshes()
+	{
+		if (blitMesh == null)
+		{
+			blitMesh = CreateBlitMesh();
+		}
+		if (skyboxMesh == null)
+		{
+			skyboxMesh = CreateSkyboxMesh();
+		}
+	}
+
+	private void DestroyMeshes()
+	{
+		if (blitMesh != null)
+		{
+			UnityEngine.Object.DestroyImmediate(blitMesh);
+			blitMesh = null;
+		}
+		if (skyboxMesh != null)
+		{
+			UnityEngine.Object.DestroyImmediate(skyboxMesh);
+			skyboxMesh = null;
+		}
+	}
+
+	private static Mesh CreateBlitMesh()
+	{
+		Mesh mesh = new Mesh();
+		mesh.vertices = new Vector3[4]
+		{
+			new Vector3(-1f, -1f, 0f),
+			new Vector3(-1f, 1f, 0f),
+			new Vector3(1f, 1f, 0f),
+			new Vector3(1f, -1f, 0f)
+		};
+		mesh.uv = new Vector2[4]
+		{
+			new Vector2(0f, 0f),
+			new Vector2(0f, 1f),
+			new Vector2(1f, 1f),
+			new Vector2(1f, 0f)
+		};
+		mesh.triangles = new int[6] { 0, 1, 2, 0, 2, 3 };
+		return mesh;
+	}
+
+	private static CubemapSkyboxVertex SubDivVert(CubemapSkyboxVertex v1, CubemapSkyboxVertex v2)
+	{
+		Vector3 a = new Vector3(v1.x, v1.y, v1.z);
+		Vector3 b = new Vector3(v2.x, v2.y, v2.z);
+		Vector3 vector = Vector3.Normalize(Vector3.Lerp(a, b, 0.5f));
+		CubemapSkyboxVertex result = default(CubemapSkyboxVertex);
+		result.x = (result.tu = vector.x);
+		result.y = (result.tv = vector.y);
+		result.z = (result.tw = vector.z);
+		result.color = Color.white;
+		return result;
+	}
+
+	private static void Subdivide(List<CubemapSkyboxVertex> destArray, CubemapSkyboxVertex v1, CubemapSkyboxVertex v2, CubemapSkyboxVertex v3)
+	{
+		CubemapSkyboxVertex item = SubDivVert(v1, v2);
+		CubemapSkyboxVertex item2 = SubDivVert(v2, v3);
+		CubemapSkyboxVertex item3 = SubDivVert(v1, v3);
+		destArray.Add(v1);
+		destArray.Add(item);
+		destArray.Add(item3);
+		destArray.Add(item);
+		destArray.Add(v2);
+		destArray.Add(item2);
+		destArray.Add(item2);
+		destArray.Add(item3);
+		destArray.Add(item);
+		destArray.Add(v3);
+		destArray.Add(item3);
+		destArray.Add(item2);
+	}
+
+	private static void SubdivideYOnly(List<CubemapSkyboxVertex> destArray, CubemapSkyboxVertex v1, CubemapSkyboxVertex v2, CubemapSkyboxVertex v3)
+	{
+		float num = Mathf.Abs(v2.y - v1.y);
+		float num2 = Mathf.Abs(v2.y - v3.y);
+		float num3 = Mathf.Abs(v3.y - v1.y);
+		CubemapSkyboxVertex cubemapSkyboxVertex;
+		CubemapSkyboxVertex cubemapSkyboxVertex2;
+		CubemapSkyboxVertex cubemapSkyboxVertex3;
+		if (num < num2 && num < num3)
+		{
+			cubemapSkyboxVertex = v3;
+			cubemapSkyboxVertex2 = v1;
+			cubemapSkyboxVertex3 = v2;
+		}
+		else if (num2 < num && num2 < num3)
+		{
+			cubemapSkyboxVertex = v1;
+			cubemapSkyboxVertex2 = v2;
+			cubemapSkyboxVertex3 = v3;
+		}
+		else
+		{
+			cubemapSkyboxVertex = v2;
+			cubemapSkyboxVertex2 = v3;
+			cubemapSkyboxVertex3 = v1;
+		}
+		CubemapSkyboxVertex item = SubDivVert(cubemapSkyboxVertex, cubemapSkyboxVertex2);
+		CubemapSkyboxVertex item2 = SubDivVert(cubemapSkyboxVertex, cubemapSkyboxVertex3);
+		destArray.Add(cubemapSkyboxVertex);
+		destArray.Add(item);
+		destArray.Add(item2);
+		Vector3 vector = new Vector3(item2.x - cubemapSkyboxVertex2.x, item2.y - cubemapSkyboxVertex2.y, item2.z - cubemapSkyboxVertex2.z);
+		Vector3 vector2 = new Vector3(item.x - cubemapSkyboxVertex3.x, item.y - cubemapSkyboxVertex3.y, item.z - cubemapSkyboxVertex3.z);
+		if (vector.x * vector.x + vector.y * vector.y + vector.z * vector.z > vector2.x * vector2.x + vector2.y * vector2.y + vector2.z * vector2.z)
+		{
+			destArray.Add(item);
+			destArray.Add(cubemapSkyboxVertex2);
+			destArray.Add(cubemapSkyboxVertex3);
+			destArray.Add(item2);
+			destArray.Add(item);
+			destArray.Add(cubemapSkyboxVertex3);
+		}
+		else
+		{
+			destArray.Add(item2);
+			destArray.Add(item);
+			destArray.Add(cubemapSkyboxVertex2);
+			destArray.Add(item2);
+			destArray.Add(cubemapSkyboxVertex2);
+			destArray.Add(cubemapSkyboxVertex3);
+		}
+	}
+
+	private static Mesh CreateSkyboxMesh()
+	{
+		List<CubemapSkyboxVertex> list = new List<CubemapSkyboxVertex>();
+		for (int i = 0; i < 24; i++)
+		{
+			CubemapSkyboxVertex item = default(CubemapSkyboxVertex);
+			Vector3 vector = Vector3.Normalize(new Vector3(octaVerts[i * 3], octaVerts[i * 3 + 1], octaVerts[i * 3 + 2]));
+			item.x = (item.tu = vector.x);
+			item.y = (item.tv = vector.y);
+			item.z = (item.tw = vector.z);
+			item.color = Color.white;
+			list.Add(item);
+		}
+		for (int j = 0; j < 3; j++)
+		{
+			List<CubemapSkyboxVertex> list2 = new List<CubemapSkyboxVertex>(list.Count);
+			list2.AddRange(list);
+			int count = list2.Count;
+			list.Clear();
+			list.Capacity = count * 4;
+			for (int k = 0; k < count; k += 3)
+			{
+				Subdivide(list, list2[k], list2[k + 1], list2[k + 2]);
+			}
+		}
+		for (int l = 0; l < 2; l++)
+		{
+			List<CubemapSkyboxVertex> list3 = new List<CubemapSkyboxVertex>(list.Count);
+			list3.AddRange(list);
+			int count2 = list3.Count;
+			float num = Mathf.Pow(0.5f, (float)l + 1f);
+			list.Clear();
+			list.Capacity = count2 * 4;
+			for (int m = 0; m < count2; m += 3)
+			{
+				float num2 = Mathf.Max(Mathf.Max(Mathf.Abs(list3[m].y), Mathf.Abs(list3[m + 1].y)), Mathf.Abs(list3[m + 2].y));
+				if (num2 > num)
+				{
+					list.Add(list3[m]);
+					list.Add(list3[m + 1]);
+					list.Add(list3[m + 2]);
+				}
+				else
+				{
+					SubdivideYOnly(list, list3[m], list3[m + 1], list3[m + 2]);
+				}
+			}
+		}
+		Mesh mesh = new Mesh();
+		Vector3[] array = new Vector3[list.Count];
+		Vector2[] array2 = new Vector2[list.Count];
+		int[] array3 = new int[list.Count];
+		for (int n = 0; n < list.Count; n++)
+		{
+			ref Vector3 reference = ref array[n];
+			reference = new Vector3(list[n].x, list[n].y, list[n].z);
+			ref Vector2 reference2 = ref array2[n];
+			reference2 = new Vector3(list[n].tu, list[n].tv);
+			array3[n] = n;
+		}
+		mesh.vertices = array;
+		mesh.uv = array2;
+		mesh.triangles = array3;
+		return mesh;
+	}
+
+	private bool InitializeCubemapFaceMatrices()
+	{
+		switch (SystemInfo.graphicsDeviceType)
+		{
+		case GraphicsDeviceType.OpenGLCore:
+			platformCubemapFaceMatrices = cubemapFaceMatrices;
+			break;
+		case GraphicsDeviceType.Direct3D11:
+			platformCubemapFaceMatrices = cubemapFaceMatricesD3D11;
+			break;
+		case GraphicsDeviceType.Direct3D12:
+			platformCubemapFaceMatrices = cubemapFaceMatricesD3D11;
+			break;
+		case GraphicsDeviceType.Vulkan:
+			platformCubemapFaceMatrices = cubemapFaceMatricesD3D11;
+			break;
+		case GraphicsDeviceType.Metal:
+			platformCubemapFaceMatrices = cubemapFaceMatricesD3D11;
+			break;
+		default:
+			platformCubemapFaceMatrices = null;
+			break;
+		}
+		if (platformCubemapFaceMatrices == null)
+		{
+			Debug.LogError("[ReflectionProbeEx] Initialization failed. No cubemap ortho basis defined for " + SystemInfo.graphicsDeviceType);
+			return false;
+		}
+		return true;
+	}
+
+	private void CreateTextures()
+	{
+		RenderTextureFormat format = RenderTextureFormat.ARGB32;
+		RenderTextureReadWrite readWrite = RenderTextureReadWrite.sRGB;
+		if (probeHdr)
+		{
+			if (probeHighPrecision)
+			{
+				format = RenderTextureFormat.ARGBHalf;
+			}
+			else
+			{
+				RenderTextureFormat renderTextureFormat = RenderTextureFormat.RGB111110Float;
+				format = ((!SystemInfo.SupportsRenderTextureFormat(renderTextureFormat)) ? RenderTextureFormat.ARGBHalf : renderTextureFormat);
+			}
+			readWrite = RenderTextureReadWrite.Linear;
+		}
+		int size = ((!(directionalLight != null)) ? 4 : probeResolution);
+		SafeCreateCubeRT(ref probeTexture, "Probe", probeResolution, 0, mips: true, TextureDimension.Cube, FilterMode.Trilinear, format, readWrite);
+		SafeCreateCubeRT(ref probeTempTexture, "ProbeTemp", probeResolution, 0, mips: true, TextureDimension.Cube, FilterMode.Trilinear, format, readWrite);
+		SafeCreateCubeRT(ref arrayTexture, "ProbeArray", probeResolution, 0, mips: true, TextureDimension.Tex2DArray, FilterMode.Point, format, readWrite);
+		SafeCreateCubeRT(ref arrayTempTexture, "ProbeArrayTemp", probeResolution, 0, mips: true, TextureDimension.Tex2DArray, FilterMode.Point, format, readWrite);
+		SafeCreateCubeRT(ref arrayDepthTexture, "ProbeArrayDepth", probeResolution, 16, mips: false, TextureDimension.Tex2DArray, FilterMode.Point, RenderTextureFormat.Depth);
+		if (shadowDistance > 0f)
+		{
+			SafeCreateCubeRT(ref probeShadowTexture, "ProbeShadow", size, 0, mips: false, TextureDimension.Cube, FilterMode.Point, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+			Graphics.SetRenderTarget(probeShadowTexture, 0, CubemapFace.PositiveX, -1);
+			GL.Clear(clearDepth: false, clearColor: true, Color.white);
+		}
+		else
+		{
+			probeShadowTexture = null;
+		}
+		mipmapCount = FastLog2(probeResolution) + 1;
+		if (reflectionCubemap == null)
+		{
+			FindEnvironmentReflection();
+		}
+	}
+
+	private void DestroyTextures()
+	{
+		RenderTexture.active = null;
+		SafeDestroy(ref probeTexture);
+		SafeDestroy(ref probeTempTexture);
+		SafeDestroy(ref probeShadowTexture);
+		SafeDestroy(ref arrayTexture);
+		SafeDestroy(ref arrayTempTexture);
+		SafeDestroy(ref arrayDepthTexture);
+	}
+
+	private Material RegisterMaterialReplacement(Material material)
+	{
+		Shader shader = material.shader;
+		Shader value = null;
+		if (!supportedShaders.TryGetValue(shader, out value))
+		{
+			string text = shader.name;
+			if (supportedShaderNames.Contains(text))
+			{
+				string text2 = "Hidden/ReflectionProbeEx/" + text;
+				value = Shader.Find(text2);
+				if (value != null)
+				{
+					supportedShaders.Add(shader, value);
+				}
+				else
+				{
+					Debug.LogError("[ReflectionProbeEx] Replacement shader " + text2 + " not found.");
+				}
+			}
+			else
+			{
+				Debug.LogError("[ReflectionProbeEx] Shader " + text + " not supported.");
+			}
+		}
+		Material value2 = null;
+		if (value != null)
+		{
+			bool flag = matchingMaterials.TryGetValue(material, out value2);
+			bool flag2 = flag && value2 == null;
+			if (!flag || flag2)
+			{
+				if (flag2)
+				{
+					matchingMaterials.Remove(material);
+				}
+				value2 = new Material(value);
+				value2.CopyPropertiesFromMaterial(material);
+				matchingMaterials.Add(material, value2);
+			}
+		}
+		return value2;
+	}
+
+	private Material FindMaterialReplacement(Material material)
+	{
+		Material value = null;
+		if (material != null && !matchingMaterials.TryGetValue(material, out value))
+		{
+			value = RegisterMaterialReplacement(material);
+		}
+		return value;
+	}
+
+	private void CreateMaterials()
+	{
+		SafeCreateMaterial(ref blitMaterial, "Hidden/ReflectionProbeEx/SinglePassBlit");
+		SafeCreateMaterial(ref filterMaterial, "Hidden/ReflectionProbeEx/SinglePassFilterEnvMap");
+		SafeCreateMaterial(ref shadowMaterial, "Hidden/ReflectionProbeEx/SinglePassShadowMask");
+		if (RenderSettings.skybox != null)
+		{
+			RegisterMaterialReplacement(RenderSettings.skybox);
+		}
+		foreach (RenderListEntry staticRender in staticRenderList)
+		{
+			if (staticRender.renderer != null && staticRender.renderer.sharedMaterial != null)
+			{
+				RegisterMaterialReplacement(staticRender.renderer.sharedMaterial);
+			}
+		}
+		useGeometryShader = blitMaterial.GetTag("GeometryShaderPath", searchFallbacks: false, string.Empty).ToUpper() == "TRUE";
+		PassCount = (useGeometryShader ? 1 : 6);
+	}
+
+	private void DestroyMaterials()
+	{
+		SafeDestroy(ref blitMaterial);
+		SafeDestroy(ref filterMaterial);
+		SafeDestroy(ref shadowMaterial);
+	}
+
+	private void CreateCommandBuffers()
+	{
+		SafeCreateCB(ref forwardCB, "ReflProbeEx-Forward");
+		SafeCreateCB(ref shadowCB, "ReflProbeEx-Shadow");
+	}
+
+	private void DestroyCommandBuffers()
+	{
+		SafeDispose(ref forwardCB);
+		SafeDispose(ref shadowCB);
+	}
+
+	private void ClearCommandBuffers()
+	{
+		forwardCB.Clear();
+		shadowCB.Clear();
+	}
+
+	private void AttachToLight()
+	{
+		if (directionalLight != null && probeShadowTexture != null)
+		{
+			DetachFromLight();
+			directionalLight.AddCommandBuffer(LightEvent.AfterScreenspaceMask, shadowCB);
+		}
+	}
+
+	private void DetachFromLight()
+	{
+		if (directionalLight != null && probeShadowTexture != null)
+		{
+			directionalLight.RemoveCommandBuffer(LightEvent.AfterScreenspaceMask, shadowCB);
+		}
+	}
+
+	private void FindEnvironmentReflection()
+	{
+		if (RenderSettings.defaultReflectionMode == DefaultReflectionMode.Custom)
+		{
+			reflectionCubemap = RenderSettings.customReflection;
+			reflectionIntensity = RenderSettings.reflectionIntensity;
+			return;
+		}
+		int defaultReflectionResolution = RenderSettings.defaultReflectionResolution;
+		TextureFormat textureFormat = TextureFormat.BC6H;
+		Cubemap[] array = Resources.FindObjectsOfTypeAll<Cubemap>();
+		Cubemap[] array2 = array;
+		foreach (Cubemap cubemap in array2)
+		{
+			if (cubemap.width == defaultReflectionResolution && cubemap.height == defaultReflectionResolution && cubemap.format == textureFormat && cubemap.mipmapCount > 1)
+			{
+				reflectionCubemap = cubemap;
+				reflectionIntensity = RenderSettings.reflectionIntensity;
+			}
+		}
+	}
+
+	private void BindGlobalProperties()
+	{
+		forwardCB.SetGlobalVector("_WorldSpaceCameraPos", base.transform.position);
+		forwardCB.SetGlobalFloat("_TextureMipBias", textureMipBias);
+	}
+
+	private void BindGlobalLight()
+	{
+		Vector3 vector = -Vector3.forward;
+		Vector4 value = Vector4.zero;
+		if (directionalLight != null && directionalLight.isActiveAndEnabled)
+		{
+			vector = -directionalLight.transform.forward;
+			value = (directionalLight.color * directionalLight.intensity).linear;
+		}
+		float num = probeResolution;
+		float num2 = 1f + 1f / (float)probeResolution;
+		forwardCB.SetGlobalVector("_WorldSpaceLightPos0", vector);
+		forwardCB.SetGlobalVector("_LightColor0", value);
+		forwardCB.SetGlobalVector("_ScreenParams", new Vector4(num, num, num2, num2));
+		forwardCB.SetGlobalMatrix("glstate_matrix_projection", GL.GetGPUProjectionMatrix(faceProjMatrix, renderIntoTexture: false));
+		if (probeShadowTexture != null)
+		{
+			forwardCB.SetGlobalTexture("_ShadowMask", probeShadowTexture);
+		}
+	}
+
+	private void BindGlobalAmbient()
+	{
+		SphericalHarmonicsL2 sphericalHarmonicsL = RenderSettings.ambientProbe;
+		if (RenderSettings.ambientMode == AmbientMode.Flat)
+		{
+			sphericalHarmonicsL = default(SphericalHarmonicsL2);
+			sphericalHarmonicsL.AddAmbientLight(RenderSettings.ambientLight.linear * RenderSettings.ambientIntensity);
+		}
+		else if (RenderSettings.ambientMode == AmbientMode.Trilight)
+		{
+			Color color = RenderSettings.ambientSkyColor.linear * RenderSettings.ambientIntensity;
+			Color color2 = RenderSettings.ambientEquatorColor.linear * RenderSettings.ambientIntensity;
+			Color color3 = RenderSettings.ambientGroundColor.linear * RenderSettings.ambientIntensity;
+			sphericalHarmonicsL = default(SphericalHarmonicsL2);
+			sphericalHarmonicsL.AddAmbientLight(color2);
+			sphericalHarmonicsL.AddDirectionalLight(Vector3.up, color - color2, 0.5f);
+			sphericalHarmonicsL.AddDirectionalLight(Vector3.down, color3 - color2, 0.5f);
+		}
+		forwardCB.SetGlobalVector("unity_SHAr", new Vector4(sphericalHarmonicsL[0, 3], sphericalHarmonicsL[0, 1], sphericalHarmonicsL[0, 2], sphericalHarmonicsL[0, 0] - sphericalHarmonicsL[0, 6]));
+		forwardCB.SetGlobalVector("unity_SHAg", new Vector4(sphericalHarmonicsL[1, 3], sphericalHarmonicsL[1, 1], sphericalHarmonicsL[1, 2], sphericalHarmonicsL[1, 0] - sphericalHarmonicsL[1, 6]));
+		forwardCB.SetGlobalVector("unity_SHAb", new Vector4(sphericalHarmonicsL[2, 3], sphericalHarmonicsL[2, 1], sphericalHarmonicsL[2, 2], sphericalHarmonicsL[2, 0] - sphericalHarmonicsL[2, 6]));
+		forwardCB.SetGlobalVector("unity_SHBr", new Vector4(sphericalHarmonicsL[0, 4], sphericalHarmonicsL[0, 5], sphericalHarmonicsL[0, 6] * 3f, sphericalHarmonicsL[0, 7]));
+		forwardCB.SetGlobalVector("unity_SHBg", new Vector4(sphericalHarmonicsL[1, 4], sphericalHarmonicsL[1, 5], sphericalHarmonicsL[1, 6] * 3f, sphericalHarmonicsL[1, 7]));
+		forwardCB.SetGlobalVector("unity_SHBb", new Vector4(sphericalHarmonicsL[2, 4], sphericalHarmonicsL[2, 5], sphericalHarmonicsL[2, 6] * 3f, sphericalHarmonicsL[2, 7]));
+		forwardCB.SetGlobalVector("unity_SHC", new Vector4(sphericalHarmonicsL[0, 8], sphericalHarmonicsL[1, 8], sphericalHarmonicsL[2, 8], 1f));
+	}
+
+	private void BindGlobalReflection()
+	{
+		Texture customReflection = reflectionCubemap;
+		float value = reflectionIntensity;
+		if (RenderSettings.customReflection != null)
+		{
+			customReflection = RenderSettings.customReflection;
+			value = RenderSettings.reflectionIntensity;
+		}
+		Vector2 vector = new Vector2(Mathf.GammaToLinearSpace(value), 1f);
+		forwardCB.SetGlobalTexture("unity_SpecCube0", customReflection);
+		forwardCB.SetGlobalTexture("unity_SpecCube1", customReflection);
+		forwardCB.SetGlobalVector("unity_SpecCube0_HDR", vector);
+		forwardCB.SetGlobalVector("unity_SpecCube1_HDR", vector);
+	}
+
+	private void RenderObjects()
+	{
+		Matrix4x4 gPUProjectionMatrix = GL.GetGPUProjectionMatrix(faceProjMatrix, renderIntoTexture: false);
+		for (int i = 0; i < 6; i++)
+		{
+			ref Matrix4x4 reference = ref viewProjMatrixArray[i];
+			reference = gPUProjectionMatrix * platformCubemapFaceMatrices[i].worldToView * base.transform.worldToLocalMatrix;
+		}
+		forwardCB.SetGlobalMatrixArray("_ViewProjMatrixArray", viewProjMatrixArray);
+		forwardCB.SetRenderTarget(arrayTexture, arrayDepthTexture, 0, CubemapFace.PositiveX, -1);
+		for (int j = 0; j < PassCount; j++)
+		{
+			forwardCB.SetGlobalInt("_TargetSlice", j);
+			foreach (RenderListEntry staticRender in staticRenderList)
+			{
+				Renderer renderer = staticRender.renderer;
+				if (renderer != null && (renderer.enabled || staticRender.alwaysEnabled) && renderer.gameObject.activeInHierarchy)
+				{
+					Material material = FindMaterialReplacement(renderer.sharedMaterial);
+					if (material != null)
+					{
+						forwardCB.DrawMesh(renderer.GetComponent<MeshFilter>().sharedMesh, renderer.transform.localToWorldMatrix, material, 0, 0);
+					}
+				}
+			}
+			foreach (RenderListEntry dynamicRender in dynamicRenderList)
+			{
+				Renderer renderer2 = dynamicRender.renderer;
+				if (renderer2 != null && (renderer2.enabled || dynamicRender.alwaysEnabled) && renderer2.gameObject.activeInHierarchy)
+				{
+					Material material2 = FindMaterialReplacement(renderer2.sharedMaterial);
+					if (material2 != null)
+					{
+						forwardCB.DrawMesh(renderer2.GetComponent<MeshFilter>().sharedMesh, renderer2.transform.localToWorldMatrix, material2, 0, 0);
+					}
+				}
+			}
+		}
+	}
+
+	private void RenderSkybox()
+	{
+		float num = 1E-06f;
+		float num2 = probeNearClip * 0.01f;
+		float num3 = probeFarClip * 10f;
+		Matrix4x4 proj = faceProjMatrix;
+		proj[2, 2] = -1f + num;
+		proj[2, 3] = (-2f + num) * num2;
+		proj[3, 2] = -1f;
+		proj = GL.GetGPUProjectionMatrix(proj, renderIntoTexture: false);
+		for (int i = 0; i < 6; i++)
+		{
+			ref Matrix4x4 reference = ref viewProjMatrixArray[i];
+			reference = proj * platformCubemapFaceMatrices[i].worldToView;
+		}
+		forwardCB.SetGlobalMatrixArray("_ViewProjMatrixArray", viewProjMatrixArray);
+		Matrix4x4 matrix = Matrix4x4.TRS(base.transform.position, Quaternion.identity, new Vector3(num3, num3, num3));
+		Material material = FindMaterialReplacement(RenderSettings.skybox);
+		if (material != null)
+		{
+			forwardCB.SetRenderTarget(arrayTexture, arrayDepthTexture, 0, CubemapFace.PositiveX, -1);
+			for (int j = 0; j < PassCount; j++)
+			{
+				forwardCB.SetGlobalInt("_TargetSlice", j);
+				forwardCB.DrawMesh(skyboxMesh, matrix, material, 0, 0);
+			}
+		}
+	}
+
+	private void IssueRender()
+	{
+		forwardCB.SetRenderTarget(arrayTexture, arrayDepthTexture, 0, CubemapFace.PositiveX, -1);
+		forwardCB.ClearRenderTarget(clearDepth: true, clearFlags == ReflectionProbeClearFlags.SolidColor, background);
+		BindGlobalProperties();
+		BindGlobalLight();
+		BindGlobalAmbient();
+		BindGlobalReflection();
+		if (clearFlags == ReflectionProbeClearFlags.Skybox)
+		{
+			RenderSkybox();
+		}
+		RenderObjects();
+	}
+
+	private void IssueGenerateMips()
+	{
+		for (int i = 0; i < PassCount; i++)
+		{
+			int slice = ((!useGeometryShader) ? i : (-1));
+			CommandBufferEx.BlitMip(forwardCB, blitMesh, arrayTexture, probeTempTexture, 0, slice, blitMaterial);
+			CommandBufferEx.BlitMip(forwardCB, blitMesh, arrayTexture, probeTexture, 0, slice, blitMaterial);
+		}
+		forwardCB.GenerateMips(probeTempTexture);
+	}
+
+	private void IssueConvolution()
+	{
+		for (int i = 0; i < 6; i++)
+		{
+			ref Matrix4x4 reference = ref viewProjMatrixArray[i];
+			reference = faceProjMatrix * cubemapFaceMatrices[i].worldToView;
+			ref Matrix4x4 reference2 = ref objectToWorldArray[i];
+			reference2 = cubemapFaceMatrices[i].viewToWorld;
+		}
+		forwardCB.SetGlobalMatrixArray("_ViewProjMatrixArray", viewProjMatrixArray);
+		forwardCB.SetGlobalMatrixArray("_ObjectToWorldArray", objectToWorldArray);
+		ApplyConvolution(probeTexture);
+	}
+
+	private void IssueShadow()
+	{
+		for (int i = 0; i < 6; i++)
+		{
+			ref Matrix4x4 reference = ref cameraToWorldArray[i];
+			reference = base.transform.localToWorldMatrix * shadowCubemapFaceMatrices[i].worldToView;
+		}
+		shadowCB.SetGlobalMatrix("unity_CameraInvProjection", faceProjInvMatrix);
+		shadowCB.SetGlobalMatrixArray("_CameraToWorldArray", cameraToWorldArray);
+		shadowCB.SetGlobalTexture("_ArrayDepthTexture", arrayDepthTexture);
+		for (int j = 0; j < PassCount; j++)
+		{
+			int slice = ((!useGeometryShader) ? j : (-1));
+			CommandBufferEx.BlitArray(shadowCB, blitMesh, BuiltinRenderTextureType.CurrentActive, probeShadowTexture, shadowMaterial, slice);
+		}
+	}
+
+	private void PrepareFullRender()
+	{
+		if (directionalLight != null && directionalLight.shadows != 0 && probeShadowTexture != null)
+		{
+			IssueShadow();
+		}
+		IssueRender();
+		IssueGenerateMips();
+		IssueConvolution();
+	}
+
+	private void PrepareTimeSlicedRender(TimeSlicingState state)
+	{
+		if (state == TimeSlicingState.Shadow)
+		{
+			if (directionalLight != null && directionalLight.shadows != 0 && probeShadowTexture != null)
+			{
+				IssueShadow();
+				return;
+			}
+			state++;
+		}
+		switch (state)
+		{
+		case TimeSlicingState.Render:
+			IssueRender();
+			break;
+		case TimeSlicingState.GenerateMips:
+			IssueGenerateMips();
+			break;
+		case TimeSlicingState.Convolution:
+			IssueConvolution();
+			break;
+		}
+	}
+
+	private void ExecuteRender()
+	{
+		if (forwardCB != null)
+		{
+			bool sRGBWrite = GL.sRGBWrite;
+			GL.sRGBWrite = !probeHdr;
+			Graphics.ExecuteCommandBuffer(forwardCB);
+			GL.sRGBWrite = sRGBWrite;
+		}
+	}
+
+	private int FastLog2(int value)
+	{
+		value |= value >> 1;
+		value |= value >> 2;
+		value |= value >> 4;
+		value |= value >> 8;
+		value |= value >> 16;
+		return tab32[(uint)((long)value * 130329821L) >> 27];
+	}
+
+	private uint ReverseBits(uint bits)
+	{
+		bits = (bits << 16) | (bits >> 16);
+		bits = ((bits & 0xFF00FF) << 8) | ((bits & 0xFF00FF00u) >> 8);
+		bits = ((bits & 0xF0F0F0F) << 4) | ((bits & 0xF0F0F0F0u) >> 4);
+		bits = ((bits & 0x33333333) << 2) | ((bits & 0xCCCCCCCCu) >> 2);
+		bits = ((bits & 0x55555555) << 1) | ((bits & 0xAAAAAAAAu) >> 1);
+		return bits;
+	}
+
+	private void SafeCreateMaterial(ref Material mat, Shader shader)
+	{
+		if (mat == null)
+		{
+			mat = new Material(shader);
+		}
+	}
+
+	private void SafeCreateMaterial(ref Material mat, string shaderName)
+	{
+		if (mat == null)
+		{
+			SafeCreateMaterial(ref mat, Shader.Find(shaderName));
+		}
+	}
+
+	private void SafeCreateCubeRT(ref RenderTexture rt, string name, int size, int depth, bool mips, TextureDimension dim, FilterMode filter, RenderTextureFormat format, RenderTextureReadWrite readWrite = RenderTextureReadWrite.Linear)
+	{
+		if (rt == null || !rt.IsCreated())
+		{
+			SafeDestroy(ref rt);
+			rt = new RenderTexture(size, size, depth, format, readWrite)
+			{
+				hideFlags = HideFlags.DontSave
+			};
+			rt.name = name;
+			rt.dimension = dim;
+			if (dim == TextureDimension.Tex2DArray)
+			{
+				rt.volumeDepth = 6;
+			}
+			rt.useMipMap = mips;
+			rt.autoGenerateMips = false;
+			rt.filterMode = filter;
+			rt.anisoLevel = 0;
+			rt.Create();
+		}
+	}
+
+	private void SafeCreateCB(ref CommandBuffer cb, string name)
+	{
+		if (cb == null)
+		{
+			cb = new CommandBuffer();
+			cb.name = name;
+		}
+	}
+
+	private void SafeDestroy<T>(ref T obj) where T : UnityEngine.Object
+	{
+		if (obj != null)
+		{
+			UnityEngine.Object.DestroyImmediate(obj);
+			obj = (T)null;
+		}
+	}
+
+	private void SafeDispose<T>(ref T obj) where T : IDisposable
+	{
+		if (obj != null)
+		{
+			obj.Dispose();
+			obj = default(T);
+		}
+	}
+}

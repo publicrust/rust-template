@@ -3,9 +3,9 @@ using System.Collections;
 using System.Collections.Generic;
 using Apex.AI;
 using Apex.AI.Components;
+using Apex.AI.Serialization;
 using Apex.LoadBalancing;
 using ConVar;
-using Facepunch;
 using Oxide.Core;
 using Rust.Ai;
 using UnityEngine;
@@ -24,7 +24,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 		public int Compare(CoverPoint a, CoverPoint b)
 		{
-			if (compareTo == null)
+			if (compareTo == null || a == null || b == null)
 			{
 				return 0;
 			}
@@ -54,6 +54,28 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		CloseRange,
 		MediumRange,
 		LongRange
+	}
+
+	public enum EnemyRangeEnum : byte
+	{
+		CloseAttackRange,
+		MediumAttackRange,
+		LongAttackRange,
+		OutOfRange
+	}
+
+	public enum EnemyEngagementRangeEnum : byte
+	{
+		AggroRange,
+		DeaggroRange,
+		NeutralRange
+	}
+
+	public enum ToolTypeEnum : byte
+	{
+		None,
+		Research,
+		Lightsource
 	}
 
 	public enum Facts
@@ -98,17 +120,24 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		IsRetreatingToCover,
 		SidesteppedOutOfCover,
 		IsCoverCompromised,
-		AttackedVeryRecently
-	}
-
-	public enum EnemyRangeEnum : byte
-	{
-		CloseAttackRange,
-		MediumAttackRange,
-		LongAttackRange,
-		AggroRange,
-		AwareRange,
-		OutOfRange
+		AttackedVeryRecently,
+		RangeToSpawnLocation,
+		AttackedRecently,
+		CurrentToolType,
+		CanSwitchTool,
+		AllyAttackedRecently,
+		IsMounted,
+		WantsToDismount,
+		CanNotWieldWeapon,
+		IsMobile,
+		HasWaypoints,
+		IsPeacekeeper,
+		IsSearchingForEnemy,
+		EnemyEngagementRange,
+		IsMovingTowardWaypoint,
+		IsMilitaryTunnelLab,
+		IncompletePathToTarget,
+		IsBandit
 	}
 
 	public enum AfraidRangeEnum : byte
@@ -149,6 +178,8 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		Crouched
 	}
 
+	public Vector2 RadioEffectRepeatRange = new Vector2(10f, 15f);
+
 	public GameObjectRef RadioEffect;
 
 	public GameObjectRef DeathEffect;
@@ -165,6 +196,20 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	public const float TickRate = 0.1f;
 
+	public bool IsInvinsible;
+
+	public float lastInvinsibleStartTime;
+
+	public float InvinsibleTime = 2f;
+
+	public static readonly HashSet<NPCPlayerApex> AllJunkpileNPCs = new HashSet<NPCPlayerApex>();
+
+	public static readonly HashSet<NPCPlayerApex> AllBanditCampNPCs = new HashSet<NPCPlayerApex>();
+
+	private float nextSensorySystemTick;
+
+	private float nextReasoningSystemTick;
+
 	private float attackTargetVisibleFor;
 
 	private BaseEntity lastAttackTarget;
@@ -172,11 +217,22 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 	public BaseNpc.AiStatistics Stats;
 
 	[SerializeField]
-	private UtilityAIComponent utilityAiComponent;
+	public UtilityAIComponent utilityAiComponent;
 
 	public bool NewAI;
 
+	public bool NeverMove;
+
+	public bool IsMountableAgent;
+
 	public float WeaponSwitchFrequency = 5f;
+
+	public float ToolSwitchFrequency = 5f;
+
+	public WaypointSet WaypointSet;
+
+	[NonSerialized]
+	public Transform[] LookAtInterestPointsStationary;
 
 	private NPCHumanContext _aiContext;
 
@@ -199,6 +255,12 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 	[ReadOnly]
 	public float NextWeaponSwitchTime;
 
+	[ReadOnly]
+	public float NextToolSwitchTime;
+
+	[ReadOnly]
+	public float NextDetectionCheck;
+
 	private bool wasAggro;
 
 	[NonSerialized]
@@ -207,9 +269,33 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 	[NonSerialized]
 	public float TimeLastMovedToCover;
 
+	[NonSerialized]
+	public float AllyAttackedRecentlyTimeout;
+
+	[NonSerialized]
+	public float LastHasEnemyTime;
+
+	[NonSerialized]
+	public bool LastDetectionCheckResult;
+
 	public BaseNpc.Behaviour _currentBehavior;
 
+	protected float lastInRangeOfSpawnPositionTime = float.NegativeInfinity;
+
 	private static Vector3[] pathCornerCache = new Vector3[128];
+
+	private static NavMeshPath _pathCache = null;
+
+	private float nextLookAtPointTime;
+
+	[NonSerialized]
+	public Transform LookAtPoint;
+
+	[NonSerialized]
+	public PlayerEyes LookAtEyes;
+
+	[Header("Npc Communication")]
+	public float CommunicationRadius = -1f;
 
 	[NonSerialized]
 	public byte[] CurrentFacts = new byte[Enum.GetValues(typeof(Facts)).Length];
@@ -220,6 +306,8 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 	public float SensesTickRate = 0.5f;
 
 	public float MaxDistanceToCover = 15f;
+
+	public float MinDistanceToRetreatCover = 6f;
 
 	[Header("NPC Player Senses Target Scoring")]
 	public float VisionRangeScore = 1f;
@@ -245,13 +333,68 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	private int sensesTicksSinceLastCoverSweep = 5;
 
-	private SquadMember squadMember;
+	private float alertness;
+
+	protected float lastSeenPlayerTime = float.NegativeInfinity;
 
 	private bool isAlreadyCheckingPathPending;
 
 	private int numPathPendingAttempts;
 
 	private float accumPathPendingDelay;
+
+	[Header("Sensory")]
+	[Tooltip("Only care about sensations from our active enemy target, and nobody else.")]
+	public bool OnlyTargetSensations;
+
+	private const int MaxPlayers = 128;
+
+	public static BasePlayer[] PlayerQueryResults = new BasePlayer[128];
+
+	public static int PlayerQueryResultCount = 0;
+
+	private static NavMeshPath PathToPlayerTarget;
+
+	private static PlayerTargetContext _playerTargetContext;
+
+	public static BaseEntity[] EntityQueryResults = new BaseEntity[128];
+
+	public static int EntityQueryResultCount = 0;
+
+	private static EntityTargetContext _entityTargetContext;
+
+	private static CoverContext _coverContext;
+
+	private static BaseAiUtilityClient _selectPlayerTargetAI;
+
+	private static BaseAiUtilityClient _selectPlayerTargetMountedAI;
+
+	private static BaseAiUtilityClient _selectEntityTargetAI;
+
+	private static BaseAiUtilityClient _selectCoverTargetsAI;
+
+	private static BaseAiUtilityClient _selectEnemyHideoutAI;
+
+	[Header("Sensory System")]
+	public AIStorage SelectPlayerTargetUtility;
+
+	public AIStorage SelectPlayerTargetMountedUtility;
+
+	public AIStorage SelectEntityTargetsUtility;
+
+	public AIStorage SelectCoverTargetsUtility;
+
+	public AIStorage SelectEnemyHideoutUtility;
+
+	private float playerTargetDecisionStartTime;
+
+	private float animalTargetDecisionStartTime;
+
+	private float nextCoverInfoTick;
+
+	private float nextCoverPosInfoTick;
+
+	private float _lastHeardGunshotTime = float.NegativeInfinity;
 
 	bool ILoadBalanced.repeat => true;
 
@@ -269,7 +412,32 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		}
 	}
 
-	public bool IsStuck { get; private set; }
+	public bool IsStuck { get; set; }
+
+	public override bool IsDormant
+	{
+		get
+		{
+			return base.IsDormant;
+		}
+		set
+		{
+			base.IsDormant = value;
+			if (value)
+			{
+				StopMoving();
+				Pause();
+			}
+			else if (GetNavAgent == null || AiManager.nav_disable)
+			{
+				IsDormant = true;
+			}
+			else
+			{
+				Resume();
+			}
+		}
+	}
 
 	public NPCHumanContext AiContext
 	{
@@ -285,6 +453,14 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	public float TimeAtDestination => timeAtDestination;
 
+	public int WaypointDirection { get; set; }
+
+	public bool IsWaitingAtWaypoint { get; set; }
+
+	public int CurrentWaypointIndex { get; set; }
+
+	public float WaypointDelayTime { get; set; }
+
 	public Vector3 Destination
 	{
 		get
@@ -299,8 +475,40 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		{
 			if (IsNavRunning())
 			{
+				IsStopped = false;
 				GetNavAgent.destination = value;
 			}
+		}
+	}
+
+	public float StoppingDistance
+	{
+		get
+		{
+			if (IsNavRunning())
+			{
+				return GetNavAgent.stoppingDistance;
+			}
+			return 0f;
+		}
+		set
+		{
+			if (IsNavRunning())
+			{
+				GetNavAgent.stoppingDistance = value;
+			}
+		}
+	}
+
+	public float SqrStoppingDistance
+	{
+		get
+		{
+			if (IsNavRunning())
+			{
+				return GetNavAgent.stoppingDistance * GetNavAgent.stoppingDistance;
+			}
+			return 0f;
 		}
 	}
 
@@ -318,6 +526,10 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		{
 			if (IsNavRunning())
 			{
+				if (value)
+				{
+					GetNavAgent.destination = ServerPosition;
+				}
 				GetNavAgent.isStopped = value;
 			}
 		}
@@ -342,19 +554,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		}
 	}
 
-	public bool HasPath
-	{
-		get
-		{
-			if (IsNavRunning())
-			{
-				return GetNavAgent.hasPath;
-			}
-			return false;
-		}
-	}
-
-	public Vector3 GuardPosition { get; set; }
+	public Vector3 SpawnPosition { get; set; }
 
 	public float AttackTargetVisibleFor => attackTargetVisibleFor;
 
@@ -437,6 +637,8 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	public float TargetSpeed { get; set; }
 
+	public float SecondsSinceLastInRangeOfSpawnPosition => UnityEngine.Time.time - lastInRangeOfSpawnPositionTime;
+
 	public ActionCallback OnFleeExplosive { get; set; }
 
 	public ActionCallback OnTakeCover { get; set; }
@@ -449,22 +651,192 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	public ActionCallback OnReload { get; set; }
 
+	public float SecondsSinceSeenPlayer => UnityEngine.Time.time - lastSeenPlayerTime;
+
+	private static PlayerTargetContext PlayerTargetContext
+	{
+		get
+		{
+			if (_playerTargetContext == null)
+			{
+				PlayerTargetContext playerTargetContext = new PlayerTargetContext();
+				playerTargetContext.Direction = new Vector3[128];
+				playerTargetContext.Dot = new float[128];
+				playerTargetContext.DistanceSqr = new float[128];
+				playerTargetContext.LineOfSight = new byte[128];
+				_playerTargetContext = playerTargetContext;
+			}
+			return _playerTargetContext;
+		}
+	}
+
+	private static EntityTargetContext EntityTargetContext
+	{
+		get
+		{
+			if (_entityTargetContext == null)
+			{
+				_entityTargetContext = new EntityTargetContext();
+			}
+			return _entityTargetContext;
+		}
+	}
+
+	private static CoverContext CoverContext
+	{
+		get
+		{
+			if (_coverContext == null)
+			{
+				_coverContext = new CoverContext();
+			}
+			return _coverContext;
+		}
+	}
+
+	private BaseAiUtilityClient SelectPlayerTargetAI
+	{
+		get
+		{
+			if (_selectPlayerTargetAI == null && SelectPlayerTargetUtility != null)
+			{
+				_selectPlayerTargetAI = new BaseAiUtilityClient(AIManager.GetAI(new Guid(SelectPlayerTargetUtility.aiId)), this);
+				_selectPlayerTargetAI.Initialize();
+			}
+			return _selectPlayerTargetAI;
+		}
+	}
+
+	private BaseAiUtilityClient SelectPlayerTargetMountedAI
+	{
+		get
+		{
+			if (_selectPlayerTargetMountedAI == null && SelectPlayerTargetMountedUtility != null)
+			{
+				_selectPlayerTargetMountedAI = new BaseAiUtilityClient(AIManager.GetAI(new Guid(SelectPlayerTargetMountedUtility.aiId)), this);
+				_selectPlayerTargetMountedAI.Initialize();
+			}
+			return _selectPlayerTargetMountedAI;
+		}
+	}
+
+	private BaseAiUtilityClient SelectEntityTargetAI
+	{
+		get
+		{
+			if (_selectEntityTargetAI == null && SelectEntityTargetsUtility != null)
+			{
+				_selectEntityTargetAI = new BaseAiUtilityClient(AIManager.GetAI(new Guid(SelectEntityTargetsUtility.aiId)), this);
+				_selectEntityTargetAI.Initialize();
+			}
+			return _selectEntityTargetAI;
+		}
+	}
+
+	private BaseAiUtilityClient SelectCoverTargetsAI
+	{
+		get
+		{
+			if (_selectCoverTargetsAI == null && SelectCoverTargetsUtility != null)
+			{
+				_selectCoverTargetsAI = new BaseAiUtilityClient(AIManager.GetAI(new Guid(SelectCoverTargetsUtility.aiId)), this);
+				_selectCoverTargetsAI.Initialize();
+			}
+			return _selectCoverTargetsAI;
+		}
+	}
+
+	private BaseAiUtilityClient SelectEnemyHideoutAI
+	{
+		get
+		{
+			if (_selectEnemyHideoutAI == null && SelectEnemyHideoutUtility != null)
+			{
+				_selectEnemyHideoutAI = new BaseAiUtilityClient(AIManager.GetAI(new Guid(SelectEnemyHideoutUtility.aiId)), this);
+				_selectEnemyHideoutAI.Initialize();
+			}
+			return _selectEnemyHideoutAI;
+		}
+	}
+
+	public float SecondsSinceLastHeardGunshot => UnityEngine.Time.time - _lastHeardGunshotTime;
+
+	public Vector3 LastHeardGunshotDirection { get; set; }
+
+	private void DelayedSpawnPosition()
+	{
+		SpawnPosition = GetPosition();
+	}
+
 	public override void ServerInit()
 	{
-		if (!base.isClient)
+		if (base.isClient)
 		{
-			base.ServerInit();
-			GuardPosition = GetPosition();
-			IsStuck = false;
-			if (NewAI)
-			{
-				InitFacts();
-				fleeHealthThresholdPercentage = Stats.HealthThresholdForFleeing;
-				coverPointComparer = new CoverPointComparer(this);
-				NPCSensesLoadBalancer.NpcSensesLoadBalancer.Add(this);
-			}
-			ReloadOperator.Reload(AiContext);
+			return;
 		}
+		base.ServerInit();
+		SpawnPosition = GetPosition();
+		if (SpawnPosition.sqrMagnitude < 0.01f)
+		{
+			Invoke(DelayedSpawnPosition, 1f);
+		}
+		IsStuck = false;
+		if (!NewAI)
+		{
+			return;
+		}
+		InitFacts();
+		CurrentWaypointIndex = 0;
+		IsWaitingAtWaypoint = false;
+		WaypointDirection = 1;
+		fleeHealthThresholdPercentage = Stats.HealthThresholdForFleeing;
+		coverPointComparer = new CoverPointComparer(this);
+		SwitchWeaponOperator.TrySwitchWeaponTo(AiContext, WeaponTypeEnum.MediumRange);
+		DelayedReloadOnInit();
+		NPCSensesLoadBalancer.NpcSensesLoadBalancer.Add(this);
+		lastInvinsibleStartTime = UnityEngine.Time.time;
+		if (AiContext.AiLocationManager == null)
+		{
+			float num = float.PositiveInfinity;
+			AiLocationManager aiLocationManager = null;
+			if (AiLocationManager.Managers != null && AiLocationManager.Managers.Count > 0)
+			{
+				foreach (AiLocationManager manager in AiLocationManager.Managers)
+				{
+					float sqrMagnitude = (manager.transform.position - ServerPosition).sqrMagnitude;
+					if (sqrMagnitude < num)
+					{
+						num = sqrMagnitude;
+						aiLocationManager = manager;
+					}
+				}
+			}
+			if (aiLocationManager != null && num <= Stats.DeaggroRange * Stats.DeaggroRange)
+			{
+				AiContext.AiLocationManager = aiLocationManager;
+				if (AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.JunkpileA || AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.JunkpileG)
+				{
+					AllJunkpileNPCs.Add(this);
+				}
+				else if (AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.BanditTown)
+				{
+					AllBanditCampNPCs.Add(this);
+				}
+			}
+		}
+		else if (AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.JunkpileA || AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.JunkpileG)
+		{
+			AllJunkpileNPCs.Add(this);
+		}
+		else if (AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.BanditTown)
+		{
+			AllBanditCampNPCs.Add(this);
+		}
+	}
+
+	private void DelayedReloadOnInit()
+	{
+		ReloadOperator.Reload(AiContext);
 	}
 
 	internal override void DoServerDestroy()
@@ -472,21 +844,59 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		base.DoServerDestroy();
 		if (NewAI)
 		{
+			if (AiContext != null && AiContext.AiLocationManager != null)
+			{
+				if (AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.JunkpileA || AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.JunkpileG)
+				{
+					AllJunkpileNPCs.Remove(this);
+				}
+				else if (AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.BanditTown)
+				{
+					AllBanditCampNPCs.Remove(this);
+				}
+			}
 			NPCSensesLoadBalancer.NpcSensesLoadBalancer.Remove(this);
 		}
+		CancelInvoke(RadioChatter);
 	}
 
 	float? ILoadBalanced.ExecuteUpdate(float deltaTime, float nextInterval)
 	{
-		using (TimeWarning.New("NPC.TickSenses"))
+		float time = UnityEngine.Time.time;
+		IsInvinsible = time - lastInvinsibleStartTime < InvinsibleTime;
+		if (time > nextSensorySystemTick)
 		{
-			TickSenses();
+			using (TimeWarning.New("NPC.TickSensorySystem"))
+			{
+				TickSensorySystem();
+			}
+			nextSensorySystemTick = time + 0.1f * AI.npc_sensory_system_tick_rate_multiplier + UnityEngine.Random.value * 0.1f;
+		}
+		if (time > nextReasoningSystemTick)
+		{
+			using (TimeWarning.New("NPC.TickReasoningSystem"))
+			{
+				TickReasoningSystem();
+			}
+			nextReasoningSystemTick = time + 0.1f * AI.npc_reasoning_system_tick_rate_multiplier + UnityEngine.Random.value * 0.1f;
+		}
+		using (TimeWarning.New("NPC.TickBehaviourState"))
+		{
+			TickBehaviourState();
 		}
 		return UnityEngine.Random.value * 0.1f + 0.1f;
 	}
 
 	public void RadioChatter()
 	{
+		if (base.IsDestroyed || base.transform == null)
+		{
+			CancelInvoke(RadioChatter);
+		}
+		else if (RadioEffect.isValid)
+		{
+			Effect.server.Run(RadioEffect.resourcePath, this, StringPool.Get("head"), Vector3.zero, Vector3.zero);
+		}
 	}
 
 	public override void OnKilled(HitInfo info)
@@ -496,21 +906,66 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		{
 			OnDeath();
 		}
+		if (NewAI)
+		{
+			if (AiContext != null && AiContext.AiLocationManager != null)
+			{
+				if (AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.JunkpileA || AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.JunkpileG)
+				{
+					AllJunkpileNPCs.Remove(this);
+				}
+				else if (AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.BanditTown)
+				{
+					AllBanditCampNPCs.Remove(this);
+				}
+			}
+			NPCSensesLoadBalancer.NpcSensesLoadBalancer.Remove(this);
+			ShutdownSensorySystem();
+		}
+		CancelInvoke(RadioChatter);
+		if (DeathEffect.isValid)
+		{
+			Effect.server.Run(DeathEffect.resourcePath, this, 0u, Vector3.zero, Vector3.zero);
+		}
 	}
 
 	public override void Hurt(HitInfo info)
 	{
-		if (info.Initiator != null && AiContext != null)
+		if (IsInvinsible)
 		{
-			float danger = info.damageTypes.Total();
-			AiContext.Memory.Update(info.Initiator, danger);
-			AiContext.LastAttacker = info.Initiator;
-			if (AiContext.CoverSet.Closest.ReservedCoverPoint != null && GetFact(Facts.IsInCover) > 0)
+			return;
+		}
+		if (AI.npc_families_no_hurt)
+		{
+			NPCPlayerApex nPCPlayerApex = info.Initiator as NPCPlayerApex;
+			if (nPCPlayerApex != null && nPCPlayerApex.Family == Family)
 			{
-				AiContext.CoverSet.Closest.ReservedCoverPoint.CoverIsCompromised(SquadManager.squad_cover_compromised_cooldown);
+				return;
 			}
 		}
 		base.Hurt(info);
+		if (info.Initiator != null && AiContext != null)
+		{
+			float dmg = info.damageTypes.Total();
+			if (info.InitiatorPlayer != null && AiContext.EnemyPlayer == null)
+			{
+				AiContext.EnemyPlayer = info.InitiatorPlayer;
+			}
+			else if (info.Initiator is BaseNpc)
+			{
+				AiContext.EnemyNpc = (BaseNpc)info.Initiator;
+			}
+			UpdateTargetMemory(info.Initiator, dmg, out var extendedInfo);
+			AiContext.LastAttacker = info.Initiator;
+			if (AiContext.CoverSet.Closest.ReservedCoverPoint != null && GetFact(Facts.IsInCover) > 0)
+			{
+				AiContext.CoverSet.Closest.ReservedCoverPoint.CoverIsCompromised(AI.npc_cover_compromised_cooldown);
+			}
+			if (TryAggro(extendedInfo.DistanceSqr) && AiContext.EnemyPlayer != null)
+			{
+				SetAttackTarget(AiContext.EnemyPlayer, 1f, extendedInfo.DistanceSqr, (extendedInfo.LineOfSight & 1) != 0, (extendedInfo.LineOfSight & 2) != 0, tryAggro: false);
+			}
+		}
 	}
 
 	public override void TickAi(float delta)
@@ -520,25 +975,24 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	public override void MovementUpdate(float delta)
 	{
-		if (!AI.move || !IsNavRunning())
+		BaseMountable baseMountable = GetMounted();
+		modelState.mounted = baseMountable != null;
+		modelState.poseType = (int)(modelState.mounted ? baseMountable.mountPose : PlayerModel.MountPoses.Chair);
+		if (!AI.move || (!base.isMounted && !IsNavRunning()))
 		{
 			return;
 		}
-		if (AiManager.nav_grid)
+		if (IsDormant || !syncPosition)
 		{
-			base.PreviousCoord = base.CurrentCoord;
-			base.CurrentCoord = SingletonComponent<AiManager>.Instance.GetCoord(ServerPosition);
-			if (base.CurrentCoord.x != base.PreviousCoord.x || base.CurrentCoord.y != base.PreviousCoord.y)
-			{
-				base.AgencyUpdateRequired = true;
-				if (NavAgent.isOnOffMeshLink)
-				{
-					base.IsOnOffmeshLinkAndReachedNewCoord = true;
-				}
-			}
+			StopMoving();
+			return;
 		}
 		base.MovementUpdate(delta);
-		if ((IsNavRunning() && !NavAgent.hasPath) || Vector3Ex.Distance2D(finalDestination, GetPosition()) < 1f)
+		if (base.isMounted)
+		{
+			timeAtDestination += delta;
+		}
+		else if ((IsNavRunning() && !NavAgent.hasPath) || Vector3Ex.Distance2D(NavAgent.destination, GetPosition()) < 1f)
 		{
 			timeAtDestination += delta;
 		}
@@ -550,12 +1004,30 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		TickStuck(delta);
 	}
 
+	protected override void UpdatePositionAndRotation(Vector3 moveToPosition)
+	{
+		if (TerrainMeta.HeightMap != null && AiContext.AiLocationManager != null && (AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.JunkpileA || AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.JunkpileG))
+		{
+			float height = TerrainMeta.HeightMap.GetHeight(moveToPosition);
+			float num = moveToPosition.y - height;
+			if (num > 0f)
+			{
+				moveToPosition.y = height;
+			}
+			else if (num < 0.5f)
+			{
+				moveToPosition.y = height;
+			}
+		}
+		base.UpdatePositionAndRotation(moveToPosition);
+	}
+
 	public void TickStuck(float delta)
 	{
-		if (IsNavRunning() && !NavAgent.isStopped && Vector3.Distance(lastStuckPos, ServerPosition) < 0.25f && AttackReady())
+		if (IsNavRunning() && !NavAgent.isStopped && (lastStuckPos - ServerPosition).sqrMagnitude < 0.0625f && AttackReady())
 		{
 			stuckDuration += delta;
-			if (stuckDuration >= 5f && lastStuckTime == 0f)
+			if (stuckDuration >= 5f && Mathf.Approximately(lastStuckTime, 0f))
 			{
 				lastStuckTime = UnityEngine.Time.time;
 				OnBecomeStuck();
@@ -596,7 +1068,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	public void UpdateAttackTargetVisibility(float delta)
 	{
-		if (AttackTarget == null || (lastAttackTarget != null && lastAttackTarget != AttackTarget) || !AttackTarget.IsVisible(AttackPosition))
+		if (AttackTarget == null || (lastAttackTarget != null && lastAttackTarget != AttackTarget) || GetFact(Facts.HasLineOfSight) == 0)
 		{
 			attackTargetVisibleFor = 0f;
 		}
@@ -619,9 +1091,11 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	public override void SetDestination(Vector3 newDestination)
 	{
-		base.SetDestination(newDestination);
-		IsStopped = false;
-		Destination = newDestination;
+		if (Interface.CallHook("OnNpcDestinationSet", this, newDestination) == null)
+		{
+			base.SetDestination(newDestination);
+			Destination = newDestination;
+		}
 	}
 
 	public float WeaponAttackRange()
@@ -636,8 +1110,11 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	public void StopMoving()
 	{
-		IsStopped = true;
-		finalDestination = GetPosition();
+		if (Interface.CallHook("OnNpcStopMoving", this) == null)
+		{
+			IsStopped = true;
+			finalDestination = GetPosition();
+		}
 	}
 
 	public override float DesiredMoveSpeed()
@@ -647,7 +1124,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		float num = 1f;
 		if (CurrentBehaviour == BaseNpc.Behaviour.Wander)
 		{
-			num = 0.6f;
+			num = AI.npc_speed_walk * 3f;
 		}
 		else
 		{
@@ -661,6 +1138,73 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	public override Vector3 GetAimDirection()
 	{
+		if (base.isMounted)
+		{
+			BaseMountable baseMountable = GetMounted();
+			if (CurrentBehaviour == BaseNpc.Behaviour.Attack && AttackTarget != null)
+			{
+				Vector3 vector = Vector3.zero;
+				BasePlayer basePlayer = AttackTarget as BasePlayer;
+				if (basePlayer != null)
+				{
+					if (basePlayer.IsDucked())
+					{
+						vector = PlayerEyes.DuckOffset;
+					}
+					else if (basePlayer.IsSleeping())
+					{
+						vector = new Vector3(0f, -1f, 0f);
+					}
+				}
+				else
+				{
+					BaseNpc baseNpc = AttackTarget as BaseNpc;
+					if (baseNpc != null)
+					{
+						vector = new Vector3(0f, -0.5f, 0f);
+					}
+				}
+				Vector3 vector2 = CenterPoint() + new Vector3(0f, 0f, 0f);
+				Vector3 vector3 = AttackTarget.CenterPoint();
+				if (!AttackTarget.IsVisible(eyes.position, AttackTarget.CenterPoint()))
+				{
+					Memory.SeenInfo info = AiContext.Memory.GetInfo(AttackTarget);
+					if (!(info.Entity != null) || !((info.Position - ServerPosition).sqrMagnitude > 4f))
+					{
+						return baseMountable.transform.forward;
+					}
+					vector3 = info.Position;
+				}
+				Vector3 vector4 = vector3 + vector;
+				return (vector4 - vector2).normalized;
+			}
+			return baseMountable.transform.forward;
+		}
+		if (LookAtEyes != null && LookAtEyes.transform != null && (CurrentBehaviour == BaseNpc.Behaviour.Wander || CurrentBehaviour == BaseNpc.Behaviour.Idle))
+		{
+			Vector3 vector5 = CenterPoint();
+			Vector3 vector6 = LookAtEyes.position + PlayerEyes.DuckOffset;
+			return (vector6 - vector5).normalized;
+		}
+		if (LookAtPoint != null && (CurrentBehaviour == BaseNpc.Behaviour.Wander || CurrentBehaviour == BaseNpc.Behaviour.Idle))
+		{
+			Vector3 vector7 = CenterPoint();
+			return (LookAtPoint.position - vector7).normalized;
+		}
+		if (_traversingNavMeshLink)
+		{
+			Vector3 vector8 = ((!(AttackTarget != null)) ? (NavAgent.destination - ServerPosition) : (AttackTarget.ServerPosition - ServerPosition));
+			float sqrMagnitude = vector8.sqrMagnitude;
+			if (sqrMagnitude > 1f)
+			{
+				vector8 = _currentNavMeshLinkEndPos - ServerPosition;
+			}
+			sqrMagnitude = vector8.sqrMagnitude;
+			if (sqrMagnitude > 0.001f)
+			{
+				return _currentNavMeshLinkOrientation * Vector3.forward;
+			}
+		}
 		if (CurrentBehaviour == BaseNpc.Behaviour.Wander || CurrentBehaviour == BaseNpc.Behaviour.RetreatingToCover)
 		{
 			if (IsNavRunning() && NavAgent.desiredVelocity.sqrMagnitude > 0.01f)
@@ -671,40 +1215,40 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		}
 		if (CurrentBehaviour == BaseNpc.Behaviour.Attack && AttackTarget != null)
 		{
-			Vector3 vector = Vector3.zero;
-			BasePlayer basePlayer = AttackTarget as BasePlayer;
-			if (basePlayer != null)
+			Vector3 vector9 = Vector3.zero;
+			BasePlayer basePlayer2 = AttackTarget as BasePlayer;
+			if (basePlayer2 != null)
 			{
-				if (basePlayer.IsDucked())
+				if (basePlayer2.IsDucked())
 				{
-					vector = PlayerEyes.DuckOffset;
+					vector9 = PlayerEyes.DuckOffset;
 				}
-				else if (basePlayer.IsSleeping())
+				else if (basePlayer2.IsSleeping())
 				{
-					vector = new Vector3(0f, -1f, 0f);
+					vector9 = new Vector3(0f, -1f, 0f);
 				}
 			}
 			else
 			{
-				BaseNpc baseNpc = AttackTarget as BaseNpc;
-				if (baseNpc != null)
+				BaseNpc baseNpc2 = AttackTarget as BaseNpc;
+				if (baseNpc2 != null)
 				{
-					vector = new Vector3(0f, -0.5f, 0f);
+					vector9 = new Vector3(0f, -0.5f, 0f);
 				}
 			}
-			Vector3 vector2 = CenterPoint() + new Vector3(0f, 0f, 0f);
-			Vector3 vector3 = AttackTarget.CenterPoint();
-			if (!AttackTarget.IsVisible(eyes.position, AttackTarget.CenterPoint()))
+			Vector3 vector10 = CenterPoint() + new Vector3(0f, 0f, 0f);
+			Vector3 vector11 = AttackTarget.CenterPoint();
+			Memory.ExtendedInfo extendedInfo = AiContext.Memory.GetExtendedInfo(AttackTarget);
+			if (extendedInfo.Entity == null || extendedInfo.LineOfSight == 0)
 			{
-				Memory.SeenInfo info = AiContext.Memory.GetInfo(AttackTarget);
-				if (!(info.Entity != null) || !(Vector3.Distance(info.Position, ServerPosition) > 2f))
+				if (IsNavRunning() && NavAgent.desiredVelocity.sqrMagnitude > 0.01f && IsMoving() > 0)
 				{
-					return base.transform.rotation * Vector3.forward;
+					return NavAgent.desiredVelocity.normalized;
 				}
-				vector3 = info.Position;
+				return base.transform.rotation * Vector3.forward;
 			}
-			Vector3 vector4 = vector3 + vector;
-			return (vector4 - vector2).normalized;
+			Vector3 vector12 = vector11 + vector9;
+			return (vector12 - vector10).normalized;
 		}
 		if (IsNavRunning() && NavAgent.desiredVelocity.sqrMagnitude > 0.01f)
 		{
@@ -723,7 +1267,20 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 				float swayModifier = 1f;
 				newAim = attackEntity.ModifyAIAim(newAim, swayModifier);
 			}
-			eyes.rotation = Quaternion.LookRotation(newAim, Vector3.up);
+			if (base.isMounted)
+			{
+				BaseMountable baseMountable = GetMounted();
+				Vector3 eulerAngles = baseMountable.transform.eulerAngles;
+				Quaternion quaternion = Quaternion.Euler(Quaternion.LookRotation(newAim, baseMountable.transform.up).eulerAngles);
+				Vector3 forward = base.transform.InverseTransformDirection(quaternion * Vector3.forward);
+				Vector3 eulerAngles2 = Quaternion.LookRotation(forward, base.transform.up).eulerAngles;
+				eulerAngles2 = BaseMountable.ConvertVector(eulerAngles2);
+				Quaternion quaternion2 = Quaternion.Euler(Mathf.Clamp(eulerAngles2.x, baseMountable.pitchClamp.x, baseMountable.pitchClamp.y), Mathf.Clamp(eulerAngles2.y, baseMountable.yawClamp.x, baseMountable.yawClamp.y), eulerAngles.z);
+				Vector3 forward2 = base.transform.TransformDirection(quaternion2 * Vector3.forward);
+				Vector3 eulerAngles3 = Quaternion.LookRotation(forward2, base.transform.up).eulerAngles;
+				newAim = BaseMountable.ConvertVector(eulerAngles3);
+			}
+			eyes.rotation = ((!base.isMounted) ? Quaternion.LookRotation(newAim, base.transform.up) : Quaternion.Slerp(eyes.rotation, Quaternion.Euler(newAim), UnityEngine.Time.smoothDeltaTime * 70f));
 			viewAngles = eyes.rotation.eulerAngles;
 			ServerRotation = eyes.rotation;
 		}
@@ -738,6 +1295,37 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		}
 	}
 
+	public Memory.SeenInfo UpdateTargetMemory(BaseEntity target, float dmg, out Memory.ExtendedInfo extendedInfo)
+	{
+		return UpdateTargetMemory(target, dmg, target.ServerPosition, out extendedInfo);
+	}
+
+	public Memory.SeenInfo UpdateTargetMemory(BaseEntity target, float dmg, Vector3 lastKnownPosition, out Memory.ExtendedInfo extendedInfo)
+	{
+		if (target == null || Interface.CallHook("OnNpcPlayerTarget", this, target) != null)
+		{
+			extendedInfo = default(Memory.ExtendedInfo);
+			return default(Memory.SeenInfo);
+		}
+		Vector3 dir;
+		float dot;
+		if (base.isMounted)
+		{
+			BestMountedPlayerDirection.Evaluate(this, lastKnownPosition, out dir, out dot);
+		}
+		else
+		{
+			BestPlayerDirection.Evaluate(this, lastKnownPosition, out dir, out dot);
+		}
+		BestPlayerDistance.Evaluate(this, lastKnownPosition, out var distanceSqr, out var _);
+		BasePlayer basePlayer = target.ToPlayer();
+		int standing;
+		int crouched;
+		byte b = (byte)((!basePlayer) ? 1 : ((!base.isMounted) ? BestLineOfSight.Evaluate(this, basePlayer, out standing, out crouched) : BestMountedLineOfSight.Evaluate(this, basePlayer)));
+		SetFact(Facts.HasLineOfSight, b);
+		return AiContext.Memory.Update(target, lastKnownPosition, dmg, dir, dot, distanceSqr, b, lastAttacker == target, lastAttackedTime, out extendedInfo);
+	}
+
 	public void StartAttack(AttackOperator.AttackType type, BaseCombatEntity target)
 	{
 		if (!IsAlive())
@@ -745,6 +1333,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			return;
 		}
 		AttackTarget = target;
+		UpdateTargetMemory(AttackTarget, 0.1f, out var _);
 		if (type == AttackOperator.AttackType.CloseRange)
 		{
 			if (!MeleeAttack())
@@ -755,6 +1344,31 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		else
 		{
 			ShotTest();
+		}
+	}
+
+	public override bool ShotTest()
+	{
+		if (base.ShotTest())
+		{
+			lastInvinsibleStartTime = 0f;
+			return true;
+		}
+		return false;
+	}
+
+	public override void TriggerDown()
+	{
+		if (AttackTarget == null || (int)SwitchToolOperator.ReactiveAimsAtTarget.Test(AiContext) == 0)
+		{
+			CancelInvoke(TriggerDown);
+			HeldEntity heldEntity = GetHeldEntity();
+			AttackEntity attackEntity = heldEntity as AttackEntity;
+			nextTriggerTime = UnityEngine.Time.time + ((!(attackEntity != null)) ? 1f : attackEntity.attackSpacing);
+		}
+		else
+		{
+			base.TriggerDown();
 		}
 	}
 
@@ -775,12 +1389,24 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	public IAIContext GetContext(Guid aiId)
 	{
+		if ((SelectPlayerTargetAI != null && aiId == SelectPlayerTargetAI.ai.id) || (SelectPlayerTargetMountedAI != null && aiId == SelectPlayerTargetMountedAI.ai.id))
+		{
+			return PlayerTargetContext;
+		}
+		if (SelectEntityTargetAI != null && aiId == SelectEntityTargetAI.ai.id)
+		{
+			return EntityTargetContext;
+		}
+		if ((SelectCoverTargetsAI != null && aiId == SelectCoverTargetsAI.ai.id) || (SelectEnemyHideoutAI != null && aiId == SelectEnemyHideoutAI.ai.id))
+		{
+			return CoverContext;
+		}
 		return AiContext;
 	}
 
 	public override bool IsNavRunning()
 	{
-		return base.isServer && !AiManager.nav_disable && GetNavAgent != null && GetNavAgent.enabled && GetNavAgent.isOnNavMesh;
+		return base.isServer && !AiManager.nav_disable && !base.isMounted && GetNavAgent != null && GetNavAgent.enabled && GetNavAgent.isOnNavMesh;
 	}
 
 	public void Pause()
@@ -798,21 +1424,35 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			utilityAiComponent.Pause();
 			utilityAiComponent.enabled = false;
 		}
+		CancelInvoke(RadioChatter);
 	}
 
 	public override void Resume()
 	{
-		if (GetNavAgent == null || AiManager.nav_disable)
+		if (base.isMounted)
 		{
-			Pause();
+			if (utilityAiComponent == null)
+			{
+				utilityAiComponent = Entity.GetComponent<UtilityAIComponent>();
+			}
+			if (utilityAiComponent != null)
+			{
+				utilityAiComponent.enabled = true;
+				utilityAiComponent.Resume();
+			}
+			SendNetworkUpdateImmediate();
 			return;
 		}
 		if (!GetNavAgent.isOnNavMesh)
 		{
-			StartCoroutine(TryForceToNavmesh());
+			if (Interface.CallHook("OnNpcPlayerResume", this) == null)
+			{
+				StartCoroutine(TryForceToNavmesh());
+			}
 			return;
 		}
 		GetNavAgent.enabled = true;
+		StoppingDistance = 1f;
 		if (utilityAiComponent == null)
 		{
 			utilityAiComponent = Entity.GetComponent<UtilityAIComponent>();
@@ -822,6 +1462,46 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			utilityAiComponent.enabled = true;
 			utilityAiComponent.Resume();
 		}
+		InvokeRandomized(RadioChatter, RadioEffectRepeatRange.x, RadioEffectRepeatRange.x, RadioEffectRepeatRange.y - RadioEffectRepeatRange.x);
+	}
+
+	public void Mount(BaseMountable mountable)
+	{
+		BasePlayer basePlayer = mountable.GetMounted();
+		if (!(basePlayer == null))
+		{
+			return;
+		}
+		mountable.AttemptMount(this);
+		mountable = GetMounted();
+		if ((bool)mountable)
+		{
+			NavAgent.enabled = false;
+			SetFact(Facts.IsMounted, 1);
+			if (!mountable.canWieldItems)
+			{
+				SetFact(Facts.CanNotWieldWeapon, 1);
+			}
+			CancelInvoke(RadioChatter);
+		}
+	}
+
+	public void Dismount()
+	{
+		BaseMountable baseMountable = GetMounted();
+		if (baseMountable != null && baseMountable.AttemptDismount(this))
+		{
+			SetFact(Facts.IsMounted, 0);
+			SetFact(Facts.WantsToDismount, 0);
+			SetFact(Facts.CanNotWieldWeapon, 0);
+			Resume();
+		}
+	}
+
+	public override void DismountObject()
+	{
+		base.DismountObject();
+		SetFact(Facts.WantsToDismount, 1);
 	}
 
 	private IEnumerator TryForceToNavmesh()
@@ -830,15 +1510,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		int numTries = 0;
 		float waitForRetryTime = 1f;
 		float maxDistanceMultiplier = 2f;
-		if (SingletonComponent<AiManager>.Instance != null && SingletonComponent<AiManager>.Instance.enabled && SingletonComponent<AiManager>.Instance.UseNavMesh)
-		{
-			while (SingletonComponent<AiManager>.Instance.IsNavmeshBuilding(AgentTypeIndex, ServerPosition))
-			{
-				yield return CoroutineEx.waitForSecondsRealtime(waitForRetryTime);
-				waitForRetryTime += 0.5f;
-			}
-		}
-		else if (!AiManager.nav_grid && SingletonComponent<DynamicNavMesh>.Instance != null)
+		if (SingletonComponent<DynamicNavMesh>.Instance != null)
 		{
 			while (SingletonComponent<DynamicNavMesh>.Instance.IsBuilding)
 			{
@@ -856,6 +1528,13 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 					ServerPosition = hit.position;
 					GetNavAgent.Warp(ServerPosition);
 					GetNavAgent.enabled = true;
+					float num = SpawnPosition.y - ServerPosition.y;
+					if (num < 0f)
+					{
+						num = Mathf.Max(num, -0.25f);
+						GetNavAgent.baseOffset = num;
+					}
+					StoppingDistance = 1f;
 					if (utilityAiComponent == null)
 					{
 						utilityAiComponent = Entity.GetComponent<UtilityAIComponent>();
@@ -865,6 +1544,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 						utilityAiComponent.enabled = true;
 						utilityAiComponent.Resume();
 					}
+					InvokeRandomized(RadioChatter, RadioEffectRepeatRange.x, RadioEffectRepeatRange.x, RadioEffectRepeatRange.y - RadioEffectRepeatRange.x);
 					yield break;
 				}
 				yield return CoroutineEx.waitForSecondsRealtime(waitForRetryTime);
@@ -872,6 +1552,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 				continue;
 			}
 			GetNavAgent.enabled = true;
+			StoppingDistance = 1f;
 			if (utilityAiComponent == null)
 			{
 				utilityAiComponent = Entity.GetComponent<UtilityAIComponent>();
@@ -881,6 +1562,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 				utilityAiComponent.enabled = true;
 				utilityAiComponent.Resume();
 			}
+			InvokeRandomized(RadioChatter, RadioEffectRepeatRange.x, RadioEffectRepeatRange.x, RadioEffectRepeatRange.y - RadioEffectRepeatRange.x);
 			yield break;
 		}
 		int walkableArea = NavMesh.GetAreaFromName("Walkable");
@@ -891,8 +1573,9 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			GetNavAgent.areaMask = 1 << walkableArea;
 			yield return TryForceToNavmesh();
 		}
-		else
+		else if (base.transform != null && !base.IsDestroyed)
 		{
+			Debug.LogWarningFormat("Failed to spawn {0} on a valid navmesh.", base.name);
 			Kill();
 		}
 	}
@@ -908,7 +1591,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		{
 			return 0f;
 		}
-		object obj = Interface.CallHook("OnNpcPlayerTarget", this, target);
+		object obj = Interface.CallHook("IOnNpcPlayerTarget", this, target);
 		if (obj is float)
 		{
 			return (float)obj;
@@ -973,12 +1656,38 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		return navPointSamples;
 	}
 
+	public List<NavPointSample> RequestNavPointSamplesInCircleWaterDepthOnly(NavPointSampler.SampleCount sampleCount, float radius, float waterDepth)
+	{
+		navPointSamples.Clear();
+		NavPointSampler.SampleCircleWaterDepthOnly(sampleCount, ServerPosition, radius, new NavPointSampler.SampleScoreParams
+		{
+			WaterMaxDepth = waterDepth,
+			Agent = this
+		}, ref navPointSamples);
+		return navPointSamples;
+	}
+
 	private void OnFactChanged(Facts fact, byte oldValue, byte newValue)
 	{
 		switch (fact)
 		{
 		case Facts.IsAggro:
 			if (newValue > 0 && GetFact(Facts.IsRetreatingToCover) == 0)
+			{
+				CurrentBehaviour = BaseNpc.Behaviour.Attack;
+				if (newValue != oldValue)
+				{
+					SetPlayerFlag(PlayerFlags.Relaxed, b: false);
+				}
+			}
+			else
+			{
+				SetPlayerFlag(PlayerFlags.Relaxed, b: true);
+				SetFact(Facts.Speed, 0);
+			}
+			break;
+		case Facts.IsSearchingForEnemy:
+			if (newValue > 0)
 			{
 				CurrentBehaviour = BaseNpc.Behaviour.Attack;
 			}
@@ -991,6 +1700,10 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 				if (GetFact(Facts.IsAggro) == 0 && GetFact(Facts.IsRetreatingToCover) == 0)
 				{
 					CurrentBehaviour = BaseNpc.Behaviour.Idle;
+					if (newValue != oldValue)
+					{
+						SetPlayerFlag(PlayerFlags.Relaxed, b: true);
+					}
 				}
 				break;
 			case SpeedEnum.Walk:
@@ -998,10 +1711,25 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 				if (GetFact(Facts.IsAggro) == 0 && GetFact(Facts.IsRetreatingToCover) == 0)
 				{
 					CurrentBehaviour = BaseNpc.Behaviour.Wander;
+					if (newValue != oldValue)
+					{
+						SetPlayerFlag(PlayerFlags.Relaxed, b: true);
+					}
 				}
 				break;
 			default:
 				IsStopped = false;
+				if (GetFact(Facts.IsAggro) > 0)
+				{
+					if (newValue != oldValue)
+					{
+						SetPlayerFlag(PlayerFlags.Relaxed, b: false);
+					}
+				}
+				else if (newValue != oldValue)
+				{
+					SetPlayerFlag(PlayerFlags.Relaxed, b: true);
+				}
 				break;
 			}
 			break;
@@ -1009,17 +1737,6 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			if (newValue == 1)
 			{
 				blockTargetingThisEnemy = null;
-			}
-			break;
-		case Facts.BodyState:
-			switch (newValue)
-			{
-			case 0:
-				modelState.ducked = false;
-				break;
-			case 1:
-				modelState.ducked = true;
-				break;
 			}
 			break;
 		case Facts.IsMoving:
@@ -1032,18 +1749,76 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			if (newValue == 1)
 			{
 				CurrentBehaviour = BaseNpc.Behaviour.RetreatingToCover;
+				if (newValue != oldValue)
+				{
+					SetPlayerFlag(PlayerFlags.Relaxed, b: true);
+				}
+			}
+			else if (GetFact(Facts.IsAggro) > 0)
+			{
+				CurrentBehaviour = BaseNpc.Behaviour.Attack;
+				if (newValue != oldValue)
+				{
+					SetPlayerFlag(PlayerFlags.Relaxed, b: false);
+				}
 			}
 			else
 			{
-				CurrentBehaviour = BaseNpc.Behaviour.Attack;
+				CurrentBehaviour = BaseNpc.Behaviour.Idle;
+				if (newValue != oldValue)
+				{
+					SetPlayerFlag(PlayerFlags.Relaxed, b: true);
+				}
+			}
+			break;
+		case Facts.HasEnemy:
+			if (newValue == 1)
+			{
+				LastHasEnemyTime = UnityEngine.Time.time;
+				if (GetFact(Facts.HasLineOfSight) > 0)
+				{
+					CurrentBehaviour = BaseNpc.Behaviour.Attack;
+				}
 			}
 			break;
 		}
 	}
 
+	private void TickBehaviourState()
+	{
+		if (GetFact(Facts.WantsToFlee) == 1 && ToPathStatus(GetPathStatus()) == NavMeshPathStatus.PathComplete && UnityEngine.Time.realtimeSinceStartup - (maxFleeTime - Stats.MaxFleeTime) > 0.5f)
+		{
+			TickFlee();
+		}
+		if (GetFact(Facts.IsAggro) == 1)
+		{
+			TickAggro();
+		}
+		if (GetFact(Facts.AllyAttackedRecently) == 1 && UnityEngine.Time.realtimeSinceStartup >= AllyAttackedRecentlyTimeout)
+		{
+			SetFact(Facts.AllyAttackedRecently, 0);
+		}
+	}
+
+	public bool TryAggro(float sqrRange)
+	{
+		if (!HostilityConsideration(AiContext.EnemyPlayer))
+		{
+			wasAggro = false;
+			return false;
+		}
+		bool flag = IsWithinAggroRange(sqrRange);
+		if (GetFact(Facts.IsAggro) == 0 && flag)
+		{
+			return StartAggro(Stats.DeaggroChaseTime);
+		}
+		wasAggro = flag;
+		return false;
+	}
+
 	public bool TryAggro(EnemyRangeEnum range)
 	{
-		if (Mathf.Approximately(Stats.Hostility, 0f) && Mathf.Approximately(Stats.Defensiveness, 0f))
+		if (!HostilityConsideration(AiContext.EnemyPlayer))
 		{
 			wasAggro = false;
 			return false;
@@ -1066,7 +1841,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		return false;
 	}
 
-	public bool StartAggro(float timeout)
+	public bool StartAggro(float timeout, bool broadcastEvent = true)
 	{
 		if (GetFact(Facts.IsAggro) == 1)
 		{
@@ -1075,12 +1850,11 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		}
 		SetFact(Facts.IsAggro, 1);
 		aggroTimeout = UnityEngine.Time.realtimeSinceStartup + timeout;
-		if (!wasAggro && OnAggro != null)
+		if (!wasAggro && broadcastEvent && OnAggro != null && GetFact(Facts.HasLineOfSight) > 0)
 		{
 			OnAggro();
 		}
 		wasAggro = true;
-		InvokeRandomized(TickAggro, timeout, 0.1f, 0.005f);
 		return true;
 	}
 
@@ -1088,14 +1862,14 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 	{
 		bool flag = false;
 		bool triggerCallback = true;
-		if (float.IsInfinity(base.SecondsSinceDealtDamage))
+		if (float.IsInfinity(base.SecondsSinceDealtDamage) || float.IsNegativeInfinity(base.SecondsSinceDealtDamage) || float.IsNaN(base.SecondsSinceDealtDamage))
 		{
 			flag = UnityEngine.Time.realtimeSinceStartup > aggroTimeout;
 		}
 		else
 		{
 			BaseCombatEntity baseCombatEntity = AttackTarget as BaseCombatEntity;
-			flag = ((!(baseCombatEntity != null) || !(baseCombatEntity.lastAttacker != null) || net == null || baseCombatEntity.lastAttacker.net == null) ? (UnityEngine.Time.realtimeSinceStartup > aggroTimeout) : (baseCombatEntity.lastAttacker.net.ID == net.ID && base.SecondsSinceDealtDamage > Stats.DeaggroChaseTime));
+			flag = ((!(baseCombatEntity != null) || !(baseCombatEntity.lastAttacker != null) || net == null || baseCombatEntity.lastAttacker.net == null || base.isMounted) ? (UnityEngine.Time.realtimeSinceStartup > aggroTimeout) : (baseCombatEntity.lastAttacker.net.ID == net.ID && base.SecondsSinceDealtDamage > Stats.DeaggroChaseTime));
 		}
 		if (!flag)
 		{
@@ -1113,7 +1887,6 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		if (flag)
 		{
 			SetFact(Facts.IsAggro, 0, triggerCallback);
-			CancelInvoke(TickAggro);
 		}
 	}
 
@@ -1143,7 +1916,6 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		{
 			SetFact(Facts.WantsToFlee, 1);
 			maxFleeTime = UnityEngine.Time.realtimeSinceStartup + Stats.MaxFleeTime;
-			InvokeRandomized(TickFlee, 2f, 0.1f, 0.0050000004f);
 		}
 	}
 
@@ -1151,7 +1923,6 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 	{
 		if (UnityEngine.Time.realtimeSinceStartup > maxFleeTime || (IsNavRunning() && NavAgent.remainingDistance <= NavAgent.stoppingDistance + 1f))
 		{
-			CancelInvoke(TickFlee);
 			SetFact(Facts.WantsToFlee, 0);
 			SetFact(Facts.IsFleeing, 0);
 			Stats.HealthThresholdForFleeing = base.healthFraction * fleeHealthThresholdPercentage;
@@ -1159,6 +1930,15 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 	}
 
 	private void FindCoverFromEnemy()
+	{
+		AiContext.CoverSet.Reset();
+		if (AttackTarget != null)
+		{
+			FindCoverFromPosition(AiContext.EnemyPosition);
+		}
+	}
+
+	private void FindCoverFromPosition(Vector3 position)
 	{
 		float num = 0f;
 		float num2 = 0f;
@@ -1169,87 +1949,99 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		AiContext.CoverSet.Reset();
 		foreach (CoverPoint sampledCoverPoint in AiContext.sampledCoverPoints)
 		{
-			if (sampledCoverPoint.IsReserved || sampledCoverPoint.IsCompromised || !ProvidesCoverFromPoint(sampledCoverPoint, AiContext.EnemyPosition, -0.8f) || !NavPointSampler.IsValidPointDirectness(sampledCoverPoint.Position, ServerPosition, AiContext.EnemyPosition))
+			if (sampledCoverPoint.IsReserved || sampledCoverPoint.IsCompromised || !sampledCoverPoint.ProvidesCoverFromPoint(position, -0.8f))
 			{
 				continue;
 			}
-			float num4 = NavPointSampler.PointDirectnessToTarget(sampledCoverPoint.Position, ServerPosition, AiContext.EnemyPosition);
+			Vector3 vector = sampledCoverPoint.Position - ServerPosition;
+			Vector3 vector2 = position - ServerPosition;
+			float num4 = Vector3.Dot(vector.normalized, vector2.normalized);
+			if (num4 > 0.5f && vector.sqrMagnitude > vector2.sqrMagnitude)
+			{
+				continue;
+			}
 			if (num4 <= -0.5f)
 			{
-				float num5 = num4 * -1f;
-				if (num5 > num)
+				float sqrMagnitude = vector.sqrMagnitude;
+				if (sqrMagnitude < MinDistanceToRetreatCover * MinDistanceToRetreatCover)
 				{
-					num = num5;
-					retreat = sampledCoverPoint;
+					num4 = 0.1f;
+				}
+				else
+				{
+					float num5 = num4 * -1f;
+					if (num5 > num)
+					{
+						num = num5;
+						retreat = sampledCoverPoint;
+					}
 				}
 			}
-			else if (num4 >= 0.5f)
+			if (num4 >= 0.5f)
 			{
+				float sqrMagnitude2 = vector.sqrMagnitude;
+				if (sqrMagnitude2 > vector2.sqrMagnitude)
+				{
+					continue;
+				}
 				float num6 = num4;
-				if (!(num6 > num3))
+				if (num6 > num3)
 				{
-					continue;
-				}
-				if (SquadManager.squad_cover_use_path_distance && IsNavRunning() && AttackTarget != null)
-				{
-					NavMeshPath obj = Facepunch.Pool.Get<NavMeshPath>();
-					if (NavMesh.CalculatePath(AttackTarget.ServerPosition, sampledCoverPoint.Position, GetNavAgent.areaMask, obj))
+					if (AI.npc_cover_use_path_distance && IsNavRunning() && AttackTarget != null && !PathDistanceIsValid(AttackTarget.ServerPosition, sampledCoverPoint.Position))
 					{
-						int cornersNonAlloc = obj.GetCornersNonAlloc(pathCornerCache);
-						if (obj.status == NavMeshPathStatus.PathComplete && cornersNonAlloc > 1)
-						{
-							float num7 = PathDistance(cornersNonAlloc, ref pathCornerCache);
-							float num8 = Vector3.Distance(AttackTarget.ServerPosition, sampledCoverPoint.Position);
-							float f = num8 - num7;
-							if (Mathf.Abs(f) > SquadManager.squad_cover_path_vs_straight_dist_max_diff)
-							{
-								continue;
-							}
-						}
+						continue;
 					}
-					Facepunch.Pool.Free(ref obj);
+					float sqrMagnitude3 = (sampledCoverPoint.Position - position).sqrMagnitude;
+					if (sqrMagnitude3 < sqrMagnitude2)
+					{
+						num6 *= 0.9f;
+					}
+					num3 = num6;
+					advance = sampledCoverPoint;
 				}
-				num3 = num6;
-				advance = sampledCoverPoint;
 			}
-			else
+			if (num4 >= -0.1f && num4 <= 0.1f)
 			{
-				if (!(num4 >= -0.1f) || !(num4 <= 0.1f))
+				float num7 = 1f - Mathf.Abs(num4);
+				if (num7 > num2 && (!AI.npc_cover_use_path_distance || !IsNavRunning() || !(AttackTarget != null) || PathDistanceIsValid(AttackTarget.ServerPosition, sampledCoverPoint.Position)))
 				{
-					continue;
+					num2 = 0.1f - Mathf.Abs(num7);
+					flank = sampledCoverPoint;
 				}
-				float num9 = num4 * -1f;
-				if (!(num9 > num2))
-				{
-					continue;
-				}
-				if (SquadManager.squad_cover_use_path_distance && IsNavRunning() && AttackTarget != null)
-				{
-					NavMeshPath obj2 = Facepunch.Pool.Get<NavMeshPath>();
-					if (NavMesh.CalculatePath(AttackTarget.ServerPosition, sampledCoverPoint.Position, GetNavAgent.areaMask, obj2))
-					{
-						int cornersNonAlloc2 = obj2.GetCornersNonAlloc(pathCornerCache);
-						if (obj2.status == NavMeshPathStatus.PathComplete && cornersNonAlloc2 > 1)
-						{
-							float num10 = PathDistance(cornersNonAlloc2, ref pathCornerCache);
-							float num11 = Vector3.Distance(AttackTarget.ServerPosition, sampledCoverPoint.Position);
-							float f2 = num11 - num10;
-							if (Mathf.Abs(f2) > SquadManager.squad_cover_path_vs_straight_dist_max_diff)
-							{
-								continue;
-							}
-						}
-					}
-					Facepunch.Pool.Free(ref obj2);
-				}
-				num2 = 0.1f - Mathf.Abs(num9);
-				flank = sampledCoverPoint;
 			}
 		}
 		AiContext.CoverSet.Update(retreat, flank, advance);
 	}
 
-	private float PathDistance(int count, ref Vector3[] path)
+	public bool PathDistanceIsValid(Vector3 from, Vector3 to, bool allowCloseRange = false)
+	{
+		float sqrMagnitude = (from - to).sqrMagnitude;
+		if (sqrMagnitude > Stats.MediumRange * Stats.MediumRange || (!allowCloseRange && sqrMagnitude < Stats.CloseRange * Stats.CloseRange))
+		{
+			return true;
+		}
+		float num = Mathf.Sqrt(sqrMagnitude);
+		if (_pathCache == null)
+		{
+			_pathCache = new NavMeshPath();
+		}
+		if (NavMesh.CalculatePath(from, to, GetNavAgent.areaMask, _pathCache))
+		{
+			int cornersNonAlloc = _pathCache.GetCornersNonAlloc(pathCornerCache);
+			if (_pathCache.status == NavMeshPathStatus.PathComplete && cornersNonAlloc > 1)
+			{
+				float num2 = PathDistance(cornersNonAlloc, ref pathCornerCache, num + AI.npc_cover_path_vs_straight_dist_max_diff);
+				float f = num - num2;
+				if (Mathf.Abs(f) > AI.npc_cover_path_vs_straight_dist_max_diff)
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	private float PathDistance(int count, ref Vector3[] path, float maxDistance)
 	{
 		if (count < 2)
 		{
@@ -1262,6 +2054,10 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			Vector3 vector = path[i];
 			num += Vector3.Distance(a, vector);
 			a = vector;
+			if (num > maxDistance)
+			{
+				return num;
+			}
 		}
 		return num;
 	}
@@ -1275,10 +2071,10 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		{
 			if (!sampledCoverPoint.IsReserved && !sampledCoverPoint.IsCompromised)
 			{
-				float num2 = Vector3.Distance(sampledCoverPoint.Position, ServerPosition);
-				if (num2 < num)
+				float sqrMagnitude = (sampledCoverPoint.Position - ServerPosition).sqrMagnitude;
+				if (sqrMagnitude < num)
 				{
-					num = num2;
+					num = sqrMagnitude;
 					coverPoint = sampledCoverPoint;
 				}
 			}
@@ -1289,15 +2085,200 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		}
 	}
 
-	public static bool ProvidesCoverFromPoint(CoverPoint cp, Vector3 point, float arcThreshold)
+	public int PeekNextWaypointIndex()
 	{
-		Vector3 normalized = (cp.Position - point).normalized;
-		float num = Vector3.Dot(cp.Normal, normalized);
-		if (num < arcThreshold)
+		if (WaypointSet == null || WaypointSet.Points.Count == 0)
 		{
-			return true;
+			return CurrentWaypointIndex;
+		}
+		int currentWaypointIndex = CurrentWaypointIndex;
+		switch (WaypointSet.NavMode)
+		{
+		case WaypointSet.NavModes.Loop:
+			currentWaypointIndex++;
+			if (currentWaypointIndex >= WaypointSet.Points.Count)
+			{
+				currentWaypointIndex = 0;
+			}
+			else if (currentWaypointIndex < 0)
+			{
+				currentWaypointIndex = WaypointSet.Points.Count - 1;
+			}
+			break;
+		case WaypointSet.NavModes.PingPong:
+			currentWaypointIndex += WaypointDirection;
+			if (currentWaypointIndex >= WaypointSet.Points.Count)
+			{
+				currentWaypointIndex = CurrentWaypointIndex - 1;
+			}
+			else if (currentWaypointIndex < 0)
+			{
+				currentWaypointIndex = 0;
+			}
+			break;
+		default:
+			throw new ArgumentOutOfRangeException();
+		}
+		return currentWaypointIndex;
+	}
+
+	public int GetNextWaypointIndex()
+	{
+		if (WaypointSet == null || WaypointSet.Points.Count == 0 || WaypointSet.Points[PeekNextWaypointIndex()].IsOccupied)
+		{
+			return CurrentWaypointIndex;
+		}
+		int currentWaypointIndex = CurrentWaypointIndex;
+		if (currentWaypointIndex >= 0 && currentWaypointIndex < WaypointSet.Points.Count)
+		{
+			WaypointSet.Waypoint value = WaypointSet.Points[currentWaypointIndex];
+			value.IsOccupied = false;
+			WaypointSet.Points[currentWaypointIndex] = value;
+		}
+		switch (WaypointSet.NavMode)
+		{
+		case WaypointSet.NavModes.Loop:
+			currentWaypointIndex++;
+			if (currentWaypointIndex >= WaypointSet.Points.Count)
+			{
+				currentWaypointIndex = 0;
+			}
+			else if (currentWaypointIndex < 0)
+			{
+				currentWaypointIndex = WaypointSet.Points.Count - 1;
+			}
+			break;
+		case WaypointSet.NavModes.PingPong:
+			currentWaypointIndex += WaypointDirection;
+			if (currentWaypointIndex >= WaypointSet.Points.Count)
+			{
+				currentWaypointIndex = CurrentWaypointIndex - 1;
+				WaypointDirection = -1;
+			}
+			else if (currentWaypointIndex < 0)
+			{
+				currentWaypointIndex = 0;
+				WaypointDirection = 1;
+			}
+			break;
+		default:
+			throw new ArgumentOutOfRangeException();
+		}
+		if (currentWaypointIndex >= 0 && currentWaypointIndex < WaypointSet.Points.Count)
+		{
+			WaypointSet.Waypoint value2 = WaypointSet.Points[currentWaypointIndex];
+			value2.IsOccupied = true;
+			WaypointSet.Points[currentWaypointIndex] = value2;
+		}
+		return currentWaypointIndex;
+	}
+
+	public Transform GetLookatPointFromWaypoints()
+	{
+		LookAtEyes = null;
+		if (WaypointSet == null || WaypointSet.Points.Count == 0)
+		{
+			return null;
+		}
+		WaypointSet.Waypoint waypoint = WaypointSet.Points[CurrentWaypointIndex];
+		if (waypoint.LookatPoints != null && waypoint.LookatPoints.Length > 0)
+		{
+			return waypoint.LookatPoints[UnityEngine.Random.Range(0, waypoint.LookatPoints.Length)];
+		}
+		return null;
+	}
+
+	private Transform GetLookatPoint(ref Transform[] points)
+	{
+		LookAtEyes = null;
+		if (points != null && points.Length > 0)
+		{
+			return points[UnityEngine.Random.Range(0, points.Length)];
+		}
+		return null;
+	}
+
+	public void LookAtRandomPoint(float nextTimeAddition = 5f)
+	{
+		if (UnityEngine.Time.realtimeSinceStartup > nextLookAtPointTime)
+		{
+			LookAtEyes = null;
+			nextLookAtPointTime = UnityEngine.Time.realtimeSinceStartup + nextTimeAddition;
+			LookAtPoint = GetLookatPointFromWaypoints();
+			if (LookAtPoint == null && LookAtInterestPointsStationary != null)
+			{
+				LookAtPoint = GetLookatPoint(ref LookAtInterestPointsStationary);
+			}
+		}
+	}
+
+	public int TopologyPreference()
+	{
+		return -1;
+	}
+
+	public bool IsInCommunicationRange(NPCPlayerApex npc)
+	{
+		if (npc != null && !npc.IsDestroyed && npc.transform != null && npc.Health() > 0f)
+		{
+			float sqrMagnitude = (npc.ServerPosition - ServerPosition).sqrMagnitude;
+			return sqrMagnitude <= CommunicationRadius * CommunicationRadius;
 		}
 		return false;
+	}
+
+	public virtual int GetAlliesInRange(out List<Scientist> allies)
+	{
+		allies = null;
+		return 0;
+	}
+
+	public virtual void SendStatement(AiStatement_EnemyEngaged statement)
+	{
+	}
+
+	public virtual void SendStatement(AiStatement_EnemySeen statement)
+	{
+	}
+
+	public virtual void OnAiStatement(NPCPlayerApex source, AiStatement_EnemyEngaged statement)
+	{
+	}
+
+	public virtual void OnAiStatement(NPCPlayerApex source, AiStatement_EnemySeen statement)
+	{
+	}
+
+	public virtual int AskQuestion(AiQuestion_ShareEnemyTarget question, out List<AiAnswer_ShareEnemyTarget> answers)
+	{
+		answers = null;
+		return 0;
+	}
+
+	public AiAnswer_ShareEnemyTarget OnAiQuestion(NPCPlayerApex source, AiQuestion_ShareEnemyTarget question)
+	{
+		AiAnswer_ShareEnemyTarget aiAnswer_ShareEnemyTarget = default(AiAnswer_ShareEnemyTarget);
+		aiAnswer_ShareEnemyTarget.Source = this;
+		aiAnswer_ShareEnemyTarget.PlayerTarget = AiContext?.EnemyPlayer;
+		AiAnswer_ShareEnemyTarget result = aiAnswer_ShareEnemyTarget;
+		if (AiContext?.EnemyPlayer != null)
+		{
+			Memory.SeenInfo info = AiContext.Memory.GetInfo(AiContext.EnemyPlayer);
+			if (info.Entity != null && !info.Entity.IsDestroyed && !AiContext.EnemyPlayer.IsDead())
+			{
+				result.LastKnownPosition = info.Position;
+				if (source?.AiContext?.AiLocationManager?.LocationType == AiLocationSpawner.SquadSpawnerLocation.BanditTown)
+				{
+					source.AiContext.LastAttacker = result.PlayerTarget;
+					source.lastAttackedTime = lastAttackedTime;
+				}
+			}
+			else
+			{
+				result.PlayerTarget = null;
+			}
+		}
+		return result;
 	}
 
 	public void InitFacts()
@@ -1320,43 +2301,89 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		}
 	}
 
-	public EnemyRangeEnum ToEnemyRangeEnum(float range)
+	public EnemyRangeEnum ToEnemyRangeEnum(float sqrRange)
 	{
-		if (range <= Stats.CloseRange)
+		if (sqrRange <= ToSqrRange(EnemyRangeEnum.CloseAttackRange))
 		{
 			return EnemyRangeEnum.CloseAttackRange;
 		}
-		if (range < Stats.MediumRange)
+		if (sqrRange <= ToSqrRange(EnemyRangeEnum.MediumAttackRange))
 		{
 			return EnemyRangeEnum.MediumAttackRange;
 		}
-		if (range < Stats.LongRange)
+		if (sqrRange <= ToSqrRange(EnemyRangeEnum.LongAttackRange))
 		{
 			return EnemyRangeEnum.LongAttackRange;
-		}
-		if (range <= Stats.AggressionRange)
-		{
-			return EnemyRangeEnum.AggroRange;
-		}
-		if (range >= Stats.DeaggroRange && GetFact(Facts.IsAggro) > 0)
-		{
-			return EnemyRangeEnum.OutOfRange;
-		}
-		if (range <= Stats.VisionRange)
-		{
-			return EnemyRangeEnum.AwareRange;
 		}
 		return EnemyRangeEnum.OutOfRange;
 	}
 
-	public bool IsWithinAggroRange(EnemyRangeEnum range)
+	public EnemyEngagementRangeEnum ToEnemyEngagementRangeEnum(float sqrRange)
 	{
-		return range == EnemyRangeEnum.AggroRange || range == EnemyRangeEnum.CloseAttackRange || range == EnemyRangeEnum.MediumAttackRange || range == EnemyRangeEnum.LongAttackRange;
+		if (sqrRange <= ToSqrRange(EnemyEngagementRangeEnum.AggroRange))
+		{
+			return EnemyEngagementRangeEnum.AggroRange;
+		}
+		if (sqrRange > ToSqrRange(EnemyEngagementRangeEnum.DeaggroRange))
+		{
+			return EnemyEngagementRangeEnum.DeaggroRange;
+		}
+		return EnemyEngagementRangeEnum.NeutralRange;
 	}
 
-	public AfraidRangeEnum ToAfraidRangeEnum(float range)
+	public float ToSqrRange(EnemyRangeEnum range)
 	{
-		if (range <= Stats.AfraidRange)
+		return range switch
+		{
+			EnemyRangeEnum.CloseAttackRange => Stats.CloseRange * Stats.CloseRange, 
+			EnemyRangeEnum.MediumAttackRange => Stats.MediumRange * Stats.MediumRange, 
+			EnemyRangeEnum.LongAttackRange => Stats.LongRange * Stats.LongRange, 
+			_ => float.PositiveInfinity, 
+		};
+	}
+
+	public float ToSqrRange(EnemyEngagementRangeEnum range)
+	{
+		return range switch
+		{
+			EnemyEngagementRangeEnum.AggroRange => Stats.AggressionRange * Stats.AggressionRange, 
+			EnemyEngagementRangeEnum.DeaggroRange => Stats.DeaggroRange * Stats.DeaggroRange, 
+			_ => float.PositiveInfinity, 
+		};
+	}
+
+	public float GetActiveAggressionRangeSqr()
+	{
+		if (GetFact(Facts.IsAggro) == 1)
+		{
+			return Stats.DeaggroRange * Stats.DeaggroRange;
+		}
+		return Stats.AggressionRange * Stats.AggressionRange;
+	}
+
+	public bool IsWithinAggroRange(EnemyRangeEnum range)
+	{
+		float sqrRange = ToSqrRange(range);
+		EnemyEngagementRangeEnum enemyEngagementRangeEnum = ToEnemyEngagementRangeEnum(sqrRange);
+		return enemyEngagementRangeEnum == EnemyEngagementRangeEnum.AggroRange || (GetFact(Facts.IsAggro) == 1 && enemyEngagementRangeEnum == EnemyEngagementRangeEnum.NeutralRange);
+	}
+
+	public bool IsWithinAggroRange(float sqrRange)
+	{
+		EnemyEngagementRangeEnum enemyEngagementRangeEnum = ToEnemyEngagementRangeEnum(sqrRange);
+		return enemyEngagementRangeEnum == EnemyEngagementRangeEnum.AggroRange || (GetFact(Facts.IsAggro) == 1 && enemyEngagementRangeEnum == EnemyEngagementRangeEnum.NeutralRange);
+	}
+
+	public bool IsBeyondDeaggroRange(EnemyRangeEnum range)
+	{
+		float sqrRange = ToSqrRange(range);
+		EnemyEngagementRangeEnum enemyEngagementRangeEnum = ToEnemyEngagementRangeEnum(sqrRange);
+		return enemyEngagementRangeEnum == EnemyEngagementRangeEnum.DeaggroRange;
+	}
+
+	public AfraidRangeEnum ToAfraidRangeEnum(float sqrRange)
+	{
+		if (sqrRange <= Stats.AfraidRange * Stats.AfraidRange)
 		{
 			return AfraidRangeEnum.InAfraidRange;
 		}
@@ -1382,19 +2409,19 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		{
 			return SpeedEnum.StandStill;
 		}
-		if (speed <= 0.1f)
+		if (speed <= AI.npc_speed_crouch_walk)
 		{
 			return SpeedEnum.CrouchWalk;
 		}
-		if (speed <= 0.18f)
+		if (speed <= AI.npc_speed_walk)
 		{
 			return SpeedEnum.Walk;
 		}
-		if (speed <= 0.25f)
+		if (speed <= AI.npc_speed_crouch_run)
 		{
 			return SpeedEnum.CrouchRun;
 		}
-		if (speed <= 0.4f)
+		if (speed <= AI.npc_speed_run)
 		{
 			return SpeedEnum.Run;
 		}
@@ -1406,11 +2433,11 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		return speed switch
 		{
 			SpeedEnum.StandStill => 0f, 
-			SpeedEnum.CrouchWalk => 0.1f * Stats.Speed, 
-			SpeedEnum.Walk => 0.18f * Stats.Speed, 
-			SpeedEnum.CrouchRun => 0.25f * Stats.Speed, 
-			SpeedEnum.Run => 0.4f * Stats.Speed, 
-			_ => Stats.Speed, 
+			SpeedEnum.CrouchWalk => AI.npc_speed_crouch_walk * Stats.Speed, 
+			SpeedEnum.Walk => AI.npc_speed_walk * Stats.Speed, 
+			SpeedEnum.CrouchRun => AI.npc_speed_crouch_run * Stats.Speed, 
+			SpeedEnum.Run => AI.npc_speed_run * Stats.Speed, 
+			_ => AI.npc_speed_sprint * Stats.Speed, 
 		};
 	}
 
@@ -1450,6 +2477,10 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 	public WeaponTypeEnum GetCurrentWeaponTypeEnum()
 	{
 		HeldEntity heldEntity = GetHeldEntity();
+		if (heldEntity == null)
+		{
+			return WeaponTypeEnum.None;
+		}
 		AttackEntity attackEntity = heldEntity as AttackEntity;
 		if (attackEntity == null)
 		{
@@ -1503,6 +2534,178 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		return (NavMeshPathStatus)value;
 	}
 
+	public ToolTypeEnum GetCurrentToolTypeEnum()
+	{
+		HeldEntity heldEntity = GetHeldEntity();
+		if (heldEntity == null)
+		{
+			return ToolTypeEnum.None;
+		}
+		return heldEntity.toolType;
+	}
+
+	public void TickReasoningSystem()
+	{
+		SetFact(Facts.HasEnemy, (byte)((AttackTarget != null) ? 1u : 0u));
+		_GatherPlayerTargetFacts();
+		if (base.isMounted)
+		{
+			_UpdateMountedSelfFacts();
+		}
+		else
+		{
+			_UpdateGroundedSelfFacts();
+			_UpdateCoverFacts();
+		}
+		if (AttackTarget != null)
+		{
+			Memory.ExtendedInfo extendedInfo = AiContext.Memory.GetExtendedInfo(AttackTarget);
+			if (extendedInfo.Entity != null)
+			{
+				TryAggro(extendedInfo.DistanceSqr);
+			}
+		}
+	}
+
+	private void _GatherPlayerTargetFacts()
+	{
+		if (AttackTarget != null)
+		{
+			float num = float.MaxValue;
+			byte b = 0;
+			if (PlayerTargetContext.Index >= 0)
+			{
+				int index = PlayerTargetContext.Index;
+				num = PlayerTargetContext.DistanceSqr[index];
+				b = PlayerTargetContext.LineOfSight[index];
+				lastSeenPlayerTime = UnityEngine.Time.time;
+			}
+			else
+			{
+				Memory.ExtendedInfo extendedInfo = AiContext.Memory.GetExtendedInfo(AttackTarget);
+				if (!(extendedInfo.Entity != null))
+				{
+					_NoEnemyFacts();
+					return;
+				}
+				num = extendedInfo.DistanceSqr;
+				b = extendedInfo.LineOfSight;
+			}
+			SetFact(Facts.EnemyRange, (byte)ToEnemyRangeEnum(num));
+			SetFact(Facts.EnemyEngagementRange, (byte)ToEnemyEngagementRangeEnum(num));
+			SetFact(Facts.AfraidRange, (byte)ToAfraidRangeEnum(num));
+			SetFact(Facts.HasLineOfSight, (b > 0) ? ((byte)1) : ((byte)0));
+			SetFact(Facts.HasLineOfSightStanding, (byte)((b == 1 || b == 3) ? 1u : 0u));
+			SetFact(Facts.HasLineOfSightCrouched, (byte)((b == 2 || b == 3) ? 1u : 0u));
+		}
+		else
+		{
+			_NoEnemyFacts();
+		}
+	}
+
+	private void _NoEnemyFacts()
+	{
+		SetFact(Facts.EnemyRange, 3);
+		SetFact(Facts.EnemyEngagementRange, 1);
+		SetFact(Facts.AfraidRange, 1);
+		SetFact(Facts.HasLineOfSight, 0);
+		SetFact(Facts.HasLineOfSightCrouched, 0);
+		SetFact(Facts.HasLineOfSightStanding, 0);
+	}
+
+	private void _UpdateMountedSelfFacts()
+	{
+		SetFact(Facts.Health, (byte)ToHealthEnum(base.healthFraction));
+		SetFact(Facts.IsWeaponAttackReady, (byte)((UnityEngine.Time.realtimeSinceStartup >= NextAttackTime()) ? 1u : 0u));
+		SetFact(Facts.AttackedLately, (byte)((base.SecondsSinceAttacked < Stats.AttackedMemoryTime) ? 1u : 0u));
+		SetFact(Facts.AttackedVeryRecently, (base.SecondsSinceAttacked < 2f) ? ((byte)1) : ((byte)0));
+		SetFact(Facts.AttackedRecently, (base.SecondsSinceAttacked < 7f) ? ((byte)1) : ((byte)0));
+		SetFact(Facts.CanSwitchWeapon, (byte)((UnityEngine.Time.realtimeSinceStartup > NextWeaponSwitchTime) ? 1u : 0u));
+		SetFact(Facts.CurrentAmmoState, (byte)GetCurrentAmmoStateEnum());
+		SetFact(Facts.CurrentWeaponType, (byte)GetCurrentWeaponTypeEnum());
+	}
+
+	private void _UpdateGroundedSelfFacts()
+	{
+		SetFact(Facts.Health, (byte)ToHealthEnum(base.healthFraction));
+		SetFact(Facts.IsWeaponAttackReady, (byte)((UnityEngine.Time.realtimeSinceStartup >= NextAttackTime()) ? 1u : 0u));
+		SetFact(Facts.IsRoamReady, (byte)((UnityEngine.Time.realtimeSinceStartup >= AiContext.NextRoamTime && IsNavRunning()) ? 1u : 0u));
+		SetFact(Facts.Speed, (byte)ToSpeedEnum(TargetSpeed / Stats.Speed));
+		SetFact(Facts.AttackedLately, (byte)((base.SecondsSinceAttacked < Stats.AttackedMemoryTime) ? 1u : 0u));
+		SetFact(Facts.AttackedVeryRecently, (base.SecondsSinceAttacked < 2f) ? ((byte)1) : ((byte)0));
+		SetFact(Facts.AttackedRecently, (base.SecondsSinceAttacked < 7f) ? ((byte)1) : ((byte)0));
+		SetFact(Facts.IsMoving, IsMoving(), triggerCallback: true, onlyTriggerCallbackOnDiffValue: false);
+		SetFact(Facts.CanSwitchWeapon, (byte)((UnityEngine.Time.realtimeSinceStartup > NextWeaponSwitchTime) ? 1u : 0u));
+		SetFact(Facts.CanSwitchTool, (byte)((UnityEngine.Time.realtimeSinceStartup > NextToolSwitchTime) ? 1u : 0u));
+		SetFact(Facts.CurrentAmmoState, (byte)GetCurrentAmmoStateEnum());
+		SetFact(Facts.CurrentWeaponType, (byte)GetCurrentWeaponTypeEnum());
+		SetFact(Facts.CurrentToolType, (byte)GetCurrentToolTypeEnum());
+		SetFact(Facts.ExplosiveInRange, (AiContext.DeployedExplosives.Count > 0) ? ((byte)1) : ((byte)0));
+		SetFact(Facts.IsMobile, (byte)(Stats.IsMobile ? 1u : 0u));
+		SetFact(Facts.HasWaypoints, (byte)((WaypointSet != null && WaypointSet.Points.Count > 0) ? 1u : 0u));
+		EnemyRangeEnum rangeToSpawnPoint = GetRangeToSpawnPoint();
+		SetFact(Facts.RangeToSpawnLocation, (byte)rangeToSpawnPoint);
+		if ((int)rangeToSpawnPoint < (int)Stats.MaxRangeToSpawnLoc || (Stats.MaxRangeToSpawnLoc == EnemyRangeEnum.CloseAttackRange && rangeToSpawnPoint == EnemyRangeEnum.CloseAttackRange))
+		{
+			lastInRangeOfSpawnPositionTime = UnityEngine.Time.time;
+		}
+		if (CheckHealthThresholdToFlee())
+		{
+			WantsToFlee();
+		}
+	}
+
+	private void _UpdateCoverFacts()
+	{
+		if (GetFact(Facts.HasEnemy) == 1)
+		{
+			SetFact(Facts.RetreatCoverInRange, (AiContext.CoverSet.Retreat.ReservedCoverPoint != null) ? ((byte)1) : ((byte)0));
+			SetFact(Facts.FlankCoverInRange, (AiContext.CoverSet.Flank.ReservedCoverPoint != null) ? ((byte)1) : ((byte)0));
+			SetFact(Facts.AdvanceCoverInRange, (AiContext.CoverSet.Advance.ReservedCoverPoint != null) ? ((byte)1) : ((byte)0));
+			SetFact(Facts.CoverInRange, (AiContext.CoverSet.Closest.ReservedCoverPoint != null) ? ((byte)1) : ((byte)0));
+			if (GetFact(Facts.IsMovingToCover) == 1)
+			{
+				SetFact(Facts.IsMovingToCover, IsMoving());
+			}
+			Memory.ExtendedInfo extendedInfo = AiContext.Memory.GetExtendedInfo(AttackTarget);
+			if (extendedInfo.Entity != null)
+			{
+				if (base.isMounted)
+				{
+					SetFact(Facts.AimsAtTarget, (byte)((extendedInfo.Dot > AI.npc_valid_mounted_aim_cone) ? 1u : 0u));
+				}
+				else
+				{
+					SetFact(Facts.AimsAtTarget, (byte)((extendedInfo.Dot > AI.npc_valid_aim_cone) ? 1u : 0u));
+				}
+			}
+		}
+		else
+		{
+			SetFact(Facts.RetreatCoverInRange, 0);
+			SetFact(Facts.FlankCoverInRange, 0);
+			SetFact(Facts.AdvanceCoverInRange, 0);
+			SetFact(Facts.CoverInRange, (AiContext.CoverSet.Closest.ReservedCoverPoint != null) ? ((byte)1) : ((byte)0));
+			SetFact(Facts.IsMovingToCover, 0);
+			SetFact(Facts.AimsAtTarget, 0);
+		}
+		if (AiContext.CoverSet.Closest.ReservedCoverPoint != null)
+		{
+			float sqrMagnitude = (AiContext.CoverSet.Closest.ReservedCoverPoint.Position - ServerPosition).sqrMagnitude;
+			byte b = ((sqrMagnitude < 0.5625f) ? ((byte)1) : ((byte)0));
+			SetFact(Facts.IsInCover, b);
+			if (b == 1)
+			{
+				SetFact(Facts.IsCoverCompromised, (byte)(AiContext.CoverSet.Closest.ReservedCoverPoint.IsCompromised ? 1u : 0u));
+			}
+		}
+		if (GetFact(Facts.IsRetreatingToCover) == 1)
+		{
+			SetFact(Facts.IsRetreatingToCover, IsMoving());
+		}
+	}
+
 	private void TickSenses()
 	{
 		if (Query.Server != null && AiContext != null && !IsDormant)
@@ -1512,13 +2715,24 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 				TickVision();
 				TickHearing();
 				TickSmell();
-				TickSquad();
 				AiContext.Memory.Forget(ForgetUnseenEntityTime);
 				lastTickTime = UnityEngine.Time.realtimeSinceStartup;
 			}
 			TickEnemyAwareness();
-			UpdateSelfFacts();
+			if (base.isMounted)
+			{
+				UpdateMountedSelfFacts();
+			}
+			else
+			{
+				UpdateSelfFacts();
+			}
 		}
+	}
+
+	public static float Distance2DSqr(Vector3 a, Vector3 b)
+	{
+		return (new Vector2(a.x, a.z) - new Vector2(b.x, b.z)).sqrMagnitude;
 	}
 
 	private void TickVision()
@@ -1526,88 +2740,131 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		AiContext.Players.Clear();
 		AiContext.Npcs.Clear();
 		AiContext.DeployedExplosives.Clear();
-		if (Query.Server == null)
+		if (IsMountableAgent)
 		{
-			return;
+			AiContext.Chairs.Clear();
 		}
-		int inSphere = Query.Server.GetInSphere(ServerPosition, Stats.VisionRange, SensesResults, AiCaresAbout);
-		if (inSphere == 0)
+		if (base.isMounted)
 		{
-			return;
-		}
-		for (int i = 0; i < inSphere; i++)
-		{
-			BaseEntity baseEntity = SensesResults[i];
-			if (baseEntity == null || baseEntity == this || !baseEntity.isServer)
+			for (int i = 0; i < BasePlayer.activePlayerList.Count; i++)
 			{
-				continue;
-			}
-			BasePlayer basePlayer = baseEntity as BasePlayer;
-			if (basePlayer != null)
-			{
-				if (!AI.ignoreplayers && !basePlayer.IsSleeping())
+				BasePlayer basePlayer = BasePlayer.activePlayerList[i];
+				if (!(basePlayer == null) && basePlayer.isServer && !AI.ignoreplayers && !basePlayer.IsSleeping() && !basePlayer.IsDead())
 				{
-					AiContext.Players.Add(baseEntity as BasePlayer);
-				}
-			}
-			else if (baseEntity is BaseNpc)
-			{
-				AiContext.Npcs.Add(baseEntity as BaseNpc);
-			}
-			else if (baseEntity is TimedExplosive)
-			{
-				TimedExplosive timedExplosive = baseEntity as TimedExplosive;
-				if (Vector3.Distance(ServerPosition, timedExplosive.ServerPosition) < timedExplosive.explosionRadius + 2f)
-				{
-					AiContext.DeployedExplosives.Add(timedExplosive);
+					float num = Distance2DSqr(basePlayer.ServerPosition, ServerPosition);
+					if (num <= Stats.VisionRange * Stats.VisionRange)
+					{
+						AiContext.Players.Add(basePlayer);
+					}
 				}
 			}
 		}
-		sensesTicksSinceLastCoverSweep++;
-		if (sensesTicksSinceLastCoverSweep > 5)
+		else
 		{
-			FindCoverPoints();
-			sensesTicksSinceLastCoverSweep = 0;
+			if (Query.Server == null)
+			{
+				return;
+			}
+			int num2 = 0;
+			num2 = ((!AI.npc_ignore_chairs) ? Query.Server.GetInSphere(base.transform.position, Stats.VisionRange, SensesResults, AiCaresAbout) : Query.Server.GetInSphere(base.transform.position, Stats.VisionRange, SensesResults, AiCaresAboutIgnoreChairs));
+			if (num2 == 0)
+			{
+				return;
+			}
+			for (int j = 0; j < num2; j++)
+			{
+				BaseEntity baseEntity = SensesResults[j];
+				if (baseEntity == null || baseEntity == this || !baseEntity.isServer)
+				{
+					continue;
+				}
+				BasePlayer basePlayer2 = baseEntity as BasePlayer;
+				if (basePlayer2 != null)
+				{
+					if (!AI.ignoreplayers && !basePlayer2.IsSleeping() && !basePlayer2.IsDead())
+					{
+						AiContext.Players.Add(baseEntity as BasePlayer);
+					}
+				}
+				else if (baseEntity is BaseNpc)
+				{
+					AiContext.Npcs.Add(baseEntity as BaseNpc);
+				}
+				else if (baseEntity is TimedExplosive)
+				{
+					TimedExplosive timedExplosive = baseEntity as TimedExplosive;
+					if ((ServerPosition - timedExplosive.ServerPosition).sqrMagnitude < (timedExplosive.explosionRadius + 2f) * (timedExplosive.explosionRadius + 2f))
+					{
+						AiContext.DeployedExplosives.Add(timedExplosive);
+					}
+				}
+				else if (IsMountableAgent && !AI.npc_ignore_chairs && baseEntity is BaseChair)
+				{
+					AiContext.Chairs.Add(baseEntity as BaseChair);
+				}
+			}
+			float num3 = float.MaxValue;
+			foreach (BasePlayer player in AiContext.Players)
+			{
+				float sqrMagnitude = (player.ServerPosition - ServerPosition).sqrMagnitude;
+				if (sqrMagnitude < num3 && !player.IsDead() && !player.IsDestroyed)
+				{
+					num3 = sqrMagnitude;
+					AiContext.ClosestPlayer = player;
+				}
+			}
+			sensesTicksSinceLastCoverSweep++;
+			if (sensesTicksSinceLastCoverSweep > 5)
+			{
+				FindCoverPoints();
+				sensesTicksSinceLastCoverSweep = 0;
+			}
 		}
 	}
 
-	private bool IsVisibleStanding(BasePlayer player)
+	public bool IsVisibleMounted(BasePlayer player)
 	{
-		Vector3 position = eyes.transform.position;
-		Vector3 up = eyes.transform.up;
-		Vector3 eyeOffset = PlayerEyes.EyeOffset;
-		Vector3 vector = position + up * eyeOffset.y;
-		if (!player.IsVisible(vector, player.CenterPoint()) && !player.IsVisible(vector, player.transform.position) && !player.IsVisible(vector, player.eyes.position))
+		Vector3 worldMountedPosition = eyes.worldMountedPosition;
+		if (!player.IsVisible(worldMountedPosition, player.CenterPoint()) && !player.IsVisible(worldMountedPosition, player.transform.position) && !player.IsVisible(worldMountedPosition, player.eyes.position))
 		{
 			return false;
 		}
-		if (!IsVisible(player.CenterPoint(), vector) && !IsVisible(player.transform.position, vector) && !IsVisible(player.eyes.position, vector))
+		if (!IsVisible(player.CenterPoint(), worldMountedPosition) && !IsVisible(player.transform.position, worldMountedPosition) && !IsVisible(player.eyes.position, worldMountedPosition))
 		{
 			return false;
 		}
 		return true;
 	}
 
-	private bool IsVisibleCrouched(BasePlayer player)
+	public bool IsVisibleStanding(BasePlayer player)
 	{
-		Vector3 position = eyes.transform.position;
-		Vector3 up = eyes.transform.up;
-		Vector3 eyeOffset = PlayerEyes.EyeOffset;
-		float y = eyeOffset.y;
-		Vector3 duckOffset = PlayerEyes.DuckOffset;
-		Vector3 vector = position + up * (y + duckOffset.y);
-		if (!player.IsVisible(vector, player.CenterPoint()) && !player.IsVisible(vector, player.transform.position) && !player.IsVisible(vector, player.eyes.position))
+		Vector3 worldStandingPosition = eyes.worldStandingPosition;
+		if (!player.IsVisible(worldStandingPosition, player.CenterPoint()) && !player.IsVisible(worldStandingPosition, player.transform.position) && !player.IsVisible(worldStandingPosition, player.eyes.position))
 		{
 			return false;
 		}
-		if (!IsVisible(player.CenterPoint(), vector) && !IsVisible(player.transform.position, vector) && !IsVisible(player.eyes.position, vector))
+		if (!IsVisible(player.CenterPoint(), worldStandingPosition) && !IsVisible(player.transform.position, worldStandingPosition) && !IsVisible(player.eyes.position, worldStandingPosition))
 		{
 			return false;
 		}
 		return true;
 	}
 
-	private bool IsVisibleStanding(BaseNpc npc)
+	public bool IsVisibleCrouched(BasePlayer player)
+	{
+		Vector3 worldCrouchedPosition = eyes.worldCrouchedPosition;
+		if (!player.IsVisible(worldCrouchedPosition, player.CenterPoint()) && !player.IsVisible(worldCrouchedPosition, player.transform.position) && !player.IsVisible(worldCrouchedPosition, player.eyes.position))
+		{
+			return false;
+		}
+		if (!IsVisible(player.CenterPoint(), worldCrouchedPosition) && !IsVisible(player.transform.position, worldCrouchedPosition) && !IsVisible(player.eyes.position, worldCrouchedPosition))
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public bool IsVisibleStanding(BaseNpc npc)
 	{
 		Vector3 position = eyes.transform.position;
 		Vector3 up = eyes.transform.up;
@@ -1624,7 +2881,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		return true;
 	}
 
-	private bool IsVisibleCrouched(BaseNpc npc)
+	public bool IsVisibleCrouched(BaseNpc npc)
 	{
 		Vector3 position = eyes.transform.position;
 		Vector3 up = eyes.transform.up;
@@ -1656,17 +2913,8 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		if (AiContext.CurrentCoverVolume == null || !AiContext.CurrentCoverVolume.Contains(AiContext.Position))
 		{
 			AiContext.CurrentCoverVolume = SingletonComponent<AiManager>.Instance.GetCoverVolumeContaining(AiContext.Position);
-			if (AiContext.CurrentCoverVolume == null)
+			if (!(AiContext.CurrentCoverVolume == null))
 			{
-				SquadMember component = GetComponent<SquadMember>();
-				if ((bool)component && (bool)component.Manager)
-				{
-					AiContext.CurrentCoverVolume = AiManager.CreateNewCoverVolume(AiContext.Position, component.Manager.CoverPointGroup);
-				}
-				else
-				{
-					AiContext.CurrentCoverVolume = AiManager.CreateNewCoverVolume(AiContext.Position, null);
-				}
 			}
 		}
 		if (!(AiContext.CurrentCoverVolume != null))
@@ -1700,11 +2948,38 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 	{
 	}
 
-	private void TickSquad()
+	private void TickMountableAwareness()
 	{
-		if (squadMember == null)
+		SelectMountable();
+	}
+
+	private void SelectMountable()
+	{
+		if (AiContext.Chairs.Count == 0 && !base.isMounted)
 		{
-			squadMember = GetComponent<SquadMember>();
+			AiContext.ChairTarget = null;
+			SetFact(Facts.IsMounted, 0);
+		}
+		else
+		{
+			TargetClosestChair();
+		}
+	}
+
+	private void TargetClosestChair()
+	{
+		float num = float.MaxValue;
+		foreach (BaseChair chair in AiContext.Chairs)
+		{
+			if (!chair.IsMounted())
+			{
+				float sqrMagnitude = (chair.ServerPosition - ServerPosition).sqrMagnitude;
+				if (sqrMagnitude < num)
+				{
+					num = sqrMagnitude;
+					AiContext.ChairTarget = chair;
+				}
+			}
 		}
 	}
 
@@ -1715,7 +2990,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			AiContext.EnemyNpc = null;
 			AiContext.EnemyPlayer = null;
 			SetFact(Facts.HasEnemy, 0);
-			SetFact(Facts.EnemyRange, 5);
+			SetFact(Facts.EnemyRange, 3);
 			SetFact(Facts.IsAggro, 0, triggerCallback: false);
 		}
 		else
@@ -1731,13 +3006,52 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			AiContext.EnemyNpc = null;
 			AiContext.EnemyPlayer = null;
 			SetFact(Facts.HasEnemy, 0);
-			SetFact(Facts.EnemyRange, 5);
+			SetFact(Facts.EnemyRange, 3);
 			SetFact(Facts.IsAggro, 0, triggerCallback: false);
+		}
+		else if (base.isMounted)
+		{
+			AggroClosestPlayerMounted();
 		}
 		else
 		{
 			AggroBestScorePlayerOrClosestAnimal();
 		}
+	}
+
+	private void AggroClosestPlayerMounted()
+	{
+		float num = float.MaxValue;
+		bool lineOfSightStanding = false;
+		bool lineOfSightCrouched = false;
+		BasePlayer player = null;
+		foreach (BasePlayer player2 in AiContext.Players)
+		{
+			if (player2.IsDead() || player2.IsDestroyed || (Stats.OnlyAggroMarkedTargets && !HostilityConsideration(player2)))
+			{
+				continue;
+			}
+			bool flag = IsVisibleMounted(player2);
+			if (flag)
+			{
+				AiContext.Memory.Update(player2);
+			}
+			Vector3 vector = player2.ServerPosition - ServerPosition;
+			BaseMountable baseMountable = GetMounted();
+			float num2 = Vector3.Dot(vector.normalized, baseMountable.transform.forward);
+			if (!(num2 < -0.1f))
+			{
+				float sqrMagnitude = vector.sqrMagnitude;
+				if (sqrMagnitude < num)
+				{
+					num = sqrMagnitude;
+					player = player2;
+					lineOfSightStanding = flag;
+					lineOfSightCrouched = flag;
+				}
+			}
+		}
+		SetAttackTarget(player, 1f, num, lineOfSightStanding, lineOfSightCrouched);
 	}
 
 	private void AggroBestScorePlayerOrClosestAnimal()
@@ -1750,10 +3064,10 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		BaseNpc baseNpc = null;
 		AiContext.AIAgent.AttackTarget = null;
 		Vector3 zero = Vector3.zero;
-		float range = float.MaxValue;
+		float sqrRange = float.MaxValue;
 		foreach (BasePlayer player in AiContext.Players)
 		{
-			if (player.IsDead() || player.IsDestroyed || (blockTargetingThisEnemy != null && player.net != null && blockTargetingThisEnemy.net != null && player.net.ID == blockTargetingThisEnemy.net.ID))
+			if (player.IsDead() || player.IsDestroyed || (blockTargetingThisEnemy != null && player.net != null && blockTargetingThisEnemy.net != null && player.net.ID == blockTargetingThisEnemy.net.ID) || (Stats.OnlyAggroMarkedTargets && !HostilityConsideration(player)))
 			{
 				continue;
 			}
@@ -1769,17 +3083,15 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			{
 				num = sqrMagnitude;
 			}
-			float num4 = Mathf.Sqrt(sqrMagnitude);
-			if (num4 < Stats.VisionRange)
+			if (sqrMagnitude < Stats.VisionRange * Stats.VisionRange)
 			{
 				num3 += VisionRangeScore;
 			}
-			if (num4 < Stats.AggressionRange)
+			if (sqrMagnitude < Stats.AggressionRange * Stats.AggressionRange)
 			{
 				num3 += AggroRangeScore;
 			}
-			EnemyRangeEnum enemyRangeEnum = ToEnemyRangeEnum(num4);
-			switch (enemyRangeEnum)
+			switch (ToEnemyRangeEnum(sqrMagnitude))
 			{
 			case EnemyRangeEnum.LongAttackRange:
 				num3 += LongRangeScore;
@@ -1799,7 +3111,7 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			}
 			if (!flag3 && !flag4)
 			{
-				if (AiContext.Memory.GetInfo(player).Entity == null || (int)enemyRangeEnum > 3)
+				if (AiContext.Memory.GetInfo(player).Entity == null || !IsWithinAggroRange(sqrMagnitude))
 				{
 					continue;
 				}
@@ -1809,34 +3121,40 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			{
 				AiContext.Memory.Update(player);
 			}
+			float dist = Mathf.Sqrt(sqrMagnitude);
+			num3 *= VisibilityScoreModifier(player, vector, dist, flag3, flag4);
 			if (num3 > num2)
 			{
 				basePlayer = player;
 				baseNpc = null;
 				zero = vector;
-				range = num4;
+				sqrRange = sqrMagnitude;
 				num2 = num3;
 				flag = flag3;
 				flag2 = flag4;
 			}
 		}
-		if (basePlayer == null && squadMember != null && squadMember.Squad != null && squadMember.Squad.PrimaryTarget != null)
+		if (!base.isMounted && basePlayer == null && AskQuestion(default(AiQuestion_ShareEnemyTarget), out var answers) > 0)
 		{
-			basePlayer = squadMember.Squad.PrimaryTarget;
-			baseNpc = null;
-			zero = basePlayer.ServerPosition - ServerPosition;
-			range = zero.magnitude;
-			num2 = 100f;
-			num = zero.sqrMagnitude;
-			flag = IsVisibleStanding(basePlayer);
-			flag2 = false;
-			if (!flag)
+			foreach (AiAnswer_ShareEnemyTarget item in answers)
 			{
-				flag2 = IsVisibleCrouched(basePlayer);
-			}
-			if (flag || flag2)
-			{
-				AiContext.Memory.Update(basePlayer);
+				if (item.PlayerTarget != null && item.LastKnownPosition.HasValue && HostilityConsideration(item.PlayerTarget))
+				{
+					basePlayer = item.PlayerTarget;
+					baseNpc = null;
+					zero = item.LastKnownPosition.Value - ServerPosition;
+					sqrRange = zero.sqrMagnitude;
+					num2 = 100f;
+					num = zero.sqrMagnitude;
+					flag = IsVisibleStanding(basePlayer);
+					flag2 = false;
+					if (!flag)
+					{
+						flag2 = IsVisibleCrouched(basePlayer);
+					}
+					AiContext.Memory.Update(basePlayer, item.LastKnownPosition.Value);
+					break;
+				}
 			}
 		}
 		if (num > 0.1f && num2 < 10f)
@@ -1854,42 +3172,37 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 				{
 					continue;
 				}
-				float num5 = Mathf.Sqrt(sqrMagnitude2);
-				if (flag5)
+				EnemyRangeEnum enemyRangeEnum = ToEnemyRangeEnum(sqrMagnitude2);
+				if ((!flag5 || (int)enemyRangeEnum <= 0) && (int)enemyRangeEnum <= 1)
 				{
-					EnemyRangeEnum enemyRangeEnum2 = ToEnemyRangeEnum(num5);
-					if ((int)enemyRangeEnum2 > 0)
+					num = sqrMagnitude2;
+					baseNpc = npc;
+					basePlayer = null;
+					zero = vector2;
+					sqrRange = sqrMagnitude2;
+					flag2 = false;
+					flag = IsVisibleStanding(npc);
+					if (!flag)
 					{
-						continue;
+						flag2 = IsVisibleCrouched(npc);
+					}
+					if (flag || flag2)
+					{
+						AiContext.Memory.Update(npc);
+					}
+					if (num < 0.1f)
+					{
+						break;
 					}
 				}
-				num = sqrMagnitude2;
-				baseNpc = npc;
-				basePlayer = null;
-				zero = vector2;
-				range = num5;
-				flag2 = false;
-				flag = IsVisibleStanding(npc);
-				if (!flag)
-				{
-					flag2 = IsVisibleCrouched(npc);
-				}
-				if (flag || flag2)
-				{
-					AiContext.Memory.Update(npc);
-				}
-				if (!(num < 0.1f))
-				{
-					continue;
-				}
-				break;
 			}
 		}
 		AiContext.EnemyPlayer = basePlayer;
 		AiContext.EnemyNpc = baseNpc;
-		if (basePlayer != null || baseNpc != null)
+		AiContext.LastTargetScore = num2;
+		if ((basePlayer != null && !basePlayer.IsDestroyed && !basePlayer.IsDead()) || baseNpc != null)
 		{
-			SetFact(Facts.HasEnemy, 1);
+			SetFact(Facts.HasEnemy, 1, triggerCallback: true, onlyTriggerCallbackOnDiffValue: false);
 			if (basePlayer != null)
 			{
 				AiContext.AIAgent.AttackTarget = basePlayer;
@@ -1898,20 +3211,24 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			{
 				AiContext.AIAgent.AttackTarget = baseNpc;
 			}
-			EnemyRangeEnum enemyRangeEnum3 = ToEnemyRangeEnum(range);
-			AfraidRangeEnum value = ToAfraidRangeEnum(range);
-			SetFact(Facts.EnemyRange, (byte)enemyRangeEnum3);
+			EnemyRangeEnum enemyRangeEnum2 = ToEnemyRangeEnum(sqrRange);
+			AfraidRangeEnum value = ToAfraidRangeEnum(sqrRange);
+			SetFact(Facts.EnemyRange, (byte)enemyRangeEnum2);
 			SetFact(Facts.AfraidRange, (byte)value);
 			bool flag6 = flag || flag2;
 			SetFact(Facts.HasLineOfSight, (byte)(flag6 ? 1u : 0u));
 			SetFact(Facts.HasLineOfSightCrouched, (byte)(flag2 ? 1u : 0u));
 			SetFact(Facts.HasLineOfSightStanding, (byte)(flag ? 1u : 0u));
-			TryAggro(enemyRangeEnum3);
+			if (basePlayer != null && flag6)
+			{
+				lastSeenPlayerTime = UnityEngine.Time.time;
+			}
+			TryAggro(enemyRangeEnum2);
 		}
 		else
 		{
 			SetFact(Facts.HasEnemy, 0);
-			SetFact(Facts.EnemyRange, 5);
+			SetFact(Facts.EnemyRange, 3);
 			SetFact(Facts.AfraidRange, 1);
 			SetFact(Facts.HasLineOfSight, 0);
 			SetFact(Facts.HasLineOfSightCrouched, 0);
@@ -1919,19 +3236,188 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		}
 	}
 
+	protected void SetAttackTarget(BasePlayer player, float score, float sqrDistance, bool lineOfSightStanding, bool lineOfSightCrouched, bool tryAggro = true)
+	{
+		if (player != null && !player.IsDestroyed && !player.IsDead())
+		{
+			AiContext.EnemyPlayer = player;
+			AiContext.EnemyNpc = null;
+			AiContext.LastTargetScore = score;
+			SetFact(Facts.HasEnemy, 1, triggerCallback: true, onlyTriggerCallbackOnDiffValue: false);
+			AiContext.AIAgent.AttackTarget = player;
+			EnemyRangeEnum enemyRangeEnum = ToEnemyRangeEnum(sqrDistance);
+			AfraidRangeEnum value = ToAfraidRangeEnum(sqrDistance);
+			SetFact(Facts.EnemyRange, (byte)enemyRangeEnum);
+			SetFact(Facts.AfraidRange, (byte)value);
+			bool flag = lineOfSightStanding || lineOfSightCrouched;
+			SetFact(Facts.HasLineOfSight, (byte)(flag ? 1u : 0u));
+			SetFact(Facts.HasLineOfSightCrouched, (byte)(lineOfSightCrouched ? 1u : 0u));
+			SetFact(Facts.HasLineOfSightStanding, (byte)(lineOfSightStanding ? 1u : 0u));
+			if (flag)
+			{
+				lastSeenPlayerTime = UnityEngine.Time.time;
+			}
+			if (tryAggro)
+			{
+				TryAggro(enemyRangeEnum);
+			}
+		}
+		else
+		{
+			SetFact(Facts.HasEnemy, 0);
+			SetFact(Facts.EnemyRange, 3);
+			SetFact(Facts.AfraidRange, 1);
+			SetFact(Facts.HasLineOfSight, 0);
+			SetFact(Facts.HasLineOfSightCrouched, 0);
+			SetFact(Facts.HasLineOfSightStanding, 0);
+		}
+	}
+
+	private float VisibilityScoreModifier(BasePlayer target, Vector3 dir, float dist, bool losStand, bool losCrouch)
+	{
+		if (base.isMounted)
+		{
+			BaseMountable baseMountable = GetMounted();
+			float num = Vector3.Dot(dir.normalized, baseMountable.transform.forward);
+			if (num > -0.1f)
+			{
+				return 1f;
+			}
+			SetFact(Facts.HasEnemy, 0);
+			SetFact(Facts.IsAggro, 0);
+			AiContext.EnemyNpc = null;
+			AiContext.EnemyPlayer = null;
+			AttackTarget = null;
+			return 0f;
+		}
+		float num2 = ((!target.IsDucked()) ? 1f : 0.5f);
+		num2 *= ((!target.IsRunning()) ? 1f : 1.5f);
+		num2 *= ((!(target.estimatedSpeed <= 0.01f)) ? 1f : 0.5f);
+		float value = 1f;
+		bool flag = false;
+		Item activeItem = target.GetActiveItem();
+		if (activeItem != null)
+		{
+			HeldEntity heldEntity = activeItem.GetHeldEntity() as HeldEntity;
+			if (heldEntity != null)
+			{
+				flag = heldEntity.LightsOn();
+			}
+		}
+		if (!flag)
+		{
+			value = Stats.DistanceVisibility.Evaluate(Mathf.Clamp01(dist / Stats.VisionRange));
+			if (!losStand && losCrouch)
+			{
+				value *= 0.75f;
+			}
+			else if (losStand && !losCrouch)
+			{
+				value *= 0.9f;
+			}
+			if (num2 < 1f)
+			{
+				float num3 = Vector3.Dot(dir.normalized, eyes.HeadForward().normalized);
+				value = ((num3 > Mathf.Abs(Stats.VisionCone)) ? (value * 1.5f) : ((!(num3 > 0f)) ? (value * (0.25f * num2)) : (value * Mathf.Clamp01(num3 + num2))));
+			}
+			else
+			{
+				value *= num2;
+			}
+		}
+		value = Mathf.Clamp01(value);
+		float num4 = 0f;
+		if (alertness > 0.5f)
+		{
+			return (!(UnityEngine.Random.value < value)) ? 0f : value;
+		}
+		if (alertness > 0.01f)
+		{
+			return (!(UnityEngine.Random.value < value * alertness)) ? 0f : value;
+		}
+		return (!(value > AI.npc_alertness_zero_detection_mod)) ? 0f : value;
+	}
+
+	public bool HostilityConsideration(BasePlayer target)
+	{
+		if (target == null || target.transform == null || target.IsDestroyed || target.IsDead())
+		{
+			return true;
+		}
+		if (Stats.OnlyAggroMarkedTargets && target.HasPlayerFlag(PlayerFlags.SafeZone))
+		{
+			if (target.IsSleeping() && target.secondsSleeping >= NPCAutoTurret.sleeperhostiledelay)
+			{
+				return true;
+			}
+			return target.IsHostile();
+		}
+		if (Stats.Hostility > 0f)
+		{
+			return true;
+		}
+		if (Stats.Defensiveness > 0f && AiContext.LastAttacker == target && Stats.AttackedMemoryTime > base.SecondsSinceAttacked)
+		{
+			return true;
+		}
+		if (AiContext.AiLocationManager != null && AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.BanditTown)
+		{
+			if (target.IsHostile())
+			{
+				return true;
+			}
+			if (target.IsSleeping() && target.secondsSleeping >= NPCAutoTurret.sleeperhostiledelay)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private void UpdateMountedSelfFacts()
+	{
+		SetFact(Facts.Health, (byte)ToHealthEnum(base.healthFraction));
+		SetFact(Facts.IsWeaponAttackReady, (byte)((UnityEngine.Time.realtimeSinceStartup >= NextAttackTime()) ? 1u : 0u));
+		SetFact(Facts.AttackedLately, (byte)((base.SecondsSinceAttacked < Stats.AttackedMemoryTime) ? 1u : 0u));
+		SetFact(Facts.AttackedVeryRecently, (base.SecondsSinceAttacked < 2f) ? ((byte)1) : ((byte)0));
+		SetFact(Facts.AttackedRecently, (base.SecondsSinceAttacked < 7f) ? ((byte)1) : ((byte)0));
+		SetFact(Facts.CanSwitchWeapon, (byte)((UnityEngine.Time.realtimeSinceStartup > NextWeaponSwitchTime) ? 1u : 0u));
+		SetFact(Facts.CurrentAmmoState, (byte)GetCurrentAmmoStateEnum());
+		SetFact(Facts.CurrentWeaponType, (byte)GetCurrentWeaponTypeEnum());
+	}
+
 	private void UpdateSelfFacts()
 	{
+		if ((!float.IsNegativeInfinity(base.SecondsSinceAttacked) && base.SecondsSinceAttacked < Stats.AttackedMemoryTime) || (!float.IsNegativeInfinity(SecondsSinceSeenPlayer) && SecondsSinceSeenPlayer < Stats.AttackedMemoryTime))
+		{
+			alertness = 1f;
+		}
+		else if (alertness > 0f)
+		{
+			alertness = Mathf.Clamp01(alertness - AI.npc_alertness_drain_rate);
+		}
 		SetFact(Facts.Health, (byte)ToHealthEnum(base.healthFraction));
 		SetFact(Facts.IsWeaponAttackReady, (byte)((UnityEngine.Time.realtimeSinceStartup >= NextAttackTime()) ? 1u : 0u));
 		SetFact(Facts.IsRoamReady, (byte)((UnityEngine.Time.realtimeSinceStartup >= AiContext.NextRoamTime && IsNavRunning()) ? 1u : 0u));
 		SetFact(Facts.Speed, (byte)ToSpeedEnum(TargetSpeed / Stats.Speed));
 		SetFact(Facts.AttackedLately, (byte)((base.SecondsSinceAttacked < Stats.AttackedMemoryTime) ? 1u : 0u));
 		SetFact(Facts.AttackedVeryRecently, (base.SecondsSinceAttacked < 2f) ? ((byte)1) : ((byte)0));
+		SetFact(Facts.AttackedRecently, (base.SecondsSinceAttacked < 7f) ? ((byte)1) : ((byte)0));
 		SetFact(Facts.IsMoving, IsMoving(), triggerCallback: true, onlyTriggerCallbackOnDiffValue: false);
 		SetFact(Facts.CanSwitchWeapon, (byte)((UnityEngine.Time.realtimeSinceStartup > NextWeaponSwitchTime) ? 1u : 0u));
+		SetFact(Facts.CanSwitchTool, (byte)((UnityEngine.Time.realtimeSinceStartup > NextToolSwitchTime) ? 1u : 0u));
 		SetFact(Facts.CurrentAmmoState, (byte)GetCurrentAmmoStateEnum());
 		SetFact(Facts.CurrentWeaponType, (byte)GetCurrentWeaponTypeEnum());
+		SetFact(Facts.CurrentToolType, (byte)GetCurrentToolTypeEnum());
 		SetFact(Facts.ExplosiveInRange, (AiContext.DeployedExplosives.Count > 0) ? ((byte)1) : ((byte)0));
+		SetFact(Facts.IsMobile, (byte)(Stats.IsMobile ? 1u : 0u));
+		SetFact(Facts.HasWaypoints, (byte)((WaypointSet != null && WaypointSet.Points.Count > 0) ? 1u : 0u));
+		EnemyRangeEnum rangeToSpawnPoint = GetRangeToSpawnPoint();
+		SetFact(Facts.RangeToSpawnLocation, (byte)rangeToSpawnPoint);
+		if ((int)rangeToSpawnPoint < (int)Stats.MaxRangeToSpawnLoc)
+		{
+			lastInRangeOfSpawnPositionTime = UnityEngine.Time.time;
+		}
 		if (CheckHealthThresholdToFlee())
 		{
 			WantsToFlee();
@@ -1949,7 +3435,14 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			}
 			Vector3 normalized = (AttackTarget.ServerPosition - ServerPosition).normalized;
 			float num = Vector3.Dot(eyes.BodyForward(), normalized);
-			SetFact(Facts.AimsAtTarget, (byte)((num > SquadManager.squad_valid_aim_cone) ? 1u : 0u));
+			if (base.isMounted)
+			{
+				SetFact(Facts.AimsAtTarget, (byte)((num > AI.npc_valid_mounted_aim_cone) ? 1u : 0u));
+			}
+			else
+			{
+				SetFact(Facts.AimsAtTarget, (byte)((num > AI.npc_valid_aim_cone) ? 1u : 0u));
+			}
 		}
 		else
 		{
@@ -1963,8 +3456,8 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		}
 		if (AiContext.CoverSet.Closest.ReservedCoverPoint != null)
 		{
-			float num2 = Vector3.Distance(AiContext.CoverSet.Closest.ReservedCoverPoint.Position, ServerPosition);
-			byte b = ((num2 < 0.75f) ? ((byte)1) : ((byte)0));
+			float sqrMagnitude = (AiContext.CoverSet.Closest.ReservedCoverPoint.Position - ServerPosition).sqrMagnitude;
+			byte b = ((sqrMagnitude < 0.5625f) ? ((byte)1) : ((byte)0));
 			SetFact(Facts.IsInCover, b);
 			if (b == 1)
 			{
@@ -1977,9 +3470,20 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 		}
 	}
 
+	private EnemyRangeEnum GetRangeToSpawnPoint()
+	{
+		float num = ToSqrRange(Stats.MaxRangeToSpawnLoc) * 2f;
+		float sqrMagnitude = (ServerPosition - SpawnPosition).sqrMagnitude;
+		if (sqrMagnitude > num)
+		{
+			return EnemyRangeEnum.OutOfRange;
+		}
+		return ToEnemyRangeEnum(sqrMagnitude);
+	}
+
 	private byte IsMoving()
 	{
-		return (byte)((IsNavRunning() && NavAgent.hasPath && NavAgent.remainingDistance > NavAgent.stoppingDistance && GetFact(Facts.Speed) != 0) ? 1u : 0u);
+		return (byte)((IsNavRunning() && NavAgent.hasPath && NavAgent.remainingDistance > NavAgent.stoppingDistance && !IsStuck && !IsStopped) ? 1u : 0u);
 	}
 
 	private float NextAttackTime()
@@ -2013,12 +3517,42 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 
 	private void DelayedTargetPathStatus()
 	{
+		numPathPendingAttempts++;
 		accumPathPendingDelay += 0.1f;
 		isAlreadyCheckingPathPending = false;
 		SetTargetPathStatus(accumPathPendingDelay);
 	}
 
 	private static bool AiCaresAbout(BaseEntity ent)
+	{
+		if (ent is BasePlayer)
+		{
+			return true;
+		}
+		if (ent is BaseNpc)
+		{
+			return true;
+		}
+		if (ent is WorldItem)
+		{
+			return true;
+		}
+		if (ent is BaseCorpse)
+		{
+			return true;
+		}
+		if (ent is TimedExplosive)
+		{
+			return true;
+		}
+		if (ent is BaseChair)
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private static bool AiCaresAboutIgnoreChairs(BaseEntity ent)
 	{
 		if (ent is BasePlayer)
 		{
@@ -2056,5 +3590,351 @@ public class NPCPlayerApex : NPCPlayer, IContextProvider, IAIAgent, ILoadBalance
 			return false;
 		}
 		return true;
+	}
+
+	private void ShutdownSensorySystem()
+	{
+		_selectPlayerTargetAI.Kill();
+		_selectPlayerTargetMountedAI.Kill();
+		_selectEntityTargetAI.Kill();
+		_selectCoverTargetsAI.Kill();
+		_selectEnemyHideoutAI.Kill();
+	}
+
+	public void TickSensorySystem()
+	{
+		if (Query.Server == null || AiContext == null || IsDormant)
+		{
+			return;
+		}
+		AiContext.Players.Clear();
+		AiContext.Npcs.Clear();
+		AiContext.DeployedExplosives.Clear();
+		_FindPlayersInVisionRange();
+		PlayerTargetContext.Refresh(this, PlayerQueryResults, PlayerQueryResultCount);
+		if (base.isMounted)
+		{
+			SelectPlayerTargetMountedAI?.Execute();
+			AiContext.EnemyPlayer = PlayerTargetContext.Target;
+			AiContext.EnemyNpc = null;
+			AttackTarget = PlayerTargetContext.Target;
+		}
+		else
+		{
+			SelectPlayerTargetAI?.Execute();
+			_FindEntitiesInCloseRange();
+			EntityTargetContext.Refresh(this, EntityQueryResults, EntityQueryResultCount);
+			SelectEntityTargetAI?.Execute();
+			byte b = 0;
+			if (AiContext.EnemyPlayer == null || AiContext.EnemyPlayer.IsDestroyed || AiContext.EnemyPlayer.IsDead() || PlayerTargetContext.Score > AiContext.LastEnemyPlayerScore + DecisionMomentumPlayerTarget())
+			{
+				AiContext.EnemyPlayer = PlayerTargetContext.Target;
+				AiContext.LastEnemyPlayerScore = PlayerTargetContext.Score;
+				playerTargetDecisionStartTime = UnityEngine.Time.time;
+				if (PlayerTargetContext.Index >= 0 && PlayerTargetContext.Index < PlayerTargetContext.LineOfSight.Length)
+				{
+					b = PlayerTargetContext.LineOfSight[PlayerTargetContext.Index];
+				}
+				else
+				{
+					Memory.ExtendedInfo extendedInfo = AiContext.Memory.GetExtendedInfo(AiContext.EnemyPlayer);
+					if ((bool)extendedInfo.Entity)
+					{
+						b = extendedInfo.LineOfSight;
+					}
+				}
+			}
+			else if (PlayerTargetContext.Target == null && DecisionMomentumPlayerTarget() < 0.01f)
+			{
+				AiContext.EnemyPlayer = PlayerTargetContext.Target;
+				AiContext.LastEnemyPlayerScore = 0f;
+				playerTargetDecisionStartTime = 0f;
+			}
+			else
+			{
+				Memory.ExtendedInfo extendedInfo2 = AiContext.Memory.GetExtendedInfo(AiContext.EnemyPlayer);
+				if ((bool)extendedInfo2.Entity)
+				{
+					b = extendedInfo2.LineOfSight;
+				}
+			}
+			AiContext.ClosestPlayer = PlayerTargetContext.Target;
+			if (AiContext.ClosestPlayer == null)
+			{
+				AiContext.ClosestPlayer = AiContext.EnemyPlayer;
+			}
+			if (AiContext.EnemyNpc == null || AiContext.EnemyNpc.IsDestroyed || AiContext.EnemyNpc.IsDead() || EntityTargetContext.AnimalScore > AiContext.LastEnemyNpcScore + DecisionMomentumAnimalTarget())
+			{
+				AiContext.EnemyNpc = EntityTargetContext.AnimalTarget;
+				AiContext.LastEnemyNpcScore = EntityTargetContext.AnimalScore;
+				animalTargetDecisionStartTime = UnityEngine.Time.time;
+			}
+			else if (EntityTargetContext.AnimalTarget == null && DecisionMomentumAnimalTarget() < 0.01f)
+			{
+				AiContext.EnemyNpc = EntityTargetContext.AnimalTarget;
+				AiContext.LastEnemyNpcScore = 0f;
+				animalTargetDecisionStartTime = 0f;
+			}
+			AiContext.DeployedExplosives.Clear();
+			if (EntityTargetContext.ExplosiveTarget != null)
+			{
+				AiContext.DeployedExplosives.Add(EntityTargetContext.ExplosiveTarget);
+			}
+			AttackTarget = AiContext.EnemyPlayer;
+			if (AttackTarget == null)
+			{
+				AttackTarget = AiContext.EnemyNpc;
+			}
+			if (AiContext.EnemyPlayer != null)
+			{
+				Memory.SeenInfo info = AiContext.Memory.GetInfo(AiContext.EnemyPlayer);
+				bool flag = false;
+				if (GetFact(Facts.IsMilitaryTunnelLab) > 0)
+				{
+					if (PathToPlayerTarget == null)
+					{
+						PathToPlayerTarget = new NavMeshPath();
+					}
+					flag = (NavAgent != null && NavAgent.isOnNavMesh && !NavAgent.CalculatePath(AiContext.EnemyPlayer.ServerPosition, PathToPlayerTarget)) || PathToPlayerTarget.status != NavMeshPathStatus.PathComplete;
+					SetFact(Facts.IncompletePathToTarget, (byte)(flag ? 1u : 0u));
+				}
+				if (!flag)
+				{
+					_FindCoverPointsInVolume();
+					CoverContext.Refresh(this, info.Position, AiContext.sampledCoverPoints);
+					SelectCoverTargetsAI?.Execute();
+					AiContext.CoverSet.Reset();
+					AiContext.CoverSet.Update(CoverContext.BestRetreatCP, CoverContext.BestFlankCP, CoverContext.BestAdvanceCP);
+					if (b == 0)
+					{
+						if (_FindCoverPointsInVolume(info.Position))
+						{
+							CoverContext.Refresh(this, info.Position, AiContext.EnemyCoverPoints);
+							SelectEnemyHideoutAI?.Execute();
+							AiContext.EnemyHideoutGuess = CoverContext.HideoutCP;
+						}
+					}
+					else
+					{
+						AiContext.EnemyHideoutGuess = null;
+					}
+				}
+			}
+			else
+			{
+				AiContext.EnemyHideoutGuess = null;
+			}
+		}
+		AiContext.Memory.Forget(ForgetUnseenEntityTime);
+		AiContext.ForgetCheckedHideouts((float)ForgetUnseenEntityTime * 0.5f);
+	}
+
+	private float DecisionMomentumPlayerTarget()
+	{
+		float num = UnityEngine.Time.time - playerTargetDecisionStartTime;
+		if (num > 1f)
+		{
+			return 0f;
+		}
+		return num;
+	}
+
+	private float DecisionMomentumAnimalTarget()
+	{
+		float num = UnityEngine.Time.time - animalTargetDecisionStartTime;
+		if (num > 1f)
+		{
+			return 0f;
+		}
+		return num;
+	}
+
+	private void _FindPlayersInVisionRange()
+	{
+		if (AI.ignoreplayers || base.transform == null || Interface.CallHook("IOnNpcPlayerSenseVision", this) != null)
+		{
+			return;
+		}
+		PlayerQueryResultCount = Query.Server.GetPlayersInSphere(base.transform.position, Stats.VisionRange, PlayerQueryResults, delegate(BasePlayer player)
+		{
+			if (player == null || !player.isServer || player.IsDead())
+			{
+				return false;
+			}
+			if (player.IsSleeping() && player.secondsSleeping < NPCAutoTurret.sleeperhostiledelay)
+			{
+				return false;
+			}
+			float num = Stats.VisionRange * Stats.VisionRange;
+			float sqrMagnitude = (player.ServerPosition - ServerPosition).sqrMagnitude;
+			return !(sqrMagnitude > num);
+		});
+	}
+
+	private void _FindEntitiesInCloseRange()
+	{
+		if (Interface.CallHook("IOnNpcPlayerSenseClose", this) != null)
+		{
+			return;
+		}
+		EntityQueryResultCount = Query.Server.GetInSphere(base.transform.position, Stats.CloseRange, EntityQueryResults, delegate(BaseEntity entity)
+		{
+			if (entity == null || !entity.isServer || entity.IsDestroyed)
+			{
+				return false;
+			}
+			return (entity is BaseNpc || entity is TimedExplosive) ? true : false;
+		});
+	}
+
+	private bool _FindCoverPointsInVolume()
+	{
+		CoverPointVolume volume = AiContext.CurrentCoverVolume;
+		return _FindCoverPointsInVolume(AiContext.Position, AiContext.sampledCoverPoints, ref volume, ref nextCoverInfoTick);
+	}
+
+	private bool _FindCoverPointsInVolume(Vector3 position)
+	{
+		CoverPointVolume volume = null;
+		return _FindCoverPointsInVolume(position, AiContext.EnemyCoverPoints, ref volume, ref nextCoverPosInfoTick);
+	}
+
+	private bool _FindCoverPointsInVolume(Vector3 position, List<CoverPoint> coverPoints, ref CoverPointVolume volume, ref float timer)
+	{
+		if (SingletonComponent<AiManager>.Instance == null || !SingletonComponent<AiManager>.Instance.enabled || !SingletonComponent<AiManager>.Instance.UseCover)
+		{
+			return false;
+		}
+		if (UnityEngine.Time.time > timer)
+		{
+			timer = UnityEngine.Time.time + 0.1f * AI.npc_cover_info_tick_rate_multiplier;
+			if (volume == null || !volume.Contains(position))
+			{
+				volume = SingletonComponent<AiManager>.Instance.GetCoverVolumeContaining(position);
+				if (volume == null)
+				{
+					volume = AiManager.CreateNewCoverVolume(position, (!(AiContext.AiLocationManager != null)) ? null : AiContext.AiLocationManager.CoverPointGroup);
+				}
+			}
+		}
+		if (volume != null)
+		{
+			if (coverPoints.Count > 0)
+			{
+				coverPoints.Clear();
+			}
+			float num = MaxDistanceToCover * MaxDistanceToCover;
+			foreach (CoverPoint coverPoint in volume.CoverPoints)
+			{
+				if (!coverPoint.IsReserved && !coverPoint.IsCompromised)
+				{
+					Vector3 position2 = coverPoint.Position;
+					float sqrMagnitude = (position - position2).sqrMagnitude;
+					if (!(sqrMagnitude > num))
+					{
+						coverPoints.Add(coverPoint);
+					}
+				}
+			}
+			if (coverPoints.Count > 1)
+			{
+				coverPoints.Sort(coverPointComparer);
+			}
+			return true;
+		}
+		return false;
+	}
+
+	public override void OnSensation(Sensation sensation)
+	{
+		if (AiContext == null || this is NPCMurderer)
+		{
+			return;
+		}
+		BasePlayer initiatorPlayer = sensation.InitiatorPlayer;
+		if (OnlyTargetSensations && (initiatorPlayer == null || initiatorPlayer != AiContext.EnemyPlayer))
+		{
+			return;
+		}
+		switch (sensation.Type)
+		{
+		case SensationType.Gunshot:
+			if (sensation.DamagePotential > 0f)
+			{
+				OnSenseGunshot(sensation, initiatorPlayer);
+			}
+			else
+			{
+				OnSenseItemOfInterest(sensation);
+			}
+			break;
+		case SensationType.ThrownWeapon:
+			if (sensation.DamagePotential > 0f)
+			{
+				OnSenseThrownThreat(sensation, initiatorPlayer);
+			}
+			else
+			{
+				OnSenseItemOfInterest(sensation);
+			}
+			break;
+		}
+	}
+
+	protected virtual void OnSenseItemOfInterest(Sensation sensation)
+	{
+		if (AttackTarget == null)
+		{
+		}
+		if (sensation.InitiatorPlayer != null && AiContext.AiLocationManager != null && AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.BanditTown && Family != sensation.InitiatorPlayer.Family && InSafeZone())
+		{
+			sensation.InitiatorPlayer.MarkHostileFor(30f);
+		}
+	}
+
+	protected virtual void OnSenseThrownThreat(Sensation sensation, BasePlayer invoker)
+	{
+		if (AiContext.Memory.GetInfo(sensation.Position).Entity == null)
+		{
+			if (invoker != null)
+			{
+				UpdateTargetMemory(invoker, 1f, sensation.Position, out var _);
+			}
+			else
+			{
+				AiContext.Memory.AddDanger(sensation.Position, 1f);
+			}
+		}
+		else
+		{
+			UpdateTargetMemory(invoker, 1f, sensation.Position, out var _);
+		}
+		_lastHeardGunshotTime = UnityEngine.Time.time;
+		LastHeardGunshotDirection = (sensation.Position - base.transform.localPosition).normalized;
+		if (invoker != null && AiContext.AiLocationManager != null && AiContext.AiLocationManager.LocationType == AiLocationSpawner.SquadSpawnerLocation.BanditTown && Family != invoker.Family && InSafeZone())
+		{
+			invoker.MarkHostileFor(30f);
+		}
+	}
+
+	protected virtual void OnSenseGunshot(Sensation sensation, BasePlayer invoker)
+	{
+		if (AiContext.Memory.GetInfo(sensation.Position).Entity == null)
+		{
+			if (invoker != null)
+			{
+				UpdateTargetMemory(invoker, 1f, sensation.Position, out var _);
+			}
+			else
+			{
+				AiContext.Memory.AddDanger(sensation.Position, 1f);
+			}
+		}
+		else
+		{
+			UpdateTargetMemory(invoker, 1f, sensation.Position, out var _);
+		}
+		_lastHeardGunshotTime = UnityEngine.Time.time;
+		LastHeardGunshotDirection = (sensation.Position - base.transform.localPosition).normalized;
 	}
 }

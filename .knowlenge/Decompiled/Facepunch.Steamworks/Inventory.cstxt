@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Linq;
 using Facepunch.Steamworks;
 using Facepunch.Steamworks.Callbacks;
@@ -139,9 +138,12 @@ public class Inventory : IDisposable
 
 		public void TriggerItemDrop()
 		{
-			SteamInventoryResult_t pResultHandle = 0;
-			inventory.inventory.TriggerItemDrop(ref pResultHandle, Id);
-			inventory.inventory.DestroyResult(pResultHandle);
+			inventory.TriggerItemDrop(Id);
+		}
+
+		public void TriggerPromoDrop()
+		{
+			inventory.TriggerPromoDrop(Id);
 		}
 
 		internal void Link(Definition[] definitions)
@@ -247,7 +249,7 @@ public class Inventory : IDisposable
 		}
 	}
 
-	public struct Item : IEquatable<Item>
+	public class Item : IEquatable<Item>
 	{
 		public struct Amount
 		{
@@ -262,13 +264,36 @@ public class Inventory : IDisposable
 
 		public int DefinitionId;
 
-		public Definition Definition;
+		internal Inventory Inventory;
+
+		private Definition _cachedDefinition;
 
 		public bool TradeLocked;
 
 		private SteamInventoryUpdateHandle_t updateHandle;
 
 		public Dictionary<string, string> Properties { get; internal set; }
+
+		public Definition Definition
+		{
+			get
+			{
+				if (_cachedDefinition != null)
+				{
+					return _cachedDefinition;
+				}
+				_cachedDefinition = Inventory.FindDefinition(DefinitionId);
+				return _cachedDefinition;
+			}
+		}
+
+		internal Item(Inventory Inventory, ulong Id, int Quantity, int DefinitionId)
+		{
+			this.Inventory = Inventory;
+			this.Id = Id;
+			this.Quantity = Quantity;
+			this.DefinitionId = DefinitionId;
+		}
 
 		public bool Equals(Item other)
 		{
@@ -277,7 +302,7 @@ public class Inventory : IDisposable
 
 		public override bool Equals(object obj)
 		{
-			if (obj == null || GetType() != obj.GetType())
+			if (obj == null || (object)GetType() != obj.GetType())
 			{
 				return false;
 			}
@@ -299,11 +324,31 @@ public class Inventory : IDisposable
 			return !c1.Equals(c2);
 		}
 
+		public Result Consume(int amount = 1)
+		{
+			SteamInventoryResult_t pResultHandle = -1;
+			if (!Inventory.inventory.ConsumeItem(ref pResultHandle, Id, (uint)amount))
+			{
+				return null;
+			}
+			return new Result(Inventory, pResultHandle, pending: true);
+		}
+
+		public Result SplitStack(int quantity = 1)
+		{
+			SteamInventoryResult_t pResultHandle = -1;
+			if (!Inventory.inventory.TransferItemQuantity(ref pResultHandle, Id, (uint)quantity, ulong.MaxValue))
+			{
+				return null;
+			}
+			return new Result(Inventory, pResultHandle, pending: true);
+		}
+
 		private void UpdatingProperties()
 		{
-			if ((ulong)updateHandle == 0)
+			if ((ulong)updateHandle == 0L)
 			{
-				updateHandle = Definition.inventory.inventory.StartUpdateProperties();
+				updateHandle = Inventory.inventory.StartUpdateProperties();
 			}
 		}
 
@@ -311,44 +356,44 @@ public class Inventory : IDisposable
 		{
 			UpdatingProperties();
 			Properties[name] = value.ToString();
-			return Definition.inventory.inventory.SetProperty(updateHandle, Id, name, value);
+			return Inventory.inventory.SetProperty(updateHandle, Id, name, value);
 		}
 
 		public bool SetProperty(string name, bool value)
 		{
 			UpdatingProperties();
 			Properties[name] = value.ToString();
-			return Definition.inventory.inventory.SetProperty0(updateHandle, Id, name, value);
+			return Inventory.inventory.SetProperty0(updateHandle, Id, name, value);
 		}
 
 		public bool SetProperty(string name, long value)
 		{
 			UpdatingProperties();
 			Properties[name] = value.ToString();
-			return Definition.inventory.inventory.SetProperty1(updateHandle, Id, name, value);
+			return Inventory.inventory.SetProperty1(updateHandle, Id, name, value);
 		}
 
 		public bool SetProperty(string name, float value)
 		{
 			UpdatingProperties();
 			Properties[name] = value.ToString();
-			return Definition.inventory.inventory.SetProperty2(updateHandle, Id, name, value);
+			return Inventory.inventory.SetProperty2(updateHandle, Id, name, value);
 		}
 
 		public bool SubmitProperties()
 		{
-			if ((ulong)updateHandle == 0)
+			if ((ulong)updateHandle == 0L)
 			{
 				throw new Exception("SubmitProperties called without updating properties");
 			}
 			try
 			{
 				SteamInventoryResult_t pResultHandle = -1;
-				if (!Definition.inventory.inventory.SubmitUpdateProperties(updateHandle, ref pResultHandle))
+				if (!Inventory.inventory.SubmitUpdateProperties(updateHandle, ref pResultHandle))
 				{
 					return false;
 				}
-				Definition.inventory.inventory.DestroyResult(pResultHandle);
+				Inventory.inventory.DestroyResult(pResultHandle);
 				return true;
 			}
 			finally
@@ -366,9 +411,9 @@ public class Inventory : IDisposable
 
 		public Action<Result> OnResult;
 
-		protected bool _gotResult = false;
+		protected bool _gotResult;
 
-		private SteamInventoryResult_t Handle { get; set; }
+		private SteamInventoryResult_t Handle { get; set; } = -1;
 
 		public Item[] Items { get; internal set; }
 
@@ -471,9 +516,9 @@ public class Inventory : IDisposable
 			}
 		}
 
-		internal void OnSteamResult(SteamInventoryResultReady_t data, bool error)
+		internal void OnSteamResult(SteamInventoryResultReady_t data)
 		{
-			if (data.Result == SteamNative.Result.OK && !error)
+			if (data.Result == SteamNative.Result.OK)
 			{
 				Fill();
 			}
@@ -499,8 +544,11 @@ public class Inventory : IDisposable
 
 		public void Dispose()
 		{
-			inventory.inventory.DestroyResult(Handle);
-			Handle = -1;
+			if ((int)Handle != -1 && inventory != null)
+			{
+				inventory.inventory.DestroyResult(Handle);
+				Handle = -1;
+			}
 			inventory = null;
 		}
 	}
@@ -513,11 +561,9 @@ public class Inventory : IDisposable
 
 	public DateTime SerializedExpireTime;
 
-	internal uint LastTimestamp = 0u;
+	internal uint LastTimestamp;
 
 	internal SteamInventory inventory;
-
-	private Stopwatch fetchRetryTimer;
 
 	public Definition[] Definitions;
 
@@ -527,6 +573,10 @@ public class Inventory : IDisposable
 	{
 		get
 		{
+			if (Definitions == null)
+			{
+				yield break;
+			}
 			for (int i = 0; i < Definitions.Length; i++)
 			{
 				if (Definitions[i].LocalPrice > 0.0)
@@ -539,39 +589,65 @@ public class Inventory : IDisposable
 
 	public string Currency { get; private set; }
 
+	public event Action OnDefinitionsUpdated;
+
 	internal Inventory(BaseSteamworks steamworks, SteamInventory c, bool server)
 	{
 		IsServer = server;
 		inventory = c;
+		steamworks.RegisterCallback<SteamInventoryDefinitionUpdate_t>(onDefinitionsUpdated);
 		Result.Pending = new Dictionary<int, Result>();
-		inventory.LoadItemDefinitions();
 		FetchItemDefinitions();
+		LoadDefinitions();
 		UpdatePrices();
 		if (!server)
 		{
-			SteamInventoryResultReady_t.RegisterCallback(steamworks, onResultReady);
-			SteamInventoryFullUpdate_t.RegisterCallback(steamworks, onFullUpdate);
+			steamworks.RegisterCallback<SteamInventoryResultReady_t>(onResultReady);
+			steamworks.RegisterCallback<SteamInventoryFullUpdate_t>(onFullUpdate);
 			Refresh();
 		}
 	}
 
-	private void onFullUpdate(SteamInventoryFullUpdate_t data, bool error)
+	private void onDefinitionsUpdated(SteamInventoryDefinitionUpdate_t obj)
 	{
-		if (!error)
+		LoadDefinitions();
+		UpdatePrices();
+		if (this.OnDefinitionsUpdated != null)
 		{
-			Result result = new Result(this, data.Handle, pending: false);
-			result.Fill();
-			onResult(result, serialize: true);
+			this.OnDefinitionsUpdated();
 		}
 	}
 
-	private void onResultReady(SteamInventoryResultReady_t data, bool error)
+	private bool LoadDefinitions()
+	{
+		SteamItemDef_t[] itemDefinitionIDs = inventory.GetItemDefinitionIDs();
+		if (itemDefinitionIDs == null)
+		{
+			return false;
+		}
+		Definitions = itemDefinitionIDs.Select((SteamItemDef_t x) => CreateDefinition(x)).ToArray();
+		Definition[] definitions = Definitions;
+		for (int i = 0; i < definitions.Length; i++)
+		{
+			definitions[i].Link(Definitions);
+		}
+		return true;
+	}
+
+	private void onFullUpdate(SteamInventoryFullUpdate_t data)
+	{
+		Result result = new Result(this, data.Handle, pending: false);
+		result.Fill();
+		onResult(result, serialize: true);
+	}
+
+	private void onResultReady(SteamInventoryResultReady_t data)
 	{
 		if (Result.Pending.ContainsKey(data.Handle))
 		{
 			Result result = Result.Pending[data.Handle];
-			result.OnSteamResult(data, error);
-			if (!error && data.Result == SteamNative.Result.OK)
+			result.OnSteamResult(data);
+			if (data.Result == SteamNative.Result.OK)
 			{
 				onResult(result, serialize: false);
 			}
@@ -646,33 +722,13 @@ public class Inventory : IDisposable
 		return new Definition(this, id);
 	}
 
-	internal void FetchItemDefinitions()
+	public void FetchItemDefinitions()
 	{
-		SteamItemDef_t[] itemDefinitionIDs = inventory.GetItemDefinitionIDs();
-		if (itemDefinitionIDs != null)
-		{
-			Definitions = itemDefinitionIDs.Select((SteamItemDef_t x) => CreateDefinition(x)).ToArray();
-			Definition[] definitions = Definitions;
-			foreach (Definition definition in definitions)
-			{
-				definition.Link(Definitions);
-			}
-		}
+		inventory.LoadItemDefinitions();
 	}
 
 	public void Update()
 	{
-		if (Definitions == null && (fetchRetryTimer == null || !(fetchRetryTimer.Elapsed.TotalSeconds < 10.0)))
-		{
-			if (fetchRetryTimer == null)
-			{
-				fetchRetryTimer = Stopwatch.StartNew();
-			}
-			fetchRetryTimer.Reset();
-			fetchRetryTimer.Start();
-			FetchItemDefinitions();
-			inventory.LoadItemDefinitions();
-		}
 	}
 
 	public static float PriceCategoryToFloat(string price)
@@ -696,7 +752,14 @@ public class Inventory : IDisposable
 		{
 			return null;
 		}
-		return Definitions.FirstOrDefault((Definition x) => x.Id == DefinitionId);
+		for (int i = 0; i < Definitions.Length; i++)
+		{
+			if (Definitions[i].Id == DefinitionId)
+			{
+				return Definitions[i];
+			}
+		}
+		return null;
 	}
 
 	public unsafe Result Deserialize(byte[] data, int dataLength = -1)
@@ -764,12 +827,7 @@ public class Inventory : IDisposable
 
 	public Result SplitStack(Item item, int quantity = 1)
 	{
-		SteamInventoryResult_t pResultHandle = -1;
-		if (!inventory.TransferItemQuantity(ref pResultHandle, item.Id, (uint)quantity, ulong.MaxValue))
-		{
-			return null;
-		}
-		return new Result(this, pResultHandle, pending: true);
+		return item.SplitStack(quantity);
 	}
 
 	public Result Stack(Item source, Item dest, int quantity = 1)
@@ -811,7 +869,7 @@ public class Inventory : IDisposable
 			return result2;
 		}).ToArray();
 		uint[] array = source.Select((IGrouping<int, Definition> x) => (uint)x.Count()).ToArray();
-		CallbackHandle callbackHandle = inventory.StartPurchase(pArrayItemDefs, array, (uint)array.Length, delegate(SteamInventoryStartPurchaseResult_t result, bool error)
+		return inventory.StartPurchase(pArrayItemDefs, array, (uint)array.Length, delegate(SteamInventoryStartPurchaseResult_t result, bool error)
 		{
 			if (error)
 			{
@@ -821,8 +879,7 @@ public class Inventory : IDisposable
 			{
 				callback?.Invoke(result.OrderID, result.TransID);
 			}
-		});
-		return callbackHandle != null;
+		}) != null;
 	}
 
 	public void UpdatePrices()
@@ -844,6 +901,27 @@ public class Inventory : IDisposable
 		});
 	}
 
+	public void TriggerPromoDrop(int definitionId)
+	{
+		SteamInventoryResult_t pResultHandle = 0;
+		inventory.AddPromoItem(ref pResultHandle, definitionId);
+		inventory.DestroyResult(pResultHandle);
+	}
+
+	public void TriggerItemDrop(int definitionId)
+	{
+		SteamInventoryResult_t pResultHandle = 0;
+		inventory.TriggerItemDrop(ref pResultHandle, definitionId);
+		inventory.DestroyResult(pResultHandle);
+	}
+
+	public void GrantAllPromoItems()
+	{
+		SteamInventoryResult_t pResultHandle = 0;
+		inventory.GrantPromoItems(ref pResultHandle);
+		inventory.DestroyResult(pResultHandle);
+	}
+
 	internal Item ItemFrom(SteamInventoryResult_t handle, SteamItemDetails_t detail, int index)
 	{
 		Dictionary<string, string> dictionary = new Dictionary<string, string>();
@@ -858,13 +936,9 @@ public class Inventory : IDisposable
 				}
 			}
 		}
-		Item result = default(Item);
-		result.Quantity = detail.Quantity;
-		result.Id = detail.ItemId;
-		result.DefinitionId = detail.Definition;
-		result.TradeLocked = (detail.Flags & 1) != 0;
-		result.Definition = FindDefinition(detail.Definition);
-		result.Properties = dictionary;
-		return result;
+		return new Item(this, detail.ItemId, detail.Quantity, detail.Definition)
+		{
+			Properties = dictionary
+		};
 	}
 }

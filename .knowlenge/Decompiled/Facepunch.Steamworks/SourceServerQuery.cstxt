@@ -1,339 +1,191 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
+using System.Threading;
+using Facepunch.Steamworks;
 
 internal class SourceServerQuery : IDisposable
 {
-	public class PlayersResponse
-	{
-		public class Player
-		{
-			public string name { get; set; }
+	public static List<SourceServerQuery> Current = new List<SourceServerQuery>();
 
-			public int score { get; set; }
+	private static readonly byte[] A2S_SERVERQUERY_GETCHALLENGE = new byte[5] { 85, 255, 255, 255, 255 };
 
-			public float playtime { get; set; }
-		}
+	private static readonly byte A2S_RULES = 86;
 
-		public short player_count;
+	public volatile bool IsRunning;
 
-		public List<Player> players = new List<Player>();
-	}
+	public volatile bool IsSuccessful;
+
+	private ServerList.Server Server;
+
+	private UdpClient udpClient;
 
 	private IPEndPoint endPoint;
 
-	private Socket socket;
+	private Thread thread;
 
-	private UdpClient client;
+	private byte[] _challengeBytes;
 
-	private int send_timeout = 2500;
+	private Dictionary<string, string> rules = new Dictionary<string, string>();
 
-	private int receive_timeout = 2500;
+	private byte[] readBuffer = new byte[4096];
 
-	private byte[] raw_data;
+	private byte[] sendBuffer = new byte[1024];
 
-	private int offset = 0;
-
-	private readonly byte[] FFFFFFFF = new byte[4] { 255, 255, 255, 255 };
-
-	public SourceServerQuery(string ip, int port)
+	public static void Cycle()
 	{
-		endPoint = new IPEndPoint(IPAddress.Parse(ip), port);
-	}
-
-	public PlayersResponse GetPlayerList()
-	{
-		GetSocket();
-		offset = 5;
-		try
+		if (Current.Count != 0)
 		{
-			PlayersResponse playersResponse = new PlayersResponse();
-			byte[] challenge = GetChallenge(85);
-			byte[] array = new byte[challenge.Length + FFFFFFFF.Length + 1];
-			Array.Copy(FFFFFFFF, 0, array, 0, FFFFFFFF.Length);
-			array[FFFFFFFF.Length] = 85;
-			Array.Copy(challenge, 0, array, FFFFFFFF.Length + 1, challenge.Length);
-			socket.Send(array);
-			raw_data = new byte[2048];
-			socket.Receive(raw_data);
-			byte b = ReadByte();
-			for (int i = 0; i < b; i++)
+			for (int num = Current.Count; num > 0; num--)
 			{
-				ReadByte();
-				PlayersResponse.Player player = new PlayersResponse.Player();
-				player.name = ReadString();
-				player.score = ReadInt32();
-				player.playtime = ReadFloat();
-				playersResponse.players.Add(player);
+				Current[num - 1].Update();
 			}
-			playersResponse.player_count = b;
-			return playersResponse;
-		}
-		catch (SocketException)
-		{
-			return null;
 		}
 	}
 
-	public Dictionary<string, string> GetRules()
+	public SourceServerQuery(ServerList.Server server, IPAddress address, int queryPort)
 	{
-		GetClient();
+		Server = server;
+		endPoint = new IPEndPoint(address, queryPort);
+		Current.Add(this);
+		IsRunning = true;
+		IsSuccessful = false;
+		thread = new Thread(ThreadedStart);
+		thread.Start();
+	}
+
+	private void Update()
+	{
+		if (!IsRunning)
+		{
+			Current.Remove(this);
+			Server.OnServerRulesReceiveFinished(rules, IsSuccessful);
+		}
+	}
+
+	private void ThreadedStart(object obj)
+	{
 		try
 		{
-			Dictionary<string, string> dictionary = new Dictionary<string, string>();
-			byte[] challenge = GetChallenge(86, socket: false);
-			byte[] array = new byte[challenge.Length + FFFFFFFF.Length + 1];
-			Array.Copy(FFFFFFFF, 0, array, 0, FFFFFFFF.Length);
-			array[FFFFFFFF.Length] = 86;
-			Array.Copy(challenge, 0, array, FFFFFFFF.Length + 1, challenge.Length);
-			client.Send(array, array.Length);
-			byte[] array2 = new byte[4096];
-			raw_data = client.Receive(ref endPoint);
-			int num = raw_data.Length;
-			offset = 0;
-			int paket = ReadInt32();
-			int num2 = ReadInt32();
-			offset = 4;
-			if (PacketIsSplit(paket))
+			using (this.udpClient = new UdpClient())
 			{
-				bool flag = false;
-				int num3 = 1;
-				int packetChecksum = 0;
-				int num4 = 0;
-				int uncompressedSize = 0;
-				List<byte[]> list = new List<byte[]>();
-				int num5;
-				do
-				{
-					int value = ReverseBytes(ReadInt32());
-					flag = PacketIsCompressed(value);
-					num5 = ReadByte();
-					int num6 = ReadByte() + 1;
-					short num7 = ReadInt16();
-					num7 -= 4;
-					if (num3 == 1)
-					{
-						for (int i = 0; i < num5; i++)
-						{
-							list.Add(new byte[0]);
-						}
-					}
-					if (flag)
-					{
-						uncompressedSize = ReverseBytes(ReadInt32());
-						packetChecksum = ReverseBytes(ReadInt32());
-					}
-					if (num6 == 1)
-					{
-						ReadInt32();
-					}
-					byte[] array3 = new byte[num7];
-					list[num6 - 1] = ReadBytes();
-					if (list[num6 - 1].Length - 1 > 0 && list[num6 - 1][list[num6 - 1].Length - 1] != 0)
-					{
-						list[num6 - 1][list[num6 - 1].Length - 1] = 0;
-					}
-					offset = 0;
-					if (num3 < num5)
-					{
-						raw_data = client.Receive(ref endPoint);
-						num = raw_data.Length;
-						num4 = ReadInt32();
-						num3++;
-					}
-					else
-					{
-						num = 0;
-					}
-				}
-				while (num3 <= num5 && num > 0 && num4 == -2);
-				array2 = ((!flag) ? ReassemblePacket(list, isCompressed: false, 0, 0) : ReassemblePacket(list, isCompressed: true, uncompressedSize, packetChecksum));
+				this.udpClient.Client.SendTimeout = 3000;
+				this.udpClient.Client.ReceiveTimeout = 3000;
+				this.udpClient.Connect(endPoint);
+				GetRules();
+				IsSuccessful = true;
 			}
-			else
-			{
-				array2 = raw_data;
-			}
-			raw_data = array2;
-			offset++;
-			short num8 = ReadInt16();
-			for (int j = 0; j < num8; j++)
-			{
-				string key = ReadString();
-				string value2 = ReadString();
-				if (!dictionary.ContainsKey(key))
-				{
-					dictionary.Add(key, value2);
-				}
-			}
-			return dictionary;
 		}
-		catch (SocketException value3)
+		catch (Exception)
 		{
-			Console.WriteLine(value3);
-			return null;
+			IsSuccessful = false;
 		}
+		this.udpClient = null;
+		IsRunning = false;
+	}
+
+	private void GetRules()
+	{
+		GetChallengeData();
+		_challengeBytes[0] = A2S_RULES;
+		Send(_challengeBytes);
+		using BinaryReader binaryReader = new BinaryReader(new MemoryStream(Receive()));
+		if (binaryReader.ReadByte() != 69)
+		{
+			throw new Exception("Invalid data received in response to A2S_RULES request");
+		}
+		ushort num = binaryReader.ReadUInt16();
+		for (int i = 0; i < num; i++)
+		{
+			rules.Add(binaryReader.ReadNullTerminatedUTF8String(readBuffer), binaryReader.ReadNullTerminatedUTF8String(readBuffer));
+		}
+	}
+
+	private byte[] Receive()
+	{
+		byte[][] array = null;
+		byte b = 0;
+		byte b2 = 1;
+		do
+		{
+			byte[] array2 = udpClient.Receive(ref endPoint);
+			using BinaryReader binaryReader = new BinaryReader(new MemoryStream(array2));
+			switch (binaryReader.ReadInt32())
+			{
+			case -1:
+			{
+				byte[] array4 = new byte[array2.Length - binaryReader.BaseStream.Position];
+				Buffer.BlockCopy(array2, (int)binaryReader.BaseStream.Position, array4, 0, array4.Length);
+				return array4;
+			}
+			case -2:
+			{
+				binaryReader.ReadInt32();
+				b = binaryReader.ReadByte();
+				b2 = binaryReader.ReadByte();
+				binaryReader.ReadInt32();
+				if (array == null)
+				{
+					array = new byte[b2][];
+				}
+				byte[] array3 = new byte[array2.Length - binaryReader.BaseStream.Position];
+				Buffer.BlockCopy(array2, (int)binaryReader.BaseStream.Position, array3, 0, array3.Length);
+				array[b] = array3;
+				break;
+			}
+			default:
+				throw new Exception("Invalid Header");
+			}
+		}
+		while (array.Any((byte[] p) => p == null));
+		return Combine(array);
+	}
+
+	private void GetChallengeData()
+	{
+		if (_challengeBytes == null)
+		{
+			Send(A2S_SERVERQUERY_GETCHALLENGE);
+			byte[] array = Receive();
+			if (array[0] != 65)
+			{
+				throw new Exception("Invalid Challenge");
+			}
+			_challengeBytes = array;
+		}
+	}
+
+	private void Send(byte[] message)
+	{
+		sendBuffer[0] = byte.MaxValue;
+		sendBuffer[1] = byte.MaxValue;
+		sendBuffer[2] = byte.MaxValue;
+		sendBuffer[3] = byte.MaxValue;
+		Buffer.BlockCopy(message, 0, sendBuffer, 4, message.Length);
+		udpClient.Send(sendBuffer, message.Length + 4);
+	}
+
+	private byte[] Combine(byte[][] arrays)
+	{
+		byte[] array = new byte[arrays.Sum((byte[] a) => a.Length)];
+		int num = 0;
+		foreach (byte[] array2 in arrays)
+		{
+			Buffer.BlockCopy(array2, 0, array, num, array2.Length);
+			num += array2.Length;
+		}
+		return array;
 	}
 
 	public void Dispose()
 	{
-		if (socket != null)
+		if (thread != null && thread.IsAlive)
 		{
-			socket.Close();
+			thread.Abort();
 		}
-		if (client != null)
-		{
-			client.Close();
-		}
-	}
-
-	private void GetSocket()
-	{
-		if (socket == null)
-		{
-			socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-			socket.SendTimeout = send_timeout;
-			socket.ReceiveTimeout = receive_timeout;
-			socket.Connect(endPoint);
-		}
-	}
-
-	private void GetClient()
-	{
-		if (client == null)
-		{
-			client = new UdpClient();
-			client.Connect(endPoint);
-			client.DontFragment = true;
-			client.Client.SendTimeout = send_timeout;
-			client.Client.ReceiveTimeout = receive_timeout;
-		}
-	}
-
-	private byte[] ReassemblePacket(List<byte[]> splitPackets, bool isCompressed, int uncompressedSize, int packetChecksum)
-	{
-		byte[] array = new byte[0];
-		foreach (byte[] splitPacket in splitPackets)
-		{
-			if (splitPacket == null)
-			{
-				throw new Exception();
-			}
-			byte[] array2 = array;
-			array = new byte[array2.Length + splitPacket.Length];
-			MemoryStream memoryStream = new MemoryStream(array);
-			memoryStream.Write(array2, 0, array2.Length);
-			memoryStream.Write(splitPacket, 0, splitPacket.Length);
-		}
-		if (isCompressed)
-		{
-			throw new NotImplementedException();
-		}
-		return array;
-	}
-
-	private int ReverseBytes(int value)
-	{
-		byte[] bytes = BitConverter.GetBytes(value);
-		if (BitConverter.IsLittleEndian)
-		{
-			Array.Reverse(bytes);
-		}
-		return BitConverter.ToInt32(bytes, 0);
-	}
-
-	private bool PacketIsCompressed(int value)
-	{
-		return (value & 0x8000) != 0;
-	}
-
-	private bool PacketIsSplit(int paket)
-	{
-		return paket == -2;
-	}
-
-	private byte[] GetChallenge(byte type, bool socket = true)
-	{
-		byte[] array = new byte[FFFFFFFF.Length + FFFFFFFF.Length + 1];
-		Array.Copy(FFFFFFFF, 0, array, 0, FFFFFFFF.Length);
-		array[FFFFFFFF.Length] = type;
-		Array.Copy(FFFFFFFF, 0, array, FFFFFFFF.Length + 1, FFFFFFFF.Length);
-		byte[] array2 = new byte[24];
-		byte[] array3 = new byte[4];
-		if (socket)
-		{
-			this.socket.Send(array);
-			this.socket.Receive(array2);
-		}
-		else
-		{
-			client.Send(array, array.Length);
-			array2 = client.Receive(ref endPoint);
-		}
-		Array.Copy(array2, 5, array3, 0, 4);
-		return array3;
-	}
-
-	private byte ReadByte()
-	{
-		byte[] array = new byte[1];
-		Array.Copy(raw_data, offset, array, 0, 1);
-		offset++;
-		return array[0];
-	}
-
-	private byte[] ReadBytes()
-	{
-		int num = raw_data.Length - offset - 4;
-		if (num < 1)
-		{
-			return new byte[0];
-		}
-		byte[] array = new byte[num];
-		Array.Copy(raw_data, offset, array, 0, raw_data.Length - offset - 4);
-		offset += raw_data.Length - offset - 4;
-		return array;
-	}
-
-	private int ReadInt32()
-	{
-		byte[] array = new byte[4];
-		Array.Copy(raw_data, offset, array, 0, 4);
-		offset += 4;
-		return BitConverter.ToInt32(array, 0);
-	}
-
-	private short ReadInt16()
-	{
-		byte[] array = new byte[2];
-		Array.Copy(raw_data, offset, array, 0, 2);
-		offset += 2;
-		return BitConverter.ToInt16(array, 0);
-	}
-
-	private float ReadFloat()
-	{
-		byte[] array = new byte[4];
-		Array.Copy(raw_data, offset, array, 0, 4);
-		offset += 4;
-		return BitConverter.ToSingle(array, 0);
-	}
-
-	private string ReadString()
-	{
-		byte[] array = new byte[1] { 1 };
-		string text = "";
-		while (array[0] != 0 && offset != raw_data.Length)
-		{
-			Array.Copy(raw_data, offset, array, 0, 1);
-			offset++;
-			if (array[0] != 0)
-			{
-				text += Encoding.UTF8.GetString(array);
-			}
-		}
-		return text;
+		thread = null;
 	}
 }

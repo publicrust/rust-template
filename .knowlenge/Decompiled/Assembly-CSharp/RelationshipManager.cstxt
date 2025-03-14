@@ -1,0 +1,513 @@
+using System.Collections.Generic;
+using Facepunch;
+using ProtoBuf;
+using UnityEngine;
+
+public class RelationshipManager : BaseEntity
+{
+	public class PlayerTeam
+	{
+		public ulong teamID;
+
+		public string teamName;
+
+		public ulong teamLeader;
+
+		public List<ulong> members = new List<ulong>();
+
+		public List<ulong> invites = new List<ulong>();
+
+		public BasePlayer GetLeader()
+		{
+			return FindByID(teamLeader);
+		}
+
+		public void SendInvite(BasePlayer player)
+		{
+			if (invites.Count > 8)
+			{
+				invites.RemoveRange(0, 1);
+			}
+			BasePlayer basePlayer = FindByID(teamLeader);
+			if (!(basePlayer == null))
+			{
+				invites.Add(player.userID);
+				player.ClientRPCPlayer(null, player, "CLIENT_PendingInvite", basePlayer.displayName, teamID);
+			}
+		}
+
+		public void AcceptInvite(BasePlayer player)
+		{
+			if (invites.Contains(player.userID))
+			{
+				invites.Remove(player.userID);
+				AddPlayer(player);
+				player.ClearPendingInvite();
+			}
+		}
+
+		public void RejectInvite(BasePlayer player)
+		{
+			player.ClearPendingInvite();
+			invites.Remove(player.userID);
+		}
+
+		public BasePlayer GetMember(ulong userID)
+		{
+			return FindByID(userID);
+		}
+
+		public BasePlayer GetMember(int index)
+		{
+			if (index >= members.Count)
+			{
+				return null;
+			}
+			return GetMember(members[index]);
+		}
+
+		public void Cleanup()
+		{
+			for (int num = members.Count - 1; num >= 0; num--)
+			{
+				ulong num2 = members[num];
+				BasePlayer basePlayer = FindByID(num2);
+				if (basePlayer == null)
+				{
+					members.Remove(num2);
+				}
+			}
+		}
+
+		public bool AddPlayer(BasePlayer player)
+		{
+			ulong userID = player.userID;
+			if (members.Contains(userID))
+			{
+				return false;
+			}
+			if (player.currentTeam != 0)
+			{
+				return false;
+			}
+			if (members.Count >= maxTeamSize)
+			{
+				return false;
+			}
+			player.currentTeam = teamID;
+			members.Add(userID);
+			MarkDirty();
+			player.SendNetworkUpdate();
+			return true;
+		}
+
+		public bool RemovePlayer(ulong playerID)
+		{
+			if (members.Contains(playerID))
+			{
+				members.Remove(playerID);
+				BasePlayer basePlayer = FindByID(playerID);
+				if (basePlayer != null)
+				{
+					basePlayer.ClearTeam();
+				}
+				if (teamLeader == playerID)
+				{
+					if (members.Count > 0)
+					{
+						SetTeamLeader(members[0]);
+					}
+					else
+					{
+						Disband();
+					}
+				}
+				MarkDirty();
+				return true;
+			}
+			return false;
+		}
+
+		public void SetTeamLeader(ulong newTeamLeader)
+		{
+			teamLeader = newTeamLeader;
+			MarkDirty();
+		}
+
+		public void Disband()
+		{
+			Instance.DisbandTeam(this);
+		}
+
+		public void MarkDirty()
+		{
+			foreach (ulong member in members)
+			{
+				BasePlayer basePlayer = FindByID(member);
+				if (basePlayer != null)
+				{
+					basePlayer.UpdateTeam(teamID);
+				}
+			}
+		}
+	}
+
+	[ServerVar]
+	public static int maxTeamSize = 8;
+
+	public static RelationshipManager _instance;
+
+	public Dictionary<ulong, BasePlayer> cachedPlayers = new Dictionary<ulong, BasePlayer>();
+
+	public Dictionary<ulong, PlayerTeam> playerTeams = new Dictionary<ulong, PlayerTeam>();
+
+	private ulong lastTeamIndex = 1uL;
+
+	public static RelationshipManager Instance => _instance;
+
+	public void OnEnable()
+	{
+		if (!base.isClient)
+		{
+			if (_instance != null)
+			{
+				Debug.LogError("Major fuckup! RelationshipManager spawned twice, Contact Developers!");
+				Object.Destroy(base.gameObject);
+			}
+			else
+			{
+				_instance = this;
+			}
+		}
+	}
+
+	public void OnDestroy()
+	{
+		_instance = null;
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		info.msg.relationshipManager = Pool.Get<ProtoBuf.RelationshipManager>();
+		info.msg.relationshipManager.maxTeamSize = maxTeamSize;
+		if (!info.forDisk)
+		{
+			return;
+		}
+		info.msg.relationshipManager.lastTeamIndex = lastTeamIndex;
+		info.msg.relationshipManager.teamList = Pool.GetList<ProtoBuf.PlayerTeam>();
+		foreach (KeyValuePair<ulong, PlayerTeam> playerTeam2 in playerTeams)
+		{
+			PlayerTeam value = playerTeam2.Value;
+			if (value == null)
+			{
+				continue;
+			}
+			ProtoBuf.PlayerTeam playerTeam = Pool.Get<ProtoBuf.PlayerTeam>();
+			playerTeam.teamLeader = value.teamLeader;
+			playerTeam.teamID = value.teamID;
+			playerTeam.teamName = value.teamName;
+			playerTeam.members = Pool.GetList<ProtoBuf.PlayerTeam.TeamMember>();
+			foreach (ulong member in value.members)
+			{
+				ProtoBuf.PlayerTeam.TeamMember teamMember = Pool.Get<ProtoBuf.PlayerTeam.TeamMember>();
+				BasePlayer basePlayer = FindByID(member);
+				teamMember.displayName = ((!(basePlayer != null)) ? "DEAD" : basePlayer.displayName);
+				teamMember.userID = member;
+				playerTeam.members.Add(teamMember);
+			}
+			info.msg.relationshipManager.teamList.Add(playerTeam);
+		}
+	}
+
+	public void DisbandTeam(PlayerTeam teamToDisband)
+	{
+		playerTeams.Remove(teamToDisband.teamID);
+		Pool.Free(ref teamToDisband);
+	}
+
+	public static BasePlayer FindByID(ulong userID)
+	{
+		BasePlayer value = null;
+		if (Instance.cachedPlayers.TryGetValue(userID, out value))
+		{
+			if (value != null)
+			{
+				return value;
+			}
+			Instance.cachedPlayers.Remove(userID);
+		}
+		BasePlayer basePlayer = BasePlayer.activePlayerList.Find((BasePlayer x) => x.userID == userID);
+		if (!basePlayer)
+		{
+			basePlayer = BasePlayer.sleepingPlayerList.Find((BasePlayer x) => x.userID == userID);
+		}
+		if (basePlayer != null)
+		{
+			Instance.cachedPlayers.Add(userID, basePlayer);
+		}
+		return basePlayer;
+	}
+
+	public PlayerTeam FindTeam(ulong TeamID)
+	{
+		if (playerTeams.ContainsKey(TeamID))
+		{
+			return playerTeams[TeamID];
+		}
+		return null;
+	}
+
+	public PlayerTeam CreateTeam()
+	{
+		PlayerTeam playerTeam = Pool.Get<PlayerTeam>();
+		playerTeam.teamID = lastTeamIndex;
+		playerTeams.Add(lastTeamIndex, playerTeam);
+		lastTeamIndex++;
+		return playerTeam;
+	}
+
+	[ServerUserVar]
+	public static void trycreateteam(ConsoleSystem.Arg arg)
+	{
+		if (maxTeamSize == 0)
+		{
+			arg.ReplyWith("Teams are disabled on this server");
+			return;
+		}
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer.currentTeam == 0)
+		{
+			PlayerTeam playerTeam = Instance.CreateTeam();
+			playerTeam.teamLeader = basePlayer.userID;
+			playerTeam.AddPlayer(basePlayer);
+		}
+	}
+
+	[ServerUserVar]
+	public static void promote(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer.currentTeam == 0)
+		{
+			return;
+		}
+		BasePlayer lookingAtPlayer = GetLookingAtPlayer(basePlayer);
+		if (!(lookingAtPlayer == null) && !lookingAtPlayer.IsDead() && !(lookingAtPlayer == basePlayer) && lookingAtPlayer.currentTeam == basePlayer.currentTeam)
+		{
+			PlayerTeam playerTeam = Instance.playerTeams[basePlayer.currentTeam];
+			if (playerTeam != null && playerTeam.teamLeader == basePlayer.userID)
+			{
+				playerTeam.SetTeamLeader(lookingAtPlayer.userID);
+			}
+		}
+	}
+
+	[ServerUserVar]
+	public static void leaveteam(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (!(basePlayer == null) && basePlayer.currentTeam != 0)
+		{
+			PlayerTeam playerTeam = Instance.FindTeam(basePlayer.currentTeam);
+			if (playerTeam != null)
+			{
+				playerTeam.RemovePlayer(basePlayer.userID);
+				basePlayer.ClearTeam();
+			}
+		}
+	}
+
+	[ServerUserVar]
+	public static void acceptinvite(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (!(basePlayer == null) && basePlayer.currentTeam == 0)
+		{
+			ulong uLong = arg.GetULong(0, 0uL);
+			PlayerTeam playerTeam = Instance.FindTeam(uLong);
+			if (playerTeam == null)
+			{
+				basePlayer.ClearPendingInvite();
+			}
+			else
+			{
+				playerTeam.AcceptInvite(basePlayer);
+			}
+		}
+	}
+
+	[ServerUserVar]
+	public static void rejectinvite(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (!(basePlayer == null) && basePlayer.currentTeam == 0)
+		{
+			ulong uLong = arg.GetULong(0, 0uL);
+			PlayerTeam playerTeam = Instance.FindTeam(uLong);
+			if (playerTeam == null)
+			{
+				basePlayer.ClearPendingInvite();
+			}
+			else
+			{
+				playerTeam.RejectInvite(basePlayer);
+			}
+		}
+	}
+
+	public static BasePlayer GetLookingAtPlayer(BasePlayer source)
+	{
+		if (Physics.Raycast(source.eyes.position, source.eyes.HeadForward(), out var hitInfo, 5f, 1218652417, QueryTriggerInteraction.Ignore))
+		{
+			BaseEntity entity = RaycastHitEx.GetEntity(hitInfo);
+			if ((bool)entity)
+			{
+				return entity.GetComponent<BasePlayer>();
+			}
+		}
+		return null;
+	}
+
+	[ServerVar]
+	public static void sleeptoggle(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer == null || !Physics.Raycast(basePlayer.eyes.position, basePlayer.eyes.HeadForward(), out var hitInfo, 5f, 1218652417, QueryTriggerInteraction.Ignore))
+		{
+			return;
+		}
+		BaseEntity entity = RaycastHitEx.GetEntity(hitInfo);
+		if (!entity)
+		{
+			return;
+		}
+		BasePlayer component = entity.GetComponent<BasePlayer>();
+		if ((bool)component && component != basePlayer && !component.IsNpc)
+		{
+			if (component.IsSleeping())
+			{
+				component.EndSleeping();
+			}
+			else
+			{
+				component.StartSleeping();
+			}
+		}
+	}
+
+	[ServerUserVar]
+	public static void kickmember(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer == null)
+		{
+			return;
+		}
+		PlayerTeam playerTeam = Instance.FindTeam(basePlayer.currentTeam);
+		if (playerTeam != null && !(playerTeam.GetLeader() != basePlayer))
+		{
+			ulong uLong = arg.GetULong(0, 0uL);
+			if (basePlayer.userID != uLong)
+			{
+				playerTeam.RemovePlayer(uLong);
+			}
+		}
+	}
+
+	[ServerUserVar]
+	public static void sendinvite(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		PlayerTeam playerTeam = Instance.FindTeam(basePlayer.currentTeam);
+		if (playerTeam == null)
+		{
+			return;
+		}
+		BasePlayer leader = playerTeam.GetLeader();
+		if (leader == null || playerTeam.GetLeader() != basePlayer || !Physics.Raycast(basePlayer.eyes.position, basePlayer.eyes.HeadForward(), out var hitInfo, 5f, 1218652417, QueryTriggerInteraction.Ignore))
+		{
+			return;
+		}
+		BaseEntity entity = RaycastHitEx.GetEntity(hitInfo);
+		if ((bool)entity)
+		{
+			BasePlayer component = entity.GetComponent<BasePlayer>();
+			if ((bool)component && component != basePlayer && !component.IsNpc && component.currentTeam == 0)
+			{
+				playerTeam.SendInvite(component);
+			}
+		}
+	}
+
+	[ServerVar]
+	public static void fakeinvite(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		ulong uLong = arg.GetULong(0, 0uL);
+		PlayerTeam playerTeam = Instance.FindTeam(uLong);
+		if (playerTeam != null)
+		{
+			if (basePlayer.currentTeam != 0)
+			{
+				Debug.Log("already in team");
+			}
+			playerTeam.SendInvite(basePlayer);
+			Debug.Log("sent bot invite");
+		}
+	}
+
+	[ServerVar]
+	public static void addtoteam(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		PlayerTeam playerTeam = Instance.FindTeam(basePlayer.currentTeam);
+		if (playerTeam == null)
+		{
+			return;
+		}
+		BasePlayer leader = playerTeam.GetLeader();
+		if (leader == null || playerTeam.GetLeader() != basePlayer || !Physics.Raycast(basePlayer.eyes.position, basePlayer.eyes.HeadForward(), out var hitInfo, 5f, 1218652417, QueryTriggerInteraction.Ignore))
+		{
+			return;
+		}
+		BaseEntity entity = RaycastHitEx.GetEntity(hitInfo);
+		if ((bool)entity)
+		{
+			BasePlayer component = entity.GetComponent<BasePlayer>();
+			if ((bool)component && component != basePlayer && !component.IsNpc)
+			{
+				playerTeam.AddPlayer(component);
+			}
+		}
+	}
+
+	public static bool TeamsEnabled()
+	{
+		return maxTeamSize > 0;
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (!info.fromDisk || info.msg.relationshipManager == null)
+		{
+			return;
+		}
+		lastTeamIndex = info.msg.relationshipManager.lastTeamIndex;
+		foreach (ProtoBuf.PlayerTeam team in info.msg.relationshipManager.teamList)
+		{
+			PlayerTeam playerTeam = Pool.Get<PlayerTeam>();
+			playerTeam.teamLeader = team.teamLeader;
+			playerTeam.teamID = team.teamID;
+			playerTeam.teamName = team.teamName;
+			playerTeam.members = new List<ulong>();
+			foreach (ProtoBuf.PlayerTeam.TeamMember member in team.members)
+			{
+				playerTeam.members.Add(member.userID);
+			}
+			playerTeams[playerTeam.teamID] = playerTeam;
+		}
+	}
+}

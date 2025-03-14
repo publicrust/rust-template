@@ -147,8 +147,8 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 		Gib
 	}
 
-	[ReadOnly]
 	[Header("BaseNetworkable")]
+	[ReadOnly]
 	public uint prefabID;
 
 	[Tooltip("If enabled the entity will send to everyone on the server - regardless of position")]
@@ -165,14 +165,17 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 
 	private const bool isServersideEntity = true;
 
-	private bool _limitedNetworking;
+	public bool _limitedNetworking;
+
+	[NonSerialized]
+	public EntityRef parentEntity;
 
 	[NonSerialized]
 	public List<BaseEntity> children = new List<BaseEntity>();
 
-	private int creationFrame;
+	public int creationFrame;
 
-	private bool isSpawned;
+	public bool isSpawned;
 
 	private MemoryStream _NetworkCache;
 
@@ -261,6 +264,30 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 
 	public static Group LimboNetworkGroup => Network.Net.sv.visibility.Get(1u);
 
+	public virtual Vector3 GetNetworkPosition()
+	{
+		return base.transform.localPosition;
+	}
+
+	public virtual Quaternion GetNetworkRotation()
+	{
+		return base.transform.localRotation;
+	}
+
+	public virtual bool PhysicsDriven()
+	{
+		return false;
+	}
+
+	public float GetNetworkTime()
+	{
+		if (PhysicsDriven())
+		{
+			return UnityEngine.Time.fixedTime;
+		}
+		return UnityEngine.Time.time;
+	}
+
 	public string InvokeString()
 	{
 		StringBuilder stringBuilder = new StringBuilder();
@@ -286,11 +313,6 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 	public bool EqualNetID(BaseNetworkable other)
 	{
 		return other != null && other.net != null && net != null && other.net.ID == net.ID;
-	}
-
-	public virtual bool SupportsPooling()
-	{
-		return false;
 	}
 
 	public virtual void ResetState()
@@ -337,7 +359,10 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 		}
 		foreach (BaseEntity child in children)
 		{
-			child.net.SwitchGroup(net.group);
+			if (child.ShouldInheritNetworkGroup())
+			{
+				child.net.SwitchGroup(net.group);
+			}
 		}
 	}
 
@@ -474,13 +499,15 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 
 	public static IEnumerable<Connection> GetConnectionsWithin(Vector3 position, float distance)
 	{
-		for (int i = 0; i < Network.Net.sv.connections.Count; i++)
+		float sqrDistance = distance * distance;
+		List<Connection> connections = GlobalNetworkGroup.subscribers;
+		for (int i = 0; i < connections.Count; i++)
 		{
-			Connection c = Network.Net.sv.connections[i];
+			Connection c = connections[i];
 			if (c.active)
 			{
 				BasePlayer player = c.player as BasePlayer;
-				if (!(player == null) && !(player.Distance(position) > distance))
+				if (!(player == null) && !(player.SqrDistance(position) > sqrDistance))
 				{
 					yield return c;
 				}
@@ -526,6 +553,16 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 		{
 			child.OnNetworkLimitEnd();
 		}
+	}
+
+	public BaseEntity GetParentEntity()
+	{
+		return parentEntity.Get(isServer);
+	}
+
+	public bool HasParent()
+	{
+		return parentEntity.IsValid(isServer);
 	}
 
 	public void AddChild(BaseEntity child)
@@ -580,7 +617,7 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 		}
 		if (net.group == null)
 		{
-			return Network.Net.sv.connections;
+			return null;
 		}
 		return net.group.subscribers;
 	}
@@ -599,12 +636,13 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 		}
 		Interface.CallHook("OnEntityKill", this);
 		OnParentDestroyingEx.BroadcastOnParentDestroying(base.gameObject);
-		Term(mode);
 		DoEntityDestroy();
+		TerminateOnClient(mode);
+		TerminateOnServer();
 		EntityDestroy();
 	}
 
-	private void Term(DestroyMode mode)
+	private void TerminateOnClient(DestroyMode mode)
 	{
 		if (net != null && net.group != null && Network.Net.sv.IsConnected())
 		{
@@ -619,9 +657,8 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 		}
 	}
 
-	internal virtual void DoServerDestroy()
+	private void TerminateOnServer()
 	{
-		isSpawned = false;
 		if (net != null)
 		{
 			InvalidateNetworkCache();
@@ -630,6 +667,11 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 			StopAllCoroutines();
 			base.gameObject.SetActive(value: false);
 		}
+	}
+
+	internal virtual void DoServerDestroy()
+	{
+		isSpawned = false;
 	}
 
 	public virtual bool ShouldNetworkTo(BasePlayer player)
@@ -737,32 +779,29 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IEntity, NetworkHandl
 			return;
 		}
 		List<Connection> subscribers = GetSubscribers();
-		if (subscribers != null && subscribers.Count != 0)
+		if (subscribers == null || subscribers.Count == 0)
 		{
-			LogEntry(LogEntryType.Network, 2, "SendNetworkUpdate_Position");
-			if (Network.Net.sv.write.Start())
-			{
-				Network.Net.sv.write.PacketID(Message.Type.EntityPosition);
-				Network.Net.sv.write.EntityID(net.ID);
-				Network.Net.sv.write.Vector3(GetNetworkPosition());
-				Network.Net.sv.write.Vector3(GetNetworkRotation());
-				Network.Net.sv.write.Send(new SendInfo(subscribers)
-				{
-					method = SendMethod.ReliableUnordered,
-					priority = Priority.Immediate
-				});
-			}
+			return;
 		}
-	}
-
-	public virtual Vector3 GetNetworkPosition()
-	{
-		return base.transform.localPosition;
-	}
-
-	public virtual Vector3 GetNetworkRotation()
-	{
-		return base.transform.localRotation.eulerAngles;
+		LogEntry(LogEntryType.Network, 2, "SendNetworkUpdate_Position");
+		if (Network.Net.sv.write.Start())
+		{
+			Network.Net.sv.write.PacketID(Message.Type.EntityPosition);
+			Network.Net.sv.write.EntityID(net.ID);
+			Network.Net.sv.write.Vector3(GetNetworkPosition());
+			Network.Net.sv.write.Vector3(GetNetworkRotation().eulerAngles);
+			Network.Net.sv.write.Float(GetNetworkTime());
+			uint uid = parentEntity.uid;
+			if (uid != 0)
+			{
+				Network.Net.sv.write.EntityID(uid);
+			}
+			Network.Net.sv.write.Send(new SendInfo(subscribers)
+			{
+				method = SendMethod.ReliableUnordered,
+				priority = Priority.Immediate
+			});
+		}
 	}
 
 	private void ToStream(Stream stream, SaveInfo saveInfo)

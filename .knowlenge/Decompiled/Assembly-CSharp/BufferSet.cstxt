@@ -1,6 +1,9 @@
 using System;
+using System.Collections.Generic;
 using RustNative;
+using Unity.Collections;
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 
 public class BufferSet
 {
@@ -22,30 +25,23 @@ public class BufferSet
 
 	public Texture2D resultReadTexture;
 
-	public IntPtr readbackInst = IntPtr.Zero;
-
 	public Color[] inputData = new Color[0];
 
 	public Color32[] resultData = new Color32[0];
 
-	private bool usingFallback = true;
+	private OcclusionCulling culling;
 
-	private Material fallbackMat;
+	private const int MaxAsyncGPUReadbackRequests = 10;
 
-	private ComputeShader compute;
+	private Queue<AsyncGPUReadbackRequest> asyncRequests = new Queue<AsyncGPUReadbackRequest>();
+
+	public IntPtr readbackInst = IntPtr.Zero;
 
 	public bool Ready => resultData.Length > 0;
 
-	public void Attach(Material fallbackMat)
+	public void Attach(OcclusionCulling culling)
 	{
-		this.fallbackMat = fallbackMat;
-		usingFallback = true;
-	}
-
-	public void Attach(ComputeShader computeShader)
-	{
-		compute = computeShader;
-		usingFallback = false;
+		this.culling = culling;
 	}
 
 	public void Dispose(bool data = true)
@@ -92,14 +88,15 @@ public class BufferSet
 
 	public bool CheckResize(int count, int granularity)
 	{
-		if (count > capacity || (usingFallback && resultTexture != null && !resultTexture.IsCreated()))
+		if (count > capacity || (culling.usePixelShaderFallback && resultTexture != null && !resultTexture.IsCreated()))
 		{
 			Dispose(data: false);
-			int num = count / granularity * granularity + granularity;
-			if (usingFallback)
+			int num = capacity;
+			int num2 = count / granularity * granularity + granularity;
+			if (culling.usePixelShaderFallback)
 			{
-				width = Mathf.CeilToInt(Mathf.Sqrt(num));
-				height = Mathf.CeilToInt((float)num / (float)width);
+				width = Mathf.CeilToInt(Mathf.Sqrt(num2));
+				height = Mathf.CeilToInt((float)num2 / (float)width);
 				inputTexture = new Texture2D(width, height, TextureFormat.RGBAFloat, mipmap: false, linear: true);
 				inputTexture.name = "_Input";
 				inputTexture.filterMode = FilterMode.Point;
@@ -114,19 +111,30 @@ public class BufferSet
 				resultReadTexture.name = "_ResultRead";
 				resultReadTexture.filterMode = FilterMode.Point;
 				resultReadTexture.wrapMode = TextureWrapMode.Clamp;
-				readbackInst = RustNative.Graphics.BufferReadback.CreateForTexture(resultTexture.GetNativeTexturePtr(), (uint)width, (uint)height, (uint)resultTexture.format);
+				if (!culling.useAsyncReadAPI)
+				{
+					readbackInst = RustNative.Graphics.BufferReadback.CreateForTexture(resultTexture.GetNativeTexturePtr(), (uint)width, (uint)height, (uint)resultTexture.format);
+				}
 				capacity = width * height;
 			}
 			else
 			{
-				inputBuffer = new ComputeBuffer(num, 16);
-				resultBuffer = new ComputeBuffer(num, 4);
-				uint size = (uint)(num * 4);
-				readbackInst = RustNative.Graphics.BufferReadback.CreateForBuffer(resultBuffer.GetNativeBufferPtr(), size);
-				capacity = num;
+				inputBuffer = new ComputeBuffer(num2, 16);
+				resultBuffer = new ComputeBuffer(num2, 4);
+				if (!culling.useAsyncReadAPI)
+				{
+					uint size = (uint)(capacity * 4);
+					readbackInst = RustNative.Graphics.BufferReadback.CreateForBuffer(resultBuffer.GetNativeBufferPtr(), size);
+				}
+				capacity = num2;
 			}
 			Array.Resize(ref inputData, capacity);
 			Array.Resize(ref resultData, capacity);
+			Color32 color = new Color32(byte.MaxValue, byte.MaxValue, byte.MaxValue, byte.MaxValue);
+			for (int i = num; i < capacity; i++)
+			{
+				resultData[i] = color;
+			}
 			this.count = count;
 			return true;
 		}
@@ -135,7 +143,7 @@ public class BufferSet
 
 	public void UploadData()
 	{
-		if (usingFallback)
+		if (culling.usePixelShaderFallback)
 		{
 			inputTexture.SetPixels(inputData);
 			inputTexture.Apply();
@@ -153,25 +161,37 @@ public class BufferSet
 
 	public void Dispatch(int count)
 	{
-		if (usingFallback)
+		if (culling.usePixelShaderFallback)
 		{
 			RenderBuffer activeColorBuffer = UnityEngine.Graphics.activeColorBuffer;
 			RenderBuffer activeDepthBuffer = UnityEngine.Graphics.activeDepthBuffer;
-			fallbackMat.SetTexture("_Input", inputTexture);
-			UnityEngine.Graphics.Blit(inputTexture, resultTexture, fallbackMat, 0);
+			culling.fallbackMat.SetTexture("_Input", inputTexture);
+			UnityEngine.Graphics.Blit(inputTexture, resultTexture, culling.fallbackMat, 0);
 			UnityEngine.Graphics.SetRenderTarget(activeColorBuffer, activeDepthBuffer);
 		}
 		else
 		{
-			compute.SetBuffer(0, "_Input", inputBuffer);
-			compute.SetBuffer(0, "_Result", resultBuffer);
-			compute.Dispatch(0, AlignDispatchSize(count), 1, 1);
+			culling.computeShader.SetBuffer(0, "_Input", inputBuffer);
+			culling.computeShader.SetBuffer(0, "_Result", resultBuffer);
+			culling.computeShader.Dispatch(0, AlignDispatchSize(count), 1, 1);
 		}
 	}
 
 	public void IssueRead()
 	{
-		if (!SafeMode)
+		if (SafeMode)
+		{
+			return;
+		}
+		if (culling.useAsyncReadAPI)
+		{
+			if (asyncRequests.Count < 10)
+			{
+				AsyncGPUReadbackRequest item = ((!culling.usePixelShaderFallback) ? AsyncGPUReadback.Request(resultBuffer) : AsyncGPUReadback.Request(resultTexture));
+				asyncRequests.Enqueue(item);
+			}
+		}
+		else if (readbackInst != IntPtr.Zero)
 		{
 			RustNative.Graphics.BufferReadback.IssueRead(readbackInst);
 		}
@@ -179,24 +199,52 @@ public class BufferSet
 
 	public void GetResults()
 	{
-		if (resultData != null && resultData.Length > 0)
+		if (resultData == null || resultData.Length <= 0)
 		{
-			if (!SafeMode && readbackInst != IntPtr.Zero)
+			return;
+		}
+		if (!SafeMode)
+		{
+			if (culling.useAsyncReadAPI)
+			{
+				while (asyncRequests.Count > 0)
+				{
+					AsyncGPUReadbackRequest asyncGPUReadbackRequest = asyncRequests.Peek();
+					if (asyncGPUReadbackRequest.hasError)
+					{
+						asyncRequests.Dequeue();
+						continue;
+					}
+					if (asyncGPUReadbackRequest.done)
+					{
+						NativeArray<Color32> data = asyncGPUReadbackRequest.GetData<Color32>();
+						for (int i = 0; i < data.Length; i++)
+						{
+							ref Color32 reference = ref resultData[i];
+							reference = data[i];
+						}
+						asyncRequests.Dequeue();
+						continue;
+					}
+					break;
+				}
+			}
+			else if (readbackInst != IntPtr.Zero)
 			{
 				RustNative.Graphics.BufferReadback.GetData(readbackInst, ref resultData[0]);
 			}
-			else if (usingFallback)
-			{
-				RenderTexture.active = resultTexture;
-				resultReadTexture.ReadPixels(new Rect(0f, 0f, width, height), 0, 0);
-				resultReadTexture.Apply();
-				Color32[] pixels = resultReadTexture.GetPixels32();
-				Array.Copy(pixels, resultData, resultData.Length);
-			}
-			else
-			{
-				resultBuffer.GetData(resultData);
-			}
+		}
+		else if (culling.usePixelShaderFallback)
+		{
+			RenderTexture.active = resultTexture;
+			resultReadTexture.ReadPixels(new Rect(0f, 0f, width, height), 0, 0);
+			resultReadTexture.Apply();
+			Color32[] pixels = resultReadTexture.GetPixels32();
+			Array.Copy(pixels, resultData, resultData.Length);
+		}
+		else
+		{
+			resultBuffer.GetData(resultData);
 		}
 	}
 }

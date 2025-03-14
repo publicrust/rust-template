@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
 using RustNative;
+using Unity.Collections;
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 
 [RequireComponent(typeof(Camera))]
@@ -30,30 +32,23 @@ public class OcclusionCulling : MonoBehaviour
 
 		public Texture2D resultReadTexture;
 
-		public IntPtr readbackInst = IntPtr.Zero;
-
 		public Color[] inputData = new Color[0];
 
 		public Color32[] resultData = new Color32[0];
 
-		private bool usingFallback = true;
+		private OcclusionCulling culling;
 
-		private Material fallbackMat;
+		private const int MaxAsyncGPUReadbackRequests = 10;
 
-		private ComputeShader compute;
+		private Queue<AsyncGPUReadbackRequest> asyncRequests = new Queue<AsyncGPUReadbackRequest>();
+
+		public IntPtr readbackInst = IntPtr.Zero;
 
 		public bool Ready => resultData.Length > 0;
 
-		public void Attach(Material fallbackMat)
+		public void Attach(OcclusionCulling culling)
 		{
-			this.fallbackMat = fallbackMat;
-			usingFallback = true;
-		}
-
-		public void Attach(ComputeShader computeShader)
-		{
-			compute = computeShader;
-			usingFallback = false;
+			this.culling = culling;
 		}
 
 		public void Dispose(bool data = true)
@@ -100,14 +95,15 @@ public class OcclusionCulling : MonoBehaviour
 
 		public bool CheckResize(int count, int granularity)
 		{
-			if (count > capacity || (usingFallback && resultTexture != null && !resultTexture.IsCreated()))
+			if (count > capacity || (culling.usePixelShaderFallback && resultTexture != null && !resultTexture.IsCreated()))
 			{
 				Dispose(data: false);
-				int num = count / granularity * granularity + granularity;
-				if (usingFallback)
+				int num = capacity;
+				int num2 = count / granularity * granularity + granularity;
+				if (culling.usePixelShaderFallback)
 				{
-					width = Mathf.CeilToInt(Mathf.Sqrt(num));
-					height = Mathf.CeilToInt((float)num / (float)width);
+					width = Mathf.CeilToInt(Mathf.Sqrt(num2));
+					height = Mathf.CeilToInt((float)num2 / (float)width);
 					inputTexture = new Texture2D(width, height, TextureFormat.RGBAFloat, mipmap: false, linear: true);
 					inputTexture.name = "_Input";
 					inputTexture.filterMode = FilterMode.Point;
@@ -122,19 +118,30 @@ public class OcclusionCulling : MonoBehaviour
 					resultReadTexture.name = "_ResultRead";
 					resultReadTexture.filterMode = FilterMode.Point;
 					resultReadTexture.wrapMode = TextureWrapMode.Clamp;
-					readbackInst = RustNative.Graphics.BufferReadback.CreateForTexture(resultTexture.GetNativeTexturePtr(), (uint)width, (uint)height, (uint)resultTexture.format);
+					if (!culling.useAsyncReadAPI)
+					{
+						readbackInst = RustNative.Graphics.BufferReadback.CreateForTexture(resultTexture.GetNativeTexturePtr(), (uint)width, (uint)height, (uint)resultTexture.format);
+					}
 					capacity = width * height;
 				}
 				else
 				{
-					inputBuffer = new ComputeBuffer(num, 16);
-					resultBuffer = new ComputeBuffer(num, 4);
-					uint size = (uint)(num * 4);
-					readbackInst = RustNative.Graphics.BufferReadback.CreateForBuffer(resultBuffer.GetNativeBufferPtr(), size);
-					capacity = num;
+					inputBuffer = new ComputeBuffer(num2, 16);
+					resultBuffer = new ComputeBuffer(num2, 4);
+					if (!culling.useAsyncReadAPI)
+					{
+						uint size = (uint)(capacity * 4);
+						readbackInst = RustNative.Graphics.BufferReadback.CreateForBuffer(resultBuffer.GetNativeBufferPtr(), size);
+					}
+					capacity = num2;
 				}
 				Array.Resize(ref inputData, capacity);
 				Array.Resize(ref resultData, capacity);
+				Color32 color = new Color32(byte.MaxValue, byte.MaxValue, byte.MaxValue, byte.MaxValue);
+				for (int i = num; i < capacity; i++)
+				{
+					resultData[i] = color;
+				}
 				this.count = count;
 				return true;
 			}
@@ -143,7 +150,7 @@ public class OcclusionCulling : MonoBehaviour
 
 		public void UploadData()
 		{
-			if (usingFallback)
+			if (culling.usePixelShaderFallback)
 			{
 				inputTexture.SetPixels(inputData);
 				inputTexture.Apply();
@@ -161,25 +168,37 @@ public class OcclusionCulling : MonoBehaviour
 
 		public void Dispatch(int count)
 		{
-			if (usingFallback)
+			if (culling.usePixelShaderFallback)
 			{
 				RenderBuffer activeColorBuffer = UnityEngine.Graphics.activeColorBuffer;
 				RenderBuffer activeDepthBuffer = UnityEngine.Graphics.activeDepthBuffer;
-				fallbackMat.SetTexture("_Input", inputTexture);
-				UnityEngine.Graphics.Blit(inputTexture, resultTexture, fallbackMat, 0);
+				culling.fallbackMat.SetTexture("_Input", inputTexture);
+				UnityEngine.Graphics.Blit(inputTexture, resultTexture, culling.fallbackMat, 0);
 				UnityEngine.Graphics.SetRenderTarget(activeColorBuffer, activeDepthBuffer);
 			}
 			else
 			{
-				compute.SetBuffer(0, "_Input", inputBuffer);
-				compute.SetBuffer(0, "_Result", resultBuffer);
-				compute.Dispatch(0, AlignDispatchSize(count), 1, 1);
+				culling.computeShader.SetBuffer(0, "_Input", inputBuffer);
+				culling.computeShader.SetBuffer(0, "_Result", resultBuffer);
+				culling.computeShader.Dispatch(0, AlignDispatchSize(count), 1, 1);
 			}
 		}
 
 		public void IssueRead()
 		{
-			if (!SafeMode)
+			if (SafeMode)
+			{
+				return;
+			}
+			if (culling.useAsyncReadAPI)
+			{
+				if (asyncRequests.Count < 10)
+				{
+					AsyncGPUReadbackRequest item = ((!culling.usePixelShaderFallback) ? AsyncGPUReadback.Request(resultBuffer) : AsyncGPUReadback.Request(resultTexture));
+					asyncRequests.Enqueue(item);
+				}
+			}
+			else if (readbackInst != IntPtr.Zero)
 			{
 				RustNative.Graphics.BufferReadback.IssueRead(readbackInst);
 			}
@@ -187,24 +206,52 @@ public class OcclusionCulling : MonoBehaviour
 
 		public void GetResults()
 		{
-			if (resultData != null && resultData.Length > 0)
+			if (resultData == null || resultData.Length <= 0)
 			{
-				if (!SafeMode && readbackInst != IntPtr.Zero)
+				return;
+			}
+			if (!SafeMode)
+			{
+				if (culling.useAsyncReadAPI)
+				{
+					while (asyncRequests.Count > 0)
+					{
+						AsyncGPUReadbackRequest asyncGPUReadbackRequest = asyncRequests.Peek();
+						if (asyncGPUReadbackRequest.hasError)
+						{
+							asyncRequests.Dequeue();
+							continue;
+						}
+						if (asyncGPUReadbackRequest.done)
+						{
+							NativeArray<Color32> data = asyncGPUReadbackRequest.GetData<Color32>();
+							for (int i = 0; i < data.Length; i++)
+							{
+								ref Color32 reference = ref resultData[i];
+								reference = data[i];
+							}
+							asyncRequests.Dequeue();
+							continue;
+						}
+						break;
+					}
+				}
+				else if (readbackInst != IntPtr.Zero)
 				{
 					RustNative.Graphics.BufferReadback.GetData(readbackInst, ref resultData[0]);
 				}
-				else if (usingFallback)
-				{
-					RenderTexture.active = resultTexture;
-					resultReadTexture.ReadPixels(new Rect(0f, 0f, width, height), 0, 0);
-					resultReadTexture.Apply();
-					Color32[] pixels = resultReadTexture.GetPixels32();
-					Array.Copy(pixels, resultData, resultData.Length);
-				}
-				else
-				{
-					resultBuffer.GetData(resultData);
-				}
+			}
+			else if (culling.usePixelShaderFallback)
+			{
+				RenderTexture.active = resultTexture;
+				resultReadTexture.ReadPixels(new Rect(0f, 0f, width, height), 0, 0);
+				resultReadTexture.Apply();
+				Color32[] pixels = resultReadTexture.GetPixels32();
+				Array.Copy(pixels, resultData, resultData.Length);
+			}
+			else
+			{
+				resultBuffer.GetData(resultData);
 			}
 		}
 	}
@@ -233,8 +280,6 @@ public class OcclusionCulling : MonoBehaviour
 	[Serializable]
 	public class DebugSettings
 	{
-		public bool forceFallback;
-
 		public bool log;
 
 		public bool showAllVisible;
@@ -252,6 +297,8 @@ public class OcclusionCulling : MonoBehaviour
 		public bool showScreenBounds;
 
 		public DebugMask showMask;
+
+		public LayerMask layerFilter = -1;
 	}
 
 	public class HashedPoolValue
@@ -648,6 +695,10 @@ public class OcclusionCulling : MonoBehaviour
 
 	public ComputeShader computeShader;
 
+	public bool usePixelShaderFallback = true;
+
+	public bool useAsyncReadAPI;
+
 	private Camera camera;
 
 	private const int ComputeThreadsPerGroup = 64;
@@ -698,8 +749,6 @@ public class OcclusionCulling : MonoBehaviour
 
 	private float[] matrixToFloatTemp = new float[16];
 
-	private bool usingFallback = true;
-
 	private Material fallbackMat;
 
 	private Material depthCopyMat;
@@ -718,10 +767,11 @@ public class OcclusionCulling : MonoBehaviour
 
 	private static OcclusionCulling instance;
 
-	private static GraphicsDeviceType[] supportedDeviceTypes = new GraphicsDeviceType[2]
+	private static GraphicsDeviceType[] supportedDeviceTypes = new GraphicsDeviceType[3]
 	{
 		GraphicsDeviceType.Direct3D11,
-		GraphicsDeviceType.OpenGLCore
+		GraphicsDeviceType.Metal,
+		GraphicsDeviceType.Vulkan
 	};
 
 	private static bool _enabled = false;
@@ -861,11 +911,19 @@ public class OcclusionCulling : MonoBehaviour
 		}
 		if (!Supported)
 		{
-			Debug.LogWarning(string.Concat("[OcclusionCulling] HiZ culling disabled due to graphics device type ", SystemInfo.graphicsDeviceType, " not supported."));
+			Debug.LogWarning(string.Concat("[OcclusionCulling] Disabled due to graphics device type ", SystemInfo.graphicsDeviceType, " not supported."));
 			Enabled = false;
 			return;
 		}
-		usingFallback = debugSettings.forceFallback || !SystemInfo.supportsComputeShaders || computeShader == null || !computeShader.HasKernel("compute_cull");
+		usePixelShaderFallback = usePixelShaderFallback || !SystemInfo.supportsComputeShaders || computeShader == null || !computeShader.HasKernel("compute_cull");
+		useNativePath = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11 && SupportsNativePath();
+		useAsyncReadAPI = !useNativePath && SystemInfo.supportsAsyncGPUReadback;
+		if (!useNativePath && !useAsyncReadAPI)
+		{
+			Debug.LogWarning("[OcclusionCulling] Disabled due to unsupported Async GPU Reads on device " + SystemInfo.graphicsDeviceType);
+			Enabled = false;
+			return;
+		}
 		for (int i = 0; i < staticOccludees.Count; i++)
 		{
 			staticChanged.Add(i);
@@ -874,33 +932,27 @@ public class OcclusionCulling : MonoBehaviour
 		{
 			dynamicChanged.Add(j);
 		}
-		if (usingFallback)
+		if (usePixelShaderFallback)
 		{
 			fallbackMat = new Material(Shader.Find("Hidden/OcclusionCulling/Culling"))
 			{
 				hideFlags = HideFlags.HideAndDontSave
 			};
-			staticSet.Attach(fallbackMat);
-			dynamicSet.Attach(fallbackMat);
-			gridSet.Attach(fallbackMat);
 		}
-		else
-		{
-			staticSet.Attach(computeShader);
-			dynamicSet.Attach(computeShader);
-			gridSet.Attach(computeShader);
-		}
+		staticSet.Attach(this);
+		dynamicSet.Attach(this);
+		gridSet.Attach(this);
 		depthCopyMat = new Material(Shader.Find("Hidden/OcclusionCulling/DepthCopy"))
 		{
 			hideFlags = HideFlags.HideAndDontSave
 		};
 		InitializeHiZMap();
 		UpdateCameraMatrices(starting: true);
-		TestNativePath();
 	}
 
-	private void TestNativePath()
+	private bool SupportsNativePath()
 	{
+		bool result = true;
 		try
 		{
 			OccludeeState.State states = default(OccludeeState.State);
@@ -914,8 +966,9 @@ public class OcclusionCulling : MonoBehaviour
 		catch (EntryPointNotFoundException)
 		{
 			Debug.Log("[OcclusionCulling] Fast native path not available. Reverting to managed fallback.");
-			useNativePath = false;
+			result = false;
 		}
+		return result;
 	}
 
 	private void OnDisable()
@@ -1032,24 +1085,24 @@ public class OcclusionCulling : MonoBehaviour
 		return null;
 	}
 
-	public static int RegisterOccludee(Vector3 center, float radius, bool isVisible, float minTimeVisible, bool isStatic, OnVisibilityChanged onVisibilityChanged = null)
+	public static int RegisterOccludee(Vector3 center, float radius, bool isVisible, float minTimeVisible, bool isStatic, int layer, OnVisibilityChanged onVisibilityChanged = null)
 	{
 		int num = -1;
-		num = ((!isStatic) ? RegisterOccludee(center, radius, isVisible, minTimeVisible, isStatic, onVisibilityChanged, dynamicOccludees, dynamicStates, dynamicRecycled, dynamicChanged, dynamicSet, dynamicVisibilityChanged) : RegisterOccludee(center, radius, isVisible, minTimeVisible, isStatic, onVisibilityChanged, staticOccludees, staticStates, staticRecycled, staticChanged, staticSet, staticVisibilityChanged));
+		num = ((!isStatic) ? RegisterOccludee(center, radius, isVisible, minTimeVisible, isStatic, layer, onVisibilityChanged, dynamicOccludees, dynamicStates, dynamicRecycled, dynamicChanged, dynamicSet, dynamicVisibilityChanged) : RegisterOccludee(center, radius, isVisible, minTimeVisible, isStatic, layer, onVisibilityChanged, staticOccludees, staticStates, staticRecycled, staticChanged, staticSet, staticVisibilityChanged));
 		return (num >= 0 && !isStatic) ? (num + 1048576) : num;
 	}
 
-	private static int RegisterOccludee(Vector3 center, float radius, bool isVisible, float minTimeVisible, bool isStatic, OnVisibilityChanged onVisibilityChanged, SimpleList<OccludeeState> occludees, SimpleList<OccludeeState.State> states, Queue<int> recycled, List<int> changed, BufferSet set, SimpleList<int> visibilityChanged)
+	private static int RegisterOccludee(Vector3 center, float radius, bool isVisible, float minTimeVisible, bool isStatic, int layer, OnVisibilityChanged onVisibilityChanged, SimpleList<OccludeeState> occludees, SimpleList<OccludeeState.State> states, Queue<int> recycled, List<int> changed, BufferSet set, SimpleList<int> visibilityChanged)
 	{
 		int num = FindFreeSlot(occludees, states, recycled);
 		if (num >= 0)
 		{
 			Vector4 sphereBounds = new Vector4(center.x, center.y, center.z, radius);
-			OccludeeState occludeeState = Allocate().Initialize(states, set, num, sphereBounds, isVisible, minTimeVisible, isStatic, onVisibilityChanged);
+			OccludeeState occludeeState = Allocate().Initialize(states, set, num, sphereBounds, isVisible, minTimeVisible, isStatic, layer, onVisibilityChanged);
 			occludeeState.cell = RegisterToGrid(occludeeState);
 			occludees[num] = occludeeState;
 			changed.Add(num);
-			if (states.array[num].isVisible != occludeeState.cell.isVisible)
+			if (states.array[num].isVisible != 0 != occludeeState.cell.isVisible)
 			{
 				visibilityChanged.Add(num);
 			}
@@ -1143,17 +1196,18 @@ public class OcclusionCulling : MonoBehaviour
 		}
 	}
 
-	private void LateUpdate()
+	private void OnPreCull()
 	{
 		UpdateCameraMatrices();
 		GenerateHiZMipChain();
 		PrepareAndDispatch();
 		IssueRead();
-	}
-
-	private void OnPreCull()
-	{
-		RetrieveAndApplyVisibility();
+		if (grid.Size <= gridSet.resultData.Length)
+		{
+			RetrieveAndApplyVisibility();
+			return;
+		}
+		Debug.LogWarning("[OcclusionCulling] Grid size and result capacity are out of sync: " + grid.Size + ", " + gridSet.resultData.Length);
 	}
 
 	private void OnPostRender()
@@ -1182,13 +1236,9 @@ public class OcclusionCulling : MonoBehaviour
 
 	private void PrepareAndDispatch()
 	{
-		if (staticOccludees.Count <= 0 && dynamicOccludees.Count <= 0)
-		{
-			return;
-		}
 		Vector2 vector = new Vector2(hiZWidth, hiZHeight);
 		ExtractFrustum(viewProjMatrix, ref frustumPlanes);
-		if (usingFallback)
+		if (usePixelShaderFallback)
 		{
 			fallbackMat.SetTexture("_HiZMap", hiZTexture);
 			fallbackMat.SetFloat("_HiZMaxLod", hiZLevelCount - 1);
@@ -1307,19 +1357,19 @@ public class OcclusionCulling : MonoBehaviour
 			{
 				flag2 = time < value.waitTime;
 			}
-			if (flag2 != value.isVisible)
+			if (flag2 != (value.isVisible != 0))
 			{
-				if (value.callback)
+				if (value.callback != 0)
 				{
 					changed.Add(slot);
 				}
 				else
 				{
-					value.isVisible = flag2;
+					value.isVisible = (byte)(flag2 ? 1 : 0);
 				}
 			}
 			states[slot] = value;
-			num += ((!value.isVisible) ? 1 : 0);
+			num += value.isVisible;
 		}
 		return num;
 	}
@@ -1330,7 +1380,7 @@ public class OcclusionCulling : MonoBehaviour
 		for (int i = 0; i < bucketCount; i++)
 		{
 			int num2 = bucket[i];
-			if (num2 < 0 || num2 >= resultCount || !states[num2].active)
+			if (num2 < 0 || num2 >= resultCount || states[num2].active == 0)
 			{
 				continue;
 			}
@@ -1345,15 +1395,15 @@ public class OcclusionCulling : MonoBehaviour
 			{
 				flag2 = time < state.waitTime;
 			}
-			if (flag2 != state.isVisible)
+			if (flag2 != (state.isVisible != 0))
 			{
-				if (state.callback)
+				if (state.callback != 0)
 				{
 					changed[changedCount++] = num2;
 				}
 				else
 				{
-					state.isVisible = flag2;
+					state.isVisible = (byte)(flag2 ? 1 : 0);
 				}
 			}
 			states[num2] = state;
@@ -1463,7 +1513,7 @@ public class OcclusionCulling : MonoBehaviour
 			OccludeeState occludeeState = occludees[num];
 			if (occludeeState != null)
 			{
-				bool flag = !states.array[num].isVisible;
+				bool flag = states.array[num].isVisible == 0;
 				OnVisibilityChanged onVisibilityChanged = occludeeState.onVisibilityChanged;
 				if (onVisibilityChanged != null && (UnityEngine.Object)onVisibilityChanged.Target != null)
 				{
@@ -1471,7 +1521,7 @@ public class OcclusionCulling : MonoBehaviour
 				}
 				if (occludeeState.slot >= 0)
 				{
-					states.array[occludeeState.slot].isVisible = flag;
+					states.array[occludeeState.slot].isVisible = (byte)(flag ? 1 : 0);
 				}
 			}
 		}
@@ -1665,6 +1715,8 @@ public class OcclusionCulling : MonoBehaviour
 	private void InitializeHiZMap(int width, int height)
 	{
 		DestroyHiZMap();
+		width = Mathf.Clamp(width, 1, 65536);
+		height = Mathf.Clamp(height, 1, 65536);
 		int num = Mathf.Min(width, height);
 		hiZLevelCount = (int)(Mathf.Log(num, 2f) + 1f);
 		hiZLevels = new RenderTexture[hiZLevelCount];

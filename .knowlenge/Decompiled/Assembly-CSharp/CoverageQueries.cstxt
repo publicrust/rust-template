@@ -1,8 +1,9 @@
 #define UNITY_ASSERTIONS
 using System;
 using System.Collections.Generic;
-using RustNative;
+using Unity.Collections;
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 
 [RequireComponent(typeof(Camera))]
 [RequireComponent(typeof(Camera))]
@@ -19,13 +20,15 @@ public class CoverageQueries : MonoBehaviour
 
 		public RenderTexture resultTexture;
 
-		public IntPtr readbackInst = IntPtr.Zero;
-
 		public Color[] inputData = new Color[0];
 
 		public Color32[] resultData = new Color32[0];
 
 		private Material coverageMat;
+
+		private const int MaxAsyncGPUReadbackRequests = 10;
+
+		private Queue<AsyncGPUReadbackRequest> asyncRequests = new Queue<AsyncGPUReadbackRequest>();
 
 		public void Attach(Material coverageMat)
 		{
@@ -44,11 +47,6 @@ public class CoverageQueries : MonoBehaviour
 				RenderTexture.active = null;
 				UnityEngine.Object.DestroyImmediate(resultTexture);
 				resultTexture = null;
-			}
-			if (readbackInst != IntPtr.Zero)
-			{
-				RustNative.Graphics.BufferReadback.Destroy(readbackInst);
-				readbackInst = IntPtr.Zero;
 			}
 			if (data)
 			{
@@ -74,10 +72,15 @@ public class CoverageQueries : MonoBehaviour
 				resultTexture.wrapMode = TextureWrapMode.Clamp;
 				resultTexture.useMipMap = false;
 				resultTexture.Create();
-				readbackInst = RustNative.Graphics.BufferReadback.CreateForTexture(resultTexture.GetNativeTexturePtr(), (uint)width, (uint)height, (uint)resultTexture.format);
-				int newSize = width * height;
-				Array.Resize(ref inputData, newSize);
-				Array.Resize(ref resultData, newSize);
+				int num = resultData.Length;
+				int num2 = width * height;
+				Array.Resize(ref inputData, num2);
+				Array.Resize(ref resultData, num2);
+				Color32 color = new Color32(byte.MaxValue, 0, 0, 0);
+				for (int i = num; i < num2; i++)
+				{
+					resultData[i] = color;
+				}
 				return true;
 			}
 			return false;
@@ -96,29 +99,56 @@ public class CoverageQueries : MonoBehaviour
 		{
 			if (inputData.Length > 0)
 			{
-				RenderBuffer activeColorBuffer = UnityEngine.Graphics.activeColorBuffer;
-				RenderBuffer activeDepthBuffer = UnityEngine.Graphics.activeDepthBuffer;
+				RenderBuffer activeColorBuffer = Graphics.activeColorBuffer;
+				RenderBuffer activeDepthBuffer = Graphics.activeDepthBuffer;
 				coverageMat.SetTexture("_Input", inputTexture);
-				UnityEngine.Graphics.Blit(inputTexture, resultTexture, coverageMat, 0);
-				UnityEngine.Graphics.SetRenderTarget(activeColorBuffer, activeDepthBuffer);
+				Graphics.Blit(inputTexture, resultTexture, coverageMat, 0);
+				Graphics.SetRenderTarget(activeColorBuffer, activeDepthBuffer);
 			}
 		}
 
 		public void IssueRead()
 		{
-			if (readbackInst != IntPtr.Zero)
+			if (asyncRequests.Count < 10)
 			{
-				RustNative.Graphics.BufferReadback.IssueRead(readbackInst);
+				asyncRequests.Enqueue(AsyncGPUReadback.Request(resultTexture));
 			}
 		}
 
 		public void GetResults()
 		{
-			if (readbackInst != IntPtr.Zero && resultData.Length > 0)
+			if (resultData.Length <= 0)
 			{
-				RustNative.Graphics.BufferReadback.GetData(readbackInst, ref resultData[0]);
+				return;
+			}
+			while (asyncRequests.Count > 0)
+			{
+				AsyncGPUReadbackRequest asyncGPUReadbackRequest = asyncRequests.Peek();
+				if (asyncGPUReadbackRequest.hasError)
+				{
+					asyncRequests.Dequeue();
+					continue;
+				}
+				if (asyncGPUReadbackRequest.done)
+				{
+					NativeArray<Color32> data = asyncGPUReadbackRequest.GetData<Color32>();
+					for (int i = 0; i < data.Length; i++)
+					{
+						ref Color32 reference = ref resultData[i];
+						reference = data[i];
+					}
+					asyncRequests.Dequeue();
+					continue;
+				}
+				break;
 			}
 		}
+	}
+
+	public enum RadiusSpace
+	{
+		ScreenNormalized,
+		World
 	}
 
 	public class Query
@@ -126,6 +156,8 @@ public class CoverageQueries : MonoBehaviour
 		public struct Input
 		{
 			public Vector3 position;
+
+			public RadiusSpace radiusSpace;
 
 			public float radius;
 
@@ -191,10 +223,11 @@ public class CoverageQueries : MonoBehaviour
 			Reset();
 		}
 
-		public Query(Vector3 position, float radius, int sampleCount, float smoothingSpeed = 15f)
+		public Query(Vector3 position, RadiusSpace radiusSpace, float radius, int sampleCount, float smoothingSpeed = 15f)
 		{
 			Reset();
 			input.position = position;
+			input.radiusSpace = radiusSpace;
 			input.radius = radius;
 			input.sampleCount = sampleCount;
 			input.smoothingSpeed = smoothingSpeed;
@@ -261,21 +294,23 @@ public class CoverageQueries : MonoBehaviour
 
 	private static CoverageQueries instance;
 
-	private static bool _debug = false;
+	private static bool _debugShow = false;
 
 	public bool debug;
 
 	public static CoverageQueries Instance => instance;
 
-	public static bool Debug
+	public static bool Supported => SystemInfo.supportsAsyncGPUReadback;
+
+	public static bool DebugShow
 	{
 		get
 		{
-			return _debug;
+			return _debugShow;
 		}
 		set
 		{
-			_debug = value;
+			_debugShow = value;
 		}
 	}
 
@@ -287,11 +322,19 @@ public class CoverageQueries : MonoBehaviour
 
 	private void OnEnable()
 	{
-		coverageMat = new Material(Shader.Find("Hidden/CoverageQueries/Coverage"))
+		if (!Supported)
 		{
-			hideFlags = HideFlags.HideAndDontSave
-		};
-		buffer.Attach(coverageMat);
+			Debug.LogWarning("[CoverageQueries] Disabled due to unsupported Async GPU Reads on device " + SystemInfo.graphicsDeviceType);
+			base.enabled = false;
+		}
+		else
+		{
+			coverageMat = new Material(Shader.Find("Hidden/CoverageQueries/Coverage"))
+			{
+				hideFlags = HideFlags.HideAndDontSave
+			};
+			buffer.Attach(coverageMat);
+		}
 	}
 
 	private void OnDisable()
@@ -323,7 +366,7 @@ public class CoverageQueries : MonoBehaviour
 			foreach (Query item in reused)
 			{
 				int id = item.intern.id;
-				UnityEngine.Debug.Assert(id >= 0 && id < pool.Count, "Reusing invalid query id ");
+				Debug.Assert(id >= 0 && id < pool.Count, "Reusing invalid query id ");
 				pool[id] = item;
 				changed.Add(id);
 			}
@@ -334,7 +377,7 @@ public class CoverageQueries : MonoBehaviour
 			foreach (Query item2 in added)
 			{
 				int id2 = item2.intern.id;
-				UnityEngine.Debug.Assert(id2 >= 0 && id2 <= pool.Count + added.Count, "Adding invalid query id");
+				Debug.Assert(id2 >= 0 && id2 <= pool.Count + added.Count, "Adding invalid query id");
 				pool.Add(item2);
 				changed.Add(id2);
 			}
@@ -345,7 +388,7 @@ public class CoverageQueries : MonoBehaviour
 			for (int i = 0; i < removed.Count; i++)
 			{
 				int num = removed[i];
-				UnityEngine.Debug.Assert(num >= 0 && num < pool.Count, "Removing invalid query id");
+				Debug.Assert(num >= 0 && num < pool.Count, "Removing invalid query id");
 				pool[num].intern.Reset();
 				pool[num].result.Reset();
 				pool[num] = null;
@@ -365,23 +408,27 @@ public class CoverageQueries : MonoBehaviour
 		Matrix4x4 worldToCameraMatrix = camera.worldToCameraMatrix;
 		Matrix4x4 gPUProjectionMatrix = GL.GetGPUProjectionMatrix(camera.projectionMatrix, renderIntoTexture: false);
 		Matrix4x4 value = gPUProjectionMatrix * worldToCameraMatrix;
+		Matrix4x4 inverse = value.inverse;
 		coverageMat.SetMatrix("_ViewProjMatrix", value);
+		coverageMat.SetMatrix("_InvViewProjMatrix", inverse);
 		coverageMat.SetFloat("_DepthBias", depthBias);
+		coverageMat.SetFloat("_RcpCameraAspect", 1f / camera.aspect);
 		if (changed.Count > 0)
 		{
 			for (int i = 0; i < changed.Count; i++)
 			{
 				int num = changed[i];
-				UnityEngine.Debug.Assert(changed[i] >= 0 && changed[i] < pool.Count);
+				Debug.Assert(changed[i] >= 0 && changed[i] < pool.Count);
 				Query query = pool[num];
 				if (query != null)
 				{
 					float x = query.input.position.x;
 					float y = query.input.position.y;
 					float z = query.input.position.z;
-					float w = (float)Mathf.RoundToInt(query.input.radius * 10000f) + (float)query.input.sampleCount / 255f;
+					float num2 = (float)Mathf.RoundToInt(query.input.radius * 10000f) + (float)query.input.sampleCount / 255f;
+					num2 *= (float)((query.input.radiusSpace == RadiusSpace.ScreenNormalized) ? 1 : (-1));
 					ref Color reference = ref buffer.inputData[num];
-					reference = new Vector4(x, y, z, w);
+					reference = new Vector4(x, y, z, num2);
 				}
 			}
 			changed.Clear();
@@ -395,7 +442,6 @@ public class CoverageQueries : MonoBehaviour
 		if (pool.Count > 0)
 		{
 			buffer.IssueRead();
-			GL.IssuePluginEvent(RustNative.Graphics.GetRenderEventFunc(), 2);
 		}
 	}
 
@@ -411,7 +457,7 @@ public class CoverageQueries : MonoBehaviour
 			Query query = pool[i];
 			if (query != null)
 			{
-				UnityEngine.Debug.Assert(query.intern.id == i);
+				Debug.Assert(query.intern.id == i);
 				query.result.passed = buffer.resultData[i].r;
 				query.result.coverage = (float)(int)buffer.resultData[i].g / 255f;
 				query.result.weightedCoverage = (float)(int)buffer.resultData[i].b / 255f;
@@ -437,8 +483,8 @@ public class CoverageQueries : MonoBehaviour
 
 	public static void RegisterQuery(Query query)
 	{
-		UnityEngine.Debug.Assert(query.input.sampleCount >= 1 && query.input.sampleCount <= 256, "RegisterQuery failed sample count check");
-		UnityEngine.Debug.Assert(query.input.radius >= 0f, "RegisterQuery failed with negative radius");
+		Debug.Assert(query.input.sampleCount >= 1 && query.input.sampleCount <= 256, "RegisterQuery failed sample count check");
+		Debug.Assert(query.input.radius >= 0f, "RegisterQuery failed with negative radius");
 		int id = query.intern.id;
 		if (id < 0)
 		{

@@ -61,7 +61,8 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		IsAfraid,
 		AfraidRange,
 		IsUnderHealthThreshold,
-		CanNotMove
+		CanNotMove,
+		PathToTargetStatus
 	}
 
 	public enum EnemyRangeEnum : byte
@@ -129,8 +130,8 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		[Tooltip("How fast can we turn around")]
 		public float TurnSpeed;
 
-		[Range(0f, 1f)]
 		[Tooltip("Determines things like how near we'll allow other species to get")]
+		[Range(0f, 1f)]
 		public float Tolerance;
 
 		[Tooltip("How far this NPC can see")]
@@ -138,6 +139,9 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 
 		[Tooltip("Our vision cone for dot product - a value of -1 means we can see all around us, 0 = only infront ")]
 		public float VisionCone;
+
+		[Tooltip("NPCs use distance visibility to basically make closer enemies easier to detect than enemies further away")]
+		public AnimationCurve DistanceVisibility;
 
 		[Tooltip("How likely are we to be offensive without being threatened")]
 		public float Hostility;
@@ -193,6 +197,9 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		[Tooltip("The maximum amount of time between each time we seek a new roam destination (when idle)")]
 		public float MaxRoamDelay;
 
+		[Tooltip("If an npc is mobile, they are allowed to move when idle.")]
+		public bool IsMobile;
+
 		[Tooltip("In the range between min and max roam delay, we evaluate the random value through this curve")]
 		public AnimationCurve RoamDelayDistribution;
 
@@ -205,6 +212,9 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		[Tooltip("The maximum water depth this npc willingly will walk into.")]
 		public float MaxWaterDepth;
 
+		[Tooltip("The water depth at which they will start swimming.")]
+		public float WaterLevelNeck;
+
 		[Tooltip("The range we consider using close range weapons.")]
 		public float CloseRange;
 
@@ -213,6 +223,15 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 
 		[Tooltip("The range we consider using long range weapons.")]
 		public float LongRange;
+
+		[Tooltip("How long can we be out of range of our spawn point before we time out and make our way back home (when idle).")]
+		public float OutOfRangeOfSpawnPointTimeout;
+
+		[Tooltip("What is the maximum distance we are allowed to have to our spawn location before we are being encourraged to go back home.")]
+		public NPCPlayerApex.EnemyRangeEnum MaxRangeToSpawnLoc;
+
+		[Tooltip("If this is set to true, then a target must hold special markers (like IsHostile) for the target to be considered for aggressive action.")]
+		public bool OnlyAggroMarkedTargets;
 	}
 
 	public int agentTypeIndex;
@@ -243,9 +262,33 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 
 	private BaseEntity blockTargetingThisEnemy;
 
+	public float waterDepth;
+
+	public bool swimming;
+
+	public bool wasSwimming;
+
 	private static readonly AnimationCurve speedFractionResponse = AnimationCurve.EaseInOut(0f, 0f, 1f, 1f);
 
+	private bool _traversingNavMeshLink;
+
+	private OffMeshLinkData _currentNavMeshLink;
+
+	private string _currentNavMeshLinkName;
+
+	private float _currentNavMeshLinkTraversalTime;
+
+	private float _currentNavMeshLinkTraversalTimeDelta;
+
+	private Quaternion _currentNavMeshLinkOrientation;
+
+	private Vector3 _currentNavMeshLinkEndPos;
+
 	private float nextAttackTime;
+
+	[SerializeField]
+	[InspectorFlags]
+	public TerrainTopology.Enum topologyPreference = (TerrainTopology.Enum)96;
 
 	[NonSerialized]
 	public Transform ChaseTransform;
@@ -275,12 +318,14 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 	[SerializeField]
 	private UtilityAIComponent utilityAiComponent;
 
-	public LayerMask movementMask = 295772417;
+	public LayerMask movementMask = 429990145;
 
 	[NonSerialized]
 	public BaseContext AiContext;
 
-	public bool IsDormant;
+	private bool _isDormant;
+
+	private float lastSetDestinationTime;
 
 	public StateTimer BusyTimer;
 
@@ -310,6 +355,16 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 
 	private float lastTickTime;
 
+	private float playerTargetDecisionStartTime;
+
+	private float animalTargetDecisionStartTime;
+
+	private bool isAlreadyCheckingPathPending;
+
+	private int numPathPendingAttempts;
+
+	private float accumPathPendingDelay;
+
 	public const float TickRate = 0.1f;
 
 	private Vector3 lastStuckPos;
@@ -338,17 +393,44 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		}
 	}
 
-	public bool IsStuck { get; private set; }
-
-	public Vector2i CurrentCoord { get; set; }
-
-	public Vector2i PreviousCoord { get; set; }
+	public bool IsStuck { get; set; }
 
 	public bool AgencyUpdateRequired { get; set; }
 
 	public bool IsOnOffmeshLinkAndReachedNewCoord { get; set; }
 
 	public float GetAttackRate => AttackRate;
+
+	public override bool IsNpc => true;
+
+	public bool IsDormant
+	{
+		get
+		{
+			return _isDormant;
+		}
+		set
+		{
+			_isDormant = value;
+			if (_isDormant)
+			{
+				StopMoving();
+				Pause();
+			}
+			else if (GetNavAgent == null || AiManager.nav_disable)
+			{
+				IsDormant = true;
+			}
+			else
+			{
+				Resume();
+			}
+		}
+	}
+
+	public float SecondsSinceLastSetDestination => UnityEngine.Time.time - lastSetDestinationTime;
+
+	public float LastSetDestinationTime => lastSetDestinationTime;
 
 	public Vector3 Destination
 	{
@@ -365,6 +447,7 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 			if (IsNavRunning())
 			{
 				GetNavAgent.destination = value;
+				lastSetDestinationTime = UnityEngine.Time.time;
 			}
 		}
 	}
@@ -383,6 +466,10 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		{
 			if (IsNavRunning())
 			{
+				if (value)
+				{
+					GetNavAgent.destination = ServerPosition;
+				}
 				GetNavAgent.isStopped = value;
 			}
 		}
@@ -427,7 +514,7 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 
 	public BaseCombatEntity CombatTarget => AttackTarget as BaseCombatEntity;
 
-	public Vector3 GuardPosition { get; set; }
+	public Vector3 SpawnPosition { get; set; }
 
 	public float AttackTargetVisibleFor => 0f;
 
@@ -553,6 +640,18 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		{
 			return;
 		}
+		if (TerrainMeta.WaterMap != null)
+		{
+			waterDepth = TerrainMeta.WaterMap.GetDepth(ServerPosition);
+			wasSwimming = swimming;
+			swimming = waterDepth > Stats.WaterLevelNeck * 0.25f;
+		}
+		else
+		{
+			wasSwimming = false;
+			swimming = false;
+			waterDepth = 0f;
+		}
 		using (TimeWarning.New("TickNavigation"))
 		{
 			TickNavigation();
@@ -574,7 +673,7 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		float speed = Stats.Speed;
 		if (NewAI)
 		{
-			speed = TargetSpeed;
+			speed = ((!swimming) ? TargetSpeed : ToSpeed(SpeedEnum.Walk));
 			speed *= 0.5f + base.healthFraction * 0.5f;
 			NavAgent.speed = Mathf.Lerp(NavAgent.speed, speed, 0.5f);
 			NavAgent.angularSpeed = Stats.TurnSpeed;
@@ -606,7 +705,7 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		{
 			num *= 0.01f;
 		}
-		if (NavAgent.velocity.sqrMagnitude > 0.1f)
+		if (NavAgent.desiredVelocity.sqrMagnitude > 0.1f)
 		{
 			num *= 2f;
 		}
@@ -690,48 +789,70 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		Sleep = Mathf.Clamp01(Sleep);
 	}
 
-	public void TickNavigation()
+	public void TickNavigationWater()
 	{
-		if (AI.move && IsNavRunning())
+		if (!AI.move || !IsNavRunning())
 		{
-			Vector3 moveToPosition = base.transform.position;
-			stepDirection = Vector3.zero;
-			if (AiManager.nav_grid)
-			{
-				UpdateCoords();
-			}
-			if ((bool)ChaseTransform)
-			{
-				TickChase();
-			}
-			if (NavAgent.isOnOffMeshLink)
-			{
-				TickNavMeshLinkTraversal(ref moveToPosition);
-			}
-			else if (NavAgent.hasPath)
-			{
-				TickFollowPath(ref moveToPosition);
-			}
-			if (ValidateNextPosition(ref moveToPosition))
-			{
-				UpdatePositionAndRotation(moveToPosition);
-				TickIdle();
-				TickStuck();
-			}
+			return;
+		}
+		if (IsDormant || !syncPosition)
+		{
+			StopMoving();
+			return;
+		}
+		Vector3 moveToPosition = base.transform.position;
+		stepDirection = Vector3.zero;
+		if ((bool)ChaseTransform)
+		{
+			TickChase();
+		}
+		if (NavAgent.isOnOffMeshLink)
+		{
+			HandleNavMeshLinkTraversal(0.1f, ref moveToPosition);
+		}
+		else if (NavAgent.hasPath)
+		{
+			TickFollowPath(ref moveToPosition);
+		}
+		if (ValidateNextPosition(ref moveToPosition))
+		{
+			moveToPosition.y = 0f - Stats.WaterLevelNeck;
+			UpdatePositionAndRotation(moveToPosition);
+			TickIdle();
+			TickStuck();
 		}
 	}
 
-	private void UpdateCoords()
+	public void TickNavigation()
 	{
-		PreviousCoord = CurrentCoord;
-		CurrentCoord = SingletonComponent<AiManager>.Instance.GetCoord(ServerPosition);
-		if (CurrentCoord.x != PreviousCoord.x || CurrentCoord.y != PreviousCoord.y)
+		if (!AI.move || !IsNavRunning())
 		{
-			AgencyUpdateRequired = true;
-			if (NavAgent.isOnOffMeshLink)
-			{
-				IsOnOffmeshLinkAndReachedNewCoord = true;
-			}
+			return;
+		}
+		if (IsDormant || !syncPosition)
+		{
+			StopMoving();
+			return;
+		}
+		Vector3 moveToPosition = base.transform.position;
+		stepDirection = Vector3.zero;
+		if ((bool)ChaseTransform)
+		{
+			TickChase();
+		}
+		if (NavAgent.isOnOffMeshLink)
+		{
+			HandleNavMeshLinkTraversal(0.1f, ref moveToPosition);
+		}
+		else if (NavAgent.hasPath)
+		{
+			TickFollowPath(ref moveToPosition);
+		}
+		if (ValidateNextPosition(ref moveToPosition))
+		{
+			UpdatePositionAndRotation(moveToPosition);
+			TickIdle();
+			TickStuck();
 		}
 	}
 
@@ -743,81 +864,129 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		{
 			position += vector.normalized * AttackOffset.z;
 		}
-		if (Vector3.Distance(NavAgent.destination, position) > 0.1f)
+		if ((NavAgent.destination - position).sqrMagnitude > 0.010000001f)
 		{
 			NavAgent.SetDestination(position);
 		}
 	}
 
-	private void TickNavMeshLinkTraversal(ref Vector3 moveToPosition)
+	private void HandleNavMeshLinkTraversal(float delta, ref Vector3 moveToPosition)
+	{
+		if (_traversingNavMeshLink || HandleNavMeshLinkTraversalStart(delta))
+		{
+			HandleNavMeshLinkTraversalTick(delta, ref moveToPosition);
+			if (!IsNavMeshLinkTraversalComplete(delta, ref moveToPosition))
+			{
+				_currentNavMeshLinkTraversalTimeDelta += delta;
+			}
+		}
+	}
+
+	private bool HandleNavMeshLinkTraversalStart(float delta)
 	{
 		OffMeshLinkData currentOffMeshLinkData = NavAgent.currentOffMeshLinkData;
-		if (!currentOffMeshLinkData.valid)
+		if (!currentOffMeshLinkData.valid || !currentOffMeshLinkData.activated || currentOffMeshLinkData.offMeshLink == null)
 		{
-			CompleteNavMeshLinkTraversal(failed: true, ref moveToPosition);
-			return;
+			return false;
 		}
-		Vector3 sourcePosition = currentOffMeshLinkData.endPos + Vector3.up * NavAgent.baseOffset;
-		if (NavMesh.SamplePosition(sourcePosition, out var hit, NavAgent.height * 2f, NavAgent.areaMask))
+		Vector3 normalized = (currentOffMeshLinkData.endPos - currentOffMeshLinkData.startPos).normalized;
+		normalized.y = 0f;
+		Vector3 desiredVelocity = NavAgent.desiredVelocity;
+		desiredVelocity.y = 0f;
+		float num = Vector3.Dot(desiredVelocity, normalized);
+		if (num < 0.1f)
 		{
-			sourcePosition = hit.position;
-			if (IsNavMeshLinkTraversalComplete(moveToPosition, sourcePosition))
+			CompleteNavMeshLink();
+			return false;
+		}
+		_currentNavMeshLink = currentOffMeshLinkData;
+		_currentNavMeshLinkName = _currentNavMeshLink.linkType.ToString();
+		if (currentOffMeshLinkData.offMeshLink.biDirectional)
+		{
+			float sqrMagnitude = (currentOffMeshLinkData.endPos - ServerPosition).sqrMagnitude;
+			if (sqrMagnitude < 0.05f)
 			{
-				CompleteNavMeshLinkTraversal(failed: false, ref moveToPosition);
+				_currentNavMeshLinkEndPos = currentOffMeshLinkData.startPos;
+				_currentNavMeshLinkOrientation = Quaternion.LookRotation(currentOffMeshLinkData.startPos + Vector3.up * (currentOffMeshLinkData.endPos.y - currentOffMeshLinkData.startPos.y) - currentOffMeshLinkData.endPos);
 			}
 			else
 			{
-				TraverseLink(ref moveToPosition, sourcePosition);
+				_currentNavMeshLinkEndPos = currentOffMeshLinkData.endPos;
+				_currentNavMeshLinkOrientation = Quaternion.LookRotation(currentOffMeshLinkData.endPos + Vector3.up * (currentOffMeshLinkData.startPos.y - currentOffMeshLinkData.endPos.y) - currentOffMeshLinkData.startPos);
 			}
 		}
 		else
 		{
-			CompleteNavMeshLinkTraversal(failed: true, ref moveToPosition);
+			_currentNavMeshLinkEndPos = currentOffMeshLinkData.endPos;
+			_currentNavMeshLinkOrientation = Quaternion.LookRotation(currentOffMeshLinkData.endPos + Vector3.up * (currentOffMeshLinkData.startPos.y - currentOffMeshLinkData.endPos.y) - currentOffMeshLinkData.startPos);
 		}
-	}
-
-	private bool IsNavMeshLinkTraversalComplete(Vector3 moveToPosition, Vector3 targetPosition)
-	{
-		return (AiManager.nav_grid && IsOnOffmeshLinkAndReachedNewCoord) || (!AiManager.nav_grid && Vector3Ex.Distance2D(moveToPosition, targetPosition) < 0.15f);
-	}
-
-	private void TraverseLink(ref Vector3 moveToPosition, Vector3 targetPosition)
-	{
-		float maxDistanceDelta = Mathf.Clamp01(NavAgent.speed * 0.1f);
-		moveToPosition = Vector3.MoveTowards(moveToPosition, targetPosition, maxDistanceDelta);
-		if (TransformUtil.GetGroundInfo(moveToPosition + Vector3.up * NavAgent.height * 0.5f, out var hitOut, NavAgent.height, movementMask, base.transform))
+		_traversingNavMeshLink = true;
+		NavAgent.ActivateCurrentOffMeshLink(activated: false);
+		NavAgent.obstacleAvoidanceType = ObstacleAvoidanceType.NoObstacleAvoidance;
+		float num2 = Mathf.Max(NavAgent.speed, 2.8f);
+		float magnitude = (_currentNavMeshLink.startPos - _currentNavMeshLink.endPos).magnitude;
+		_currentNavMeshLinkTraversalTime = magnitude / num2;
+		_currentNavMeshLinkTraversalTimeDelta = 0f;
+		if (_currentNavMeshLinkName == "OpenDoorLink" || _currentNavMeshLinkName == "JumpRockLink" || _currentNavMeshLinkName == "JumpFoundationLink")
 		{
-			moveToPosition = hitOut.point;
 		}
-		stepDirection = (moveToPosition - base.transform.position).normalized;
+		return true;
 	}
 
-	private void CompleteNavMeshLinkTraversal(bool failed, ref Vector3 moveToPosition)
+	private void HandleNavMeshLinkTraversalTick(float delta, ref Vector3 moveToPosition)
 	{
+		if (_currentNavMeshLinkName == "OpenDoorLink")
+		{
+			moveToPosition = Vector3.Lerp(_currentNavMeshLink.startPos, _currentNavMeshLink.endPos, _currentNavMeshLinkTraversalTimeDelta);
+		}
+		else if (_currentNavMeshLinkName == "JumpRockLink")
+		{
+			moveToPosition = Vector3.Lerp(_currentNavMeshLink.startPos, _currentNavMeshLink.endPos, _currentNavMeshLinkTraversalTimeDelta);
+		}
+		else if (_currentNavMeshLinkName == "JumpFoundationLink")
+		{
+			moveToPosition = Vector3.Lerp(_currentNavMeshLink.startPos, _currentNavMeshLink.endPos, _currentNavMeshLinkTraversalTimeDelta);
+		}
+		else
+		{
+			moveToPosition = Vector3.Lerp(_currentNavMeshLink.startPos, _currentNavMeshLink.endPos, _currentNavMeshLinkTraversalTimeDelta);
+		}
+	}
+
+	private bool IsNavMeshLinkTraversalComplete(float delta, ref Vector3 moveToPosition)
+	{
+		if (_currentNavMeshLinkTraversalTimeDelta >= _currentNavMeshLinkTraversalTime)
+		{
+			moveToPosition = _currentNavMeshLink.endPos;
+			_traversingNavMeshLink = false;
+			_currentNavMeshLink = default(OffMeshLinkData);
+			_currentNavMeshLinkTraversalTime = 0f;
+			_currentNavMeshLinkTraversalTimeDelta = 0f;
+			_currentNavMeshLinkName = string.Empty;
+			_currentNavMeshLinkOrientation = Quaternion.identity;
+			CompleteNavMeshLink();
+			return true;
+		}
+		return false;
+	}
+
+	private void CompleteNavMeshLink()
+	{
+		NavAgent.ActivateCurrentOffMeshLink(activated: true);
 		NavAgent.CompleteOffMeshLink();
-		IsOnOffmeshLinkAndReachedNewCoord = false;
-		if (failed)
-		{
-			NavAgent.ResetPath();
-			stepDirection = Vector3.zero;
-		}
-		else if (NavAgent.hasPath)
-		{
-			moveToPosition = NavAgent.nextPosition;
-			stepDirection = NavAgent.velocity.normalized;
-		}
-		Resume();
+		NavAgent.isStopped = false;
+		NavAgent.obstacleAvoidanceType = ObstacleAvoidanceType.HighQualityObstacleAvoidance;
 	}
 
 	private void TickFollowPath(ref Vector3 moveToPosition)
 	{
 		moveToPosition = NavAgent.nextPosition;
-		stepDirection = NavAgent.velocity.normalized;
+		stepDirection = NavAgent.desiredVelocity.normalized;
 	}
 
 	private bool ValidateNextPosition(ref Vector3 moveToPosition)
 	{
-		if (!ValidBounds.Test(moveToPosition))
+		if (!ValidBounds.Test(moveToPosition) && base.transform != null && !base.IsDestroyed)
 		{
 			Debug.Log(string.Concat("Invalid NavAgent Position: ", this, " ", moveToPosition, " (destroying)"));
 			Kill();
@@ -846,10 +1015,10 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 
 	public void TickStuck()
 	{
-		if (IsNavRunning() && !NavAgent.isStopped && Vector3.Distance(lastStuckPos, ServerPosition) < 0.25f && AttackReady())
+		if (IsNavRunning() && !NavAgent.isStopped && (lastStuckPos - ServerPosition).sqrMagnitude < 0.0625f && AttackReady())
 		{
 			stuckDuration += 0.1f;
-			if (stuckDuration >= 5f && lastStuckTime == 0f)
+			if (stuckDuration >= 5f && Mathf.Approximately(lastStuckTime, 0f))
 			{
 				lastStuckTime = UnityEngine.Time.time;
 				OnBecomeStuck();
@@ -881,11 +1050,26 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		{
 			return;
 		}
-		if (Vector3.Distance(NavAgent.destination, ServerPosition) > 1f)
+		if (_traversingNavMeshLink)
+		{
+			Vector3 vector = ((ChaseTransform != null) ? (ChaseTransform.localPosition - ServerPosition) : ((!(AttackTarget != null)) ? (NavAgent.destination - ServerPosition) : (AttackTarget.ServerPosition - ServerPosition)));
+			float sqrMagnitude = vector.sqrMagnitude;
+			if (sqrMagnitude > 1f)
+			{
+				vector = _currentNavMeshLinkEndPos - ServerPosition;
+			}
+			sqrMagnitude = vector.sqrMagnitude;
+			if (sqrMagnitude > 0.001f)
+			{
+				ServerRotation = _currentNavMeshLinkOrientation;
+				return;
+			}
+		}
+		else if ((NavAgent.destination - ServerPosition).sqrMagnitude > 1f)
 		{
 			Vector3 forward = stepDirection;
-			float sqrMagnitude = forward.sqrMagnitude;
-			if (sqrMagnitude > 0.001f)
+			float sqrMagnitude2 = forward.sqrMagnitude;
+			if (sqrMagnitude2 > 0.001f)
 			{
 				ServerRotation = Quaternion.LookRotation(forward);
 				return;
@@ -893,21 +1077,20 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		}
 		if ((bool)ChaseTransform && CurrentBehaviour == Behaviour.Attack)
 		{
-			Vector3 vector = ChaseTransform.localPosition - ServerPosition;
-			float magnitude = vector.magnitude;
-			if (magnitude < 3f && magnitude > 0.001f)
-			{
-				ServerRotation = Quaternion.LookRotation(vector.normalized);
-				return;
-			}
-		}
-		if ((bool)AttackTarget && CurrentBehaviour == Behaviour.Attack)
-		{
-			Vector3 vector2 = AttackTarget.ServerPosition - ServerPosition;
-			float magnitude2 = vector2.magnitude;
-			if (magnitude2 < 3f && magnitude2 > 0.001f)
+			Vector3 vector2 = ChaseTransform.localPosition - ServerPosition;
+			float sqrMagnitude3 = vector2.sqrMagnitude;
+			if (sqrMagnitude3 < 9f && sqrMagnitude3 > 0.001f)
 			{
 				ServerRotation = Quaternion.LookRotation(vector2.normalized);
+			}
+		}
+		else if ((bool)AttackTarget && CurrentBehaviour == Behaviour.Attack)
+		{
+			Vector3 vector3 = AttackTarget.ServerPosition - ServerPosition;
+			float sqrMagnitude4 = vector3.sqrMagnitude;
+			if (sqrMagnitude4 < 9f && sqrMagnitude4 > 0.001f)
+			{
+				ServerRotation = Quaternion.LookRotation(vector3.normalized);
 			}
 		}
 	}
@@ -1034,13 +1217,40 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		return flag;
 	}
 
+	private void TickBehaviourState()
+	{
+		if (GetFact(Facts.WantsToFlee) == 1 && IsNavRunning() && NavAgent.pathStatus == NavMeshPathStatus.PathComplete && UnityEngine.Time.realtimeSinceStartup - (maxFleeTime - Stats.MaxFleeTime) > 0.5f)
+		{
+			TickFlee();
+		}
+		if (GetFact(Facts.CanTargetEnemies) == 0)
+		{
+			TickBlockEnemyTargeting();
+		}
+		if (GetFact(Facts.CanTargetFood) == 0)
+		{
+			TickBlockFoodTargeting();
+		}
+		if (GetFact(Facts.IsAggro) == 1)
+		{
+			TickAggro();
+		}
+		if (GetFact(Facts.IsEating) == 1)
+		{
+			TickEating();
+		}
+		if (GetFact(Facts.CanNotMove) == 1)
+		{
+			TickWakeUpBlockMove();
+		}
+	}
+
 	private void WantsToFlee()
 	{
 		if (GetFact(Facts.WantsToFlee) != 1 && IsNavRunning())
 		{
 			SetFact(Facts.WantsToFlee, 1);
 			maxFleeTime = UnityEngine.Time.realtimeSinceStartup + Stats.MaxFleeTime;
-			InvokeRandomized(TickFlee, 2f, 0.1f, 0.0050000004f);
 		}
 	}
 
@@ -1054,7 +1264,6 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 				NavigateToOperator.FleeEnemy(AiContext);
 				return;
 			}
-			CancelInvoke(TickFlee);
 			SetFact(Facts.WantsToFlee, 0);
 			SetFact(Facts.IsFleeing, 0);
 			Stats.HealthThresholdForFleeing = base.healthFraction * fleeHealthThresholdPercentage;
@@ -1070,20 +1279,14 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		SetFact(Facts.CanTargetEnemies, 0);
 		blockEnemyTargetingTimeout = UnityEngine.Time.realtimeSinceStartup + timeout;
 		blockTargetingThisEnemy = AttackTarget;
-		InvokeRandomized(TickBlockEnemyTargeting, timeout, 0.1f, 0.0050000004f);
 		return true;
 	}
 
 	private void TickBlockEnemyTargeting()
 	{
-		if (GetFact(Facts.CanTargetEnemies) == 1)
-		{
-			CancelInvoke(TickBlockEnemyTargeting);
-		}
-		else if (UnityEngine.Time.realtimeSinceStartup > blockEnemyTargetingTimeout)
+		if (GetFact(Facts.CanTargetEnemies) != 1 && UnityEngine.Time.realtimeSinceStartup > blockEnemyTargetingTimeout)
 		{
 			SetFact(Facts.CanTargetEnemies, 1);
-			CancelInvoke(TickBlockEnemyTargeting);
 		}
 	}
 
@@ -1095,20 +1298,14 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		}
 		SetFact(Facts.CanTargetFood, 0);
 		blockFoodTargetingTimeout = UnityEngine.Time.realtimeSinceStartup + timeout;
-		InvokeRandomized(TickBlockFoodTargeting, timeout, 0.1f, 0.0050000004f);
 		return true;
 	}
 
 	private void TickBlockFoodTargeting()
 	{
-		if (GetFact(Facts.CanTargetFood) == 1)
-		{
-			CancelInvoke(TickBlockFoodTargeting);
-		}
-		else if (UnityEngine.Time.realtimeSinceStartup > blockFoodTargetingTimeout)
+		if (GetFact(Facts.CanTargetFood) != 1 && UnityEngine.Time.realtimeSinceStartup > blockFoodTargetingTimeout)
 		{
 			SetFact(Facts.CanTargetFood, 1);
-			CancelInvoke(TickBlockFoodTargeting);
 		}
 	}
 
@@ -1143,7 +1340,6 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		}
 		SetFact(Facts.IsAggro, 1);
 		aggroTimeout = UnityEngine.Time.realtimeSinceStartup + timeout;
-		InvokeRandomized(TickAggro, timeout, 0.1f, 0.0050000004f);
 		return true;
 	}
 
@@ -1176,7 +1372,6 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		if (flag)
 		{
 			SetFact(Facts.IsAggro, 0, triggerCallback);
-			CancelInvoke(TickAggro);
 		}
 	}
 
@@ -1188,20 +1383,14 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		}
 		SetFact(Facts.IsEating, 1);
 		eatTimeout = UnityEngine.Time.realtimeSinceStartup + timeout;
-		InvokeRandomized(TickEating, timeout, 0.1f, 0.0050000004f);
 		return true;
 	}
 
 	private void TickEating()
 	{
-		if (GetFact(Facts.IsEating) == 0)
-		{
-			CancelInvoke(TickEating);
-		}
-		else if (UnityEngine.Time.realtimeSinceStartup > eatTimeout)
+		if (GetFact(Facts.IsEating) != 0 && UnityEngine.Time.realtimeSinceStartup > eatTimeout)
 		{
 			SetFact(Facts.IsEating, 0);
-			CancelInvoke(TickEating);
 		}
 	}
 
@@ -1213,20 +1402,14 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		}
 		SetFact(Facts.CanNotMove, 1);
 		wakeUpBlockMoveTimeout = UnityEngine.Time.realtimeSinceStartup + timeout;
-		InvokeRandomized(TickWakeUpBlockMove, timeout, 0.1f, 0.0050000004f);
 		return true;
 	}
 
 	private void TickWakeUpBlockMove()
 	{
-		if (GetFact(Facts.CanNotMove) == 0)
-		{
-			CancelInvoke(TickWakeUpBlockMove);
-		}
-		else if (UnityEngine.Time.realtimeSinceStartup > wakeUpBlockMoveTimeout)
+		if (GetFact(Facts.CanNotMove) != 0 && UnityEngine.Time.realtimeSinceStartup > wakeUpBlockMoveTimeout)
 		{
 			SetFact(Facts.CanNotMove, 0);
-			CancelInvoke(TickWakeUpBlockMove);
 		}
 	}
 
@@ -1297,13 +1480,18 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		}
 	}
 
+	public int TopologyPreference()
+	{
+		return (int)topologyPreference;
+	}
+
 	public void UpdateDestination(Vector3 position)
 	{
 		if (IsStopped)
 		{
 			IsStopped = false;
 		}
-		if (Vector3.Distance(Destination, position) > 0.1f)
+		if ((Destination - position).sqrMagnitude > 0.010000001f)
 		{
 			Destination = position;
 		}
@@ -1320,6 +1508,7 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 	{
 		IsStopped = true;
 		ChaseTransform = null;
+		SetFact(Facts.PathToTargetStatus, 0);
 	}
 
 	public bool IsNavRunning()
@@ -1329,7 +1518,6 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 
 	public void Pause()
 	{
-		IsDormant = true;
 		if (GetNavAgent != null && GetNavAgent.enabled)
 		{
 			GetNavAgent.enabled = false;
@@ -1347,17 +1535,11 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 
 	public void Resume()
 	{
-		if (GetNavAgent == null || AiManager.nav_disable)
-		{
-			Pause();
-			return;
-		}
 		if (!GetNavAgent.isOnNavMesh)
 		{
 			StartCoroutine(TryForceToNavmesh());
 			return;
 		}
-		IsDormant = false;
 		GetNavAgent.enabled = true;
 		if (utilityAiComponent == null)
 		{
@@ -1376,15 +1558,7 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		int numTries = 0;
 		float waitForRetryTime = 1f;
 		float maxDistanceMultiplier = 2f;
-		if (SingletonComponent<AiManager>.Instance != null && SingletonComponent<AiManager>.Instance.enabled && SingletonComponent<AiManager>.Instance.UseNavMesh)
-		{
-			while (SingletonComponent<AiManager>.Instance.IsNavmeshBuilding(AgentTypeIndex, ServerPosition))
-			{
-				yield return CoroutineEx.waitForSecondsRealtime(waitForRetryTime);
-				waitForRetryTime += 0.5f;
-			}
-		}
-		else if (!AiManager.nav_grid && SingletonComponent<DynamicNavMesh>.Instance != null)
+		if (SingletonComponent<DynamicNavMesh>.Instance != null)
 		{
 			while (SingletonComponent<DynamicNavMesh>.Instance.IsBuilding)
 			{
@@ -1411,7 +1585,6 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 						utilityAiComponent.enabled = true;
 						utilityAiComponent.Resume();
 					}
-					IsDormant = false;
 					yield break;
 				}
 				yield return CoroutineEx.waitForSecondsRealtime(waitForRetryTime);
@@ -1429,14 +1602,19 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 				utilityAiComponent.enabled = true;
 				utilityAiComponent.Resume();
 			}
-			IsDormant = false;
 			yield break;
 		}
+		Debug.LogWarningFormat("Failed to spawn {0} on a valid navmesh.", base.name);
 		DieInstantly();
 	}
 
 	public float GetWantsToAttack(BaseEntity target)
 	{
+		object obj = Interface.CallHook("IOnNpcTarget", this, target);
+		if (obj is float)
+		{
+			return (float)obj;
+		}
 		return WantsToAttack(target);
 	}
 
@@ -1452,11 +1630,6 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 
 	internal float WantsToAttack(BaseEntity target)
 	{
-		object obj = Interface.CallHook("OnNpcTarget", this, target);
-		if (obj is float)
-		{
-			return (float)obj;
-		}
 		if (target == null)
 		{
 			return 0f;
@@ -1504,11 +1677,6 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		{
 			aiFlags = (AiFlags)info.msg.baseNPC.flags;
 		}
-	}
-
-	public override bool SupportsPooling()
-	{
-		return true;
 	}
 
 	public override float MaxVelocity()
@@ -1594,6 +1762,15 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		return EnemyRangeEnum.OutOfRange;
 	}
 
+	public float GetActiveAggressionRangeSqr()
+	{
+		if (GetFact(Facts.IsAggro) == 1)
+		{
+			return Stats.DeaggroRange * Stats.DeaggroRange;
+		}
+		return Stats.AggressionRange * Stats.AggressionRange;
+	}
+
 	public FoodRangeEnum ToFoodRangeEnum(float range)
 	{
 		if (range <= 0.5f)
@@ -1666,6 +1843,20 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		};
 	}
 
+	public byte GetPathStatus()
+	{
+		if (!IsNavRunning())
+		{
+			return 2;
+		}
+		return (byte)NavAgent.pathStatus;
+	}
+
+	public NavMeshPathStatus ToPathStatus(byte value)
+	{
+		return (NavMeshPathStatus)value;
+	}
+
 	private void TickSenses()
 	{
 		if (Query.Server != null && AiContext != null && !IsDormant)
@@ -1679,7 +1870,10 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 				lastTickTime = UnityEngine.Time.realtimeSinceStartup;
 			}
 			TickEnemyAwareness();
-			TickFoodAwareness();
+			if (!AI.animal_ignore_food)
+			{
+				TickFoodAwareness();
+			}
 			UpdateSelfFacts();
 		}
 	}
@@ -1694,7 +1888,7 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		{
 			return;
 		}
-		int inSphere = Query.Server.GetInSphere(ServerPosition, Stats.VisionRange, SensesResults, AiCaresAbout);
+		int inSphere = Query.Server.GetInSphere(base.transform.position, Stats.VisionRange, SensesResults, AiCaresAbout);
 		if (inSphere == 0)
 		{
 			return;
@@ -1711,14 +1905,14 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 				BasePlayer basePlayer = baseEntity as BasePlayer;
 				if (basePlayer != null)
 				{
-					if (!AI.ignoreplayers && Vector3.Distance(basePlayer.ServerPosition, ServerPosition) <= AttackRange + 2f)
+					if (!AI.ignoreplayers && (basePlayer.ServerPosition - ServerPosition).sqrMagnitude <= (AttackRange + 2f) * (AttackRange + 2f))
 					{
 						AiContext.PlayersBehindUs.Add(basePlayer);
 					}
 					continue;
 				}
 				BaseNpc baseNpc = baseEntity as BaseNpc;
-				if (baseNpc != null && Vector3.Distance(baseNpc.ServerPosition, ServerPosition) <= AttackRange + 2f)
+				if (baseNpc != null && (baseNpc.ServerPosition - ServerPosition).sqrMagnitude <= (AttackRange + 2f) * (AttackRange + 2f))
 				{
 					AiContext.NpcsBehindUs.Add(baseNpc);
 				}
@@ -1798,6 +1992,8 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		BaseNpc baseNpc = null;
 		AiContext.AIAgent.AttackTarget = null;
 		Vector3 vector = Vector3.zero;
+		float num2 = 0f;
+		float num3 = 0f;
 		foreach (BasePlayer player in AiContext.Players)
 		{
 			if (player.IsDead() || player.IsDestroyed || (blockTargetingThisEnemy != null && player.net != null && blockTargetingThisEnemy.net != null && player.net.ID == blockTargetingThisEnemy.net.ID))
@@ -1806,6 +2002,7 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 			}
 			Vector3 vector2 = player.ServerPosition - ServerPosition;
 			float sqrMagnitude = vector2.sqrMagnitude;
+			num2 += Mathf.Min(Mathf.Sqrt(sqrMagnitude), Stats.VisionRange) / Stats.VisionRange;
 			if (sqrMagnitude < num)
 			{
 				num = sqrMagnitude;
@@ -1828,6 +2025,7 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 				}
 				Vector3 vector3 = npc.ServerPosition - ServerPosition;
 				float sqrMagnitude2 = vector3.sqrMagnitude;
+				num3 += Mathf.Min(Mathf.Sqrt(sqrMagnitude2), Stats.VisionRange) / Stats.VisionRange;
 				if (sqrMagnitude2 < num)
 				{
 					num = sqrMagnitude2;
@@ -1854,8 +2052,30 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 				baseNpc = AiContext.NpcsBehindUs[0];
 			}
 		}
-		AiContext.EnemyPlayer = basePlayer;
-		AiContext.EnemyNpc = baseNpc;
+		if (AiContext.EnemyPlayer == null || AiContext.EnemyPlayer.IsDestroyed || AiContext.EnemyPlayer.IsDead() || num2 > AiContext.LastEnemyPlayerScore + DecisionMomentumPlayerTarget())
+		{
+			AiContext.EnemyPlayer = basePlayer;
+			AiContext.LastEnemyPlayerScore = num2;
+			playerTargetDecisionStartTime = UnityEngine.Time.time;
+		}
+		else if (basePlayer == null && DecisionMomentumPlayerTarget() < 0.01f)
+		{
+			AiContext.EnemyPlayer = basePlayer;
+			AiContext.LastEnemyPlayerScore = 0f;
+			playerTargetDecisionStartTime = 0f;
+		}
+		if (AiContext.EnemyNpc == null || AiContext.EnemyNpc.IsDestroyed || AiContext.EnemyNpc.IsDead() || num3 > AiContext.LastEnemyNpcScore + DecisionMomentumAnimalTarget())
+		{
+			AiContext.EnemyNpc = baseNpc;
+			AiContext.LastEnemyNpcScore = num3;
+			animalTargetDecisionStartTime = UnityEngine.Time.time;
+		}
+		else if (baseNpc == null && DecisionMomentumAnimalTarget() < 0.01f)
+		{
+			AiContext.EnemyNpc = baseNpc;
+			AiContext.LastEnemyNpcScore = 0f;
+			animalTargetDecisionStartTime = 0f;
+		}
 		if (basePlayer != null || baseNpc != null)
 		{
 			SetFact(Facts.HasEnemy, 1);
@@ -1867,12 +2087,15 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 			{
 				AiContext.AIAgent.AttackTarget = baseNpc;
 			}
-			float magnitude = vector.magnitude;
-			EnemyRangeEnum enemyRangeEnum = ToEnemyRangeEnum(magnitude);
-			AfraidRangeEnum value = ToAfraidRangeEnum(magnitude);
-			SetFact(Facts.EnemyRange, (byte)enemyRangeEnum);
-			SetFact(Facts.AfraidRange, (byte)value);
-			TryAggro(enemyRangeEnum);
+			if (Interface.CallHook("IOnNpcTarget", this, AiContext.AIAgent.AttackTarget) == null)
+			{
+				float magnitude = vector.magnitude;
+				EnemyRangeEnum enemyRangeEnum = ToEnemyRangeEnum(magnitude);
+				AfraidRangeEnum value = ToAfraidRangeEnum(magnitude);
+				SetFact(Facts.EnemyRange, (byte)enemyRangeEnum);
+				SetFact(Facts.AfraidRange, (byte)value);
+				TryAggro(enemyRangeEnum);
+			}
 		}
 		else
 		{
@@ -1880,6 +2103,26 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 			SetFact(Facts.EnemyRange, 3);
 			SetFact(Facts.AfraidRange, 1);
 		}
+	}
+
+	private float DecisionMomentumPlayerTarget()
+	{
+		float num = UnityEngine.Time.time - playerTargetDecisionStartTime;
+		if (num > 1f)
+		{
+			return 0f;
+		}
+		return num;
+	}
+
+	private float DecisionMomentumAnimalTarget()
+	{
+		float num = UnityEngine.Time.time - animalTargetDecisionStartTime;
+		if (num > 1f)
+		{
+			return 0f;
+		}
+		return num;
 	}
 
 	private void TickFoodAwareness()
@@ -1953,12 +2196,17 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		SetFact(Facts.IsRoamReady, (byte)((UnityEngine.Time.realtimeSinceStartup >= AiContext.NextRoamTime && IsNavRunning()) ? 1u : 0u));
 		SetFact(Facts.Speed, (byte)ToSpeedEnum(TargetSpeed / Stats.Speed));
 		SetFact(Facts.IsHungry, (Energy.Level < 0.25f) ? ((byte)1) : ((byte)0));
-		SetFact(Facts.AttackedLately, (byte)((base.SecondsSinceAttacked < Stats.AttackedMemoryTime) ? 1u : 0u));
-		SetFact(Facts.IsMoving, (byte)((IsNavRunning() && NavAgent.hasPath && !float.IsInfinity(NavAgent.remainingDistance) && NavAgent.remainingDistance > NavAgent.stoppingDistance && !IsStuck && NavAgent.desiredVelocity.sqrMagnitude > 0f) ? 1u : 0u));
+		SetFact(Facts.AttackedLately, (byte)((!float.IsNegativeInfinity(base.SecondsSinceAttacked) && base.SecondsSinceAttacked < Stats.AttackedMemoryTime) ? 1u : 0u));
+		SetFact(Facts.IsMoving, IsMoving());
 		if (CheckHealthThresholdToFlee() || IsAfraid())
 		{
 			WantsToFlee();
 		}
+	}
+
+	private byte IsMoving()
+	{
+		return (byte)((IsNavRunning() && NavAgent.hasPath && NavAgent.remainingDistance > NavAgent.stoppingDistance && !IsStuck && GetFact(Facts.Speed) != 0) ? 1u : 0u);
 	}
 
 	private static bool AiCaresAbout(BaseEntity ent)
@@ -1971,17 +2219,20 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		{
 			return true;
 		}
-		if (ent is WorldItem)
+		if (!AI.animal_ignore_food)
 		{
-			return true;
-		}
-		if (ent is BaseCorpse)
-		{
-			return true;
-		}
-		if (ent is CollectibleEntity)
-		{
-			return true;
+			if (ent is WorldItem)
+			{
+				return true;
+			}
+			if (ent is BaseCorpse)
+			{
+				return true;
+			}
+			if (ent is CollectibleEntity)
+			{
+				return true;
+			}
 		}
 		return false;
 	}
@@ -2001,6 +2252,31 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 		return true;
 	}
 
+	public void SetTargetPathStatus(float pendingDelay = 0.05f)
+	{
+		if (!isAlreadyCheckingPathPending)
+		{
+			if (NavAgent.pathPending && numPathPendingAttempts < 10)
+			{
+				isAlreadyCheckingPathPending = true;
+				Invoke(DelayedTargetPathStatus, pendingDelay);
+			}
+			else
+			{
+				numPathPendingAttempts = 0;
+				accumPathPendingDelay = 0f;
+				SetFact(Facts.PathToTargetStatus, GetPathStatus());
+			}
+		}
+	}
+
+	private void DelayedTargetPathStatus()
+	{
+		accumPathPendingDelay += 0.1f;
+		isAlreadyCheckingPathPending = false;
+		SetTargetPathStatus(accumPathPendingDelay);
+	}
+
 	public List<NavPointSample> RequestNavPointSamplesInCircle(NavPointSampler.SampleCount sampleCount, float radius, NavPointSampler.SampleFeatures features = NavPointSampler.SampleFeatures.None)
 	{
 		navPointSamples.Clear();
@@ -2009,6 +2285,17 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 			WaterMaxDepth = Stats.MaxWaterDepth,
 			Agent = this,
 			Features = features
+		}, ref navPointSamples);
+		return navPointSamples;
+	}
+
+	public List<NavPointSample> RequestNavPointSamplesInCircleWaterDepthOnly(NavPointSampler.SampleCount sampleCount, float radius, float waterDepth)
+	{
+		navPointSamples.Clear();
+		NavPointSampler.SampleCircleWaterDepthOnly(sampleCount, ServerPosition, radius, new NavPointSampler.SampleScoreParams
+		{
+			WaterMaxDepth = waterDepth,
+			Agent = this
 		}, ref navPointSamples);
 		return navPointSamples;
 	}
@@ -2025,7 +2312,6 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 			NavAgent.updateRotation = false;
 			NavAgent.updatePosition = false;
 		}
-		IsDormant = false;
 		IsStuck = false;
 		AgencyUpdateRequired = false;
 		IsOnOffmeshLinkAndReachedNewCoord = false;
@@ -2053,9 +2339,18 @@ public class BaseNpc : BaseCombatEntity, IContextProvider, IAIAgent, ILoadBalanc
 
 	float? ILoadBalanced.ExecuteUpdate(float deltaTime, float nextInterval)
 	{
+		if (base.IsDestroyed || this == null || base.transform == null)
+		{
+			AnimalSensesLoadBalancer.animalSensesLoadBalancer.Remove(this);
+			return nextInterval;
+		}
 		using (TimeWarning.New("Animal.TickSenses"))
 		{
 			TickSenses();
+		}
+		using (TimeWarning.New("Animal.TickBehaviourState"))
+		{
+			TickBehaviourState();
 		}
 		return UnityEngine.Random.value * 0.1f + 0.1f;
 	}

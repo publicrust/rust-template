@@ -31,11 +31,15 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 
 	public PlayerLoot loot;
 
+	private float nextCheckTime;
+
+	private bool wasBirthday;
+
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
 		using (TimeWarning.New("PlayerInventory.OnRpcMessage"))
 		{
-			if (rpc == 2116208967 && player != null)
+			if (rpc == 3482449460u && player != null)
 			{
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
@@ -71,7 +75,7 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 				}
 				return true;
 			}
-			if (rpc == 4191184484u && player != null)
+			if (rpc == 3041092525u && player != null)
 			{
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
 				if (ConVar.Global.developer > 2)
@@ -163,7 +167,7 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 		{
 			containerBelt.GiveUID();
 		}
-		containerWear.ServerInitialize(null, 6);
+		containerWear.ServerInitialize(null, 7);
 		if (containerWear.uid == 0)
 		{
 			containerWear.GiveUID();
@@ -203,8 +207,9 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 	public void UpdatedVisibleHolsteredItems()
 	{
 		List<HeldEntity> obj = Facepunch.Pool.GetList<HeldEntity>();
-		Item[] array = AllItems();
-		foreach (Item item in array)
+		List<Item> items = Facepunch.Pool.GetList<Item>();
+		AllItemsNoAlloc(ref items);
+		foreach (Item item in items)
 		{
 			if (!item.info.isHoldable)
 			{
@@ -220,6 +225,7 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 				}
 			}
 		}
+		Facepunch.Pool.FreeList(ref items);
 		IOrderedEnumerable<HeldEntity> orderedEnumerable = obj.OrderByDescending((HeldEntity x) => x.hostileScore);
 		bool flag = true;
 		bool flag2 = true;
@@ -270,8 +276,8 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 		return true;
 	}
 
-	[BaseEntity.RPC_Server.FromOwner]
 	[BaseEntity.RPC_Server]
+	[BaseEntity.RPC_Server.FromOwner]
 	private void ItemCmd(BaseEntity.RPCMessage msg)
 	{
 		uint id = msg.read.UInt32();
@@ -291,11 +297,11 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 			base.baseEntity.stats.Add("item_drop", 1);
 			if (num < item.amount)
 			{
-				item.SplitItem(num)?.Drop(base.baseEntity.eyes.position, base.baseEntity.eyes.BodyForward() * 4f + Vector3Ex.Range(-0.5f, 0.5f));
+				item.SplitItem(num)?.Drop(base.baseEntity.GetDropPosition(), base.baseEntity.GetDropVelocity());
 			}
 			else
 			{
-				item.Drop(base.baseEntity.eyes.position, base.baseEntity.eyes.BodyForward() * 4f + Vector3Ex.Range(-0.5f, 0.5f));
+				item.Drop(base.baseEntity.GetDropPosition(), base.baseEntity.GetDropVelocity());
 			}
 			base.baseEntity.SignalBroadcast(BaseEntity.Signal.Gesture, "drop_item");
 		}
@@ -307,58 +313,80 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 		}
 	}
 
-	[BaseEntity.RPC_Server.FromOwner]
 	[BaseEntity.RPC_Server]
+	[BaseEntity.RPC_Server.FromOwner]
 	private void MoveItem(BaseEntity.RPCMessage msg)
 	{
-		uint id = msg.read.UInt32();
 		uint num = msg.read.UInt32();
-		int num2 = msg.read.Int8();
-		int num3 = msg.read.UInt16();
-		Item item = FindItemUID(id);
-		if (item == null || Interface.CallHook("CanMoveItem", item, this, num, num2, num3) != null || !CanMoveItemsFrom(item.parent.entityOwner, item))
+		uint num2 = msg.read.UInt32();
+		int num3 = msg.read.Int8();
+		int num4 = msg.read.UInt16();
+		Item item = FindItemUID(num);
+		if (item == null)
 		{
-			return;
+			msg.player.ChatMessage("Invalid item (" + num + ")");
 		}
-		if (num3 <= 0)
+		else
 		{
-			num3 = item.amount;
-		}
-		num3 = Mathf.Clamp(num3, 1, item.info.stackable);
-		if (num == 0)
-		{
-			GiveItem(item);
-			return;
-		}
-		ItemContainer itemContainer = FindContainer(num);
-		if (itemContainer == null)
-		{
-			return;
-		}
-		ItemContainer parent = item.parent;
-		if ((parent != null && parent.IsLocked()) || itemContainer.IsLocked() || itemContainer.PlayerItemInputBlocked())
-		{
-			return;
-		}
-		using (TimeWarning.New("Split"))
-		{
-			if (item.amount > num3)
+			if (Interface.CallHook("CanMoveItem", item, this, num2, num3, num4) != null)
 			{
-				Item item2 = item.SplitItem(num3);
-				if (!item2.MoveToContainer(itemContainer, num2))
-				{
-					item.amount += item2.amount;
-					item2.Remove();
-				}
-				ItemManager.DoRemoves();
-				ServerUpdate(0f);
 				return;
 			}
-		}
-		if (item.MoveToContainer(itemContainer, num2))
-		{
-			ItemManager.DoRemoves();
-			ServerUpdate(0f);
+			if (!CanMoveItemsFrom(item.parent.entityOwner, item))
+			{
+				msg.player.ChatMessage("Cannot move item!");
+				return;
+			}
+			if (num4 <= 0)
+			{
+				num4 = item.amount;
+			}
+			num4 = Mathf.Clamp(num4, 1, item.MaxStackable());
+			if (num2 == 0)
+			{
+				if (!GiveItem(item))
+				{
+					msg.player.ChatMessage("GiveItem failed!");
+				}
+				return;
+			}
+			ItemContainer itemContainer = FindContainer(num2);
+			if (itemContainer == null)
+			{
+				msg.player.ChatMessage("Invalid container (" + num2 + ")");
+				return;
+			}
+			ItemContainer parent = item.parent;
+			if ((parent != null && parent.IsLocked()) || itemContainer.IsLocked())
+			{
+				msg.player.ChatMessage("Container is locked!");
+				return;
+			}
+			if (itemContainer.PlayerItemInputBlocked())
+			{
+				msg.player.ChatMessage("Container does not accept player items!");
+				return;
+			}
+			using (TimeWarning.New("Split"))
+			{
+				if (item.amount > num4)
+				{
+					Item item2 = item.SplitItem(num4);
+					if (!item2.MoveToContainer(itemContainer, num3))
+					{
+						item.amount += item2.amount;
+						item2.Remove();
+					}
+					ItemManager.DoRemoves();
+					ServerUpdate(0f);
+					return;
+				}
+			}
+			if (item.MoveToContainer(itemContainer, num3))
+			{
+				ItemManager.DoRemoves();
+				ServerUpdate(0f);
+			}
 		}
 	}
 
@@ -394,7 +422,7 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 				ItemModContainerRestriction component2 = item2.info.GetComponent<ItemModContainerRestriction>();
 				if (!(component2 == null) && !component.CanExistWith(component2) && !item2.MoveToContainer(containerMain))
 				{
-					item2.Drop(base.baseEntity.eyes.position, base.baseEntity.eyes.BodyForward() * 2f);
+					item2.Drop(base.baseEntity.GetDropPosition(), base.baseEntity.GetDropVelocity());
 				}
 			}
 		}
@@ -421,7 +449,7 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 				ItemModWearable component2 = item2.info.GetComponent<ItemModWearable>();
 				if (!(component2 == null) && !component.CanExistWith(component2) && !item2.MoveToContainer(containerMain))
 				{
-					item2.Drop(base.baseEntity.eyes.position, base.baseEntity.eyes.BodyForward() * 2f);
+					item2.Drop(base.baseEntity.GetDropPosition(), base.baseEntity.GetDropVelocity());
 				}
 			}
 		}
@@ -664,6 +692,18 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 		ItemManager.DoRemoves();
 	}
 
+	public bool IsBirthday()
+	{
+		if (UnityEngine.Time.time < nextCheckTime)
+		{
+			return wasBirthday;
+		}
+		nextCheckTime = UnityEngine.Time.time + 60f;
+		DateTime now = DateTime.Now;
+		wasBirthday = now.Day == 11 && now.Month == 12 && now.Year == 2018;
+		return wasBirthday;
+	}
+
 	public void GiveDefaultItems()
 	{
 		Strip();
@@ -679,6 +719,11 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 		}
 		GiveItem(ItemManager.CreateByName("rock", 1, skin), containerBelt);
 		GiveItem(ItemManager.CreateByName("torch", 1, 0uL), containerBelt);
+		if (IsBirthday())
+		{
+			GiveItem(ItemManager.CreateByName("cakefiveyear", 1, 0uL), containerBelt);
+			GiveItem(ItemManager.CreateByName("partyhat", 1, 0uL), containerWear);
+		}
 	}
 
 	public ProtoBuf.PlayerInventory Save(bool bForDisk)
@@ -773,6 +818,24 @@ public class PlayerInventory : EntityComponent<BasePlayer>
 			list.AddRange(containerWear.itemList);
 		}
 		return list.ToArray();
+	}
+
+	public int AllItemsNoAlloc(ref List<Item> items)
+	{
+		items.Clear();
+		if (containerMain != null)
+		{
+			items.AddRange(containerMain.itemList);
+		}
+		if (containerBelt != null)
+		{
+			items.AddRange(containerBelt.itemList);
+		}
+		if (containerWear != null)
+		{
+			items.AddRange(containerWear.itemList);
+		}
+		return items.Count;
 	}
 
 	public void FindAmmo(List<Item> list, AmmoTypes ammoType)
