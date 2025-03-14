@@ -91,8 +91,8 @@ public class GestureDoor : Door
 		return delay > 0f;
 	}
 
-	[RPC_Server]
 	[RPC_Server.MaxDistance(3f)]
+	[RPC_Server]
 	private void ServerKick(RPCMessage msg)
 	{
 		wasKick = true;

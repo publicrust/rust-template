@@ -24,8 +24,8 @@ public class RadialBlur : PostProcessEffectSettings
 		value = 0f
 	};
 
-	[Header("Blur Quality")]
 	[Range(0f, 3f)]
+	[Header("Blur Quality")]
 	public FixedIntParameter downsample = new FixedIntParameter
 	{
 		value = 1

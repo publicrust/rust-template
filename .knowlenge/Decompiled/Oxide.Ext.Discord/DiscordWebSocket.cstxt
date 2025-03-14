@@ -1,0 +1,306 @@
+using System;
+using System.Net.WebSockets;
+using System.Threading.Tasks;
+using Oxide.Ext.Discord.Callbacks;
+using Oxide.Ext.Discord.Clients;
+using Oxide.Ext.Discord.Entities;
+using Oxide.Ext.Discord.Interfaces;
+using Oxide.Ext.Discord.Json;
+using Oxide.Ext.Discord.Libraries;
+using Oxide.Ext.Discord.Logging;
+using Oxide.Ext.Discord.WebSockets;
+
+public class DiscordWebSocket : IDebugLoggable
+{
+	private string _sessionId;
+
+	private string _resumeSessionUrl;
+
+	public bool ShouldReconnect;
+
+	public bool ShouldResume;
+
+	private int _sequence;
+
+	private readonly BotClient _client;
+
+	internal readonly WebSocketHandler Handler;
+
+	private readonly WebSocketEventHandler _listener;
+
+	private readonly WebSocketCommandHandler _commands;
+
+	private readonly DiscordHeartbeatHandler _heartbeat;
+
+	private readonly WebSocketReconnectHandler _reconnect;
+
+	private readonly ILogger _logger;
+
+	private bool _isShutdown;
+
+	public bool SocketHasConnected { get; private set; }
+
+	internal GatewayIntents Intents { get; private set; }
+
+	public DiscordWebSocket(BotClient client, ILogger logger)
+	{
+		_client = client;
+		_logger = logger;
+		_reconnect = new WebSocketReconnectHandler(client, this, logger);
+		_commands = new WebSocketCommandHandler(client, this, logger);
+		_heartbeat = new DiscordHeartbeatHandler(client, this, logger);
+		_listener = new WebSocketEventHandler(client, this, logger);
+		Handler = new WebSocketHandler(_listener, client, logger);
+	}
+
+	public void Connect()
+	{
+		_logger.Debug("DiscordWebSocket.Connect Start websocket connection");
+		string text = Gateway.WebsocketUrl;
+		if (ShouldResume && !string.IsNullOrEmpty(_resumeSessionUrl))
+		{
+			text = _resumeSessionUrl;
+		}
+		if (string.IsNullOrEmpty(text) || (_reconnect.AttemptGatewayUpdate && Gateway.LastUpdate + TimeSpan.FromMinutes(5.0) <= DateTime.UtcNow))
+		{
+			Gateway.UpdateGatewayUrl(_client).Then(delegate
+			{
+				Connect();
+			}).Catch<ResponseError>(OnGatewayUrlUpdateFailed);
+			return;
+		}
+		ShouldReconnect = false;
+		ShouldResume = false;
+		Intents = _client.Connection.Intents;
+		_logger.Debug("DiscordWebSocket.Connect Bot: {0} Websocket connecting to: {1} with intents: {2}", _client.Connection.HiddenToken, text, Intents);
+		Handler.Connect(text);
+	}
+
+	private void OnGatewayUrlUpdateFailed(ResponseError error)
+	{
+		_logger.Warning("Failed to update gateway url. Attempting reconnect.");
+		WebsocketReconnectCallback.Start(_reconnect);
+	}
+
+	public async void Disconnect(bool reconnect, bool resume, bool requested = false)
+	{
+		_logger.Debug("DiscordWebSocket.Disconnect Disconnecting Web Socket. Socket State: {0} Reconnect: {1} Resume: {2} Requested {3}", Handler.SocketState, reconnect, resume, requested);
+		ShouldReconnect = reconnect;
+		ShouldResume = resume;
+		_reconnect.CancelReconnect();
+		if (!IsDisconnected() && !IsDisconnecting())
+		{
+			OnSocketDisconnected();
+			if (!requested)
+			{
+				await Handler.Disconnect(WebSocketCloseStatus.NormalClosure, "Normal Websocket Disconnect Requested").ConfigureAwait(continueOnCapturedContext: false);
+			}
+			else
+			{
+				await Handler.Disconnect(4199, "Discord Requested Reconnect").ConfigureAwait(continueOnCapturedContext: false);
+			}
+		}
+		ReconnectIfRequested();
+	}
+
+	internal bool IsCurrentSocket(Snowflake webSocketId)
+	{
+		return !Handler.WebsocketId.IsValid() || Handler.WebsocketId == webSocketId;
+	}
+
+	public void Shutdown()
+	{
+		_isShutdown = true;
+		Disconnect(reconnect: false, resume: false);
+		_reconnect.OnSocketShutdown();
+		_heartbeat.OnSocketShutdown();
+		_commands.OnSocketShutdown();
+	}
+
+	public void Send(DiscordClient client, GatewayCommandCode opCode, object data)
+	{
+		WebSocketCommand command = WebSocketCommand.CreateCommand(client, opCode, data);
+		_commands.Enqueue(command);
+	}
+
+	private async ValueTask SendImmediatelyAsync(GatewayCommandCode opCode, object data)
+	{
+		CommandPayload payload = CommandPayload.CreatePayload(opCode, data);
+		if (!(await SendAsync(payload).ConfigureAwait(continueOnCapturedContext: false)))
+		{
+			_logger.Debug("DiscordWebSocket.SendImmediatelyAsync Failed to send command! {0}", opCode);
+		}
+		payload.Dispose();
+	}
+
+	internal ValueTask<bool> SendAsync(CommandPayload payload)
+	{
+		if (Handler == null)
+		{
+			return new ValueTask<bool>(result: false);
+		}
+		using DiscordJsonWriter discordJsonWriter = DiscordJsonWriter.Get(DiscordPool.Internal);
+		discordJsonWriter.Write(_client.JsonSerializer, payload);
+		discordJsonWriter.Stream.Position = 0L;
+		if (_client.Logger.IsLogging(DiscordLogLevel.Verbose))
+		{
+			string text = discordJsonWriter.ReadAsString();
+			if (payload.OpCode == GatewayCommandCode.Identify)
+			{
+				text = text.Replace(_client.Connection.ApiToken, _client.Connection.HiddenToken);
+			}
+			_logger.Verbose("DiscordWebSocket.SendAsync Sending Payload {0} Body: {1}", payload.OpCode, text);
+		}
+		return Handler.SendAsync(discordJsonWriter.Stream);
+	}
+
+	public void ReconnectIfRequested()
+	{
+		if (ShouldReconnect && !_isShutdown)
+		{
+			_logger.Debug("DiscordWebSocket.Disconnect Attempting Reconnect");
+			ShouldReconnect = false;
+			WebsocketReconnectCallback.Start(_reconnect);
+		}
+	}
+
+	internal void OnSocketConnected()
+	{
+		_reconnect.CancelReconnect();
+	}
+
+	internal void OnSocketReady(GatewayReadyEvent ready)
+	{
+		_sessionId = ready.SessionId;
+		_resumeSessionUrl = ready.ResumeSessionUrl;
+		SocketHasConnected = true;
+		ShouldResume = true;
+		_reconnect.OnWebsocketReady();
+		_commands.OnWebSocketReady();
+	}
+
+	internal void OnSocketDisconnected()
+	{
+		_commands.OnSocketDisconnected();
+	}
+
+	internal void OnSequenceUpdate(int? sequence)
+	{
+		if (sequence.HasValue)
+		{
+			_sequence = sequence.Value;
+		}
+	}
+
+	internal async ValueTask OnDiscordHello(GatewayHelloEvent hello)
+	{
+		_logger.Debug("DiscordWebSocket.OnDiscordHello");
+		if (!ShouldResume || string.IsNullOrEmpty(_sessionId))
+		{
+			await Identify().ConfigureAwait(continueOnCapturedContext: false);
+		}
+		else
+		{
+			await Resume().ConfigureAwait(continueOnCapturedContext: false);
+		}
+		_heartbeat.SetupHeartbeat(hello.HeartbeatInterval);
+	}
+
+	internal ValueTask Identify()
+	{
+		if (!_client.Initialized)
+		{
+			return default(ValueTask);
+		}
+		_logger.Debug("DiscordWebSocket.Identify Identifying bot with discord.");
+		IdentifyCommand data = new IdentifyCommand
+		{
+			Token = _client.Connection.ApiToken,
+			Properties = Gateway.Properties,
+			Intents = _client.Connection.Intents,
+			Compress = false,
+			LargeThreshold = 50,
+			Shard = Gateway.Shard
+		};
+		return SendImmediatelyAsync(GatewayCommandCode.Identify, data);
+	}
+
+	private ValueTask Resume()
+	{
+		if (!_client.Initialized)
+		{
+			return default(ValueTask);
+		}
+		ResumeSessionCommand data = new ResumeSessionCommand
+		{
+			Sequence = _sequence,
+			SessionId = _sessionId,
+			Token = _client.Connection.ApiToken
+		};
+		_sessionId = null;
+		_logger.Debug("DiscordWebSocket.Resume Attempting to resume session with ID: {0} Sequence: {1}", _sessionId, _sequence);
+		return SendImmediatelyAsync(GatewayCommandCode.Resume, data);
+	}
+
+	internal void OnHeartbeatAcknowledge()
+	{
+		_heartbeat.OnHeartbeatAcknowledge();
+	}
+
+	internal ValueTask SendHeartbeat()
+	{
+		if (IsConnected())
+		{
+			return SendImmediatelyAsync(GatewayCommandCode.Heartbeat, _sequence);
+		}
+		return default(ValueTask);
+	}
+
+	internal void OnInvalidSession(bool resume)
+	{
+		bool flag = !string.IsNullOrEmpty(_sessionId) && resume;
+		_logger.Warning("Invalid Session ID opcode received! Attempting to reconnect. Should Resume? {0}", flag);
+		if (!resume)
+		{
+			_sessionId = null;
+		}
+		Disconnect(reconnect: true, flag);
+	}
+
+	internal void OnReconnectRequested()
+	{
+		_logger.Debug("Discord has requested a reconnect. Reconnecting...");
+		Disconnect(reconnect: true, resume: true, requested: true);
+	}
+
+	public bool IsConnecting()
+	{
+		return Handler.SocketState == SocketState.Connecting;
+	}
+
+	public bool IsConnected()
+	{
+		return Handler.SocketState == SocketState.Connected;
+	}
+
+	public bool IsPendingReconnect()
+	{
+		return _reconnect.IsPendingReconnect;
+	}
+
+	public bool IsDisconnecting()
+	{
+		return Handler.SocketState == SocketState.Disconnecting;
+	}
+
+	public bool IsDisconnected()
+	{
+		return Handler.SocketState == SocketState.Disconnected;
+	}
+
+	public void LogDebug(DebugLogger logger)
+	{
+		logger.AppendFieldEnum("State", Handler.SocketState);
+		logger.AppendList("Pending Commands", _commands.GetPendingCommands());
+	}
+}

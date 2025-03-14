@@ -7,7 +7,7 @@ using Unity.Mathematics;
 [BurstCompile]
 internal struct BoxBlur3DJob : IJobFor
 {
-	[ReadOnly]
+	[Unity.Collections.ReadOnly]
 	public Point3DGrid InputGrid;
 
 	public NativeBitArray OutputGrid;
@@ -20,8 +20,9 @@ internal struct BoxBlur3DJob : IJobFor
 	{
 		int3 @int = new int3(index % Width, index % WidthHeight / Width, index / WidthHeight);
 		bool flag = InputGrid[index];
-		if (!InputGrid.InBounds(@int + new int3(-1, -1, -1)) || !InputGrid.InBounds(@int + new int3(1, 1, 1)))
+		if (!InputGrid.InBoundsNotTouching(@int))
 		{
+			OutputGrid.Set(index, value: false);
 			return;
 		}
 		float num = 0f;

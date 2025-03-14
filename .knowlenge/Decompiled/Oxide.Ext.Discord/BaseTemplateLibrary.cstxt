@@ -1,0 +1,212 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using Newtonsoft.Json;
+using Oxide.Core;
+using Oxide.Core.Plugins;
+using Oxide.Ext.Discord.Cache;
+using Oxide.Ext.Discord.Exceptions;
+using Oxide.Ext.Discord.Extensions;
+using Oxide.Ext.Discord.Interfaces;
+using Oxide.Ext.Discord.Json;
+using Oxide.Ext.Discord.Libraries;
+using Oxide.Ext.Discord.Logging;
+using Oxide.Ext.Discord.Plugins;
+using Oxide.Ext.Discord.Types;
+
+public abstract class BaseTemplateLibrary<TTemplate> : BaseDiscordLibrary where TTemplate : class
+{
+	protected readonly ILogger Logger;
+
+	private readonly string _rootDirectory;
+
+	private readonly string _templateTypeDirectory;
+
+	protected readonly TemplateType TemplateType;
+
+	private readonly DiscordConcurrentSet<TemplateId> _registeredTemplates = new DiscordConcurrentSet<TemplateId>();
+
+	private readonly ConcurrentDictionary<PluginId, string> _pluginTemplatePath = new ConcurrentDictionary<PluginId, string>();
+
+	protected BaseTemplateLibrary(TemplateType type, ILogger logger)
+	{
+		_rootDirectory = Path.Combine(Interface.Oxide.InstanceDirectory, "discord");
+		Logger = logger;
+		TemplateType = type;
+		_templateTypeDirectory = Singleton<EnumCache<TemplateType>>.Instance.ToLower(TemplateType);
+		if (!Directory.Exists(_rootDirectory))
+		{
+			Directory.CreateDirectory(_rootDirectory);
+		}
+	}
+
+	internal void HandleRegisterTemplate(TemplateId id, TTemplate template, TemplateVersion version, TemplateVersion minVersion, IPendingPromise<TTemplate> promise)
+	{
+		if (version < minVersion)
+		{
+			string message = $"Failed to register for template: {id} because the template version {version} is less than the min supported version {minVersion}";
+			Logger.Error(message);
+			promise.Reject(new InvalidTemplateVersionException(message));
+			return;
+		}
+		if (!_registeredTemplates.Add(id))
+		{
+			string message2 = $"Failed to register template Type: {TemplateType} {id}. Template has already been registered.";
+			Logger.Error(message2);
+			promise.Reject(new DuplicateTemplateException(message2));
+			return;
+		}
+		DiscordTemplate<TTemplate> template2 = new DiscordTemplate<TTemplate>(template, version);
+		string templatePath = GetTemplatePath(id);
+		if (File.Exists(templatePath))
+		{
+			DiscordTemplate<TTemplate> discordTemplate = LoadTemplate(id);
+			if (discordTemplate != null)
+			{
+				if (discordTemplate.Version < minVersion)
+				{
+					BackupTemplateFiles(id, minVersion);
+					CreateFile(templatePath, template2);
+					OnTemplateRegistered(id, template);
+					promise.Resolve(template);
+				}
+				else
+				{
+					OnTemplateRegistered(id, discordTemplate.Template);
+					promise.Resolve(discordTemplate.Template);
+				}
+			}
+		}
+		else
+		{
+			CreateFile(templatePath, template2);
+			OnTemplateRegistered(id, template);
+			promise.Resolve(template);
+		}
+	}
+
+	internal void HandleBulkRegisterTemplate(TemplateId id, List<BulkTemplateRegistration<TTemplate>> templates, TemplateVersion minVersion, IPendingPromise promise)
+	{
+		for (int i = 0; i < templates.Count; i++)
+		{
+			BulkTemplateRegistration<TTemplate> bulkTemplateRegistration = templates[i];
+			HandleRegisterTemplate(id.WithLanguage(ServerLocale.Parse(bulkTemplateRegistration.Language)), bulkTemplateRegistration.Template, bulkTemplateRegistration.Version, minVersion, null);
+		}
+		promise.Resolve();
+	}
+
+	internal DiscordTemplate<TTemplate> LoadTemplate(TemplateId id)
+	{
+		string templatePath = GetTemplatePath(id);
+		if (!File.Exists(templatePath))
+		{
+			return null;
+		}
+		try
+		{
+			string value = File.ReadAllText(templatePath);
+			return JsonConvert.DeserializeObject<DiscordTemplate<TTemplate>>(value, DiscordJson.IndentedSettings);
+		}
+		catch (Exception exception)
+		{
+			Logger.Exception("Failed to load template from file: {0} Path: {1}", id.ToString(), templatePath.Substring(Interface.Oxide.RootDirectory.Length), exception);
+			return null;
+		}
+	}
+
+	internal DiscordTemplate<TTemplate> LoadTemplate(TemplateId id, ServerLocale language)
+	{
+		return LoadTemplate(id.WithLanguage(language));
+	}
+
+	private void CreateFile(string path, DiscordTemplate<TTemplate> template)
+	{
+		string directoryName = Path.GetDirectoryName(path);
+		if (!string.IsNullOrEmpty(directoryName) && !Directory.Exists(directoryName))
+		{
+			Directory.CreateDirectory(directoryName);
+		}
+		string contents = JsonConvert.SerializeObject(template, DiscordJson.IndentedSettings);
+		File.WriteAllText(path, contents);
+	}
+
+	private void BackupTemplateFiles(TemplateId id, TemplateVersion minVersion)
+	{
+		if (id.IsGlobal)
+		{
+			BackupTemplate(minVersion, id);
+			return;
+		}
+		string templateFolder = GetTemplateFolder(id.PluginId);
+		if (Logger.IsLogging(DiscordLogLevel.Debug))
+		{
+			Logger.Debug("Backup Template files for: {0} Path: {1}", id.ToString(), templateFolder);
+		}
+		foreach (string item in Directory.EnumerateDirectories(templateFolder))
+		{
+			ServerLocale serverLocale = ServerLocale.Parse(Path.GetFileName(item));
+			Logger.Debug("Processing Directory: {0} Lang: {1}", item, serverLocale);
+			BackupTemplate(minVersion, id.WithLanguage(serverLocale));
+		}
+	}
+
+	private void BackupTemplate(TemplateVersion minVersion, TemplateId langId)
+	{
+		string templatePath = GetTemplatePath(langId);
+		if (!File.Exists(templatePath))
+		{
+			return;
+		}
+		DiscordTemplate<TTemplate> discordTemplate = LoadTemplate(langId);
+		if (discordTemplate != null && !(discordTemplate.Version >= minVersion))
+		{
+			string renamePath = GetRenamePath(templatePath, discordTemplate.Version);
+			if (File.Exists(renamePath))
+			{
+				File.Delete(renamePath);
+			}
+			File.Move(templatePath, renamePath);
+		}
+	}
+
+	protected string GetTemplateFolder(PluginId plugin)
+	{
+		if (!_pluginTemplatePath.TryGetValue(plugin, out var value))
+		{
+			value = Path.Combine(_rootDirectory, plugin.PluginName(), _templateTypeDirectory);
+			_pluginTemplatePath[plugin] = value;
+		}
+		return value;
+	}
+
+	private string GetTemplatePath(TemplateId id)
+	{
+		DiscordTemplateException.ThrowIfInvalidTemplateName(id.TemplateName.Name, TemplateType);
+		if (id.IsGlobal)
+		{
+			return Path.Combine(GetTemplateFolder(id.PluginId), $"{id.TemplateName}.json");
+		}
+		return Path.Combine(GetTemplateFolder(id.PluginId), id.Language.Id, $"{id.TemplateName}.json");
+	}
+
+	private string GetRenamePath(string path, TemplateVersion version)
+	{
+		if (string.IsNullOrEmpty(path))
+		{
+			throw new ArgumentNullException("path");
+		}
+		return Path.Combine(Path.GetDirectoryName(path) ?? string.Empty, $"{Path.GetFileNameWithoutExtension(path)}.{version}.json");
+	}
+
+	internal virtual void OnTemplateRegistered(TemplateId id, TTemplate template)
+	{
+	}
+
+	protected override void OnPluginUnloaded(Plugin plugin)
+	{
+		PluginId id = plugin.Id();
+		_registeredTemplates.RemoveWhere((TemplateId t) => t.PluginId == id);
+		_pluginTemplatePath.TryRemove(id, out var _);
+	}
+}

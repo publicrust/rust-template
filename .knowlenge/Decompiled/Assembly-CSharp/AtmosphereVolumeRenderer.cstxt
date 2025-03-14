@@ -1,7 +1,7 @@
 using UnityEngine;
 
-[ExecuteInEditMode]
 [RequireComponent(typeof(Camera))]
+[ExecuteInEditMode]
 public class AtmosphereVolumeRenderer : MonoBehaviour
 {
 	public FogMode Mode = FogMode.ExponentialSquared;

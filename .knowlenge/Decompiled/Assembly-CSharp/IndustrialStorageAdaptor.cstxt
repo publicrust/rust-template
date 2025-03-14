@@ -68,10 +68,6 @@ public class IndustrialStorageAdaptor : IndustrialEntity, IIndustrialStorage
 	{
 		if (cachedParent != null)
 		{
-			if (cachedParent is DropBox && Container != null)
-			{
-				return new Vector2i(0, Container.capacity - 2);
-			}
 			if (cachedParent is IIndustrialStorage industrialStorage)
 			{
 				return industrialStorage.OutputSlotRange(slotIndex);

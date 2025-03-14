@@ -1,0 +1,570 @@
+using UnityEngine;
+
+private class GlueAttachementHandler
+{
+	public class LegTransitionAnimation
+	{
+		private enum EMoveType
+		{
+			FromAnimation,
+			FromLastAttachement
+		}
+
+		private GlueAttachementHandler handler;
+
+		public float LegAdjustementYOffset;
+
+		public float LegAdjustementFootAngleOffset;
+
+		private Vector3 _legSpherizeLocalVector = Vector3.zero;
+
+		private float _legMoveDurMul = 1f;
+
+		private Quaternion baseRotationOnStepUp;
+
+		public float legMoveDistanceFactor;
+
+		private float sd_trProgress;
+
+		private Vector3 previousPositionLocal;
+
+		private Vector3 previousPositionWorld;
+
+		private Quaternion previousRotationWorld;
+
+		private Vector3 lastAppliedGluePosition;
+
+		private Vector3 lastAppliedGluePositionLocal;
+
+		private Quaternion lastAppliedGlueRotation;
+
+		private float lastSpeedup;
+
+		private EMoveType animationMoveType;
+
+		private bool _instantTransition;
+
+		private bool _wasAnimatingLeg;
+
+		private LegsAnimator Owner => handler.Owner;
+
+		private Leg leg => handler.leg;
+
+		public bool duringLegAdjustMovement { get; private set; }
+
+		public bool wasAttaching { get; private set; }
+
+		public bool attached { get; private set; }
+
+		public float transitionProgress { get; private set; }
+
+		public float lastAttachCompleteTime { get; private set; }
+
+		public float transitionProgressLastFrame { get; private set; }
+
+		public EGlueMode LastAnimationGlueMode
+		{
+			get
+			{
+				if (animationMoveType != 0)
+				{
+					return EGlueMode.Idle;
+				}
+				return EGlueMode.Moving;
+			}
+		}
+
+		public LegTransitionAnimation(GlueAttachementHandler glueTransitionHelper)
+		{
+			handler = glueTransitionHelper;
+			Reset();
+		}
+
+		public void Reset()
+		{
+			animationMoveType = EMoveType.FromAnimation;
+			transitionProgress = 0f;
+			transitionProgressLastFrame = 0f;
+			baseRotationOnStepUp = Owner.BaseTransform.rotation;
+			duringLegAdjustMovement = false;
+			wasAttaching = false;
+			attached = false;
+			_legSpherizeLocalVector = Vector3.zero;
+			ReInitialize();
+		}
+
+		public void ReInitialize()
+		{
+			lastAppliedGluePosition = leg._SourceIKPos;
+			lastAppliedGlueRotation = leg._SourceIKRot;
+			previousPositionWorld = leg._SourceIKPos;
+			previousRotationWorld = leg._SourceIKRot;
+			previousPositionLocal = leg.ToRootLocalSpace(leg._SourceIKPos);
+		}
+
+		internal void ScheduleInstantTransition()
+		{
+			_instantTransition = true;
+		}
+
+		internal void DoAttaching(bool canAttach)
+		{
+			if (canAttach != wasAttaching)
+			{
+				wasAttaching = canAttach;
+				if (canAttach)
+				{
+					OnChangeTargetPosition();
+				}
+				else
+				{
+					attached = false;
+					if (transitionProgress != 0f)
+					{
+						OnChangeTargetPosition();
+					}
+				}
+			}
+			if (duringLegAdjustMovement && transitionProgress >= 1f)
+			{
+				duringLegAdjustMovement = false;
+			}
+		}
+
+		internal Vector3 EnsureAnkleNotOverlappingGroundLevel(Vector3 legAnimPos)
+		{
+			if (leg.A_PreWasAligning && leg.A_WasAligningFrameBack)
+			{
+				Vector3 localPos = Owner.ToRootLocalSpace(legAnimPos);
+				Vector3 vector = ((!(Owner.SmoothSuddenSteps < 0.0001f)) ? (leg.A_WasSmoothing ? leg.A_LastSmoothTargetedPosLocal : leg.ankleAlignedOnGroundHitRootLocal) : leg.ankleAlignedOnGroundHitRootLocal);
+				if (localPos.y < vector.y)
+				{
+					localPos.y = vector.y;
+					legAnimPos = Owner.RootToWorldSpace(localPos);
+				}
+			}
+			return legAnimPos;
+		}
+
+		public Vector3 CalculateAnimatedLegPosition(Vector3 a, Vector3 b)
+		{
+			LegStepAnimatingParameters legAnimatingSettings = leg.LegAnimatingSettings;
+			Vector3 result = Vector3.LerpUnclamped(a, b, legAnimatingSettings.MoveToGoalCurve.Evaluate(transitionProgress));
+			if (legAnimatingSettings.SpherizeTrack.length > 1)
+			{
+				float num = legAnimatingSettings.SpherizeTrack.Evaluate(transitionProgress) * legAnimatingSettings.SpherizePower * Owner.BaseTransform.lossyScale.x;
+				result += leg.RootSpaceToWorldVec(_legSpherizeLocalVector * (num * 12f));
+			}
+			if (Owner.AnimateFeet)
+			{
+				LegAdjustementFootAngleOffset = legAnimatingSettings.FootRotationCurve.Evaluate(transitionProgress) * 90f * Mathf.Min(0.5f, legMoveDistanceFactor * 1.1f);
+				LegAdjustementFootAngleOffset /= lastSpeedup;
+			}
+			float num2 = Owner.ScaleReferenceNoScale * 0.75f;
+			float num3 = Mathf.Lerp(legAnimatingSettings.MinFootRaise, legAnimatingSettings.MaxFootRaise, legMoveDistanceFactor);
+			num3 *= num2;
+			LegAdjustementYOffset = num3 * legAnimatingSettings.RaiseYAxisCurve.Evaluate(transitionProgress);
+			_wasAnimatingLeg = true;
+			return result;
+		}
+
+		internal Vector3 GetTargetPosition()
+		{
+			float glueAnimationBlend = handler.glueAnimationBlend;
+			if (animationMoveType == EMoveType.FromAnimation)
+			{
+				if (glueAnimationBlend < 0.0001f)
+				{
+					return Owner.RootToWorldSpace(previousPositionLocal);
+				}
+				Vector3 vector = Owner.RootToWorldSpace(previousPositionLocal);
+				if (transitionProgress < 0.0001f)
+				{
+					return vector;
+				}
+				Vector3 vector2 = ((!attached) ? leg.ankleAlignedOnGroundHitWorldPos : ((glueAnimationBlend > 0.9995f) ? leg._GlueLastAttachPosition : ((!leg.Owner.OnlyLocalAnimation) ? Vector3.LerpUnclamped(leg.RootSpaceToWorld(leg._GlueLastAttachPositionRootLocal), leg._GlueLastAttachPosition, glueAnimationBlend) : leg.RootSpaceToWorld(leg._GlueLastAttachPositionRootLocal))));
+				if (transitionProgress > 0.9995f)
+				{
+					return vector2;
+				}
+				return Vector3.LerpUnclamped(vector, vector2, transitionProgress);
+			}
+			Vector3 vector3;
+			if (leg.Owner.OnlyLocalAnimation)
+			{
+				vector3 = Owner.RootToWorldSpace(previousPositionLocal);
+				if (transitionProgress < 0.0001f)
+				{
+					return vector3;
+				}
+			}
+			else
+			{
+				vector3 = previousPositionWorld;
+				if (transitionProgress < 0.0001f)
+				{
+					return vector3;
+				}
+				vector3 = Vector3.LerpUnclamped(previousPositionWorld, Owner.RootToWorldSpace(previousPositionLocal), transitionProgress);
+			}
+			Vector3 vector4 = ((!(transitionProgress > 0.9995f)) ? CalculateAnimatedLegPosition(vector3, leg.ankleAlignedOnGroundHitWorldPos) : leg._GlueLastAttachPosition);
+			if (transitionProgress >= 1f)
+			{
+				return vector4;
+			}
+			float num = 1f - transitionProgress;
+			return Vector3.LerpUnclamped(vector3, vector4, 1f - num * num);
+		}
+
+		internal void RequireRepose()
+		{
+			if (attached)
+			{
+				attached = false;
+				OnChangeTargetPosition();
+			}
+		}
+
+		internal Quaternion GetTargetRotation()
+		{
+			Quaternion quaternion = previousRotationWorld;
+			if (transitionProgress < 0.001f)
+			{
+				return quaternion;
+			}
+			Quaternion quaternion2 = ((!attached) ? leg.ankleAlignedOnGroundHitRotation : leg._GlueLastAttachRotation);
+			if (transitionProgress > 0.9995f)
+			{
+				return quaternion2;
+			}
+			return Quaternion.LerpUnclamped(quaternion, quaternion2, transitionProgress);
+		}
+
+		internal void OnChangeTargetPosition()
+		{
+			handler.lasGlueModeOnAttaching = Owner._glueModeExecuted;
+			baseRotationOnStepUp = Owner.BaseTransform.rotation;
+			if (handler.glueAnimationBlend < 0.2f)
+			{
+				animationMoveType = EMoveType.FromAnimation;
+			}
+			else if (handler.lasGlueModeOnAttaching == EGlueMode.Moving)
+			{
+				animationMoveType = EMoveType.FromAnimation;
+			}
+			else if (animationMoveType == EMoveType.FromLastAttachement)
+			{
+				animationMoveType = EMoveType.FromLastAttachement;
+			}
+			else if (handler.glueAnimationBlend > 0.75f)
+			{
+				if (transitionProgress < 0.1f || transitionProgress > 0.9f)
+				{
+					animationMoveType = EMoveType.FromLastAttachement;
+				}
+				else
+				{
+					animationMoveType = EMoveType.FromAnimation;
+				}
+			}
+			else
+			{
+				animationMoveType = EMoveType.FromAnimation;
+			}
+			if (leg.Owner.OnlyLocalAnimation)
+			{
+				previousPositionWorld = leg.RootSpaceToWorld(lastAppliedGluePositionLocal);
+			}
+			else
+			{
+				previousPositionWorld = lastAppliedGluePosition;
+			}
+			previousRotationWorld = lastAppliedGlueRotation;
+			previousPositionLocal = Owner.ToRootLocalSpace(previousPositionWorld);
+			if (animationMoveType == EMoveType.FromLastAttachement)
+			{
+				if (!(transitionProgress > 0.1f) || !(transitionProgress < 0.9f))
+				{
+					transitionProgress = 0f;
+				}
+				Vector3 vector = previousPositionWorld;
+				Vector3 vector2 = leg.ankleAlignedOnGroundHitWorldPos - vector;
+				float magnitude = vector2.magnitude;
+				legMoveDistanceFactor = magnitude / (Owner.ScaleReference * 0.6f);
+				legMoveDistanceFactor = Mathf.Clamp(legMoveDistanceFactor, 0.05f, 1f);
+				Vector3 normalized = vector2.normalized;
+				normalized = Vector3.ProjectOnPlane(normalized, Owner.Up);
+				normalized.Normalize();
+				leg.SendRaiseEvent(magnitude);
+				if (legMoveDistanceFactor > 0.0401f)
+				{
+					_legMoveDurMul = Mathf.Lerp(1.55f, 0.85f, legMoveDistanceFactor * 2f);
+					Vector3 worldDir = Vector3.Cross(normalized, Owner.Up);
+					worldDir.Normalize();
+					_legSpherizeLocalVector = leg.ToRootLocalSpaceDir(worldDir) * Owner.ScaleReferenceNoScale * -0.03f;
+					duringLegAdjustMovement = true;
+				}
+				else
+				{
+					animationMoveType = EMoveType.FromAnimation;
+					_legSpherizeLocalVector = Vector3.zero;
+					duringLegAdjustMovement = false;
+				}
+			}
+			else
+			{
+				duringLegAdjustMovement = false;
+				transitionProgress = 0f;
+			}
+		}
+
+		public void UpdateAnimation()
+		{
+			float num = (Owner.JustGrounded ? 0.2f : 1f);
+			float num2 = (Owner.JustGrounded ? 5f : 1f);
+			transitionProgressLastFrame = transitionProgress;
+			if (_instantTransition)
+			{
+				_instantTransition = false;
+				transitionProgress = 1f;
+				lastAttachCompleteTime = Time.time;
+			}
+			if (!Owner.IsGrounded)
+			{
+				return;
+			}
+			if (animationMoveType == EMoveType.FromLastAttachement)
+			{
+				float num3 = 1f / (leg.LegAnimatingSettings.StepMoveDuration * 0.8f);
+				float num4 = 1f;
+				lastSpeedup = 1f;
+				if (leg.LegAnimatingSettings.AllowSpeedups > 0f)
+				{
+					if (leg.hasOppositeleg)
+					{
+						Leg oppositeLeg = leg.GetOppositeLeg();
+						Vector3 targetPos = oppositeLeg._PreviousFinalIKPos;
+						if (leg.Owner.OnlyLocalAnimation)
+						{
+							targetPos = leg.RootSpaceToWorld(oppositeLeg._PreviousFinalIKPosRootLocal);
+						}
+						float stretchValue = oppositeLeg.IKProcessor.GetStretchValue(targetPos);
+						if (stretchValue > leg.LegStretchLimit * 0.95f)
+						{
+							float num5 = (stretchValue - leg.LegStretchLimit * 0.95f) * 2f;
+							if (num5 < 0f)
+							{
+								num5 = 0f;
+							}
+							num4 += num5;
+						}
+						if (!oppositeLeg._UsingCustomRaycast && oppositeLeg.G_AttachementHandler.legMoveAnimation.attached)
+						{
+							float magnitude = (leg.RootSpaceToWorld(oppositeLeg.AnkleH.LastKeyframeRootPos) - oppositeLeg.G_Attachement.GetRelevantHitPoint()).magnitude;
+							float num6 = Owner.ScaleReference * 0.4f;
+							if (magnitude > num6)
+							{
+								float num7 = magnitude - num6;
+								num4 += num7 / num6 * 2f;
+							}
+						}
+					}
+					if (leg.LegAnimatingSettings.AllowSpeedups > 0.25f)
+					{
+						float num8 = Quaternion.Angle(baseRotationOnStepUp, Owner.BaseTransform.rotation);
+						if (num8 > 12f)
+						{
+							float t = Mathf.InverseLerp(30f, 135f, num8);
+							t = Mathf.LerpUnclamped(0.5f, 2f, t) * (0.4f + leg.LegAnimatingSettings.AllowSpeedups * 0.6f);
+							transitionProgress += Owner.DeltaTime * t * num2;
+						}
+					}
+					num4 = Mathf.LerpUnclamped(1f, num4, leg.LegAnimatingSettings.AllowSpeedups);
+				}
+				lastSpeedup = num4;
+				transitionProgress = Mathf.MoveTowards(transitionProgress, 1f, num3 * num4 * _legMoveDurMul * leg.LegMoveSpeedMultiplier * Owner.DeltaTime * num2);
+				if (transitionProgress > 0.9995f && duringLegAdjustMovement)
+				{
+					TriggerAttach();
+				}
+			}
+			else if (transitionProgress > 0.9995f && handler.glueAnimationBlend > 0.95f)
+			{
+				TriggerAttach();
+			}
+			else
+			{
+				transitionProgress = Mathf.SmoothDamp(transitionProgress, 1.001f, ref sd_trProgress, (0.01f + Mathf.LerpUnclamped(0.225f, 0.01f, wasAttaching ? Owner.GlueFadeInSpeed : Owner.GlueFadeOutSpeed)) * num, 10000000f, Owner.DeltaTime);
+			}
+		}
+
+		private void TriggerAttach()
+		{
+			if (!attached)
+			{
+				transitionProgress = 1f;
+				lastAttachCompleteTime = Time.time;
+				attached = leg.Glue_TriggerFinalAttach();
+				duringLegAdjustMovement = false;
+			}
+		}
+
+		public void PostUpdate()
+		{
+			lastAppliedGluePosition = leg._GluePosition;
+			lastAppliedGluePositionLocal = leg.ToRootLocalSpace(lastAppliedGluePosition);
+			lastAppliedGlueRotation = leg._GlueRotation;
+			if (!_wasAnimatingLeg)
+			{
+				LegAdjustementFootAngleOffset = Mathf.MoveTowards(LegAdjustementFootAngleOffset, 0f, leg.DeltaTime * 20f);
+				LegAdjustementYOffset = Mathf.MoveTowards(LegAdjustementYOffset, 0f, leg.DeltaTime * 20f);
+			}
+			else
+			{
+				_wasAnimatingLeg = false;
+			}
+		}
+	}
+
+	private LegsAnimator Owner;
+
+	private Leg ParentLeg;
+
+	private float _sd_glueAnimationBlend;
+
+	private bool _instantTransition;
+
+	private Vector3 lastGluePosition = Vector3.zero;
+
+	private Quaternion lastGlueRotation = Quaternion.identity;
+
+	public LegTransitionAnimation legMoveAnimation { get; private set; }
+
+	private Leg leg => ParentLeg;
+
+	public float glueAnimationBlend { get; private set; }
+
+	public float attachTransitionProgress => legMoveAnimation.transitionProgress;
+
+	public float attachTransitionProgressLastFrame => legMoveAnimation.transitionProgressLastFrame;
+
+	public float legMoveDistanceFactor => legMoveAnimation.legMoveDistanceFactor;
+
+	public EGlueMode lasGlueModeOnAttaching { get; private set; }
+
+	public GlueAttachementHandler(Leg leg)
+	{
+		ParentLeg = leg;
+		Owner = leg.Owner;
+		legMoveAnimation = new LegTransitionAnimation(this);
+		lasGlueModeOnAttaching = Owner._glueModeExecuted;
+		Reset(initializing: true);
+	}
+
+	public void Reset(bool initializing)
+	{
+		glueAnimationBlend = 0f;
+		_sd_glueAnimationBlend = 0f;
+		if (initializing)
+		{
+			lastGluePosition = leg.BoneEnd.position;
+			lastGlueRotation = leg.BoneEnd.rotation;
+		}
+		legMoveAnimation.Reset();
+	}
+
+	public void SheduleInstantTransition()
+	{
+		_instantTransition = true;
+		legMoveAnimation.ScheduleInstantTransition();
+	}
+
+	public void TransitionToGlueAnimation()
+	{
+		legMoveAnimation.DoAttaching(canAttach: true);
+		ChangeGlueAnimationBlendTo(1f, Owner.GlueFadeInSpeed);
+	}
+
+	public void TransitionToDisableGlueAnimation()
+	{
+		legMoveAnimation.DoAttaching(canAttach: false);
+		ChangeGlueAnimationBlendTo(0f, Owner.GlueFadeOutSpeed);
+	}
+
+	public Vector3 GetGluePosition()
+	{
+		if (glueAnimationBlend > 0.9995f)
+		{
+			lastGluePosition = legMoveAnimation.GetTargetPosition();
+		}
+		else if (glueAnimationBlend < 0.0001f)
+		{
+			lastGluePosition = leg.A_PreIKPosForGluing;
+		}
+		else
+		{
+			lastGluePosition = Vector3.LerpUnclamped(leg.A_PreIKPosForGluing, legMoveAnimation.GetTargetPosition(), glueAnimationBlend);
+		}
+		return lastGluePosition;
+	}
+
+	public Quaternion GetGlueRotation()
+	{
+		if (glueAnimationBlend > 0.999f)
+		{
+			lastGlueRotation = legMoveAnimation.GetTargetRotation();
+		}
+		else if (glueAnimationBlend < 0f)
+		{
+			lastGlueRotation = leg._FinalIKRot;
+		}
+		else
+		{
+			lastGlueRotation = Quaternion.LerpUnclamped(leg._FinalIKRot, legMoveAnimation.GetTargetRotation(), glueAnimationBlend);
+		}
+		return lastGlueRotation;
+	}
+
+	public void UpdateTransitioning(bool attaching)
+	{
+		legMoveAnimation.UpdateAnimation();
+	}
+
+	public void PostUpdate()
+	{
+		legMoveAnimation.PostUpdate();
+	}
+
+	internal void OnLegRequireRepose()
+	{
+		legMoveAnimation.RequireRepose();
+	}
+
+	private void ChangeGlueAnimationBlendTo(float target, float speed)
+	{
+		if (Owner.GroundedTime < 0f)
+		{
+			speed = 0.99f;
+		}
+		if (_instantTransition && target > 0f)
+		{
+			glueAnimationBlend = target;
+			_instantTransition = false;
+			return;
+		}
+		if (speed >= 1f)
+		{
+			glueAnimationBlend = target;
+			return;
+		}
+		if (leg.G_JustLanded)
+		{
+			glueAnimationBlend = Mathf.MoveTowards(glueAnimationBlend, target, Owner.DeltaTime * 3f);
+		}
+		glueAnimationBlend = Mathf.SmoothDamp(glueAnimationBlend, target, ref _sd_glueAnimationBlend, Mathf.LerpUnclamped(0.2f, 0.005f, speed), 100000f, Owner.DeltaTime);
+		if (float.IsNaN(_sd_glueAnimationBlend))
+		{
+			_sd_glueAnimationBlend = 0f;
+		}
+	}
+}

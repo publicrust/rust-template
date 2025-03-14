@@ -344,6 +344,13 @@ public class ElectricBattery : IOEntity, IInstanceDataReceiver
 		}
 	}
 
+	public void SetCharge(float charge)
+	{
+		float oldCharge = rustWattSeconds;
+		rustWattSeconds = charge;
+		ChargeChanged(oldCharge);
+	}
+
 	public void AddCharge()
 	{
 		float oldCharge = rustWattSeconds;

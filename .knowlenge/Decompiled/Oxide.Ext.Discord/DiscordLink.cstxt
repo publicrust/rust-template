@@ -1,0 +1,269 @@
+using System;
+using System.Collections.Generic;
+using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Plugins;
+using Oxide.Ext.Discord.Cache;
+using Oxide.Ext.Discord.Entities;
+using Oxide.Ext.Discord.Extensions;
+using Oxide.Ext.Discord.Interfaces;
+using Oxide.Ext.Discord.Libraries;
+using Oxide.Ext.Discord.Logging;
+using Oxide.Ext.Discord.Plugins;
+using Oxide.Ext.Discord.Types;
+using Oxide.Plugins;
+
+public class DiscordLink : BaseDiscordLibrary<DiscordLink>, IDebugLoggable
+{
+	public readonly IReadOnlyDictionary<PlayerId, Snowflake> PlayerToDiscordIds;
+
+	public readonly IReadOnlyDictionary<Snowflake, PlayerId> DiscordToPlayerIds;
+
+	public readonly ICollection<PlayerId> PlayerIds;
+
+	public readonly ICollection<Snowflake> DiscordIds;
+
+	private readonly BidirectionalDictionary<PlayerId, Snowflake> _links = new BidirectionalDictionary<PlayerId, Snowflake>();
+
+	private readonly Hash<PluginId, IDictionary<PlayerId, Snowflake>> _linkPlugins = new Hash<PluginId, IDictionary<PlayerId, Snowflake>>();
+
+	private readonly ILogger _logger;
+
+	public bool IsEnabled => _linkPlugins.Count != 0;
+
+	public int LinkedCount => _links.Count;
+
+	internal DiscordLink(ILogger logger)
+	{
+		_logger = logger;
+		PlayerToDiscordIds = _links.AsReadOnlyKeyToValue();
+		DiscordToPlayerIds = _links.AsReadOnlyValueToKey();
+		PlayerIds = _links.AsKeyCollection();
+		DiscordIds = _links.AsValueCollection();
+	}
+
+	public void AddLinkPlugin(IDiscordLink link)
+	{
+		if (link == null)
+		{
+			throw new ArgumentNullException("link");
+		}
+		IDictionary<PlayerId, Snowflake> playerIdToDiscordIds = link.GetPlayerIdToDiscordIds();
+		if (playerIdToDiscordIds == null)
+		{
+			_logger.Error("{0} returned null when GetPlayerIdToDiscordIds was called", link.Name);
+			return;
+		}
+		_linkPlugins[link.Id()] = playerIdToDiscordIds;
+		foreach (KeyValuePair<PlayerId, Snowflake> item in playerIdToDiscordIds)
+		{
+			AddLink(item.Key, item.Value);
+		}
+		_logger.Debug("{0} has been registered as a DiscordLink plugin", link.Name);
+	}
+
+	public void RemoveLinkPlugin(IDiscordLink plugin)
+	{
+		if (plugin == null)
+		{
+			throw new ArgumentNullException("plugin");
+		}
+		PluginId key = plugin.Id();
+		IDictionary<PlayerId, Snowflake> dictionary = _linkPlugins[key];
+		if (dictionary == null)
+		{
+			return;
+		}
+		_linkPlugins.Remove(key);
+		foreach (KeyValuePair<PlayerId, Snowflake> item in dictionary)
+		{
+			bool flag = false;
+			foreach (IDictionary<PlayerId, Snowflake> value in _linkPlugins.Values)
+			{
+				if (value.ContainsKey(item.Key))
+				{
+					flag = true;
+					break;
+				}
+			}
+			if (!flag)
+			{
+				RemoveLink(item.Key, item.Value);
+			}
+		}
+	}
+
+	protected override void OnPluginUnloaded(Plugin plugin)
+	{
+		if (plugin is IDiscordLink plugin2)
+		{
+			RemoveLinkPlugin(plugin2);
+		}
+	}
+
+	public bool IsLinked(string playerId)
+	{
+		return IsLinked(new PlayerId(playerId));
+	}
+
+	public bool IsLinked(PlayerId playerId)
+	{
+		return _links.ContainsKey(playerId);
+	}
+
+	public bool IsLinked(Snowflake discordId)
+	{
+		return _links.ContainsKey(discordId);
+	}
+
+	public bool IsLinked(IPlayer player)
+	{
+		return IsLinked(player.Id);
+	}
+
+	public bool IsLinked(DiscordUser user)
+	{
+		return IsLinked(user.Id);
+	}
+
+	public PlayerId GetPlayerId(Snowflake discordId)
+	{
+		PlayerId value;
+		return _links.TryGetValue(discordId, out value) ? value : default(PlayerId);
+	}
+
+	public PlayerId GetPlayerId(DiscordUser user)
+	{
+		return GetPlayerId(user.Id);
+	}
+
+	public IPlayer GetPlayer(Snowflake discordId)
+	{
+		PlayerId value;
+		return _links.TryGetValue(discordId, out value) ? Singleton<ServerPlayerCache>.Instance.GetPlayerById(value.Id) : null;
+	}
+
+	public Snowflake GetDiscordId(string playerId)
+	{
+		return GetDiscordId(new PlayerId(playerId));
+	}
+
+	public Snowflake GetDiscordId(PlayerId playerId)
+	{
+		Snowflake value;
+		return _links.TryGetValue(playerId, out value) ? value : default(Snowflake);
+	}
+
+	public Snowflake GetDiscordId(IPlayer player)
+	{
+		return GetDiscordId(player.Id);
+	}
+
+	public DiscordUser GetDiscordUser(string playerId)
+	{
+		return GetDiscordUser(new PlayerId(playerId));
+	}
+
+	public DiscordUser GetDiscordUser(PlayerId playerId)
+	{
+		Snowflake value;
+		return (_links.TryGetValue(playerId, out value) && value.IsValid()) ? Singleton<EntityCache<DiscordUser>>.Instance.GetOrCreate(value) : null;
+	}
+
+	public DiscordUser GetDiscordUser(IPlayer player)
+	{
+		return GetDiscordUser(player.Id);
+	}
+
+	public GuildMember GetLinkedMember(string playerId, DiscordGuild guild)
+	{
+		return GetLinkedMember(new PlayerId(playerId), guild);
+	}
+
+	public GuildMember GetLinkedMember(PlayerId playerId, DiscordGuild guild)
+	{
+		if (guild == null)
+		{
+			throw new ArgumentNullException("guild");
+		}
+		Snowflake discordId = GetDiscordId(playerId);
+		if (!discordId.IsValid() || !guild.IsAvailable)
+		{
+			return null;
+		}
+		return guild.Members[discordId];
+	}
+
+	public GuildMember GetLinkedMember(IPlayer player, DiscordGuild guild)
+	{
+		return GetLinkedMember(player.Id, guild);
+	}
+
+	public void OnLinked(Plugin plugin, IPlayer player, DiscordUser discord)
+	{
+		if (player == null)
+		{
+			throw new ArgumentNullException("player");
+		}
+		if (discord == null)
+		{
+			throw new ArgumentNullException("discord");
+		}
+		if (IsValidLinkPlugin(plugin))
+		{
+			_linkPlugins[plugin.Id()][player.PlayerId()] = discord.Id;
+			AddLink(new PlayerId(player.Id), discord.Id);
+			DiscordHook.CallGlobalHook("OnDiscordPlayerLinked", player, discord);
+		}
+	}
+
+	public void OnUnlinked(Plugin plugin, IPlayer player, DiscordUser discord)
+	{
+		if (player == null)
+		{
+			throw new ArgumentNullException("player");
+		}
+		if (discord == null)
+		{
+			throw new ArgumentNullException("discord");
+		}
+		if (IsValidLinkPlugin(plugin))
+		{
+			DiscordHook.CallGlobalHook("OnDiscordPlayerUnlink", player, discord);
+			RemoveLink(new PlayerId(player.Id), discord.Id);
+			_linkPlugins[plugin.Id()].Remove(player.PlayerId());
+			DiscordHook.CallGlobalHook("OnDiscordPlayerUnlinked", player, discord);
+		}
+	}
+
+	private void AddLink(PlayerId playerId, Snowflake discordId)
+	{
+		_links[playerId] = discordId;
+	}
+
+	private void RemoveLink(PlayerId playerId, Snowflake discordId)
+	{
+		_links.Remove(playerId);
+		_links.Remove(discordId);
+	}
+
+	private bool IsValidLinkPlugin(Plugin plugin)
+	{
+		if (!(plugin is IDiscordLink plugin2))
+		{
+			_logger.Error(plugin.Name + " tried to link but is not registered as a link plugin");
+			return false;
+		}
+		if (!_linkPlugins.ContainsKey(plugin2.Id()))
+		{
+			_logger.Error(plugin.Name + " has not been added as a link plugin and cannot set a link");
+			return false;
+		}
+		return true;
+	}
+
+	public void LogDebug(DebugLogger logger)
+	{
+		logger.AppendField("Total Links", _links.Count);
+		logger.AppendList("Plugins", _linkPlugins.Keys);
+	}
+}

@@ -60,6 +60,7 @@ public class EventRecord : Pool.IPooled
 		{
 			eventRecord.AddField("wipe_id", SaveRestore.WipeId);
 		}
+		eventRecord.AddField("frame_count", Time.frameCount);
 		eventRecord.Timestamp = DateTime.UtcNow;
 		eventRecord.TimesCreated++;
 		return eventRecord;

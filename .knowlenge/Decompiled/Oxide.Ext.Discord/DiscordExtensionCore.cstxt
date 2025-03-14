@@ -1,0 +1,689 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading;
+using Oxide.Core;
+using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Plugins;
+using Oxide.Ext.Discord;
+using Oxide.Ext.Discord.Attributes;
+using Oxide.Ext.Discord.Builders;
+using Oxide.Ext.Discord.Cache;
+using Oxide.Ext.Discord.Callbacks.Data;
+using Oxide.Ext.Discord.Clients;
+using Oxide.Ext.Discord.Configuration;
+using Oxide.Ext.Discord.Data;
+using Oxide.Ext.Discord.Data.Ip;
+using Oxide.Ext.Discord.Entities;
+using Oxide.Ext.Discord.Extensions;
+using Oxide.Ext.Discord.Factory;
+using Oxide.Ext.Discord.Interfaces;
+using Oxide.Ext.Discord.Libraries;
+using Oxide.Ext.Discord.Logging;
+using Oxide.Ext.Discord.Plugins;
+using Oxide.Ext.Discord.Rest;
+using Oxide.Ext.Discord.Types;
+using Oxide.Plugins;
+
+internal class DiscordExtensionCore : BaseDiscordPlugin
+{
+	private readonly Hash<Snowflake, CommandCache> _commandCache = new Hash<Snowflake, CommandCache>();
+
+	private CommandCreate _create;
+
+	private PluginSetup _setup;
+
+	[PluginReference]
+	public Plugin ImageLibrary;
+
+	private Action<IPlayer, StringBuilder, bool> _replacer;
+
+	private Plugin _clans;
+
+	private readonly Hash<PlayerDisplayNameMode, Hash<string, string>> _playerNameCache = new Hash<PlayerDisplayNameMode, Hash<string, string>>();
+
+	public readonly PluginId PluginId;
+
+	public static DiscordExtensionCore Instance;
+
+	private ILogger _logger;
+
+	internal bool IsServerLoaded;
+
+	private readonly Hash<string, Action<Plugin>> _pluginReferences;
+
+	private void RegisterApplicationCommands()
+	{
+		_setup = new PluginSetup(this, DiscordExtension.GlobalLogger);
+		ApplicationCommandBuilder applicationCommandBuilder = new ApplicationCommandBuilder("de", "Discord Extension Commands", ApplicationCommandType.ChatInput).AddDefaultPermissions(PermissionFlags.Administrator).AddSubCommandGroup("commands", "Application Commands", delegate(ApplicationCommandGroupBuilder group)
+		{
+			group.AddSubCommand("delete", "Delete a registered application command", delegate(ApplicationSubCommandBuilder sub)
+			{
+				sub.AddOption(CommandOptionType.String, "command", "Application Command To Delete", delegate(ApplicationCommandOptionBuilder options)
+				{
+					options.AutoComplete().Required();
+				});
+			});
+		});
+		applicationCommandBuilder.AllowInDirectMessages(allow: false);
+		CommandCreate create = applicationCommandBuilder.Build();
+		DiscordCommandLocalization localization = applicationCommandBuilder.BuildCommandLocalization();
+		TemplateKey template = new TemplateKey("DiscordExtension");
+		DiscordExtension.DiscordCommandLocalizations.RegisterCommandLocalizationAsync(this, template, localization, new TemplateVersion(1, 0, 0), new TemplateVersion(1, 0, 0)).Then(delegate
+		{
+			DiscordExtension.DiscordCommandLocalizations.ApplyCommandLocalizationsAsync(this, create, template).Then(delegate
+			{
+				_create = create;
+				foreach (BotClient item in Singleton<BotClientFactory>.Instance.Clients.ToList())
+				{
+					ApplyApplicationCommands(item);
+				}
+			});
+		});
+	}
+
+	public void ApplyApplicationCommands(BotClient client)
+	{
+		_logger.Verbose("DiscordExtensionCore.ApplyApplicationCommands Create Exists: {0} Client Is Ready: {1}", _create != null, client.IsReady);
+		if (_create != null && client.IsReady)
+		{
+			client.Application.CreateGlobalCommand(client.GetFirstClient(), _create);
+			BaseDiscordLibrary<DiscordAppCommand>.Instance.RegisterApplicationCommands(this, _setup, client.Connection);
+		}
+	}
+
+	[HookMethod("HandleDeleteApplicationCommand")]
+	[DiscordApplicationCommand("de", "delete", "commands")]
+	private void HandleDeleteApplicationCommand(DiscordInteraction interaction, InteractionDataParsed parsed)
+	{
+		DiscordClient client = Singleton<BotClientFactory>.Instance.GetByApplicationId(interaction.ApplicationId)?.GetFirstClient();
+		if (client == null)
+		{
+			return;
+		}
+		string @string = parsed.Args.GetString("command");
+		string[] array = @string.Split(':');
+		if (!Snowflake.TryParse((array.Length == 1) ? array[0] : array[1], out var snowflake))
+		{
+			SendTemplateMessage(client, TemplateKeys.Commands.Delete.Errors.InvalidSelection, interaction);
+			return;
+		}
+		Snowflake snowflake2 = default(Snowflake);
+		if (array.Length == 2 && !Snowflake.TryParse(array[0], out snowflake2))
+		{
+			SendTemplateMessage(client, TemplateKeys.Commands.Delete.Errors.InvalidSelection, interaction);
+		}
+		else if (snowflake2.IsValid())
+		{
+			client.Bot.Application.GetGuildCommand(client, snowflake2, snowflake).Then(delegate(DiscordApplicationCommand command)
+			{
+				DeleteGetSuccess(client, interaction, command);
+			}).Catch(delegate(ResponseError ex)
+			{
+				DeleteGetError(client, interaction, ex);
+			});
+		}
+		else
+		{
+			client.Bot.Application.GetGlobalCommand(client, snowflake).Then(delegate(DiscordApplicationCommand command)
+			{
+				DeleteGetSuccess(client, interaction, command);
+			}).Catch(delegate(ResponseError ex)
+			{
+				DeleteGetError(client, interaction, ex);
+			});
+		}
+	}
+
+	private void DeleteGetSuccess(DiscordClient client, DiscordInteraction interaction, DiscordApplicationCommand command)
+	{
+		command.Delete(client).Then(delegate
+		{
+			SendTemplateMessage(client, TemplateKeys.Commands.Delete.Success, interaction, GetPlaceholderData().AddCommand(command));
+			_commandCache[interaction.ApplicationId]?.RemoveCommand(command.Id);
+		}).Catch(delegate(ResponseError error)
+		{
+			SendTemplateMessage(client, TemplateKeys.Commands.Delete.Errors.DeleteCommandError, interaction, GetPlaceholderData().AddCommand(command).AddRequestError(error));
+		});
+	}
+
+	private void DeleteGetError(DiscordClient client, DiscordInteraction interaction, ResponseError error)
+	{
+		SendTemplateMessage(client, TemplateKeys.Commands.Delete.Success, interaction, GetPlaceholderData().AddRequestError(error));
+	}
+
+	[HookMethod("HandleDeleteApplicationAutoComplete")]
+	[DiscordAutoCompleteCommand("de", "command", "delete", "commands")]
+	private void HandleDeleteApplicationAutoComplete(DiscordInteraction interaction, InteractionDataOption focused)
+	{
+		string search = focused.GetString();
+		CommandCache commandCache2 = _commandCache[interaction.ApplicationId];
+		InteractionAutoCompleteBuilder builder = new InteractionAutoCompleteBuilder(interaction);
+		BotClient client = Singleton<BotClientFactory>.Instance.GetByApplicationId(interaction.ApplicationId);
+		if (client == null)
+		{
+			return;
+		}
+		if (commandCache2 != null && !commandCache2.IsExpired)
+		{
+			AddCommands(builder, search, commandCache2.Commands);
+			interaction.CreateResponse(client.GetFirstClient(), builder.Build());
+			return;
+		}
+		CacheCommands(client, delegate(CommandCache commandCache)
+		{
+			AddCommands(builder, search, commandCache.Commands);
+			interaction.CreateResponse(client.GetFirstClient(), builder.Build());
+		});
+	}
+
+	private static void AddCommands(InteractionAutoCompleteBuilder builder, string search, List<DiscordApplicationCommand> commands)
+	{
+		for (int i = 0; i < commands.Count; i++)
+		{
+			if (!builder.CanAddChoice())
+			{
+				break;
+			}
+			DiscordApplicationCommand discordApplicationCommand = commands[i];
+			if (string.IsNullOrEmpty(search) || discordApplicationCommand.Name.IndexOf(search, StringComparison.OrdinalIgnoreCase) != -1)
+			{
+				if (discordApplicationCommand.GuildId.HasValue && discordApplicationCommand.GuildId.Value.IsValid())
+				{
+					builder.AddChoice("[Guild] " + discordApplicationCommand.Name, $"{discordApplicationCommand.GuildId.Value}:{discordApplicationCommand.Id}");
+				}
+				else
+				{
+					builder.AddChoice("[Global] " + discordApplicationCommand.Name, discordApplicationCommand.Id.ToString());
+				}
+			}
+		}
+	}
+
+	private void CacheCommands(BotClient bot, Action<CommandCache> callback)
+	{
+		bot.Application.GetAllCommands(bot.GetFirstClient()).Then(delegate(List<DiscordApplicationCommand> commands)
+		{
+			CommandCache commandCache = new CommandCache(commands);
+			_commandCache[bot.Application.Id] = commandCache;
+			callback(commandCache);
+		});
+	}
+
+	private PlaceholderData GetPlaceholderData()
+	{
+		return BaseDiscordLibrary<DiscordPlaceholders>.Instance.CreateData(this);
+	}
+
+	private static bool IsPluginLoaded(Plugin plugin)
+	{
+		return plugin?.IsLoaded ?? false;
+	}
+
+	public string GetPlayerAvatarUrl(string playerId)
+	{
+		return IsPluginLoaded(ImageLibrary) ? ImageLibrary.Call<string>("GetImageURL", new object[2] { playerId, 0uL }) : string.Empty;
+	}
+
+	public string GetImageUrl(string imageName, ulong imageId)
+	{
+		return IsPluginLoaded(ImageLibrary) ? ImageLibrary.Call<string>("GetImageURL", new object[2] { imageName, imageId }) : string.Empty;
+	}
+
+	public Action<IPlayer, StringBuilder, bool> GetReplacer()
+	{
+		return _replacer;
+	}
+
+	private void HandlePlaceholderApi(Plugin plugin)
+	{
+		_replacer = plugin?.Call("GetProcessPlaceholders", 1) as Action<IPlayer, StringBuilder, bool>;
+	}
+
+	[HookMethod("OnClanCreate")]
+	private void OnClanCreate()
+	{
+		ClearClanCache();
+	}
+
+	[HookMethod("OnClanUpdate")]
+	private void OnClanUpdate()
+	{
+		ClearClanCache();
+	}
+
+	[HookMethod("OnClanDestroy")]
+	private void OnClanDestroy()
+	{
+		ClearClanCache();
+	}
+
+	[HookMethod("OnUserNameUpdated")]
+	private void OnUserNameUpdated(string playerId, string oldName, string newName)
+	{
+		if (!(oldName != newName))
+		{
+			return;
+		}
+		foreach (KeyValuePair<PlayerDisplayNameMode, Hash<string, string>> item in _playerNameCache)
+		{
+			item.Value.Remove(playerId);
+		}
+	}
+
+	private void ClearClanCache()
+	{
+		foreach (KeyValuePair<PlayerDisplayNameMode, Hash<string, string>> item in _playerNameCache)
+		{
+			if (HasFlag(item.Key, PlayerDisplayNameMode.Clan))
+			{
+				item.Value.Clear();
+			}
+		}
+	}
+
+	internal string GetClanTag(IPlayer player)
+	{
+		if (!IsPluginLoaded(_clans))
+		{
+			return string.Empty;
+		}
+		string text = _clans.Call<string>("GetClanOf", new object[1] { player.Id });
+		return (!string.IsNullOrEmpty(text)) ? text : string.Empty;
+	}
+
+	public string GetPlayerName(IPlayer player, PlayerDisplayNameMode options)
+	{
+		Hash<string, string> hash = _playerNameCache[options];
+		if (hash == null)
+		{
+			hash = new Hash<string, string>();
+			_playerNameCache[options] = hash;
+		}
+		string text = hash[player.Id];
+		if (!string.IsNullOrEmpty(text))
+		{
+			return text;
+		}
+		ValueStringBuilder valueStringBuilder = default(ValueStringBuilder);
+		Plugin clans = _clans;
+		if (clans != null && clans.IsLoaded && HasFlag(options, PlayerDisplayNameMode.Clan))
+		{
+			string text2 = _clans.Call<string>("GetClanOf", new object[1] { player.Id });
+			if (!string.IsNullOrEmpty(text2))
+			{
+				valueStringBuilder.Append('[');
+				valueStringBuilder.Append(text2);
+				valueStringBuilder.Append("] ");
+			}
+		}
+		valueStringBuilder.Append(player.Name);
+		if (HasFlag(options, PlayerDisplayNameMode.PlayerId))
+		{
+			valueStringBuilder.Append(" (");
+			valueStringBuilder.Append(player.Id);
+			valueStringBuilder.Append(')');
+		}
+		text = valueStringBuilder.ToString();
+		hash[player.Id] = text;
+		return text;
+	}
+
+	private bool HasFlag(PlayerDisplayNameMode options, PlayerDisplayNameMode flag)
+	{
+		return (options & flag) == flag;
+	}
+
+	private void CreateTemplates()
+	{
+		DiscordMessageTemplate template = CreateTemplateEmbed($"You have successfully deleted application command {DefaultKeys.AppCommand.Name}", DiscordColor.Success);
+		DiscordExtension.DiscordMessageTemplates.RegisterLocalizedTemplateAsync(this, TemplateKeys.Commands.Delete.Success, template, new TemplateVersion(1, 0, 0), new TemplateVersion(1, 0, 0));
+		DiscordMessageTemplate template2 = CreateTemplateEmbed($"An error occured deleting command {DefaultKeys.AppCommand.Name}. Please try the command again. \nError: {DefaultKeys.ResponseError.Message}", DiscordColor.Danger);
+		DiscordExtension.DiscordMessageTemplates.RegisterLocalizedTemplateAsync(this, TemplateKeys.Commands.Delete.Errors.DeleteCommandError, template2, new TemplateVersion(1, 0, 0), new TemplateVersion(1, 0, 0));
+		DiscordMessageTemplate template3 = CreateTemplateEmbed("We failed to find a matching command. Please make sure you select a command from the drop down.", DiscordColor.Danger);
+		DiscordExtension.DiscordMessageTemplates.RegisterLocalizedTemplateAsync(this, TemplateKeys.Commands.Delete.Errors.CommandIdNotFound, template3, new TemplateVersion(1, 0, 0), new TemplateVersion(1, 0, 0));
+		DiscordMessageTemplate template4 = CreateTemplateEmbed("You have selected an invalid command. Please try the command again and be sure to select an option from the drop down.", DiscordColor.Danger);
+		DiscordExtension.DiscordMessageTemplates.RegisterLocalizedTemplateAsync(this, TemplateKeys.Commands.Delete.Errors.InvalidSelection, template4, new TemplateVersion(1, 0, 0), new TemplateVersion(1, 0, 0));
+	}
+
+	private DiscordMessageTemplate CreateTemplateEmbed(string description, DiscordColor color)
+	{
+		return new DiscordMessageTemplate
+		{
+			Embeds = new List<DiscordEmbedTemplate>
+			{
+				new DiscordEmbedTemplate
+				{
+					Description = description,
+					Color = color.ToHex()
+				}
+			}
+		};
+	}
+
+	private void SendTemplateMessage(DiscordClient client, TemplateKey key, DiscordInteraction interaction, PlaceholderData placeholders = null)
+	{
+		InteractionCallbackData interactionCallbackData = new InteractionCallbackData
+		{
+			Flags = (interaction.GuildId.HasValue ? new MessageFlags?(MessageFlags.Ephemeral) : ((MessageFlags?)null))
+		};
+		DiscordMessageTemplate localizedTemplate = DiscordExtension.DiscordMessageTemplates.GetLocalizedTemplate(this, key, interaction);
+		localizedTemplate.ToMessage(placeholders, interactionCallbackData);
+		interaction.CreateResponse(client, InteractionResponseType.ChannelMessageWithSource, interactionCallbackData);
+	}
+
+	public DiscordExtensionCore()
+	{
+		base.Name = "DiscordExtension";
+		base.Title = "Discord Extension";
+		PluginId = new PluginId(this);
+		_pluginReferences = new Hash<string, Action<Plugin>>
+		{
+			["PlaceholderAPI"] = HandlePlaceholderApi,
+			["Clans"] = delegate(Plugin plugin)
+			{
+				_clans = plugin;
+			}
+		};
+	}
+
+	[HookMethod("Init")]
+	private void Init()
+	{
+		Instance = this;
+		_logger = Singleton<DiscordLoggerFactory>.Instance.CreateExtensionLogger(DiscordLogLevel.Info);
+		BaseDiscordLibrary<DiscordPool>.Instance.CreateInternal(this);
+		Singleton<DataHandler>.Instance.LoadAll();
+		AddCovalenceCommand(new string[1] { "de.version" }, "VersionCommand", "de.version");
+		AddCovalenceCommand(new string[1] { "de.websocket.reset" }, "ResetWebSocketCommand", "de.websocket.reset");
+		AddCovalenceCommand(new string[1] { "de.websocket.reconnect" }, "ReconnectWebSocketCommand", "de.websocket.reconnect");
+		AddCovalenceCommand(new string[1] { "de.rest.reset" }, "ResetRestApiCommand", "de.rest.reset");
+		AddCovalenceCommand(new string[1] { "de.search.highperformance.enable" }, "SearchHighPerformanceEnabled", "de.search.highperformance.enable");
+		AddCovalenceCommand(new string[1] { "de.placeholders.list" }, "PlaceholdersList", "de.placeholders.list");
+		AddCovalenceCommand(new string[1] { "de.pool.clearentities" }, "ClearEntitiesDiscordPool", "de.pool.clearentities");
+		AddCovalenceCommand(new string[1] { "de.pool.remove" }, "RemoveDiscordPool", "de.pool.remove");
+		AddCovalenceCommand(new string[1] { "de.log.console" }, "ConsoleLogCommand", "de.log.console");
+		AddCovalenceCommand(new string[1] { "de.log.file" }, "FileLogCommand", "de.log.file");
+		AddCovalenceCommand(new string[1] { "de.validation.enable" }, "ValidationEnableCommand", "de.validation.enable");
+		AddCovalenceCommand(new string[1] { "de.debug" }, "DiscordDebugCommand", "de.debug");
+		AddCovalenceCommand(new string[1] { "de.help" }, "DiscordHelpCommand", "de.help");
+		foreach (KeyValuePair<string, Dictionary<string, string>> language in Oxide.Ext.Discord.Plugins.Localization.Languages)
+		{
+			Lang.RegisterMessages(language.Value, this, language.Key);
+		}
+		BaseDiscordLibrary<DiscordPlaceholders>.Instance.RegisterPlaceholders();
+		Singleton<ServerPlayerCache>.Instance.SetSearchService();
+		CreateTemplates();
+		RegisterApplicationCommands();
+	}
+
+	[HookMethod("OnServerInitialized")]
+	private void OnServerInitialized()
+	{
+		IsServerLoaded = true;
+	}
+
+	[HookMethod("OnServerSave")]
+	private void OnServerSave()
+	{
+		Singleton<DataHandler>.Instance.OnServerSave();
+	}
+
+	[HookMethod("OnServerShutdown")]
+	private void OnServerShutdown()
+	{
+		DiscordExtension.IsShuttingDown = true;
+	}
+
+	[HookMethod("Unload")]
+	private void Unload()
+	{
+		Instance = null;
+	}
+
+	[HookMethod("VersionCommand")]
+	private void VersionCommand(IPlayer player)
+	{
+		Chat(player, "Version", DiscordExtension.FullExtensionVersion);
+	}
+
+	[HookMethod("ResetWebSocketCommand")]
+	private void ResetWebSocketCommand(IPlayer player)
+	{
+		Singleton<BotClientFactory>.Instance.ResetAllWebSockets();
+		Chat(player, "Websocket.Reset");
+	}
+
+	[HookMethod("ReconnectWebSocketCommand")]
+	private void ReconnectWebSocketCommand(IPlayer player)
+	{
+		Singleton<BotClientFactory>.Instance.ReconnectAllWebSockets();
+		Chat(player, "Websocket.Reconnect");
+	}
+
+	[HookMethod("ResetRestApiCommand")]
+	private void ResetRestApiCommand(IPlayer player)
+	{
+		Singleton<BotClientFactory>.Instance.ResetAllRestApis();
+		Chat(player, "RestApi.Reset");
+	}
+
+	[HookMethod("SearchHighPerformanceEnabled")]
+	private void SearchHighPerformanceEnabled(IPlayer player, string cmd, string[] args)
+	{
+		DiscordSearchConfig search = DiscordConfig.Instance.Search;
+		if (args.Length == 0)
+		{
+			Chat(player, "Search.HighPerformance.Show", GetLang(search.EnablePlayerNameSearchTrie ? "Enabled" : "Disabled"));
+			return;
+		}
+		if (!args[0].ParseBool(out var value))
+		{
+			Chat(player, "Search.HighPerformance.Invalid", args[0]);
+			return;
+		}
+		Chat(player, "Search.HighPerformance.Set", GetLang(value ? "Enabled" : "Disabled"));
+		if (search.EnablePlayerNameSearchTrie != value)
+		{
+			search.EnablePlayerNameSearchTrie = value;
+			Singleton<ServerPlayerCache>.Instance.SetSearchService();
+			DiscordConfig.Instance.Save();
+		}
+	}
+
+	[HookMethod("PlaceholdersList")]
+	private void PlaceholdersList(IPlayer player)
+	{
+		ValueStringBuilder valueStringBuilder = default(ValueStringBuilder);
+		string text = this.PluginName();
+		foreach (KeyValuePair<PlaceholderKey, IPlaceholder> item in from p in BaseDiscordLibrary<DiscordPlaceholders>.Instance.GetPlaceholders()
+			orderby p.Key
+			select p)
+		{
+			valueStringBuilder.Append('{');
+			valueStringBuilder.Append(item.Key.Placeholder);
+			valueStringBuilder.Append("} - Return Type: ");
+			valueStringBuilder.Append(item.Value.GetReturnType().Name);
+			valueStringBuilder.Append(" Plugin: ");
+			valueStringBuilder.Append(item.Value.IsExtensionPlaceholder ? text : item.Value.PluginName);
+			valueStringBuilder.AppendLine();
+		}
+		Chat(player, "Placeholders.List", valueStringBuilder.ToString());
+	}
+
+	[HookMethod("ClearEntitiesDiscordPool")]
+	private void ClearEntitiesDiscordPool(IPlayer player)
+	{
+		Chat(player, "Pool.ClearEntities");
+		BaseDiscordLibrary<DiscordPool>.Instance.Clear();
+	}
+
+	[HookMethod("RemoveDiscordPool")]
+	private void RemoveDiscordPool(IPlayer player)
+	{
+		Chat(player, "Pool.Remove");
+		BaseDiscordLibrary<DiscordPool>.Instance.Wipe();
+	}
+
+	[HookMethod("ConsoleLogCommand")]
+	private void ConsoleLogCommand(IPlayer player, string cmd, string[] args)
+	{
+		if (args.Length == 0)
+		{
+			Chat(player, "Log.Show", "Console", DiscordConfig.Instance.Logging.ConsoleLogLevel);
+			return;
+		}
+		try
+		{
+			DiscordLogLevel discordLogLevel = (DiscordLogLevel)Enum.Parse(typeof(DiscordLogLevel), args[0], ignoreCase: true);
+			DiscordConfig.Instance.Logging.ConsoleLogLevel = discordLogLevel;
+			DiscordConfig.Instance.Save();
+			Chat(player, "Log.Set", "Console", discordLogLevel);
+			Singleton<BotClientFactory>.Instance.UpdateLogLevel();
+			Singleton<WebhookClientFactory>.Instance.UpdateLogLevel();
+		}
+		catch
+		{
+			Chat(player, "Log.InvalidEnum", args[0]);
+		}
+	}
+
+	[HookMethod("FileLogCommand")]
+	private void FileLogCommand(IPlayer player, string cmd, string[] args)
+	{
+		if (args.Length == 0)
+		{
+			Chat(player, "Log.Show", "File", DiscordConfig.Instance.Logging.FileLogLevel);
+			return;
+		}
+		try
+		{
+			DiscordLogLevel discordLogLevel = (DiscordLogLevel)Enum.Parse(typeof(DiscordLogLevel), args[0], ignoreCase: true);
+			DiscordConfig.Instance.Logging.FileLogLevel = discordLogLevel;
+			DiscordConfig.Instance.Save();
+			Chat(player, "Log.Set", "File", discordLogLevel);
+			Singleton<BotClientFactory>.Instance.UpdateLogLevel();
+			Singleton<WebhookClientFactory>.Instance.UpdateLogLevel();
+			Singleton<DiscordClientFactory>.Instance.UpdateLogLevel();
+		}
+		catch
+		{
+			Chat(player, "Log.InvalidEnum", args[0]);
+		}
+	}
+
+	[HookMethod("ValidationEnableCommand")]
+	private void ValidationEnableCommand(IPlayer player, string cmd, string[] args)
+	{
+		if (args.Length == 0)
+		{
+			Chat(player, "Validation.Show", GetLang(DiscordConfig.Instance.Validation.EnableValidation ? "Enabled" : "Disabled"));
+			return;
+		}
+		if (!args[0].ParseBool(out var value))
+		{
+			Chat(player, "Validation.InvalidEnum", args[0]);
+			return;
+		}
+		DiscordConfig.Instance.Validation.EnableValidation = value;
+		Chat(player, "Validation.Set", GetLang(value ? "Enabled" : "Disabled"));
+		DiscordConfig.Instance.Save();
+	}
+
+	[HookMethod("DiscordDebugCommand")]
+	private void DiscordDebugCommand(IPlayer player, string cmd, string[] args)
+	{
+		DebugLogger debugLogger = new DebugLogger();
+		ThreadPool.GetAvailableThreads(out var workerThreads, out var completionPortThreads);
+		ThreadPool.GetMaxThreads(out var workerThreads2, out var completionPortThreads2);
+		debugLogger.AppendLine("Discord Extension Version: " + DiscordExtension.FullExtensionVersion);
+		debugLogger.AppendList("Bot Clients", Singleton<BotClientFactory>.Instance.Clients);
+		debugLogger.AppendList("Webhook Clients", Singleton<WebhookClientFactory>.Instance.Clients);
+		debugLogger.AppendObject("Global Rest", RestHandler.Global);
+		debugLogger.StartObject("Threads");
+		debugLogger.AppendFieldOutOf("Worker", workerThreads, workerThreads2);
+		debugLogger.AppendFieldOutOf("Port", completionPortThreads, completionPortThreads2);
+		debugLogger.EndObject();
+		debugLogger.StartObject("Libraries");
+		debugLogger.AppendObject("Discord Application Command", BaseDiscordLibrary<DiscordAppCommand>.Instance);
+		debugLogger.AppendObject("Discord Command", BaseDiscordLibrary<DiscordCommand>.Instance);
+		debugLogger.AppendObject("Discord Subscriptions", BaseDiscordLibrary<DiscordSubscriptions>.Instance);
+		BaseDiscordLibrary<DiscordAppCommand>.Instance.LogDebug(debugLogger);
+		BaseDiscordLibrary<DiscordCommand>.Instance.LogDebug(debugLogger);
+		BaseDiscordLibrary<DiscordSubscriptions>.Instance.LogDebug(debugLogger);
+		debugLogger.AppendObject("Discord Pool", BaseDiscordLibrary<DiscordPool>.Instance);
+		debugLogger.EndObject();
+		string text = debugLogger.ToString();
+		if (args.Length != 0 && args[0].Equals("file", StringComparison.OrdinalIgnoreCase))
+		{
+			string text2 = Path.Combine(Interface.Oxide.LogDirectory, "DiscordExtension");
+			string text3 = Path.Combine(text2, $"DEBUG-{DateTime.Now:yyyy-MM-dd_h-mm-ss-tt}.txt");
+			if (!Directory.Exists(text2))
+			{
+				Directory.CreateDirectory(text2);
+			}
+			File.WriteAllText(text3, text);
+			player.Message("Debug Saved to File. Path: " + text3.Replace(Interface.Oxide.RootDirectory, "").Substring(1));
+		}
+		else
+		{
+			player.Message(text);
+			_logger.Info(text);
+		}
+	}
+
+	[HookMethod("DiscordHelpCommand")]
+	private void DiscordHelpCommand(IPlayer player)
+	{
+		Chat(player, "Help", DiscordExtension.FullExtensionVersion);
+	}
+
+	[HookMethod("OnPluginLoaded")]
+	private void OnPluginLoaded(Plugin plugin)
+	{
+		_pluginReferences[plugin.Name]?.Invoke(plugin);
+	}
+
+	[HookMethod("OnPluginUnloaded")]
+	private void OnPluginUnloaded(Plugin plugin)
+	{
+		_pluginReferences[plugin.Name]?.Invoke(null);
+	}
+
+	[HookMethod("OnUserApproved")]
+	private void OnUserApproved(string name, string id, string ipAddress)
+	{
+		if (!BaseDataFile<DiscordIpData>.Instance.HasData(ipAddress))
+		{
+			_logger.Verbose("DiscordExtensionCore.OnUserConnected No data found for IP: {0}. Requesting Data.", ipAddress);
+			GetIpDataCallback.Start(ipAddress);
+		}
+	}
+
+	[HookMethod("OnUserConnected")]
+	private void OnUserConnected(IPlayer player)
+	{
+		Singleton<ServerPlayerCache>.Instance.OnUserConnected(player);
+	}
+
+	[HookMethod("OnUserDisconnected")]
+	private void OnUserDisconnected(IPlayer player)
+	{
+		try
+		{
+			Singleton<ServerPlayerCache>.Instance.OnUserDisconnected(player);
+		}
+		catch (Exception exception)
+		{
+			DiscordExtension.GlobalLogger.Exception("An error occured", exception);
+		}
+	}
+
+	[HookMethod("OnUserNameUpdated")]
+	private void OnUserNameUpdated(IPlayer player, string oldName, string newName)
+	{
+		Singleton<ServerPlayerCache>.Instance.OnUserNameUpdated(player, oldName, newName);
+	}
+}

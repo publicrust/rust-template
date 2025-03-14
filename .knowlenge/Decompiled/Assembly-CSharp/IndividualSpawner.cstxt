@@ -12,8 +12,8 @@ public class IndividualSpawner : BaseMonoBehaviour, IServerComponent, ISpawnPoin
 
 	public LayerMask customBoundsCheckMask;
 
-	[SerializeField]
 	[Tooltip("Simply spawns the entity once. No respawning. Entity can be saved if desired.")]
+	[SerializeField]
 	public bool oneTimeSpawner;
 
 	internal bool isSpawnerActive = true;

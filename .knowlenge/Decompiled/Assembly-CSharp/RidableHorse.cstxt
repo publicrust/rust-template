@@ -8,8 +8,10 @@ using ProtoBuf;
 using UnityEngine;
 using UnityEngine.Assertions;
 
-public class RidableHorse : BaseRidableAnimal
+[Obsolete("See RidableHorse2")]
+public class RidableHorse : BaseRidableAnimal, ITowing, HitchTrough.IHitchable
 {
+	[Header("Ridable Horse")]
 	public Translate.Phrase SwapToSingleTitle;
 
 	public Translate.Phrase SwapToSingleDescription;
@@ -24,9 +26,6 @@ public class RidableHorse : BaseRidableAnimal
 
 	public ItemDefinition WildSaddleItem;
 
-	[ServerVar(Help = "Population active on the server, per square km", ShowInAdminUI = true)]
-	public static float Population = 2f;
-
 	public string distanceStatName = "";
 
 	public HorseBreed[] breeds;
@@ -34,6 +33,32 @@ public class RidableHorse : BaseRidableAnimal
 	public SkinnedMeshRenderer[] bodyRenderers;
 
 	public SkinnedMeshRenderer[] hairRenderers;
+
+	[Header("Towing")]
+	public TriggerTowing towingTrigger;
+
+	public Transform towingPoint;
+
+	public float towingSpeedModifier = 0.6f;
+
+	public TowingVisuals towingVisuals;
+
+	public GameObjectRef towingAttachEffect;
+
+	public GameObjectRef towingDetachEffect;
+
+	[Header("Head IK")]
+	public Transform[] neckBones;
+
+	public float yawInertiaFactor = 150f;
+
+	public float maxYawAngle = 10f;
+
+	public float headTurnSpeed = 3.5f;
+
+	public float returnSpeed = 2f;
+
+	public Vector3 lookOffset = Vector3.zero;
 
 	public int currentBreed = -1;
 
@@ -53,9 +78,17 @@ public class RidableHorse : BaseRidableAnimal
 
 	public float equipmentSpeedMod;
 
+	private NetworkableId towingEntityId;
+
 	private int prevBreed;
 
 	private int prevSlots;
+
+	private Rigidbody kinematicBody;
+
+	private TowingAttachment<RidableHorse> towingAttachment;
+
+	private ITowing towableEntity;
 
 	private float distanceRecordingSpacing = 5f;
 
@@ -66,6 +99,16 @@ public class RidableHorse : BaseRidableAnimal
 	public float kmDistance;
 
 	public float tempDistanceTravelled;
+
+	public bool IsTowing => HasFlag(Flags.Reserved14);
+
+	public bool IsTowingAllowed => !IsTowing;
+
+	public BaseEntity TowEntity => this;
+
+	public Transform TowAnchor => towingPoint;
+
+	public Rigidbody TowBody => kinematicBody;
 
 	public override float RealisticMass => 550f;
 
@@ -117,6 +160,64 @@ public class RidableHorse : BaseRidableAnimal
 				}
 				return true;
 			}
+			if (rpc == 1734055891 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SV_RequestDetach ");
+				}
+				using (TimeWarning.New("SV_RequestDetach"))
+				{
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg3 = rPCMessage;
+							SV_RequestDetach(msg3);
+						}
+					}
+					catch (Exception exception2)
+					{
+						Debug.LogException(exception2);
+						player.Kick("RPC Error in SV_RequestDetach");
+					}
+				}
+				return true;
+			}
+			if (rpc == 155913585 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SV_RequestTow ");
+				}
+				using (TimeWarning.New("SV_RequestTow"))
+				{
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg4 = rPCMessage;
+							SV_RequestTow(msg4);
+						}
+					}
+					catch (Exception exception3)
+					{
+						Debug.LogException(exception3);
+						player.Kick("RPC Error in SV_RequestTow");
+					}
+				}
+				return true;
+			}
 		}
 		return base.OnRpcMessage(player, rpc, msg);
 	}
@@ -158,17 +259,36 @@ public class RidableHorse : BaseRidableAnimal
 		return breeds[currentBreed];
 	}
 
+	public override float GetWalkSpeed()
+	{
+		float num = (IsTowing ? towingSpeedModifier : 1f);
+		return base.GetWalkSpeed() * num;
+	}
+
 	public override float GetTrotSpeed()
 	{
-		float num = equipmentSpeedMod / (base.GetRunSpeed() * GetBreed().maxSpeed);
-		return base.GetTrotSpeed() * GetBreed().maxSpeed * (1f + num);
+		float num = (IsTowing ? towingSpeedModifier : 1f);
+		float num2 = equipmentSpeedMod / (base.GetRunSpeed() * GetBreed().maxSpeed);
+		return base.GetTrotSpeed() * GetBreed().maxSpeed * (1f + num2) * num;
 	}
 
 	public override float GetRunSpeed()
 	{
-		float num = base.GetRunSpeed();
+		float num = (IsTowing ? towingSpeedModifier : 1f);
+		float num2 = base.GetRunSpeed();
 		HorseBreed breed = GetBreed();
-		return num * breed.maxSpeed + equipmentSpeedMod;
+		return (num2 * breed.maxSpeed + equipmentSpeedMod) * num;
+	}
+
+	public override float GetTurnSpeed()
+	{
+		float num = (IsTowing ? towingSpeedModifier : 1f);
+		return base.GetTurnSpeed() * num;
+	}
+
+	public void OnJointBreak(float breakForce)
+	{
+		SV_TowDetach();
 	}
 
 	private void SpawnWildSaddle()
@@ -250,7 +370,7 @@ public class RidableHorse : BaseRidableAnimal
 			}
 			baseMountable = ((HasDriver() || player.IsRestrained) ? mountPoints[2].mountable : mountPoints[1].mountable);
 		}
-		if (!GamePhysics.OverlapSphere(animalNeck.transform.position, obstacleDetectionRadius * 1.8f, 2097152))
+		if (!GamePhysics.CheckSphere(animalNeck.transform.position, obstacleDetectionRadius * 1.8f, 2097152))
 		{
 			if (baseMountable != null)
 			{
@@ -283,10 +403,11 @@ public class RidableHorse : BaseRidableAnimal
 		riderProtection.Scale(info.damageTypes);
 	}
 
-	public override void OnKilled(HitInfo hitInfo = null)
+	public override void OnDied(HitInfo hitInfo = null)
 	{
 		TryLeaveHitch();
-		base.OnKilled(hitInfo);
+		SV_TowDetach();
+		base.OnDied(hitInfo);
 	}
 
 	public void SetBreed(int index)
@@ -303,6 +424,11 @@ public class RidableHorse : BaseRidableAnimal
 		}
 	}
 
+	public override bool SH_LeadCheck()
+	{
+		return !IsTowing;
+	}
+
 	public override void ServerInit()
 	{
 		SetBreed(UnityEngine.Random.Range(0, breeds.Length));
@@ -312,9 +438,106 @@ public class RidableHorse : BaseRidableAnimal
 		baseProtection.Add(baseHorseProtection, 1f);
 		obstacleDetectionRadius = 0.25f;
 		obstacleHeadDetectionRadius = 0.35f;
+		towingTrigger.OnEntityEnterTrigger = HandleTowTrigger;
+		towingTrigger.OnEntityLeaveTrigger = HandleTowTriggerLeave;
+		towingAttachment = new TowingAttachment<RidableHorse>(this);
+		kinematicBody = GetComponent<Rigidbody>();
 		base.ServerInit();
 		SpawnWildSaddle();
 		EquipmentUpdate();
+	}
+
+	internal override void DoServerDestroy()
+	{
+		base.DoServerDestroy();
+		if (towableEntity != null)
+		{
+			SV_TowDetach();
+		}
+	}
+
+	private void HandleTowTrigger(BaseNetworkable networkable)
+	{
+		if (networkable is ITowing { IsTowing: false } towing)
+		{
+			towableEntity = towing;
+			ClientRPC(RpcTarget.NetworkGroup("CL_CanTow"), arg1: true);
+		}
+		else
+		{
+			towableEntity = null;
+			ClientRPC(RpcTarget.NetworkGroup("CL_CanTow"), arg1: false);
+		}
+	}
+
+	private void HandleTowTriggerLeave(BaseNetworkable networkable)
+	{
+		ClientRPC(RpcTarget.NetworkGroup("CL_CanTow"), arg1: false);
+		towableEntity = null;
+	}
+
+	[RPC_Server]
+	public void SV_RequestTow(RPCMessage msg)
+	{
+		if (towableEntity != null && !IsTowing)
+		{
+			SV_TowAttach();
+			Effect.server.Run(towingAttachEffect.resourcePath, this, 0u, Vector3.zero, Vector3.zero);
+		}
+	}
+
+	[RPC_Server]
+	public void SV_RequestDetach(RPCMessage msg)
+	{
+		if (IsTowing)
+		{
+			SV_TowDetach();
+			Effect.server.Run(towingDetachEffect.resourcePath, this, 0u, Vector3.zero, Vector3.zero);
+		}
+	}
+
+	public override void VehicleFixedUpdate()
+	{
+		base.VehicleFixedUpdate();
+		towingAttachment.FixedUpdate();
+	}
+
+	private void ValidateTowableEntity()
+	{
+		if (towableEntity != null)
+		{
+			towingEntityId = towableEntity.TowEntity.net.ID;
+		}
+		else
+		{
+			towableEntity = BaseNetworkable.serverEntities.Find(towingEntityId) as ITowing;
+		}
+	}
+
+	private void SV_TowAttach()
+	{
+		if (towableEntity == null || !towingEntityId.IsValid)
+		{
+			ValidateTowableEntity();
+		}
+		if (towableEntity != null)
+		{
+			ClientRPC(RpcTarget.NetworkGroup("CL_SetTowId"), towableEntity.TowEntity.net.ID);
+			towingAttachment.AttachTo(towableEntity);
+			Invoke(delegate
+			{
+				towingTrigger.SetActive(active: false);
+			}, 0f);
+		}
+	}
+
+	private void SV_TowDetach()
+	{
+		towingEntityId = default(NetworkableId);
+		ClientRPC(RpcTarget.NetworkGroup("CL_SetTowId"), 0);
+		ClientRPC(RpcTarget.NetworkGroup("CL_CanTow"), arg1: false);
+		towableEntity = null;
+		towingAttachment.Detach();
 	}
 
 	public override void PlayerMounted(BasePlayer player, BaseMountable seat)
@@ -339,10 +562,15 @@ public class RidableHorse : BaseRidableAnimal
 		return currentHitch != null;
 	}
 
-	public void SetHitch(HitchTrough Hitch)
+	public void SetHitch(HitchTrough hitch, HitchTrough.HitchSpot spot)
 	{
-		currentHitch = Hitch;
+		currentHitch = hitch;
 		SetFlag(Flags.Reserved3, currentHitch != null);
+		if (hitch != null)
+		{
+			base.transform.SetPositionAndRotation(spot.tr.position, spot.tr.rotation);
+			DismountAllPlayers();
+		}
 	}
 
 	public override float ReplenishRatio()
@@ -380,7 +608,7 @@ public class RidableHorse : BaseRidableAnimal
 	{
 		if ((bool)currentHitch)
 		{
-			currentHitch.Unhitch(this);
+			currentHitch.UnHitch(this);
 		}
 	}
 
@@ -390,7 +618,7 @@ public class RidableHorse : BaseRidableAnimal
 		Vis.Entities(base.transform.position, 2.5f, obj, 256, QueryTriggerInteraction.Ignore);
 		foreach (HitchTrough item in obj)
 		{
-			if (!(Vector3.Dot(Vector3Ex.Direction2D(item.transform.position, base.transform.position), base.transform.forward) < 0.4f) && !item.isClient && item.HasSpace() && item.ValidHitchPosition(base.transform.position) && item.AttemptToHitch(this))
+			if (!(Vector3.Dot(Vector3Ex.Direction2D(item.transform.position, base.transform.position), base.transform.forward) < 0.4f) && !item.isClient && item.HasSpace() && item.IsValidHitchPosition(base.transform.position) && item.AttemptToHitch(this))
 			{
 				break;
 			}
@@ -426,11 +654,12 @@ public class RidableHorse : BaseRidableAnimal
 	public override void Save(SaveInfo info)
 	{
 		base.Save(info);
-		info.msg.horse = Facepunch.Pool.Get<ProtoBuf.Horse>();
+		info.msg.horse = Facepunch.Pool.Get<Horse>();
 		info.msg.horse.staminaSeconds = staminaSeconds;
 		info.msg.horse.currentMaxStaminaSeconds = currentMaxStaminaSeconds;
 		info.msg.horse.breedIndex = currentBreed;
 		info.msg.horse.numStorageSlots = numStorageSlots;
+		info.msg.horse.towEntityId = towingEntityId;
 		if (!info.forDisk)
 		{
 			info.msg.horse.runState = (int)currentRunState;
@@ -637,6 +866,11 @@ public class RidableHorse : BaseRidableAnimal
 		{
 			staminaSeconds = info.msg.horse.staminaSeconds;
 			currentMaxStaminaSeconds = info.msg.horse.currentMaxStaminaSeconds;
+			if (info.fromDisk)
+			{
+				towingEntityId = info.msg.horse.towEntityId;
+				SV_TowAttach();
+			}
 			ApplyBreed(info.msg.horse.breedIndex);
 		}
 	}
@@ -719,5 +953,21 @@ public class RidableHorse : BaseRidableAnimal
 			item.SetBreed(@int);
 		}
 		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	public void OnTowAttach()
+	{
+		Invoke(delegate
+		{
+			towingTrigger.SetActive(active: false);
+		}, 0f);
+	}
+
+	public void OnTowDetach()
+	{
+		Invoke(delegate
+		{
+			towingTrigger.SetActive(active: true);
+		}, 1f);
 	}
 }

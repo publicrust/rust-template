@@ -1,0 +1,284 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Text.RegularExpressions;
+using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Plugins;
+using Oxide.Ext.Discord.Cache;
+using Oxide.Ext.Discord.Entities;
+using Oxide.Ext.Discord.Exceptions;
+using Oxide.Ext.Discord.Extensions;
+using Oxide.Ext.Discord.Factory;
+using Oxide.Ext.Discord.Interfaces;
+using Oxide.Ext.Discord.Libraries;
+using Oxide.Ext.Discord.Logging;
+using Oxide.Ext.Discord.Plugins;
+using Oxide.Ext.Discord.Types;
+using Oxide.Plugins;
+
+public class DiscordPlaceholders : BaseDiscordLibrary<DiscordPlaceholders>
+{
+	private readonly Regex _placeholderRegex = new Regex("{([^\\d][^:{}\"]+)(?::([^{}\"]+))*?}", RegexOptions.Compiled, TimeSpan.FromSeconds(1.0));
+
+	private readonly Hash<PlaceholderKey, IPlaceholder> _placeholders = new Hash<PlaceholderKey, IPlaceholder>();
+
+	private readonly Hash<PlaceholderKey, IPlaceholder> _internalPlaceholders = new Hash<PlaceholderKey, IPlaceholder>();
+
+	private readonly ILogger _logger;
+
+	internal DiscordPlaceholders(ILogger logger)
+	{
+		_logger = logger;
+	}
+
+	internal void RegisterPlaceholders()
+	{
+		ChannelPlaceholders.RegisterPlaceholders();
+		DateTimePlaceholders.RegisterPlaceholders();
+		GuildPlaceholders.RegisterPlaceholders();
+		InteractionPlaceholders.RegisterPlaceholders();
+		IpPlaceholders.RegisterPlaceholders();
+		ServerPlaceholders.RegisterPlaceholders();
+		MemberPlaceholders.RegisterPlaceholders();
+		MessagePlaceholders.RegisterPlaceholders();
+		PlayerPlaceholders.RegisterPlaceholders();
+		PluginPlaceholders.RegisterPlaceholders();
+		RolePlaceholders.RegisterPlaceholders();
+		TimestampPlaceholders.RegisterPlaceholders();
+		UserPlaceholders.RegisterPlaceholders();
+		ApplicationCommandPlaceholders.RegisterPlaceholders();
+		ResponseErrorPlaceholders.RegisterPlaceholders();
+		SnowflakePlaceholders.RegisterPlaceholders();
+		TimeSpanPlaceholders.RegisterPlaceholders();
+	}
+
+	internal IEnumerable<KeyValuePair<PlaceholderKey, IPlaceholder>> GetPlaceholders()
+	{
+		return _placeholders;
+	}
+
+	public bool HasPlaceholders(string text)
+	{
+		if (string.IsNullOrEmpty(text))
+		{
+			return false;
+		}
+		MatchCollection matchCollection = _placeholderRegex.Matches(text);
+		return matchCollection.Count != 0;
+	}
+
+	public IEnumerable<string> GetPlaceholders(string text)
+	{
+		if (string.IsNullOrEmpty(text))
+		{
+			yield break;
+		}
+		MatchCollection matches = _placeholderRegex.Matches(text);
+		foreach (Match match in matches)
+		{
+			yield return match.Groups[1].Value;
+		}
+	}
+
+	public string ProcessPlaceholders(string text, PlaceholderData data)
+	{
+		if (data == null)
+		{
+			return text;
+		}
+		if (string.IsNullOrEmpty(text))
+		{
+			data.AutoDispose();
+			return text;
+		}
+		if (data == null)
+		{
+			throw new ArgumentNullException("data");
+		}
+		MatchCollection matchCollection = _placeholderRegex.Matches(text);
+		if (matchCollection.Count != 0)
+		{
+			StringBuilder stringBuilder = DiscordPool.Internal.GetStringBuilder();
+			stringBuilder.Append(text);
+			PlaceholderState placeholderState = PlaceholderState.Create(data);
+			bool flag = false;
+			for (int num = matchCollection.Count - 1; num >= 0; num--)
+			{
+				Match match = matchCollection[num];
+				placeholderState.UpdateState(match);
+				IPlaceholder placeholder = _placeholders[placeholderState.Key];
+				if (placeholder == null)
+				{
+					flag = true;
+				}
+				else
+				{
+					placeholder.Invoke(stringBuilder, placeholderState);
+				}
+			}
+			if (flag)
+			{
+				DiscordExtensionCore.Instance.GetReplacer()?.Invoke(data.Get<IPlayer>(), stringBuilder, arg3: true);
+			}
+			text = DiscordPool.Internal.ToStringAndFree(stringBuilder);
+			placeholderState.Dispose();
+		}
+		data.AutoDispose();
+		return text;
+	}
+
+	public PlaceholderData CreateData(Plugin plugin)
+	{
+		if (plugin == null)
+		{
+			throw new ArgumentNullException("plugin");
+		}
+		PlaceholderData placeholderData = BaseDiscordLibrary<DiscordPool>.Instance.GetOrCreate(plugin).GetPlaceholderData();
+		placeholderData.AddServer(Singleton<OxideLibrary>.Instance.Covalence.Server);
+		placeholderData.AddPlugin(plugin);
+		DiscordUser discordUser = Singleton<DiscordClientFactory>.Instance.GetClient(plugin)?.Bot?.BotUser;
+		if (discordUser != null)
+		{
+			placeholderData.AddBotUser(discordUser);
+		}
+		return placeholderData;
+	}
+
+	public void RegisterPlaceholder(Plugin plugin, PlaceholderKey key, string value)
+	{
+		InvalidPlaceholderException.ThrowIfInvalid(key);
+		if (plugin == null)
+		{
+			throw new ArgumentNullException("plugin");
+		}
+		if (value == null)
+		{
+			throw new ArgumentNullException("value");
+		}
+		StaticPlaceholder value2 = new StaticPlaceholder(plugin, value);
+		IPlaceholder placeholder = _placeholders[key];
+		if (placeholder != null && !placeholder.IsExtensionPlaceholder && !placeholder.IsForPlugin(plugin))
+		{
+			_logger.Warning("Plugin {0} has replaced placeholder '{1}' previously registered by plugin {2}", plugin.FullName(), key.Placeholder, placeholder.PluginName);
+		}
+		_placeholders[key] = value2;
+	}
+
+	public void RegisterPlaceholder<TResult>(Plugin plugin, PlaceholderKey key, Func<TResult> callback)
+	{
+		InvalidPlaceholderException.ThrowIfInvalid(key);
+		if (plugin == null)
+		{
+			throw new ArgumentNullException("plugin");
+		}
+		if (callback == null)
+		{
+			throw new ArgumentNullException("callback");
+		}
+		Placeholder<TResult> value = new Placeholder<TResult>(plugin, callback);
+		IPlaceholder placeholder = _placeholders[key];
+		if (placeholder != null && !placeholder.IsExtensionPlaceholder && !placeholder.IsForPlugin(plugin))
+		{
+			_logger.Warning("Plugin {0} has replaced placeholder '{1}' previously registered by plugin {2}", plugin.FullName(), key.Placeholder, placeholder.PluginName);
+		}
+		_placeholders[key] = value;
+	}
+
+	public void RegisterPlaceholder<TData>(Plugin plugin, PlaceholderKey key, PlaceholderDataKey dataKey)
+	{
+		InvalidPlaceholderException.ThrowIfInvalid(key);
+		if (plugin == null)
+		{
+			throw new ArgumentNullException("plugin");
+		}
+		Placeholder<TData, TData> placeholder = new Placeholder<TData, TData>(dataKey, plugin, (TData data) => data);
+		if (!placeholder.IsExtensionPlaceholder && !_internalPlaceholders.ContainsKey(key) && !key.Placeholder.StartsWith(plugin.Name, StringComparison.OrdinalIgnoreCase))
+		{
+			_logger.Error("Plugin placeholder {0} must be prefixed with the plugin name {1} unless overriding a Discord Extension provided placeholder.", key.Placeholder, plugin.Name.ToLower());
+			return;
+		}
+		_placeholders[key] = placeholder;
+		if (placeholder.IsExtensionPlaceholder)
+		{
+			_internalPlaceholders[key] = placeholder;
+		}
+	}
+
+	public void RegisterPlaceholder<TData, TResult>(Plugin plugin, PlaceholderKey key, Func<TData, TResult> callback)
+	{
+		RegisterPlaceholder(plugin, key, new PlaceholderDataKey(typeof(TData).Name), callback);
+	}
+
+	public void RegisterPlaceholder<TData, TResult>(Plugin plugin, PlaceholderKey key, PlaceholderDataKey dataKey, Func<TData, TResult> callback)
+	{
+		InvalidPlaceholderException.ThrowIfInvalid(key);
+		if (!dataKey.IsValid)
+		{
+			throw new ArgumentNullException("dataKey");
+		}
+		if (plugin == null)
+		{
+			throw new ArgumentNullException("plugin");
+		}
+		if (callback == null)
+		{
+			throw new ArgumentNullException("callback");
+		}
+		Placeholder<TData, TResult> placeholder = new Placeholder<TData, TResult>(dataKey, plugin, callback);
+		if (!placeholder.IsExtensionPlaceholder && !_internalPlaceholders.ContainsKey(key) && !key.Placeholder.StartsWith(plugin.Name, StringComparison.OrdinalIgnoreCase))
+		{
+			_logger.Error("Plugin placeholder {0} must be prefixed with the plugin name {1} unless overriding a Discord Extension provided placeholder.", key.Placeholder, plugin.Name.ToLower());
+			return;
+		}
+		_placeholders[key] = placeholder;
+		if (placeholder.IsExtensionPlaceholder)
+		{
+			_internalPlaceholders[key] = placeholder;
+		}
+	}
+
+	public void RegisterPlaceholder<TData, TResult>(Plugin plugin, PlaceholderKey key, Func<PlaceholderState, TData, TResult> callback)
+	{
+		RegisterPlaceholder(plugin, key, new PlaceholderDataKey(typeof(TData).Name), callback);
+	}
+
+	public void RegisterPlaceholder<TData, TResult>(Plugin plugin, PlaceholderKey key, PlaceholderDataKey dataKey, Func<PlaceholderState, TData, TResult> callback)
+	{
+		InvalidPlaceholderException.ThrowIfInvalid(key);
+		if (!dataKey.IsValid)
+		{
+			throw new ArgumentNullException("dataKey");
+		}
+		if (plugin == null)
+		{
+			throw new ArgumentNullException("plugin");
+		}
+		if (callback == null)
+		{
+			throw new ArgumentNullException("callback");
+		}
+		Placeholder<TData, TResult> placeholder = new Placeholder<TData, TResult>(dataKey, plugin, callback);
+		if (!placeholder.IsExtensionPlaceholder && !_internalPlaceholders.ContainsKey(key) && !key.Placeholder.StartsWith(plugin.Name, StringComparison.OrdinalIgnoreCase))
+		{
+			_logger.Error("Plugin placeholder {0} must be prefixed with the plugin name {1} unless overriding a Discord Extension provided placeholder.", key.Placeholder, plugin.Name.ToLower());
+			return;
+		}
+		_placeholders[key] = placeholder;
+		if (placeholder.IsExtensionPlaceholder)
+		{
+			_internalPlaceholders[key] = placeholder;
+		}
+	}
+
+	protected override void OnPluginUnloaded(Plugin plugin)
+	{
+		_placeholders.RemoveAll((IPlaceholder p) => p.IsForPlugin(plugin));
+		foreach (KeyValuePair<PlaceholderKey, IPlaceholder> internalPlaceholder in _internalPlaceholders)
+		{
+			if (!_placeholders.ContainsKey(internalPlaceholder.Key))
+			{
+				_placeholders[internalPlaceholder.Key] = internalPlaceholder.Value;
+			}
+		}
+	}
+}

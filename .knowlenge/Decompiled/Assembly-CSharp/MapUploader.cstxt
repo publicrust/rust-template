@@ -82,8 +82,11 @@ public static class MapUploader
 			try
 			{
 				stream.Seek(0L, SeekOrigin.Begin);
+				using MemoryStream streamCopy = new MemoryStream();
+				await stream.CopyToAsync(streamCopy);
+				streamCopy.Position = 0L;
 				using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Put, requestUri);
-				request.Content = new StreamContent(stream);
+				request.Content = new StreamContent(streamCopy);
 				using HttpResponseMessage response = await Http.SendAsync(request);
 				if (response.IsSuccessStatusCode)
 				{

@@ -154,6 +154,10 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 
 	public static HashSet<AutoTurret> interferenceUpdateList = new HashSet<AutoTurret>();
 
+	private const float SlowProjectileSpeedMultplier = 2f;
+
+	private const float SlowProjectileSpeedThreshold = 100f;
+
 	public float nextForcedAimTime;
 
 	public Vector3 lastSentAimDir = Vector3.zero;
@@ -617,6 +621,10 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 			{
 				return basePlayer.transform.position + Vector3.up * 0.25f;
 			}
+			if (basePlayer.GetActiveShield(out var foundShield) && foundShield.IsBlocking())
+			{
+				return foundShield.transform.position;
+			}
 			return basePlayer.eyes.position;
 		}
 		return aimat.CenterPoint();
@@ -770,9 +778,20 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 			BaseProjectile attachedWeapon = GetAttachedWeapon();
 			if ((bool)attachedWeapon)
 			{
+				float damageModifier = 1f;
+				float speedModifier = 1f;
+				ItemDefinition ammoType = attachedWeapon.primaryMagazine.ammoType;
+				if ((bool)ammoType)
+				{
+					ItemModProjectile component = ammoType.GetComponent<ItemModProjectile>();
+					if ((bool)component && component.projectileVelocity < 100f)
+					{
+						speedModifier = 2f;
+					}
+				}
 				if (attachedWeapon.primaryMagazine.contents > 0)
 				{
-					FireAttachedGun(Vector3.zero, aimCone);
+					FireAttachedGun(Vector3.zero, aimCone, null, null, damageModifier, speedModifier);
 					float delay = (attachedWeapon.isSemiAuto ? (attachedWeapon.repeatDelay * 1.5f) : attachedWeapon.repeatDelay);
 					delay = attachedWeapon.ScaleRepeatDelay(delay);
 					nextShotTime = UnityEngine.Time.time + delay;
@@ -841,8 +860,8 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 	}
 
-	[RPC_Server]
 	[RPC_Server.MaxDistance(3f)]
+	[RPC_Server]
 	public void Server_SetID(RPCMessage msg)
 	{
 		if (msg.player == null || !CanChangeID(msg.player))
@@ -1133,8 +1152,8 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
 	private void RemoveSelfAuthorize(RPCMessage rpc)
 	{
 		RPCMessage rpc2 = rpc;
@@ -1162,8 +1181,8 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
 	public void AssignToFriend(RPCMessage msg)
 	{
 		if (AtMaxAuthCapacity() || msg.player == null || !msg.player.CanInteract() || !CanChangeSettings(msg.player))
@@ -1195,8 +1214,8 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
 	private void SERVER_AttackAll(RPCMessage rpc)
 	{
 		if (IsAuthed(rpc.player) && Interface.CallHook("OnTurretModeToggle", this, rpc.player) == null)
@@ -1259,7 +1278,7 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 	{
 		if (Interface.CallHook("OnTurretTarget", this, targ) == null)
 		{
-			if (targ != target)
+			if (targ != target || targ.IsRealNull() != target.IsRealNull())
 			{
 				Effect.server.Run((targ == null) ? targetLostEffect.resourcePath : targetAcquiredEffect.resourcePath, base.transform.position, Vector3.up);
 				MarkDirtyForceUpdateOutputs();
@@ -1318,12 +1337,12 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		return false;
 	}
 
-	public virtual void FireAttachedGun(Vector3 targetPos, float aimCone, Transform muzzleToUse = null, BaseCombatEntity target = null)
+	public virtual void FireAttachedGun(Vector3 targetPos, float aimCone, Transform muzzleToUse = null, BaseCombatEntity target = null, float damageModifier = 1f, float speedModifier = 1f)
 	{
 		BaseProjectile attachedWeapon = GetAttachedWeapon();
 		if (!(attachedWeapon == null) && !IsOffline())
 		{
-			attachedWeapon.ServerUse(1f, IsBeingControlled ? RCEyes : gun_pitch, useBulletThickness: false);
+			attachedWeapon.ServerUse(damageModifier, speedModifier, IsBeingControlled ? RCEyes : gun_pitch, useBulletThickness: false);
 		}
 	}
 
@@ -1490,7 +1509,8 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 			return;
 		}
 		_ = attachedWeapon.primaryMagazine.ammoType;
-		nextShotTime = Mathf.Max(nextShotTime, UnityEngine.Time.time + Mathf.Min(attachedWeapon.GetReloadDuration() * 0.5f, 2f));
+		float turretReloadDuration = attachedWeapon.GetTurretReloadDuration();
+		nextShotTime = Mathf.Max(nextShotTime, UnityEngine.Time.time + Mathf.Min(turretReloadDuration, 2f));
 		AmmoTypes ammoTypes = attachedWeapon.primaryMagazine.definition.ammoTypes;
 		if (attachedWeapon.primaryMagazine.contents > 0)
 		{
@@ -1664,6 +1684,13 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 			}
 			AttachedWeapon = null;
 		}
+		bool b = false;
+		if (flag)
+		{
+			BaseProjectile component = heldEntity.GetComponent<BaseProjectile>();
+			b = component != null && component.largeTurretWeapon;
+		}
+		SetFlag(Flags.Reserved2, b);
 	}
 
 	public static HeldEntity TryAddWeaponToTurret(Item weaponItem, Transform parent, BaseEntity entityParent, float zOffsetScale)
@@ -1706,7 +1733,7 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		return heldEntity;
 	}
 
-	public override void OnKilled(HitInfo info)
+	public override void OnDied(HitInfo info)
 	{
 		BaseProjectile attachedWeapon = GetAttachedWeapon();
 		if (attachedWeapon != null)
@@ -1715,7 +1742,7 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 			attachedWeapon.SetLightsOn(isOn: false);
 		}
 		AttachedWeapon = null;
-		base.OnKilled(info);
+		base.OnDied(info);
 	}
 
 	public override bool OnStartBeingLooted(BasePlayer baseEntity)
@@ -1760,40 +1787,48 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 		EnsureReloaded();
 		BaseProjectile attachedWeapon = GetAttachedWeapon();
-		if (UnityEngine.Time.time >= nextShotTime && targetVisible && Mathf.Abs(AngleToTarget(target, currentAmmoGravity != 0f)) < GetMaxAngleForEngagement())
+		if (!(UnityEngine.Time.time >= nextShotTime) || !targetVisible || !(Mathf.Abs(AngleToTarget(target, currentAmmoGravity != 0f)) < GetMaxAngleForEngagement()))
 		{
-			if ((bool)attachedWeapon)
+			return;
+		}
+		if ((bool)attachedWeapon)
+		{
+			float damageModifier = 1f;
+			float speedModifier = 1f;
+			ItemDefinition ammoType = attachedWeapon.primaryMagazine.ammoType;
+			if ((bool)ammoType)
 			{
-				if (attachedWeapon.primaryMagazine.contents > 0)
+				ItemModProjectile component = ammoType.GetComponent<ItemModProjectile>();
+				if ((bool)component && component.projectileVelocity < 100f)
 				{
-					FireAttachedGun(AimOffset(target), aimCone, null, PeacekeeperMode() ? target : null);
-					float delay = (attachedWeapon.isSemiAuto ? (attachedWeapon.repeatDelay * 1.5f) : attachedWeapon.repeatDelay);
-					delay = attachedWeapon.ScaleRepeatDelay(delay);
-					nextShotTime = UnityEngine.Time.time + delay;
-				}
-				else
-				{
-					nextShotTime = UnityEngine.Time.time + 5f;
+					speedModifier = 2f;
 				}
 			}
-			else if (HasFallbackWeapon())
+			if (attachedWeapon.primaryMagazine.contents > 0)
 			{
-				FireGun(AimOffset(target), aimCone, null, target);
-				nextShotTime = UnityEngine.Time.time + 0.115f;
-			}
-			else if (HasGenericFireable())
-			{
-				AttachedWeapon.ServerUse();
-				nextShotTime = UnityEngine.Time.time + 0.115f;
+				FireAttachedGun(AimOffset(target), aimCone, null, PeacekeeperMode() ? target : null, damageModifier, speedModifier);
+				float delay = (attachedWeapon.isSemiAuto ? (attachedWeapon.repeatDelay * 1.5f) : attachedWeapon.repeatDelay);
+				delay = attachedWeapon.ScaleRepeatDelay(delay);
+				nextShotTime = UnityEngine.Time.time + delay;
 			}
 			else
 			{
-				nextShotTime = UnityEngine.Time.time + 1f;
+				nextShotTime = UnityEngine.Time.time + 5f;
 			}
 		}
-		if (target == null || target.IsDead() || UnityEngine.Time.realtimeSinceStartup - lastTargetSeenTime > 3f || Vector3.Distance(base.transform.position, target.transform.position) > sightRange || (PeacekeeperMode() && !IsEntityHostile(target)))
+		else if (HasFallbackWeapon())
 		{
-			SetTarget(null);
+			FireGun(AimOffset(target), aimCone, null, target);
+			nextShotTime = UnityEngine.Time.time + 0.115f;
+		}
+		else if (HasGenericFireable())
+		{
+			AttachedWeapon.ServerUse();
+			nextShotTime = UnityEngine.Time.time + 0.115f;
+		}
+		else
+		{
+			nextShotTime = UnityEngine.Time.time + 1f;
 		}
 	}
 
@@ -1835,6 +1870,10 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 			return false;
 		}
 		if (targ is RidableHorse)
+		{
+			return false;
+		}
+		if (targ is RidableHorse2)
 		{
 			return false;
 		}
@@ -1926,6 +1965,10 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 
 	public void TargetScan()
 	{
+		if (!target.IsRealNull() && (target == null || target.IsDead() || UnityEngine.Time.realtimeSinceStartup - lastTargetSeenTime > 3f || Vector3.Distance(base.transform.position, target.transform.position) > sightRange || (PeacekeeperMode() && !IsEntityHostile(target))))
+		{
+			SetTarget(null);
+		}
 		if (!authDirty && !hasPotentialUnauthedTarget)
 		{
 			return;

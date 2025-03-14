@@ -8,15 +8,6 @@ public class Socket_Free : Socket_Base
 
 	public bool blendAimAngle = true;
 
-	private void OnDrawGizmosSelected()
-	{
-		Gizmos.matrix = base.transform.localToWorldMatrix;
-		Gizmos.color = Color.green;
-		Gizmos.DrawLine(Vector3.zero, Vector3.forward * 1f);
-		GizmosUtil.DrawWireCircleZ(Vector3.forward * 0f, 0.2f);
-		Gizmos.DrawIcon(base.transform.position, "light_circle_green.png", allowScaling: false);
-	}
-
 	public override bool TestTarget(Construction.Target target)
 	{
 		return target.onTerrain;

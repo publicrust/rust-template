@@ -1,7 +1,7 @@
 using UnityEngine;
 
-[ExecuteInEditMode]
 [RequireComponent(typeof(Renderer))]
+[ExecuteInEditMode]
 public class DeferredMeshDecal : MonoBehaviour, IClientComponent
 {
 }

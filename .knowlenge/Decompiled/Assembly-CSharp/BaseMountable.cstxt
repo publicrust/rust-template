@@ -49,6 +49,8 @@ public class BaseMountable : BaseCombatEntity
 
 	public Transform eyeCenterOverride;
 
+	public bool overrideEyesRotation;
+
 	public Vector2 pitchClamp = new Vector2(-80f, 50f);
 
 	public Vector2 yawClamp = new Vector2(-80f, 80f);
@@ -279,6 +281,15 @@ public class BaseMountable : BaseCombatEntity
 		return GetEyeOverride().position;
 	}
 
+	public virtual Quaternion EyeRotationForPlayer(BasePlayer player)
+	{
+		if (player.GetMounted() != this || !overrideEyesRotation)
+		{
+			return Quaternion.identity;
+		}
+		return GetEyeOverride().rotation;
+	}
+
 	public virtual Vector3 EyeCenterForPlayer(BasePlayer player, Quaternion lookRot)
 	{
 		if (player.GetMounted() != this)
@@ -352,40 +363,31 @@ public class BaseMountable : BaseCombatEntity
 		if (!UnityEngine.Physics.CheckCapsule(start, end, 0.5f, 1537286401))
 		{
 			Vector3 position = disPos + base.transform.up * 0.5f;
-			if (debugDismounts)
-			{
-				Debug.Log($"ValidDismountPosition debug: Dismount point {disPos} capsule check is OK.");
-			}
 			if (IsVisibleAndCanSee(position))
 			{
-				Vector3 vector = disPos + player.NoClipOffset();
+				Vector3 newPos = disPos + player.NoClipOffset();
 				if (debugDismounts)
 				{
 					Debug.Log($"ValidDismountPosition debug: Dismount point {disPos} is visible.");
 				}
-				if (legacyDismount || !AntiHack.TestNoClipping(player, dismountCheckStart, vector, player.NoClipRadius(ConVar.AntiHack.noclip_margin_dismount), ConVar.AntiHack.noclip_backtracking, out var _, vehicleLayer: false, this))
+				if (legacyDismount || !AntiHack.TestNoClipping(player, dismountCheckStart, newPos, player.NoClipRadius(ConVar.AntiHack.noclip_margin_dismount), ConVar.AntiHack.noclip_backtracking, out var _, vehicleLayer: false, this))
 				{
 					if (debugDismounts)
 					{
 						Debug.Log($"<color=green>ValidDismountPosition debug: Dismount point {disPos} is valid</color>.");
-						Debug.DrawLine(dismountCheckStart, vector, Color.green, 10f);
 					}
 					return true;
 				}
 			}
 		}
-		if (debugDismounts)
+		if (debugDismounts && debugDismounts)
 		{
-			Debug.DrawLine(dismountCheckStart, disPos, Color.red, 10f);
-			if (debugDismounts)
-			{
-				Debug.Log($"<color=red>ValidDismountPosition debug: Dismount point {disPos} is invalid</color>.");
-			}
+			Debug.Log($"<color=red>ValidDismountPosition debug: Dismount point {disPos} is invalid</color>.");
 		}
 		return false;
 	}
 
-	public BasePlayer GetMounted()
+	public virtual BasePlayer GetMounted()
 	{
 		return _mounted;
 	}
@@ -421,10 +423,10 @@ public class BaseMountable : BaseCombatEntity
 		return false;
 	}
 
-	public override void OnKilled(HitInfo info)
+	public override void OnDied(HitInfo info)
 	{
 		DismountAllPlayers();
-		base.OnKilled(info);
+		base.OnDied(info);
 	}
 
 	[RPC_Server]
@@ -470,7 +472,8 @@ public class BaseMountable : BaseCombatEntity
 				}
 				if (!flag)
 				{
-					Debug.Log("No line of sight to mount pos");
+					Debug.Log("not self, " + entity.name + " vs " + VehicleParent()?.name);
+					Debug.Log(entity.isClient + " vs " + VehicleParent()?.isClient);
 					return;
 				}
 			}
@@ -493,11 +496,20 @@ public class BaseMountable : BaseCombatEntity
 		{
 			return false;
 		}
+		if (!AllowPlayerInstigatedDismount(player))
+		{
+			return false;
+		}
 		if (VehicleParent() != null && !VehicleParent().AllowPlayerInstigatedDismount(player))
 		{
 			return false;
 		}
 		DismountPlayer(player);
+		return true;
+	}
+
+	public virtual bool AllowPlayerInstigatedDismount(BasePlayer player)
+	{
 		return true;
 	}
 
@@ -646,11 +658,11 @@ public class BaseMountable : BaseCombatEntity
 			player.ClientRPC(RpcTarget.Player("ForcePositionTo", player), res);
 		}
 		Facepunch.Rust.Analytics.Azure.OnDismountEntity(player, this, baseVehicle);
-		OnPlayerDismounted(player);
 		Interface.CallHook("OnEntityDismounted", this, player);
+		OnPlayerDismounted(player);
 	}
 
-	public virtual bool GetDismountPosition(BasePlayer player, out Vector3 res)
+	public virtual bool GetDismountPosition(BasePlayer player, out Vector3 res, bool silent = false)
 	{
 		BaseVehicle baseVehicle = VehicleParent();
 		if (baseVehicle != null && baseVehicle.IsVehicleMountPoint(this))
@@ -668,7 +680,10 @@ public class BaseMountable : BaseCombatEntity
 			}
 			num++;
 		}
-		Debug.LogWarning("Failed to find dismount position for player :" + player.displayName + " / " + player.userID.Get() + " on obj : " + base.gameObject.name);
+		if (!silent)
+		{
+			Debug.LogWarning("Failed to find dismount position for player :" + player.displayName + " / " + player.userID.Get() + " on obj : " + base.gameObject.name);
+		}
 		res = player.transform.position;
 		return false;
 	}
@@ -769,7 +784,7 @@ public class BaseMountable : BaseCombatEntity
 	{
 	}
 
-	protected virtual void MountedPlayerSync()
+	public virtual void MountedPlayerSync()
 	{
 		_mounted.transform.rotation = mountAnchor.transform.rotation;
 		_mounted.ServerRotation = mountAnchor.transform.rotation;
@@ -796,9 +811,24 @@ public class BaseMountable : BaseCombatEntity
 		{
 			return false;
 		}
+		ItemContainer inventory = ammoStorage.inventory;
+		if (inventory == null)
+		{
+			return false;
+		}
+		return TryFireProjectile(inventory, ammoType, firingPos, firingDir, shooter, launchOffset, minSpeed, out projectile);
+	}
+
+	public bool TryFireProjectile(ItemContainer ammoContainer, AmmoTypes ammoType, Vector3 firingPos, Vector3 firingDir, BasePlayer shooter, float launchOffset, float minSpeed, out ServerProjectile projectile)
+	{
+		projectile = null;
+		if (ammoContainer == null)
+		{
+			return false;
+		}
 		bool result = false;
 		List<Item> obj = Facepunch.Pool.Get<List<Item>>();
-		ammoStorage.inventory.FindAmmo(obj, ammoType);
+		ammoContainer.FindAmmo(obj, ammoType);
 		for (int num = obj.Count - 1; num >= 0; num--)
 		{
 			if (obj[num].amount <= 0)
@@ -808,36 +838,50 @@ public class BaseMountable : BaseCombatEntity
 		}
 		if (obj.Count > 0)
 		{
-			if (UnityEngine.Physics.Raycast(firingPos, firingDir, out var hitInfo, launchOffset, 1237003025))
-			{
-				launchOffset = hitInfo.distance - 0.1f;
-			}
-			Item item = obj[obj.Count - 1];
-			ItemModProjectile component = item.info.GetComponent<ItemModProjectile>();
-			BaseEntity baseEntity = GameManager.server.CreateEntity(component.projectileObject.resourcePath, firingPos + firingDir * launchOffset);
-			projectile = baseEntity.GetComponent<ServerProjectile>();
-			Vector3 vector = projectile.initialVelocity + firingDir * projectile.speed;
-			if (minSpeed > 0f)
-			{
-				float num2 = Vector3.Dot(vector, firingDir) - minSpeed;
-				if (num2 < 0f)
-				{
-					vector += firingDir * (0f - num2);
-				}
-			}
-			projectile.InitializeVelocity(vector);
-			if (shooter.IsValid())
-			{
-				baseEntity.creatorEntity = shooter;
-				baseEntity.OwnerID = shooter.userID;
-			}
-			baseEntity.Spawn();
-			Facepunch.Rust.Analytics.Azure.OnExplosiveLaunched(shooter, baseEntity, this);
-			item.UseItem();
-			result = true;
+			Item ammoItem = obj[obj.Count - 1];
+			result = FireProjectile(ammoItem, firingPos, firingDir, shooter, launchOffset, minSpeed, out projectile);
 		}
 		Facepunch.Pool.Free(ref obj, freeElements: false);
 		return result;
+	}
+
+	public bool FireProjectile(Item ammoItem, Vector3 firingPos, Vector3 firingDir, BasePlayer shooter, float launchOffset, float minSpeed, out ServerProjectile projectile)
+	{
+		ItemModProjectile component = ammoItem.info.GetComponent<ItemModProjectile>();
+		if (FireProjectile(component.projectileObject, firingPos, firingDir, shooter, launchOffset, minSpeed, out projectile))
+		{
+			ammoItem.UseItem();
+			return true;
+		}
+		return false;
+	}
+
+	public bool FireProjectile(GameObjectRef projectilePrefab, Vector3 firingPos, Vector3 firingDir, BasePlayer shooter, float launchOffset, float minSpeed, out ServerProjectile projectile)
+	{
+		if (UnityEngine.Physics.Raycast(firingPos, firingDir, out var hitInfo, launchOffset, 1237003025))
+		{
+			launchOffset = hitInfo.distance - 0.1f;
+		}
+		BaseEntity baseEntity = GameManager.server.CreateEntity(projectilePrefab.resourcePath, firingPos + firingDir * launchOffset);
+		projectile = baseEntity.GetComponent<ServerProjectile>();
+		Vector3 vector = projectile.initialVelocity + firingDir * projectile.speed;
+		if (minSpeed > 0f)
+		{
+			float num = Vector3.Dot(vector, firingDir) - minSpeed;
+			if (num < 0f)
+			{
+				vector += firingDir * (0f - num);
+			}
+		}
+		projectile.InitializeVelocity(vector);
+		if (shooter.IsValid())
+		{
+			baseEntity.creatorEntity = shooter;
+			baseEntity.OwnerID = shooter.userID;
+		}
+		baseEntity.Spawn();
+		Facepunch.Rust.Analytics.Azure.OnExplosiveLaunched(shooter, baseEntity, this);
+		return true;
 	}
 
 	public override void DisableTransferProtection()
@@ -920,7 +964,7 @@ public class BaseMountable : BaseCombatEntity
 		return result;
 	}
 
-	public Vector3 GetMountedPosition()
+	public virtual Vector3 GetMountedPosition()
 	{
 		if (mountAnchor == null)
 		{

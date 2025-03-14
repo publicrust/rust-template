@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 using ConVar;
+using Facepunch;
 using Oxide.Core;
 using Rust;
 using Rust.Ai;
@@ -211,6 +212,8 @@ public class PatrolHelicopterAI : BaseMonoBehaviour
 
 	public List<targetinfo> _targetList = new List<targetinfo>();
 
+	private HashSet<BasePlayer> _targetSet = new HashSet<BasePlayer>();
+
 	public List<DangerZone> dangerZones = new List<DangerZone>();
 
 	public List<DangerZone> noGoZones = new List<DangerZone>();
@@ -411,7 +414,7 @@ public class PatrolHelicopterAI : BaseMonoBehaviour
 	{
 		if (use_danger_zones && Interface.CallHook("OnNoGoZoneAdded", this, zone) == null && zone.IsPointInside(base.transform.position))
 		{
-			_targetList.Clear();
+			ClearTargets();
 			ExitCurrentState();
 			Vector3 nearestEdge = zone.GetNearestEdge(base.transform.position);
 			nearestEdge.y = UnityEngine.Random.Range(35f, 45f);
@@ -741,17 +744,17 @@ public class PatrolHelicopterAI : BaseMonoBehaviour
 		for (int num2 = _targetList.Count - 1; num2 >= 0; num2--)
 		{
 			targetinfo targetinfo2 = _targetList[num2];
-			if (targetinfo2 == null || targetinfo2.ent == null)
+			if (targetinfo2 == null || !targetinfo2.ent.IsValid())
 			{
-				_targetList.Remove(targetinfo2);
+				RemoveTargetAt(num2);
 			}
 			else if (use_danger_zones && IsInNoGoZone(targetinfo2.ply.transform.position))
 			{
-				_targetList.Remove(targetinfo2);
+				RemoveTargetAt(num2);
 			}
 			else if (AI.ignoreplayers || SimpleAIMemory.PlayerIgnoreList.Contains(targetinfo2.ply))
 			{
-				_targetList.Remove(targetinfo2);
+				RemoveTargetAt(num2);
 			}
 			else
 			{
@@ -766,7 +769,7 @@ public class PatrolHelicopterAI : BaseMonoBehaviour
 						flag = true;
 						strafeTarget = targetinfo2.ply;
 					}
-					_targetList.Remove(targetinfo2);
+					RemoveTargetAt(num2);
 					if (leftGun._target == targetinfo2.ply)
 					{
 						leftGun._target = null;
@@ -817,26 +820,73 @@ public class PatrolHelicopterAI : BaseMonoBehaviour
 
 	private void AddNewTargetsToList()
 	{
-		foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+		using (TimeWarning.New("PatrolHelicoperAI.AddNewTargetsToList"))
 		{
-			if (AI.ignoreplayers || SimpleAIMemory.PlayerIgnoreList.Contains(activePlayer) || activePlayer.InSafeZone() || activePlayer.IsInTutorial || Vector3Ex.Distance2D(base.transform.position, activePlayer.transform.position) > 150f || (use_danger_zones && IsInNoGoZone(activePlayer.transform.position)))
+			if (AI.ignoreplayers)
 			{
-				continue;
+				return;
 			}
-			bool flag = false;
-			foreach (targetinfo target in _targetList)
+			using PooledList<BasePlayer> pooledList = Facepunch.Pool.Get<PooledList<BasePlayer>>();
+			BaseEntity.Query.Server.GetPlayersInSphere(base.transform.position, 150f, pooledList, BaseEntity.Query.DistanceCheckType.None);
+			foreach (BasePlayer item in pooledList)
 			{
-				if (target.ply == activePlayer)
+				if (SimpleAIMemory.PlayerIgnoreList.Contains(item))
 				{
-					flag = true;
-					break;
+					continue;
+				}
+				using (TimeWarning.New("PatrolHelicoperAI.SafeZone"))
+				{
+					if (item.InSafeZone())
+					{
+						continue;
+					}
+				}
+				if (item.IsInTutorial)
+				{
+					continue;
+				}
+				using (TimeWarning.New("PatrolHelicoperAI.NoGoZone"))
+				{
+					if (use_danger_zones && IsInNoGoZone(item.transform.position))
+					{
+						continue;
+					}
+				}
+				if (!IsAlreadyInTargets(item) && item.GetThreatLevel() > 0.5f && PlayerVisible(item))
+				{
+					TryAddTarget(item);
 				}
 			}
-			if (!flag && activePlayer.GetThreatLevel() > 0.5f && PlayerVisible(activePlayer))
-			{
-				_targetList.Add(new targetinfo(activePlayer, activePlayer));
-			}
 		}
+	}
+
+	private bool TryAddTarget(BasePlayer ply)
+	{
+		if (IsAlreadyInTargets(ply))
+		{
+			return false;
+		}
+		_targetList.Add(new targetinfo(ply, ply));
+		_targetSet.Add(ply);
+		return true;
+	}
+
+	private void RemoveTargetAt(int i)
+	{
+		BasePlayer ply = _targetList[i].ply;
+		_targetSet.Remove(ply);
+		_targetList.RemoveAt(i);
+	}
+
+	private void ClearTargets()
+	{
+		_targetList.Clear();
+		_targetSet.Clear();
+	}
+
+	private bool IsAlreadyInTargets(BasePlayer ply)
+	{
+		return _targetSet.Contains(ply);
 	}
 
 	private Vector3? FindTargetWithZones(bool withOffset = true)
@@ -889,31 +939,34 @@ public class PatrolHelicopterAI : BaseMonoBehaviour
 		{
 			return (bool)obj;
 		}
-		Vector3 position = ply.eyes.position;
-		if (ply.eyes.position.y < WaterSystem.OceanLevel && Mathf.Abs(WaterSystem.OceanLevel - ply.eyes.position.y) > oceanDepthTargetCutoff)
+		using (TimeWarning.New("PatrolHelicoperAI.PlayerVisible"))
 		{
+			Vector3 position = ply.eyes.position;
+			if (ply.eyes.position.y < WaterSystem.OceanLevel && Mathf.Abs(WaterSystem.OceanLevel - ply.eyes.position.y) > oceanDepthTargetCutoff)
+			{
+				return false;
+			}
+			if (TOD_Sky.Instance.IsNight && Vector3.Distance(position, interestZoneOrigin) > 40f)
+			{
+				return false;
+			}
+			Vector3 vector = base.transform.position - Vector3.up * 6f;
+			float num = Vector3.Distance(position, vector);
+			Vector3 normalized = (position - vector).normalized;
+			if (GamePhysics.Trace(new Ray(vector + normalized * 5f, normalized), 0f, out var hitInfo, num * 1.1f, 1218652417) && GameObjectEx.ToBaseEntity(hitInfo.collider.gameObject) == ply)
+			{
+				return true;
+			}
 			return false;
 		}
-		if (TOD_Sky.Instance.IsNight && Vector3.Distance(position, interestZoneOrigin) > 40f)
-		{
-			return false;
-		}
-		Vector3 vector = base.transform.position - Vector3.up * 6f;
-		float num = Vector3.Distance(position, vector);
-		Vector3 normalized = (position - vector).normalized;
-		if (GamePhysics.Trace(new Ray(vector + normalized * 5f, normalized), 0f, out var hitInfo, num * 1.1f, 1218652417) && GameObjectEx.ToBaseEntity(hitInfo.collider.gameObject) == ply)
-		{
-			return true;
-		}
-		return false;
 	}
 
 	public void WasAttacked(HitInfo info)
 	{
 		BasePlayer basePlayer = info.Initiator as BasePlayer;
-		if (!(basePlayer is ScientistNPC) && basePlayer != null)
+		if (!(basePlayer is ScientistNPC) && basePlayer.IsValid())
 		{
-			_targetList.Add(new targetinfo(basePlayer, basePlayer));
+			TryAddTarget(basePlayer);
 		}
 	}
 
@@ -1041,15 +1094,18 @@ public class PatrolHelicopterAI : BaseMonoBehaviour
 
 	public bool IsInNoGoZone(Vector3 position)
 	{
-		bool result = false;
-		foreach (DangerZone noGoZone in noGoZones)
+		using (TimeWarning.New("PatrolHelicoperAI.IsInNoGoZone"))
 		{
-			if (noGoZone.IsPointInside(position))
+			bool result = false;
+			foreach (DangerZone noGoZone in noGoZones)
 			{
-				result = true;
+				if (noGoZone.IsPointInside(position))
+				{
+					result = true;
+				}
 			}
+			return result;
 		}
-		return result;
 	}
 
 	public bool IsInDangerZone(Vector3 position, out DangerZone dangerZone)
