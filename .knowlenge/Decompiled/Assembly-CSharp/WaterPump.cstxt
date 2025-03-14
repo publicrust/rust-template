@@ -1,3 +1,4 @@
+using Oxide.Core;
 using UnityEngine;
 
 public class WaterPump : LiquidContainer
@@ -22,7 +23,7 @@ public class WaterPump : LiquidContainer
 		if (!IsFull())
 		{
 			ItemDefinition atPoint = WaterResource.GetAtPoint(WaterResourceLocation.position);
-			if (atPoint != null)
+			if (atPoint != null && Interface.CallHook("OnWaterCollect", this, atPoint) == null)
 			{
 				base.inventory.AddItem(atPoint, AmountPerPump, 0uL);
 				UpdateOnFlag();

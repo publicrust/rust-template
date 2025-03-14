@@ -1,6 +1,6 @@
 public class Stag : BaseAnimalNPC
 {
-	[ServerVar(Help = "Population active on the server, per square km")]
+	[ServerVar(Help = "Population active on the server, per square km", ShowInAdminUI = true)]
 	public static float Population = 3f;
 
 	public override float RealisticMass => 200f;

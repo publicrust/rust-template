@@ -1,7 +1,7 @@
 using Rust.UI;
 using UnityEngine;
 
-public class DemoText : SingletonComponent<DemoText>
+public class DemoText : MonoBehaviour
 {
 	public RustText TimeText;
 

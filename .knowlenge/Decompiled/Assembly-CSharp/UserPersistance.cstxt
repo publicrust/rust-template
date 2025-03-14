@@ -1,62 +1,77 @@
 using System;
 using System.Collections.Generic;
+using Facepunch;
 using Facepunch.Math;
+using Facepunch.Rust;
 using Facepunch.Sqlite;
 using ProtoBuf;
 using UnityEngine;
 
 public class UserPersistance : IDisposable
 {
-	public static Database blueprints;
+	public static Facepunch.Sqlite.Database blueprints;
 
-	public static Database deaths;
+	public static Facepunch.Sqlite.Database deaths;
 
-	private static Database identities;
+	public static Facepunch.Sqlite.Database identities;
 
-	private static Database tokens;
+	public static Facepunch.Sqlite.Database tokens;
 
-	private static Database playerState;
+	public static Facepunch.Sqlite.Database playerState;
 
-	private static Dictionary<ulong, string> nameCache;
+	public static Dictionary<ulong, string> nameCache;
 
-	private static MruDictionary<ulong, int> tokenCache;
+	private static Dictionary<ulong, string> wipeIdCache;
+
+	public static MruDictionary<ulong, (int Token, bool Locked)> tokenCache;
 
 	public UserPersistance(string strFolder)
 	{
-		blueprints = new Database();
-		blueprints.Open(strFolder + "/player.blueprints." + 3 + ".db");
+		blueprints = new Facepunch.Sqlite.Database();
+		BaseGameMode activeGameMode = BaseGameMode.GetActiveGameMode(serverside: true);
+		string text = strFolder + "/player.blueprints.";
+		if (activeGameMode != null && activeGameMode.wipeBpsOnProtocol)
+		{
+			text = text + 237 + ".";
+		}
+		blueprints.Open(text + 5 + ".db");
 		if (!blueprints.TableExists("data"))
 		{
 			blueprints.Execute("CREATE TABLE data ( userid TEXT PRIMARY KEY, info BLOB, updated INTEGER )");
 		}
-		deaths = new Database();
-		deaths.Open(strFolder + "/player.deaths." + 3 + ".db");
+		deaths = new Facepunch.Sqlite.Database();
+		deaths.Open(strFolder + "/player.deaths." + 5 + ".db");
 		if (!deaths.TableExists("data"))
 		{
 			deaths.Execute("CREATE TABLE data ( userid TEXT, born INTEGER, died INTEGER, info BLOB )");
 			deaths.Execute("CREATE INDEX IF NOT EXISTS userindex ON data ( userid )");
 			deaths.Execute("CREATE INDEX IF NOT EXISTS diedindex ON data ( died )");
 		}
-		identities = new Database();
-		identities.Open(strFolder + "/player.identities." + 3 + ".db");
+		identities = new Facepunch.Sqlite.Database();
+		identities.Open(strFolder + "/player.identities." + 5 + ".db");
 		if (!identities.TableExists("data"))
 		{
 			identities.Execute("CREATE TABLE data ( userid INT PRIMARY KEY, username TEXT )");
 		}
-		tokens = new Database();
+		tokens = new Facepunch.Sqlite.Database();
 		tokens.Open(strFolder + "/player.tokens.db");
 		if (!tokens.TableExists("data"))
 		{
-			tokens.Execute("CREATE TABLE data ( userid INT PRIMARY KEY, token INT )");
+			tokens.Execute("CREATE TABLE data ( userid INT PRIMARY KEY, token INT, locked BOOLEAN DEFAULT 0 )");
 		}
-		playerState = new Database();
-		playerState.Open(strFolder + "/player.states." + 201 + ".db");
+		if (!tokens.ColumnExists("data", "locked"))
+		{
+			tokens.Execute("ALTER TABLE data ADD COLUMN locked BOOLEAN DEFAULT 0");
+		}
+		playerState = new Facepunch.Sqlite.Database();
+		playerState.Open(strFolder + "/player.states." + 237 + ".db");
 		if (!playerState.TableExists("data"))
 		{
 			playerState.Execute("CREATE TABLE data ( userid INT PRIMARY KEY, state BLOB )");
 		}
 		nameCache = new Dictionary<ulong, string>();
-		tokenCache = new MruDictionary<ulong, int>(500);
+		tokenCache = new MruDictionary<ulong, (int, bool)>(500);
+		wipeIdCache = new Dictionary<ulong, string>();
 	}
 
 	public virtual void Dispose()
@@ -93,12 +108,11 @@ public class UserPersistance : IDisposable
 		PersistantPlayer persistantPlayer = FetchFromDatabase(playerID);
 		if (persistantPlayer == null)
 		{
-			persistantPlayer = new PersistantPlayer();
+			persistantPlayer = Pool.Get<PersistantPlayer>();
 		}
-		persistantPlayer.ShouldPool = false;
 		if (persistantPlayer.unlockedItems == null)
 		{
-			persistantPlayer.unlockedItems = new List<int>();
+			persistantPlayer.unlockedItems = Pool.GetList<int>();
 		}
 		return persistantPlayer;
 	}
@@ -107,10 +121,10 @@ public class UserPersistance : IDisposable
 	{
 		try
 		{
-			Row row = blueprints.QueryRow("SELECT info FROM data WHERE userid = ?", playerID.ToString());
-			if (row != null)
+			byte[] array = blueprints.QueryBlob("SELECT info FROM data WHERE userid = ?", playerID.ToString());
+			if (array != null)
 			{
-				return PersistantPlayer.Deserialize(row.GetBlob("info"));
+				return PersistantPlayer.Deserialize(array);
 			}
 		}
 		catch (Exception ex)
@@ -124,12 +138,12 @@ public class UserPersistance : IDisposable
 	{
 		using (TimeWarning.New("SetPlayerInfo"))
 		{
-			byte[] array;
+			byte[] arg;
 			using (TimeWarning.New("ToProtoBytes"))
 			{
-				array = info.ToProtoBytes();
+				arg = info.ToProtoBytes();
 			}
-			blueprints.Execute("INSERT OR REPLACE INTO data ( userid, info, updated ) VALUES ( ?, ?, ? )", playerID.ToString(), array, Epoch.Current);
+			blueprints.Execute("INSERT OR REPLACE INTO data ( userid, info, updated ) VALUES ( ?, ?, ? )", playerID.ToString(), arg, Epoch.Current);
 		}
 	}
 
@@ -141,12 +155,12 @@ public class UserPersistance : IDisposable
 		}
 		using (TimeWarning.New("AddLifeStory"))
 		{
-			byte[] array;
+			byte[] arg;
 			using (TimeWarning.New("ToProtoBytes"))
 			{
-				array = lifeStory.ToProtoBytes();
+				arg = lifeStory.ToProtoBytes();
 			}
-			deaths.Execute("INSERT INTO data ( userid, born, died, info ) VALUES ( ?, ?, ?, ? )", playerID.ToString(), (int)lifeStory.timeBorn, (int)lifeStory.timeDied, array);
+			deaths.Execute("INSERT INTO data ( userid, born, died, info ) VALUES ( ?, ?, ?, ? )", playerID.ToString(), (int)lifeStory.timeBorn, (int)lifeStory.timeDied, arg);
 		}
 	}
 
@@ -208,29 +222,76 @@ public class UserPersistance : IDisposable
 		}
 	}
 
-	public int GetOrGenerateAppToken(ulong playerID)
+	public int GetOrGenerateAppToken(ulong playerID, out bool locked)
 	{
 		if (tokens == null)
 		{
+			locked = false;
 			return 0;
 		}
 		using (TimeWarning.New("GetOrGenerateAppToken"))
 		{
-			if (tokenCache.TryGetValue(playerID, out var value))
+			if (tokenCache.TryGetValue(playerID, out (int, bool) value))
 			{
-				return value;
+				locked = value.Item2;
+				return value.Item1;
 			}
 			int num = tokens.QueryInt("SELECT token FROM data WHERE userid = ?", playerID);
 			if (num != 0)
 			{
-				tokenCache.Add(playerID, num);
+				bool flag = tokens.QueryInt("SELECT locked FROM data WHERE userid = ?", playerID) != 0;
+				tokenCache.Add(playerID, (num, flag));
+				locked = flag;
 				return num;
 			}
-			int num2 = UnityEngine.Random.Range(int.MinValue, int.MaxValue);
+			int num2 = GenerateAppToken();
 			tokens.Execute("INSERT INTO data ( userid, token ) VALUES ( ?, ? )", playerID, num2);
-			tokenCache.Add(playerID, num2);
+			tokenCache.Add(playerID, (num2, false));
+			locked = false;
 			return num2;
 		}
+	}
+
+	public void RegenerateAppToken(ulong playerID)
+	{
+		if (tokens == null)
+		{
+			return;
+		}
+		using (TimeWarning.New("RegenerateAppToken"))
+		{
+			tokenCache.Remove(playerID);
+			bool arg = tokens.QueryInt("SELECT locked FROM data WHERE userid = ?", playerID) != 0;
+			int num = GenerateAppToken();
+			tokens.Execute("INSERT OR REPLACE INTO data ( userid, token, locked ) VALUES ( ?, ?, ? )", playerID, num, arg);
+			tokenCache.Add(playerID, (num, false));
+		}
+	}
+
+	private static int GenerateAppToken()
+	{
+		int num = UnityEngine.Random.Range(int.MinValue, int.MaxValue);
+		if (num == 0)
+		{
+			num++;
+		}
+		return num;
+	}
+
+	public bool SetAppTokenLocked(ulong playerID, bool locked)
+	{
+		if (tokens == null)
+		{
+			return false;
+		}
+		GetOrGenerateAppToken(playerID, out var locked2);
+		if (locked2 == locked)
+		{
+			return false;
+		}
+		tokens.Execute("UPDATE data SET locked = ? WHERE userid = ?", locked ? 1 : 0, playerID);
+		tokenCache.Remove(playerID);
+		return true;
 	}
 
 	public byte[] GetPlayerState(ulong playerID)
@@ -248,6 +309,22 @@ public class UserPersistance : IDisposable
 		{
 			playerState.Execute("INSERT OR REPLACE INTO data ( userid, state ) VALUES ( ?, ? )", playerID, state);
 		}
+	}
+
+	public string GetUserWipeId(ulong playerID)
+	{
+		if (playerID <= 10000000)
+		{
+			return null;
+		}
+		if (wipeIdCache.TryGetValue(playerID, out var value))
+		{
+			return value;
+		}
+		value = (playerID + SaveRestore.WipeId).Sha256().HexString();
+		wipeIdCache[playerID] = value;
+		Analytics.Azure.OnPlayerInitializedWipeId(playerID, value);
+		return value;
 	}
 
 	public void ResetPlayerState(ulong playerID)

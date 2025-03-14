@@ -1,6 +1,7 @@
 using System;
 using ConVar;
 using Facepunch;
+using Oxide.Core;
 using ProtoBuf;
 using UnityEngine;
 
@@ -12,7 +13,7 @@ public class Composter : StorageContainer
 	[Tooltip("If enabled, entire item stacks will be composted each tick, instead of a single item of a stack.")]
 	public bool CompostEntireStack;
 
-	private float fertilizerProductionProgress;
+	public float fertilizerProductionProgress;
 
 	protected float UpdateInterval => Server.composterUpdateInterval;
 
@@ -53,13 +54,17 @@ public class Composter : StorageContainer
 		}
 	}
 
-	private bool ItemIsFertilizer(Item item)
+	public bool ItemIsFertilizer(Item item)
 	{
 		return item.info.shortname == "fertilizer";
 	}
 
 	public void UpdateComposting()
 	{
+		if (Interface.CallHook("OnComposterUpdate", this) != null)
+		{
+			return;
+		}
 		for (int i = 0; i < base.inventory.capacity; i++)
 		{
 			Item slot = base.inventory.GetSlot(i);
@@ -70,7 +75,7 @@ public class Composter : StorageContainer
 		}
 	}
 
-	private void CompostItem(Item item)
+	public void CompostItem(Item item)
 	{
 		if (!ItemIsFertilizer(item))
 		{
@@ -85,7 +90,7 @@ public class Composter : StorageContainer
 		}
 	}
 
-	private void ProduceFertilizer(int amount)
+	public void ProduceFertilizer(int amount)
 	{
 		if (amount > 0)
 		{

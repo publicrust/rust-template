@@ -9,7 +9,7 @@ public class ProgressBar : UIBehaviour
 
 	private Action<BasePlayer> action;
 
-	private float timeFinished;
+	public float timeFinished;
 
 	private float timeCounter;
 
@@ -27,5 +27,17 @@ public class ProgressBar : UIBehaviour
 
 	public SoundDefinition clipCancel;
 
-	public bool IsOpen;
+	private bool isOpen;
+
+	public bool InstanceIsOpen
+	{
+		get
+		{
+			if (Instance == this)
+			{
+				return isOpen;
+			}
+			return Instance.InstanceIsOpen;
+		}
+	}
 }

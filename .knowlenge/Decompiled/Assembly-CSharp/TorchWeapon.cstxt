@@ -14,6 +14,8 @@ public class TorchWeapon : BaseMelee
 	[Header("TorchWeapon")]
 	public AnimatorOverrideController LitHoldAnimationOverride;
 
+	public GameObjectRef litStrikeFX;
+
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
 		using (TimeWarning.New("TorchWeapon.OnRpcMessage"))
@@ -154,5 +156,21 @@ public class TorchWeapon : BaseMelee
 			SetFlag(Flags.On, b: false);
 			CancelInvoke(UseFuel);
 		}
+	}
+
+	public override string GetStrikeEffectPath(string materialName)
+	{
+		for (int i = 0; i < materialStrikeFX.Count; i++)
+		{
+			if (materialStrikeFX[i].materialName == materialName && materialStrikeFX[i].fx.isValid)
+			{
+				return materialStrikeFX[i].fx.resourcePath;
+			}
+		}
+		if (HasFlag(Flags.On) && litStrikeFX.isValid)
+		{
+			return litStrikeFX.resourcePath;
+		}
+		return strikeFX.resourcePath;
 	}
 }

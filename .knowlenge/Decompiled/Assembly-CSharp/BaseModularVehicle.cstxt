@@ -6,7 +6,7 @@ using ProtoBuf;
 using Rust.Modular;
 using UnityEngine;
 
-public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMoveFrom, IPrefabPreProcess
+public abstract class BaseModularVehicle : GroundVehicle, PlayerInventory.ICanMoveFrom, IPrefabPreProcess
 {
 	public bool inEditableLocation;
 
@@ -20,12 +20,7 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 
 	private bool disablePhysics;
 
-	public bool waterlogged;
-
 	[Header("Modular Vehicle")]
-	[HideInInspector]
-	public float mass;
-
 	[SerializeField]
 	public List<ModularVehicleSocket> moduleSockets;
 
@@ -37,6 +32,10 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 
 	[SerializeField]
 	public LODGroup lodGroup;
+
+	public GameObjectRef keyEnterDialog;
+
+	private float _mass = -1f;
 
 	public const Flags FLAG_KINEMATIC = Flags.Reserved6;
 
@@ -67,31 +66,27 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 		}
 	}
 
-	public float TotalMass { get; set; }
-
-	public Vector3 Velocity { get; set; }
-
-	public bool LightsAreOn => HasFlag(Flags.Reserved5);
-
-	public bool IsKinematic => HasFlag(Flags.Reserved6);
-
-	public bool VehicleIsActive
+	private float Mass
 	{
 		get
 		{
-			if (IsStationary())
+			if (base.isServer)
 			{
-				return IsOn();
+				return rigidBody.mass;
 			}
-			return true;
+			return _mass;
 		}
 	}
+
+	public float TotalMass { get; set; }
+
+	public bool IsKinematic => HasFlag(Flags.Reserved6);
 
 	public virtual bool IsLockable => false;
 
 	public bool HasInited { get; private set; }
 
-	public static ItemDefinition AssociatedItemDef => ((BaseCombatEntity)/*Error: ldarg 0 (out-of-bounds)*/).repair.itemTarget;
+	public ItemDefinition AssociatedItemDef => repair.itemTarget;
 
 	public bool IsEditableNow
 	{
@@ -111,7 +106,6 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 
 	public override void ServerInit()
 	{
-		//IL_0041->IL0041: Incompatible stack heights: 1 vs 0
 		base.ServerInit();
 		if (!disablePhysics)
 		{
@@ -126,7 +120,6 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 
 	public override void PreServerLoad()
 	{
-		//IL_0021->IL0021: Incompatible stack heights: 1 vs 0
 		base.PreServerLoad();
 		if (Inventory == null)
 		{
@@ -137,7 +130,7 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 	public override void PostServerLoad()
 	{
 		base.PostServerLoad();
-		if (Inventory != null && Inventory.UID == 0)
+		if (Inventory != null && !Inventory.UID.IsValid)
 		{
 			Inventory.GiveUIDs();
 		}
@@ -158,20 +151,6 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 		return Mathf.Max(GetMaxForwardSpeed() * 1.3f, 30f);
 	}
 
-	public override Vector3 GetLocalVelocityServer()
-	{
-		return rigidBody.velocity;
-	}
-
-	public override Quaternion GetAngularVelocityServer()
-	{
-		if (rigidBody.angularVelocity.sqrMagnitude < 0.1f)
-		{
-			return Quaternion.identity;
-		}
-		return Quaternion.LookRotation(rigidBody.angularVelocity, base.transform.up);
-	}
-
 	public abstract bool IsComplete();
 
 	public bool CouldBeEdited()
@@ -186,7 +165,6 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 	public void DisablePhysics()
 	{
 		disablePhysics = true;
-		rigidBody.collisionDetectionMode = CollisionDetectionMode.Discrete;
 		rigidBody.isKinematic = true;
 	}
 
@@ -199,32 +177,12 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 	public override void VehicleFixedUpdate()
 	{
 		base.VehicleFixedUpdate();
-		if (!base.isClient && isSpawned)
+		if (IsEditableNow != prevEditable)
 		{
-			if (IsEditableNow != prevEditable)
-			{
-				SendNetworkUpdate();
-				prevEditable = IsEditableNow;
-			}
-			if (VehicleIsActive)
-			{
-				Velocity = GetWorldVelocity();
-				waterlogged = WaterLevel.Test(waterSample.transform.position, waves: true, this);
-			}
-			else
-			{
-				Velocity = Vector3.zero;
-			}
-			SetFlag(Flags.Reserved6, rigidBody.isKinematic);
-			if (LightsAreOn && !HasDriver())
-			{
-				SetLightsState(on: false);
-			}
-			for (int i = 0; i < NumAttachedModules; i++)
-			{
-				AttachedModuleEntities[i].VehicleFixedUpdate(VehicleIsActive);
-			}
+			SendNetworkUpdate();
+			prevEditable = IsEditableNow;
 		}
+		SetFlag(Flags.Reserved6, rigidBody.isKinematic);
 	}
 
 	public override bool MountEligable(BasePlayer player)
@@ -237,7 +195,7 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 		{
 			return false;
 		}
-		if (HasDriver() && Velocity.magnitude >= 2f)
+		if (HasDriver() && base.Velocity.magnitude >= 2f)
 		{
 			return false;
 		}
@@ -248,19 +206,7 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 	{
 		base.Save(info);
 		info.msg.modularVehicle = Pool.Get<ModularVehicle>();
-		if (Inventory != null)
-		{
-			Inventory.Save(info);
-		}
 		info.msg.modularVehicle.editable = IsEditableNow;
-	}
-
-	public override void LightToggle(BasePlayer player)
-	{
-		if (IsDriver(player))
-		{
-			SetLightsState(!LightsAreOn);
-		}
 	}
 
 	public bool CanMoveFrom(BasePlayer player, Item item)
@@ -283,19 +229,6 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 	}
 
 	protected abstract Vector3 GetCOMMultiplier();
-
-	public void OnPhysicsNeighbourChanged()
-	{
-		if (rigidBody != null)
-		{
-			rigidBody.WakeUp();
-		}
-	}
-
-	public void SetLightsState(bool on)
-	{
-		SetFlag(Flags.Reserved5, on);
-	}
 
 	public abstract void ModuleHurt(BaseVehicleModule hurtModule, HitInfo info);
 
@@ -388,7 +321,7 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 		}
 	}
 
-	public Item GetVehicleItem(uint itemUID)
+	public Item GetVehicleItem(ItemId itemUID)
 	{
 		Item item = Inventory.ChassisContainer.FindItemByUID(itemUID);
 		if (item == null)
@@ -429,7 +362,7 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 	public override void InitShared()
 	{
 		base.InitShared();
-		AddMass(mass, CentreOfMass, base.transform.position);
+		AddMass(Mass, CentreOfMass, base.transform.position);
 		HasInited = true;
 		foreach (BaseVehicleModule attachedModuleEntity in AttachedModuleEntities)
 		{
@@ -437,26 +370,10 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 		}
 	}
 
-	public override void PreProcess(IPrefabProcessor process, GameObject rootObj, string name, bool serverside, bool clientside, bool bundling)
+	public virtual bool PlayerCanUseThis(BasePlayer player, ModularCarCodeLock.LockType lockType)
 	{
-		base.PreProcess(process, rootObj, name, serverside, clientside, bundling);
-		Rigidbody component = GetComponent<Rigidbody>();
-		if (component != null)
-		{
-			mass = component.mass;
-		}
+		return true;
 	}
-
-	public float GetSpeed()
-	{
-		if (IsStationary())
-		{
-			return 0f;
-		}
-		return Velocity.magnitude * Vector3.Dot(Velocity.normalized, base.transform.forward);
-	}
-
-	public abstract float GetMaxForwardSpeed();
 
 	public bool TryDeduceSocketIndex(BaseVehicleModule addedModule, out int index)
 	{
@@ -540,17 +457,7 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 	public override void Load(LoadInfo info)
 	{
 		base.Load(info);
-		if (info.msg.modularVehicle != null && base.isServer)
-		{
-			if (Inventory != null)
-			{
-				Inventory.Load(info);
-			}
-			else
-			{
-				Debug.LogWarning("Module Manager without inventory: " + ToString());
-			}
-		}
+		_ = info.msg.modularVehicle;
 	}
 
 	public override bool CanPushNow(BasePlayer pusher)
@@ -568,6 +475,7 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 
 	public override void OnChildAdded(BaseEntity childEntity)
 	{
+		base.OnChildAdded(childEntity);
 		BaseVehicleModule module;
 		if ((object)(module = childEntity as BaseVehicleModule) != null)
 		{
@@ -582,6 +490,7 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 
 	public override void OnChildRemoved(BaseEntity childEntity)
 	{
+		base.OnChildRemoved(childEntity);
 		if (childEntity is BaseVehicleModule removedModule)
 		{
 			ModuleEntityRemoved(removedModule);
@@ -624,28 +533,40 @@ public abstract class BaseModularVehicle : BaseVehicle, PlayerInventory.ICanMove
 		AttachedModuleEntities.Add(addedModule);
 		addedModule.ModuleAdded(this, index);
 		AddMass(addedModule.Mass, addedModule.CentreOfMass, addedModule.transform.position);
+		if (base.isServer && !Inventory.TrySyncModuleInventory(addedModule, index))
+		{
+			Debug.LogError($"{GetType().Name}: Unable to add module {addedModule.name} to socket ({index}). Destroying it.", base.gameObject);
+			addedModule.Kill();
+			AttachedModuleEntities.Remove(addedModule);
+			return;
+		}
 		RefreshModulesExcept(addedModule);
 		if (base.isServer)
 		{
-			Inventory.SyncModuleInventory(addedModule, index);
+			UpdateMountFlags();
 		}
 	}
 
 	public virtual void ModuleEntityRemoved(BaseVehicleModule removedModule)
 	{
-		if (!base.IsDestroyed)
+		if (base.IsDestroyed)
 		{
-			if (moduleAddActions.ContainsKey(removedModule))
+			return;
+		}
+		if (moduleAddActions.ContainsKey(removedModule))
+		{
+			removedModule.CancelInvoke(moduleAddActions[removedModule]);
+			moduleAddActions.Remove(removedModule);
+		}
+		if (AttachedModuleEntities.Contains(removedModule))
+		{
+			RemoveMass(removedModule.Mass, removedModule.CentreOfMass, removedModule.transform.position);
+			AttachedModuleEntities.Remove(removedModule);
+			removedModule.ModuleRemoved();
+			RefreshModulesExcept(removedModule);
+			if (base.isServer)
 			{
-				removedModule.CancelInvoke(moduleAddActions[removedModule]);
-				moduleAddActions.Remove(removedModule);
-			}
-			if (AttachedModuleEntities.Contains(removedModule))
-			{
-				RemoveMass(removedModule.Mass, removedModule.CentreOfMass, removedModule.transform.position);
-				AttachedModuleEntities.Remove(removedModule);
-				removedModule.ModuleRemoved();
-				RefreshModulesExcept(removedModule);
+				UpdateMountFlags();
 			}
 		}
 	}

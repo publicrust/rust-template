@@ -9,40 +9,38 @@ public class TerrainAlphaMap : TerrainMap<byte>
 
 	public override void Setup()
 	{
-		if (AlphaTexture != null)
-		{
-			if (AlphaTexture.width == AlphaTexture.height)
-			{
-				res = AlphaTexture.width;
-				src = (dst = new byte[res * res]);
-				Color32[] pixels = AlphaTexture.GetPixels32();
-				int i = 0;
-				int num = 0;
-				for (; i < res; i++)
-				{
-					int num2 = 0;
-					while (num2 < res)
-					{
-						dst[i * res + num2] = pixels[num].a;
-						num2++;
-						num++;
-					}
-				}
-			}
-			else
-			{
-				Debug.LogError("Invalid alpha texture: " + AlphaTexture.name);
-			}
-			return;
-		}
 		res = terrain.terrainData.alphamapResolution;
 		src = (dst = new byte[res * res]);
-		for (int j = 0; j < res; j++)
+		for (int i = 0; i < res; i++)
 		{
-			for (int k = 0; k < res; k++)
+			for (int j = 0; j < res; j++)
 			{
-				dst[j * res + k] = byte.MaxValue;
+				dst[i * res + j] = byte.MaxValue;
 			}
+		}
+		if (!(AlphaTexture != null))
+		{
+			return;
+		}
+		if (AlphaTexture.width == AlphaTexture.height && AlphaTexture.width == res)
+		{
+			Color32[] pixels = AlphaTexture.GetPixels32();
+			int k = 0;
+			int num = 0;
+			for (; k < res; k++)
+			{
+				int num2 = 0;
+				while (num2 < res)
+				{
+					dst[k * res + num2] = pixels[num].a;
+					num2++;
+					num++;
+				}
+			}
+		}
+		else
+		{
+			Debug.LogError("Invalid alpha texture: " + AlphaTexture.name);
 		}
 	}
 

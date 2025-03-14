@@ -1,16 +1,11 @@
 using UnityEngine;
+using UnityEngine.Rendering.PostProcessing;
 
-public class NVGCamera : ImageEffectLayer, IClothingChanged
+public class NVGCamera : FacepunchBehaviour, IClothingChanged
 {
-	public NVGEffect effect;
-
-	public GameObject lights;
-
 	public static NVGCamera instance;
 
-	public float exposure = 4f;
+	public PostProcessVolume postProcessVolume;
 
-	public float bloomIntensity = 0.9f;
-
-	public float bloomCutoff = 0.15f;
+	public GameObject lights;
 }

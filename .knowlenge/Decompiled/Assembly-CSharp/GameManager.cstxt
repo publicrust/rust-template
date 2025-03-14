@@ -130,9 +130,15 @@ public class GameManager
 			return null;
 		}
 		BaseEntity component = gameObject.GetComponent<BaseEntity>();
-		if (!component)
+		if (component == null)
 		{
 			Debug.LogError("CreateEntity called on a prefab that isn't an entity! " + strPrefab);
+			Object.Destroy(gameObject);
+			return null;
+		}
+		if (component.CompareTag("CannotBeCreated"))
+		{
+			Debug.LogWarning("CreateEntity called on a prefab that has the CannotBeCreated tag set. " + strPrefab);
 			Object.Destroy(gameObject);
 			return null;
 		}

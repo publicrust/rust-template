@@ -7,6 +7,10 @@ public class TweakUISlider : TweakUIBase
 
 	public TextMeshProUGUI textControl;
 
+	public static string lastConVarChanged;
+
+	public static TimeSince timeSinceLastConVarChange;
+
 	protected override void Init()
 	{
 		base.Init();
@@ -37,6 +41,8 @@ public class TweakUISlider : TweakUIBase
 			{
 				conVar.Set(value);
 				RefreshSliderDisplay(conVar.AsFloat);
+				lastConVarChanged = conVar.FullName;
+				timeSinceLastConVarChange = 0f;
 			}
 		}
 	}

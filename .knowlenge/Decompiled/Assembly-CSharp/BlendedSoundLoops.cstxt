@@ -38,6 +38,8 @@ public class BlendedSoundLoops : MonoBehaviour, IClientComponent
 
 	public bool shouldPlay = true;
 
+	public float gain = 1f;
+
 	public List<Loop> loops = new List<Loop>();
 
 	public float maxDistance;

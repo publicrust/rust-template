@@ -8,5 +8,7 @@ public class TimerConfig : UIDialog
 
 	public InputField input;
 
-	public int seconds;
+	public static float minTime = 0.25f;
+
+	public float seconds;
 }

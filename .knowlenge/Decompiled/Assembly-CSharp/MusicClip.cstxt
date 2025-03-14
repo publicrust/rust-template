@@ -15,7 +15,7 @@ public class MusicClip : ScriptableObject
 	{
 		if (fadeInPoints.Count == 0)
 		{
-			return currentClipTimeBars;
+			return currentClipTimeBars + 0.125f;
 		}
 		float result = -1f;
 		float num = float.PositiveInfinity;

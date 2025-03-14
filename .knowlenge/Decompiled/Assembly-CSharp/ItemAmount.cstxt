@@ -1,4 +1,7 @@
 using System;
+using System.Collections.Generic;
+using Facepunch;
+using ProtoBuf;
 using UnityEngine;
 
 [Serializable]
@@ -43,5 +46,30 @@ public class ItemAmount : ISerializationCallbackReceiver
 
 	public virtual void OnBeforeSerialize()
 	{
+	}
+
+	public static ItemAmountList SerialiseList(List<ItemAmount> list)
+	{
+		ItemAmountList itemAmountList = Pool.Get<ItemAmountList>();
+		itemAmountList.amount = Pool.GetList<float>();
+		itemAmountList.itemID = Pool.GetList<int>();
+		foreach (ItemAmount item in list)
+		{
+			itemAmountList.amount.Add(item.amount);
+			itemAmountList.itemID.Add(item.itemid);
+		}
+		return itemAmountList;
+	}
+
+	public static void DeserialiseList(List<ItemAmount> target, ItemAmountList source)
+	{
+		target.Clear();
+		if (source.amount.Count == source.itemID.Count)
+		{
+			for (int i = 0; i < source.amount.Count; i++)
+			{
+				target.Add(new ItemAmount(ItemManager.FindItemDefinition(source.itemID[i]), source.amount[i]));
+			}
+		}
 	}
 }

@@ -78,12 +78,10 @@ public class WorldNetworking
 
 	private static void SendWorldData(Connection connection, ref WorldMessage data)
 	{
-		if (Net.sv.write.Start())
-		{
-			Net.sv.write.PacketID(Message.Type.World);
-			data.ToProto(Net.sv.write);
-			Net.sv.write.Send(new SendInfo(connection));
-		}
+		NetWrite netWrite = Net.sv.StartWrite();
+		netWrite.PacketID(Message.Type.World);
+		data.ToProto(netWrite);
+		netWrite.Send(new SendInfo(connection));
 		if (data.prefabs != null)
 		{
 			data.prefabs.Clear();

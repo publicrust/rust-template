@@ -2,6 +2,7 @@
 using System;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
@@ -11,6 +12,12 @@ using UnityEngine.Assertions;
 
 public class ResearchTable : StorageContainer
 {
+	public enum ResearchType
+	{
+		ResearchTable,
+		TechTree
+	}
+
 	[NonSerialized]
 	public float researchFinishedTime;
 
@@ -29,8 +36,6 @@ public class ResearchTable : StorageContainer
 	public ItemDefinition researchResource;
 
 	public BasePlayer user;
-
-	public static ItemDefinition blueprintBaseDef;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -82,6 +87,23 @@ public class ResearchTable : StorageContainer
 		researchFinishedTime = 0f;
 	}
 
+	public override int GetIdealSlot(BasePlayer player, Item item)
+	{
+		if (item.info.shortname == "scrap")
+		{
+			Item slot = base.inventory.GetSlot(1);
+			if (slot == null)
+			{
+				return 1;
+			}
+			if (slot.amount < item.MaxStackable())
+			{
+				return 1;
+			}
+		}
+		return base.GetIdealSlot(player, item);
+	}
+
 	public bool IsResearching()
 	{
 		return HasFlag(Flags.On);
@@ -103,40 +125,27 @@ public class ResearchTable : StorageContainer
 		int result = RarityMultiplier(sourceItem.info.rarity);
 		if (sourceItem.info.category == ItemCategory.Ammunition)
 		{
-			result = Mathf.FloorToInt((float)sourceItem.info.stackable / (float)sourceItem.info.Blueprint.amountToCreate) * 2;
+			result = Mathf.FloorToInt((float)sourceItem.MaxStackable() / (float)sourceItem.info.Blueprint.amountToCreate) * 2;
 		}
 		return result;
 	}
 
 	public int ScrapForResearch(Item item)
 	{
-		object obj = Interface.CallHook("OnItemScrap", this, item);
+		object obj = Interface.CallHook("OnResearchCostDetermine", item, this);
 		if (obj is int)
 		{
 			return (int)obj;
 		}
-		int result = 0;
-		if (item.info.rarity == Rarity.Common)
-		{
-			result = 20;
-		}
-		if (item.info.rarity == Rarity.Uncommon)
-		{
-			result = 75;
-		}
-		if (item.info.rarity == Rarity.Rare)
-		{
-			result = 125;
-		}
-		if (item.info.rarity == Rarity.VeryRare || item.info.rarity == Rarity.None)
-		{
-			result = 500;
-		}
-		return result;
+		return ScrapForResearch(item.info);
 	}
 
-	public static int ScrapForResearch(ItemDefinition info)
+	public int ScrapForResearch(ItemDefinition info)
 	{
+		if (info.isRedirectOf != null)
+		{
+			return ScrapForResearch(info.isRedirectOf);
+		}
 		int result = 0;
 		if (info.rarity == Rarity.Common)
 		{
@@ -154,13 +163,62 @@ public class ResearchTable : StorageContainer
 		{
 			result = 500;
 		}
+		ItemBlueprint itemBlueprint = ItemManager.FindBlueprint(info);
+		if (itemBlueprint != null && itemBlueprint.defaultBlueprint)
+		{
+			return ConVar.Server.defaultBlueprintResearchCost;
+		}
 		return result;
+	}
+
+	public static int ScrapForResearch(ItemDefinition info, ResearchType type)
+	{
+		object obj = Interface.CallHook("OnResearchCostDetermine", info);
+		if (obj is int)
+		{
+			return (int)obj;
+		}
+		int num = 0;
+		if (info.rarity == Rarity.Common)
+		{
+			num = 20;
+		}
+		if (info.rarity == Rarity.Uncommon)
+		{
+			num = 75;
+		}
+		if (info.rarity == Rarity.Rare)
+		{
+			num = 125;
+		}
+		if (info.rarity == Rarity.VeryRare || info.rarity == Rarity.None)
+		{
+			num = 500;
+		}
+		BaseGameMode activeGameMode = BaseGameMode.GetActiveGameMode(serverside: true);
+		if (activeGameMode != null)
+		{
+			BaseGameMode.ResearchCostResult scrapCostForResearch = activeGameMode.GetScrapCostForResearch(info, type);
+			if (scrapCostForResearch.Scale.HasValue)
+			{
+				num = Mathf.RoundToInt((float)num * scrapCostForResearch.Scale.Value);
+			}
+			else if (scrapCostForResearch.Amount.HasValue)
+			{
+				num = scrapCostForResearch.Amount.Value;
+			}
+		}
+		return num;
 	}
 
 	public bool IsItemResearchable(Item item)
 	{
 		ItemBlueprint itemBlueprint = ItemManager.FindBlueprint((item.info.isRedirectOf != null) ? item.info.isRedirectOf : item.info);
-		if (itemBlueprint == null || !itemBlueprint.isResearchable || itemBlueprint.defaultBlueprint)
+		if (itemBlueprint != null && itemBlueprint.defaultBlueprint)
+		{
+			return true;
+		}
+		if (itemBlueprint == null || !itemBlueprint.isResearchable)
 		{
 			return false;
 		}
@@ -190,7 +248,7 @@ public class ResearchTable : StorageContainer
 	public Item GetScrapItem()
 	{
 		Item slot = base.inventory.GetSlot(1);
-		if (slot.info != researchResource)
+		if (slot == null || slot.info != researchResource)
 		{
 			return null;
 		}
@@ -200,9 +258,9 @@ public class ResearchTable : StorageContainer
 	public override void PostServerLoad()
 	{
 		base.PostServerLoad();
-		if (HasFlag(Flags.On) && researchFinishedTime != 0f)
+		if (HasFlag(Flags.On))
 		{
-			Invoke(ResearchAttemptFinished, researchFinishedTime - UnityEngine.Time.realtimeSinceStartup);
+			Invoke(ResearchAttemptFinished, researchDuration);
 		}
 		base.inventory.SetLocked(isLocked: false);
 	}
@@ -236,6 +294,8 @@ public class ResearchTable : StorageContainer
 			researchFinishedTime = UnityEngine.Time.realtimeSinceStartup + researchDuration;
 			Invoke(ResearchAttemptFinished, researchDuration);
 			base.inventory.SetLocked(isLocked: true);
+			int scrapCost = ScrapForResearch(targetItem);
+			Facepunch.Rust.Analytics.Azure.OnResearchStarted(player, this, targetItem, scrapCost);
 			SetFlag(Flags.On, b: true);
 			SendNetworkUpdate();
 			player.inventory.loot.SendImmediate();
@@ -245,15 +305,6 @@ public class ResearchTable : StorageContainer
 			}
 			msg.player.GiveAchievement("RESEARCH_ITEM");
 		}
-	}
-
-	public static ItemDefinition GetBlueprintTemplate()
-	{
-		if (blueprintBaseDef == null)
-		{
-			blueprintBaseDef = ItemManager.FindItemDefinition("blueprintbase");
-		}
-		return blueprintBaseDef;
 	}
 
 	public void ResearchAttemptFinished()
@@ -270,7 +321,7 @@ public class ResearchTable : StorageContainer
 			}
 			if (scrapItem.amount >= num)
 			{
-				if (scrapItem.amount <= num)
+				if (scrapItem.amount == num)
 				{
 					base.inventory.Remove(scrapItem);
 					scrapItem.RemoveFromContainer();
@@ -282,7 +333,7 @@ public class ResearchTable : StorageContainer
 				}
 				base.inventory.Remove(targetItem);
 				targetItem.Remove();
-				Item item = ItemManager.Create(GetBlueprintTemplate(), 1, 0uL);
+				Item item = ItemManager.Create(ItemManager.blueprintBaseDef, 1, 0uL);
 				item.blueprintTarget = ((targetItem.info.isRedirectOf != null) ? targetItem.info.isRedirectOf.itemid : targetItem.info.itemid);
 				if (!item.MoveToContainer(base.inventory, 0))
 				{

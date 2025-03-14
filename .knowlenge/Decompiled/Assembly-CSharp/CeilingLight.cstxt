@@ -98,7 +98,7 @@ public class CeilingLight : IOEntity
 	public override void OnAttacked(HitInfo info)
 	{
 		float num = 3f * (info.damageTypes.Total() / 50f);
-		ClientRPC(null, "ClientPhysPush", (info.Initiator != null && info.Initiator is BasePlayer && !info.IsPredicting) ? info.Initiator.net.ID : 0u, info.attackNormal * num, info.HitPositionWorld);
+		ClientRPC(null, "ClientPhysPush", (info.Initiator != null && info.Initiator is BasePlayer && !info.IsPredicting) ? info.Initiator.net.ID : default(NetworkableId), info.attackNormal * num, info.HitPositionWorld);
 		base.OnAttacked(info);
 	}
 }

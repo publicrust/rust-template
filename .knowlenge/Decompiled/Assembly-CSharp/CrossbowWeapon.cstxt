@@ -1,6 +1,6 @@
 public class CrossbowWeapon : BaseProjectile
 {
-	public override bool ForceSendMagazine()
+	public override bool ForceSendMagazine(SaveInfo saveInfo)
 	{
 		return true;
 	}

@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
@@ -12,6 +13,20 @@ using UnityEngine.Assertions;
 
 public class BaseRidableAnimal : BaseVehicle
 {
+	[Serializable]
+	public struct PurchaseOption
+	{
+		public ItemDefinition TokenItem;
+
+		public Translate.Phrase Title;
+
+		public Translate.Phrase Description;
+
+		public Sprite Icon;
+
+		public int order;
+	}
+
 	public enum RunState
 	{
 		stopped = 1,
@@ -39,6 +54,14 @@ public class BaseRidableAnimal : BaseVehicle
 
 	public const Flags Flag_ForSale = Flags.Reserved2;
 
+	public Translate.Phrase SingleHorseTitle = new Translate.Phrase("purchase_single_horse", "Purchase Single Saddle");
+
+	public Translate.Phrase SingleHorseDescription = new Translate.Phrase("purchase_single_horse_desc", "A single saddle for one player.");
+
+	public Translate.Phrase DoubleHorseTitle = new Translate.Phrase("purchase_double_horse", "Purchase Double Saddle");
+
+	public Translate.Phrase DoubleHorseDescription = new Translate.Phrase("purchase_double_horse_desc", "A double saddle for two players.");
+
 	private Vector3 lastMoveDirection;
 
 	public GameObjectRef saddlePrefab;
@@ -56,6 +79,8 @@ public class BaseRidableAnimal : BaseVehicle
 	public const Flags Flag_HasRider = Flags.On;
 
 	[Header("Purchase")]
+	public List<PurchaseOption> PurchaseOptions;
+
 	public ItemDefinition purchaseToken;
 
 	public GameObjectRef eatEffect;
@@ -102,6 +127,14 @@ public class BaseRidableAnimal : BaseVehicle
 	private float pendingDungCalories;
 
 	private float dungProduction;
+
+	protected float prevStamina;
+
+	protected float prevMaxStamina;
+
+	protected int prevRunState;
+
+	protected float prevMaxSpeed;
 
 	[Header("Stamina")]
 	public float staminaSeconds = 10f;
@@ -351,7 +384,7 @@ public class BaseRidableAnimal : BaseVehicle
 		inventory = new ItemContainer();
 		inventory.entityOwner = this;
 		inventory.allowedContents = ((allowedContents == (ItemContainer.ContentsType)0) ? ItemContainer.ContentsType.Generic : allowedContents);
-		inventory.onlyAllowedItem = onlyAllowedItem;
+		inventory.SetOnlyAllowedItem(onlyAllowedItem);
 		inventory.maxStackSize = maxStackSize;
 		inventory.ServerInitialize(null, numSlots);
 		inventory.canAcceptItem = ItemFilter;
@@ -428,7 +461,7 @@ public class BaseRidableAnimal : BaseVehicle
 		{
 			return true;
 		}
-		if (player.GetMountedVehicle() == this)
+		if (PlayerIsMounted(player))
 		{
 			return true;
 		}
@@ -521,6 +554,16 @@ public class BaseRidableAnimal : BaseVehicle
 		LoadContainer(info);
 	}
 
+	public virtual bool HasValidSaddle()
+	{
+		return true;
+	}
+
+	public virtual bool HasSeatAvailable()
+	{
+		return true;
+	}
+
 	public override void AttemptMount(BasePlayer player, bool doMountChecks = true)
 	{
 		if (!IsForSale())
@@ -538,13 +581,17 @@ public class BaseRidableAnimal : BaseVehicle
 	public void RPC_Claim(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
-		if (!(player == null) && Interface.CallHook("OnRidableAnimalClaim", this, player) == null && IsForSale())
+		if (!(player == null) && IsForSale())
 		{
-			Item item = GetPurchaseToken(player);
-			if (item != null)
+			int tokenItemID = msg.read.Int32();
+			Item item = GetPurchaseToken(player, tokenItemID);
+			if (item != null && Interface.CallHook("OnRidableAnimalClaim", this, player, item) == null)
 			{
-				item.UseItem();
 				SetFlag(Flags.Reserved2, b: false);
+				OnClaimedWithToken(item);
+				item.UseItem();
+				Facepunch.Rust.Analytics.Server.VehiclePurchased(base.ShortPrefabName);
+				Facepunch.Rust.Analytics.Azure.OnVehiclePurchased(msg.player, this);
 				AttemptMount(player, doMountChecks: false);
 				Interface.CallHook("OnRidableAnimalClaimed", this, player);
 			}
@@ -556,7 +603,7 @@ public class BaseRidableAnimal : BaseVehicle
 	public void RPC_Lead(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
-		if (!(player == null) && !HasDriver() && !IsForSale())
+		if (!(player == null) && !AnyMounted() && !IsForSale())
 		{
 			bool num = IsLeading();
 			bool flag = msg.read.Bit();
@@ -568,6 +615,10 @@ public class BaseRidableAnimal : BaseVehicle
 		}
 	}
 
+	public virtual void OnClaimedWithToken(Item tokenItem)
+	{
+	}
+
 	public override void PlayerMounted(BasePlayer player, BaseMountable seat)
 	{
 		base.PlayerMounted(player, seat);
@@ -577,7 +628,10 @@ public class BaseRidableAnimal : BaseVehicle
 	public override void PlayerDismounted(BasePlayer player, BaseMountable seat)
 	{
 		base.PlayerDismounted(player, seat);
-		SetFlag(Flags.On, b: false, recursive: true);
+		if (NumMounted() == 0)
+		{
+			SetFlag(Flags.On, b: false, recursive: true);
+		}
 	}
 
 	public void SetDecayActive(bool isActive)
@@ -590,6 +644,11 @@ public class BaseRidableAnimal : BaseVehicle
 		{
 			CancelInvoke(AnimalDecay);
 		}
+	}
+
+	public float TimeUntilNextDecay()
+	{
+		return nextDecayTime - UnityEngine.Time.time;
 	}
 
 	public void AddDecayDelay(float amount)
@@ -629,7 +688,7 @@ public class BaseRidableAnimal : BaseVehicle
 		else
 		{
 			float num = 1f / decayminutes;
-			float num2 = ((!IsOutside()) ? 2f : 1f);
+			float num2 = ((!IsOutside()) ? 1f : 0.5f);
 			Hurt(MaxHealth() * num * num2, DamageType.Decay, this, useProtection: false);
 		}
 	}
@@ -705,7 +764,29 @@ public class BaseRidableAnimal : BaseVehicle
 
 	public override void PlayerServerInput(InputState inputState, BasePlayer player)
 	{
-		RiderInput(inputState, player);
+		if (IsDriver(player))
+		{
+			RiderInput(inputState, player);
+		}
+	}
+
+	public void DismountHeavyPlayers()
+	{
+		if (!AnyMounted())
+		{
+			return;
+		}
+		foreach (MountPointInfo allMountPoint in base.allMountPoints)
+		{
+			if (!(allMountPoint.mountable == null))
+			{
+				BasePlayer mounted = allMountPoint.mountable.GetMounted();
+				if (!(mounted == null) && IsPlayerTooHeavy(mounted))
+				{
+					allMountPoint.mountable.DismountAllPlayers();
+				}
+			}
+		}
 	}
 
 	public BaseMountable GetSaddle()
@@ -719,6 +800,7 @@ public class BaseRidableAnimal : BaseVehicle
 
 	public void BudgetedUpdate()
 	{
+		DismountHeavyPlayers();
 		UpdateOnIdealTerrain();
 		UpdateStamina(UnityEngine.Time.fixedDeltaTime);
 		if (currentRunState == RunState.stopped)
@@ -760,17 +842,14 @@ public class BaseRidableAnimal : BaseVehicle
 		ItemManager.Create(Dung, 1, 0uL).Drop(base.transform.position + -base.transform.forward + Vector3.up * 1.1f + UnityEngine.Random.insideUnitSphere * 0.1f, -base.transform.forward);
 	}
 
-	public new void FixedUpdate()
+	public override void VehicleFixedUpdate()
 	{
-		base.FixedUpdate();
-		if (!base.isClient)
+		base.VehicleFixedUpdate();
+		timeAlive += UnityEngine.Time.fixedDeltaTime;
+		if (!inQueue)
 		{
-			timeAlive += UnityEngine.Time.fixedDeltaTime;
-			if (!inQueue)
-			{
-				_processQueue.Enqueue(this);
-				inQueue = true;
-			}
+			_processQueue.Enqueue(this);
+			inQueue = true;
 		}
 	}
 
@@ -795,7 +874,7 @@ public class BaseRidableAnimal : BaseVehicle
 			float num = consumable.GetIfType(MetabolismAttribute.Type.Health) + consumable.GetIfType(MetabolismAttribute.Type.HealthOverTime);
 			ApplyDungCalories(ifType);
 			ReplenishStaminaCore(ifType, ifType2);
-			Heal(num * 2f);
+			Heal(num * 4f);
 		}
 	}
 
@@ -868,7 +947,7 @@ public class BaseRidableAnimal : BaseVehicle
 		{
 			nextIdealTerrainCheckTime = UnityEngine.Time.time + UnityEngine.Random.Range(1f, 2f);
 			onIdealTerrain = false;
-			if (TerrainMeta.TopologyMap != null && (TerrainMeta.TopologyMap.GetTopology(base.transform.position) & 0x800) != 0)
+			if (TerrainMeta.TopologyMap != null && (TerrainMeta.TopologyMap.GetTopology(base.transform.position) & 0x80800) != 0)
 			{
 				onIdealTerrain = true;
 			}
@@ -928,15 +1007,16 @@ public class BaseRidableAnimal : BaseVehicle
 		{
 			return false;
 		}
-		bool flag = false;
+		return IsStandCollisionClear();
+	}
+
+	public virtual bool IsStandCollisionClear()
+	{
 		List<Collider> obj = Facepunch.Pool.GetList<Collider>();
-		Vis.Colliders(mountPoints[0].mountable.eyeOverride.transform.position - base.transform.forward * 1f, 2f, obj, 2162689);
-		if (obj.Count > 0)
-		{
-			flag = true;
-		}
+		Vis.Colliders(mountPoints[0].mountable.eyePositionOverride.transform.position - base.transform.forward * 1f, 2f, obj, 2162689);
+		bool num = obj.Count > 0;
 		Facepunch.Pool.FreeList(ref obj);
-		return !flag;
+		return !num;
 	}
 
 	public void DoDebugMovement()
@@ -1085,7 +1165,7 @@ public class BaseRidableAnimal : BaseVehicle
 			Transform[] array = groundSampleOffsets;
 			for (int i = 0; i < array.Length; i++)
 			{
-				if (TransformUtil.GetGroundInfo(array[i].position + Vector3.up * 2f, out var _, out var normal, 4f, 278986753))
+				if (TransformUtil.GetGroundInfo(array[i].position + Vector3.up * 2f, out var _, out var normal, 4f, 295763969))
 				{
 					targetUp += normal;
 				}
@@ -1149,7 +1229,7 @@ public class BaseRidableAnimal : BaseVehicle
 			}
 			if (!flag)
 			{
-				if (!TransformUtil.GetGroundInfo(vector4 + Vector3.up * 2f, out pos, out normal, 2f + num7, 278986753))
+				if (!TransformUtil.GetGroundInfo(vector4 + Vector3.up * 2f, out pos, out normal, 2f + num7, 295763969))
 				{
 					return num4;
 				}
@@ -1174,7 +1254,7 @@ public class BaseRidableAnimal : BaseVehicle
 					{
 						Vector3 vector6 = vector4 + normalOffsets[j].x * base.transform.right;
 						float num12 = maxStepHeight * 2.5f;
-						if (TransformUtil.GetGroundInfo(vector6 + Vector3.up * num12 + normalOffsets[j].z * base.transform.forward, out var pos2, out var normal2, num7 + num12, 278986753))
+						if (TransformUtil.GetGroundInfo(vector6 + Vector3.up * num12 + normalOffsets[j].z * base.transform.forward, out var pos2, out var normal2, num7 + num12, 295763969))
 						{
 							num11++;
 							vector5 += normal2;
@@ -1280,10 +1360,9 @@ public class BaseRidableAnimal : BaseVehicle
 		}
 		float desiredVelocity = GetDesiredVelocity();
 		Vector3 direction = Vector3.forward * Mathf.Sign(desiredVelocity);
-		base.transform.hasChanged = true;
 		float num6 = Mathf.InverseLerp(0.85f, 1f, obstacleDistance);
 		float num7 = Mathf.InverseLerp(1.25f, 10f, obstacleDistance);
-		float num8 = 1f - Mathf.InverseLerp(20f, 35f, Vector3.Angle(Vector3.up, averagedUp));
+		float num8 = 1f - Mathf.InverseLerp(20f, 45f, Vector3.Angle(Vector3.up, averagedUp));
 		num7 = num6 * 0.1f + num7 * 0.9f;
 		float num9 = Mathf.Min(Mathf.Clamp01(Mathf.Min(num8 + 0.2f, num7)) * GetRunSpeed(), desiredVelocity);
 		float num10 = ((num9 < currentSpeed) ? 3f : 1f);
@@ -1345,9 +1424,9 @@ public class BaseRidableAnimal : BaseVehicle
 	public bool DropToGround(Vector3 targetPos, bool force = false)
 	{
 		float range = (force ? 10000f : (maxStepHeight + maxStepDownHeight));
-		if (TransformUtil.GetGroundInfo(targetPos, out var pos, out var _, range, 278986753))
+		if (TransformUtil.GetGroundInfo(targetPos, out var pos, out var _, range, 295763969))
 		{
-			if (UnityEngine.Physics.CheckSphere(pos + Vector3.up * 1f, 0.2f, 278986753))
+			if (UnityEngine.Physics.CheckSphere(pos + Vector3.up * 1f, 0.2f, 295763969))
 			{
 				return false;
 			}
@@ -1368,9 +1447,17 @@ public class BaseRidableAnimal : BaseVehicle
 		return false;
 	}
 
-	public void DoNetworkUpdate()
+	public virtual void DoNetworkUpdate()
 	{
-		SendNetworkUpdate();
+		bool num = false || prevStamina != staminaSeconds || prevMaxStamina != currentMaxStaminaSeconds || prevRunState != (int)currentRunState || prevMaxSpeed != GetRunSpeed();
+		prevStamina = staminaSeconds;
+		prevMaxStamina = currentMaxStaminaSeconds;
+		prevRunState = (int)currentRunState;
+		prevMaxSpeed = GetRunSpeed();
+		if (num)
+		{
+			SendNetworkUpdate();
+		}
 	}
 
 	public override void PreServerLoad()
@@ -1425,15 +1512,19 @@ public class BaseRidableAnimal : BaseVehicle
 		dropUntilTime = duration;
 	}
 
-	public bool PlayerHasToken(BasePlayer player)
+	public override void InitShared()
 	{
-		return GetPurchaseToken(player) != null;
+		base.InitShared();
 	}
 
-	public Item GetPurchaseToken(BasePlayer player)
+	public bool PlayerHasToken(BasePlayer player, int tokenItemID)
 	{
-		int itemid = purchaseToken.itemid;
-		return player.inventory.FindItemID(itemid);
+		return GetPurchaseToken(player, tokenItemID) != null;
+	}
+
+	public Item GetPurchaseToken(BasePlayer player, int tokenItemID)
+	{
+		return player.inventory.FindItemID(tokenItemID);
 	}
 
 	public virtual float GetWalkSpeed()
@@ -1456,5 +1547,10 @@ public class BaseRidableAnimal : BaseVehicle
 			return runSpeed + num + num2;
 		}
 		return runSpeed;
+	}
+
+	public bool IsPlayerTooHeavy(BasePlayer player)
+	{
+		return player.Weight >= 10f;
 	}
 }

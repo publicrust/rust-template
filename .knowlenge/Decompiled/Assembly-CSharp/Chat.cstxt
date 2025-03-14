@@ -2,10 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using CircularBuffer;
 using CompanionServer;
 using ConVar;
 using Facepunch;
 using Facepunch.Math;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using UnityEngine;
@@ -17,7 +19,9 @@ public class Chat : ConsoleSystem
 	{
 		Global,
 		Team,
-		Server
+		Server,
+		Cards,
+		Local
 	}
 
 	public struct ChatEntry
@@ -35,7 +39,14 @@ public class Chat : ConsoleSystem
 		public int Time { get; set; }
 	}
 
-	private const float textRange = 50f;
+	[ServerVar]
+	public static float localChatRange = 100f;
+
+	[ReplicatedVar]
+	public static bool globalchat = true;
+
+	[ReplicatedVar]
+	public static bool localchat = false;
 
 	private const float textVolumeBoost = 0.2f;
 
@@ -43,7 +54,10 @@ public class Chat : ConsoleSystem
 	[ClientVar]
 	public static bool enabled = true;
 
-	public static List<ChatEntry> History = new List<ChatEntry>();
+	[ServerVar(Help = "Number of messages to keep in memory for chat history")]
+	public static int historysize = 1000;
+
+	public static CircularBuffer<ChatEntry> History = new CircularBuffer<ChatEntry>(historysize);
 
 	[ServerVar]
 	public static bool serverlog = true;
@@ -54,29 +68,45 @@ public class Chat : ConsoleSystem
 		{
 			string text = username.EscapeRichText();
 			ConsoleNetwork.BroadcastToAllClients("chat.add", 2, 0, "<color=" + color + ">" + text + "</color> " + message);
-			ChatEntry chatEntry = default(ChatEntry);
-			chatEntry.Channel = ChatChannel.Server;
-			chatEntry.Message = message;
-			chatEntry.UserId = userid.ToString();
-			chatEntry.Username = username;
-			chatEntry.Color = color;
-			chatEntry.Time = Epoch.Current;
-			ChatEntry chatEntry2 = chatEntry;
-			History.Add(chatEntry2);
-			RCon.Broadcast(RCon.LogType.Chat, chatEntry2);
+			ChatEntry ce = default(ChatEntry);
+			ce.Channel = ChatChannel.Server;
+			ce.Message = message;
+			ce.UserId = userid.ToString();
+			ce.Username = username;
+			ce.Color = color;
+			ce.Time = Epoch.Current;
+			Record(ce);
 		}
 	}
 
 	[ServerUserVar]
 	public static void say(Arg arg)
 	{
-		sayImpl(ChatChannel.Global, arg);
+		if (globalchat)
+		{
+			sayImpl(ChatChannel.Global, arg);
+		}
+	}
+
+	[ServerUserVar]
+	public static void localsay(Arg arg)
+	{
+		if (localchat)
+		{
+			sayImpl(ChatChannel.Local, arg);
+		}
 	}
 
 	[ServerUserVar]
 	public static void teamsay(Arg arg)
 	{
 		sayImpl(ChatChannel.Team, arg);
+	}
+
+	[ServerUserVar]
+	public static void cardgamesay(Arg arg)
+	{
+		sayImpl(ChatChannel.Cards, arg);
 	}
 
 	private static void sayImpl(ChatChannel targetChannel, Arg arg)
@@ -110,7 +140,9 @@ public class Chat : ConsoleSystem
 			}
 		}
 		string @string = arg.GetString(0, "text");
-		if (sayAs(targetChannel, basePlayer.userID, basePlayer.displayName, @string, basePlayer))
+		bool num2 = sayAs(targetChannel, basePlayer.userID, basePlayer.displayName, @string, basePlayer);
+		Facepunch.Rust.Analytics.Azure.OnChatMessage(basePlayer, @string, (int)targetChannel);
+		if (num2)
 		{
 			basePlayer.NextChatTime = UnityEngine.Time.realtimeSinceStartup + 1.5f;
 		}
@@ -159,13 +191,17 @@ public class Chat : ConsoleSystem
 		{
 			ServerConsole.PrintColoured(ConsoleColor.DarkYellow, string.Concat("[", targetChannel, "] ", username, ": "), ConsoleColor.DarkGreen, text);
 			string text2 = player?.ToString() ?? $"{username}[{userId}]";
-			if (targetChannel == ChatChannel.Team)
+			switch (targetChannel)
 			{
+			case ChatChannel.Team:
 				DebugEx.Log("[TEAM CHAT] " + text2 + " : " + text);
-			}
-			else
-			{
+				break;
+			case ChatChannel.Cards:
+				DebugEx.Log("[CARDS CHAT] " + text2 + " : " + text);
+				break;
+			default:
 				DebugEx.Log("[CHAT] " + text2 + " : " + text);
+				break;
 			}
 		}
 		bool flag = userGroup == ServerUsers.UserGroup.Owner || userGroup == ServerUsers.UserGroup.Moderator;
@@ -180,28 +216,63 @@ public class Chat : ConsoleSystem
 			text3 = "#fa5";
 		}
 		string text4 = username.EscapeRichText();
-		ChatEntry chatEntry = default(ChatEntry);
-		chatEntry.Channel = targetChannel;
-		chatEntry.Message = text;
-		chatEntry.UserId = ((player != null) ? player.UserIDString : userId.ToString());
-		chatEntry.Username = username;
-		chatEntry.Color = text3;
-		chatEntry.Time = Epoch.Current;
-		ChatEntry chatEntry2 = chatEntry;
-		History.Add(chatEntry2);
-		RCon.Broadcast(RCon.LogType.Chat, chatEntry2);
+		ChatEntry ce = default(ChatEntry);
+		ce.Channel = targetChannel;
+		ce.Message = text;
+		ce.UserId = ((player != null) ? player.UserIDString : userId.ToString());
+		ce.Username = username;
+		ce.Color = text3;
+		ce.Time = Epoch.Current;
+		Record(ce);
 		switch (targetChannel)
 		{
-		case ChatChannel.Global:
-			if (ConVar.Server.globalchat)
+		case ChatChannel.Cards:
+		{
+			if (player == null)
 			{
-				ConsoleNetwork.BroadcastToAllClients("chat.add2", 0, userId, text, text4, text3, 1f);
-				return true;
+				return false;
 			}
-			break;
+			if (!player.isMounted)
+			{
+				return false;
+			}
+			BaseCardGameEntity baseCardGameEntity = player.GetMountedVehicle() as BaseCardGameEntity;
+			if (baseCardGameEntity == null || !baseCardGameEntity.GameController.IsAtTable(player))
+			{
+				return false;
+			}
+			List<Network.Connection> obj2 = Facepunch.Pool.GetList<Network.Connection>();
+			baseCardGameEntity.GameController.GetConnectionsInGame(obj2);
+			if (obj2.Count > 0)
+			{
+				ConsoleNetwork.SendClientCommand(obj2, "chat.add2", 3, userId, text, text4, text3, 1f);
+			}
+			Facepunch.Pool.FreeList(ref obj2);
+			return true;
+		}
+		case ChatChannel.Global:
+			ConsoleNetwork.BroadcastToAllClients("chat.add2", 0, userId, text, text4, text3, 1f);
+			return true;
+		case ChatChannel.Local:
+		{
+			if (!(player != null))
+			{
+				break;
+			}
+			float num2 = localChatRange * localChatRange;
+			foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+			{
+				float sqrMagnitude = (activePlayer.transform.position - player.transform.position).sqrMagnitude;
+				if (!(sqrMagnitude > num2))
+				{
+					ConsoleNetwork.SendClientCommand(activePlayer.net.connection, "chat.add2", 4, userId, text, text4, text3, Mathf.Clamp01(sqrMagnitude / num2 + 0.2f));
+				}
+			}
+			return true;
+		}
 		case ChatChannel.Team:
 		{
-			RelationshipManager.PlayerTeam playerTeam = RelationshipManager.Instance.FindPlayersTeam(userId);
+			RelationshipManager.PlayerTeam playerTeam = RelationshipManager.ServerInstance.FindPlayersTeam(userId);
 			if (playerTeam == null)
 			{
 				return false;
@@ -215,19 +286,6 @@ public class Chat : ConsoleSystem
 			return true;
 		}
 		}
-		if (player != null)
-		{
-			float num2 = 2500f;
-			foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
-			{
-				float sqrMagnitude = (activePlayer.transform.position - player.transform.position).sqrMagnitude;
-				if (!(sqrMagnitude > num2))
-				{
-					ConsoleNetwork.SendClientCommand(activePlayer.net.connection, "chat.add2", 0, userId, text, text4, text3, Mathf.Clamp01(num2 - sqrMagnitude + 0.2f));
-				}
-			}
-			return true;
-		}
 		return false;
 	}
 
@@ -236,7 +294,7 @@ public class Chat : ConsoleSystem
 	public static IEnumerable<ChatEntry> tail(Arg arg)
 	{
 		int @int = arg.GetInt(0, 200);
-		int num = History.Count - @int;
+		int num = History.Size - @int;
 		if (num < 0)
 		{
 			num = 0;
@@ -254,5 +312,21 @@ public class Chat : ConsoleSystem
 			return Enumerable.Empty<ChatEntry>();
 		}
 		return History.Where((ChatEntry x) => x.Message.Length < 4096 && x.Message.Contains(search, CompareOptions.IgnoreCase));
+	}
+
+	public static void Record(ChatEntry ce)
+	{
+		int num = Mathf.Max(historysize, 10);
+		if (History.Capacity != num)
+		{
+			CircularBuffer<ChatEntry> circularBuffer = new CircularBuffer<ChatEntry>(num);
+			foreach (ChatEntry item in History)
+			{
+				circularBuffer.PushBack(item);
+			}
+			History = circularBuffer;
+		}
+		History.PushBack(ce);
+		RCon.Broadcast(RCon.LogType.Chat, ce);
 	}
 }

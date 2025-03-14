@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
 using ConVar;
 using Rust;
@@ -9,18 +10,32 @@ using UnityEngine;
 
 public class PrefabPoolWarmup
 {
-	public static void Run()
+	public static void Run(string filter = null, int countOverride = 0)
 	{
-		if (!Rust.Application.isLoadingPrefabs)
+		if (Rust.Application.isLoadingPrefabs)
 		{
-			Rust.Application.isLoadingPrefabs = true;
-			string[] assetList = GetAssetList();
+			return;
+		}
+		Rust.Application.isLoadingPrefabs = true;
+		string[] assetList = GetAssetList();
+		if (string.IsNullOrEmpty(filter))
+		{
 			for (int i = 0; i < assetList.Length; i++)
 			{
-				PrefabWarmup(assetList[i]);
+				PrefabWarmup(assetList[i], countOverride);
 			}
-			Rust.Application.isLoadingPrefabs = false;
 		}
+		else
+		{
+			foreach (string text in assetList)
+			{
+				if (text.Contains(filter, CompareOptions.IgnoreCase))
+				{
+					PrefabWarmup(text, countOverride);
+				}
+			}
+		}
+		Rust.Application.isLoadingPrefabs = false;
 	}
 
 	public static IEnumerator Run(float deltaTime, Action<string> statusFunction = null, string format = null)
@@ -53,7 +68,7 @@ public class PrefabPoolWarmup
 			select x.name).ToArray();
 	}
 
-	private static void PrefabWarmup(string path)
+	private static void PrefabWarmup(string path, int countOverride = 0)
 	{
 		if (string.IsNullOrEmpty(path))
 		{
@@ -62,13 +77,17 @@ public class PrefabPoolWarmup
 		GameObject gameObject = GameManager.server.FindPrefab(path);
 		if (gameObject != null && PoolableEx.SupportsPooling(gameObject))
 		{
-			int serverCount = gameObject.GetComponent<Poolable>().ServerCount;
+			int num = gameObject.GetComponent<Poolable>().ServerCount;
 			List<GameObject> list = new List<GameObject>();
-			for (int i = 0; i < serverCount; i++)
+			if (num > 0 && countOverride > 0)
+			{
+				num = countOverride;
+			}
+			for (int i = 0; i < num; i++)
 			{
 				list.Add(GameManager.server.CreatePrefab(path));
 			}
-			for (int j = 0; j < serverCount; j++)
+			for (int j = 0; j < num; j++)
 			{
 				GameManager.server.Retire(list[j]);
 			}

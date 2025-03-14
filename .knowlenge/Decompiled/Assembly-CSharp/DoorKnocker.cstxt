@@ -1,4 +1,5 @@
 using Network;
+using Oxide.Core;
 using UnityEngine;
 
 public class DoorKnocker : BaseCombatEntity
@@ -18,5 +19,6 @@ public class DoorKnocker : BaseCombatEntity
 	public void Knock(BasePlayer player)
 	{
 		ClientRPC(null, "ClientKnock", player.transform.position);
+		Interface.CallHook("OnDoorKnocked", this, player);
 	}
 }

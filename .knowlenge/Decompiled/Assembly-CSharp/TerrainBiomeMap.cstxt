@@ -8,43 +8,38 @@ public class TerrainBiomeMap : TerrainMap<byte>
 
 	public override void Setup()
 	{
-		if (BiomeTexture != null)
+		res = terrain.terrainData.alphamapResolution;
+		this.num = 4;
+		src = (dst = new byte[this.num * res * res]);
+		if (!(BiomeTexture != null))
 		{
-			if (BiomeTexture.width == BiomeTexture.height)
+			return;
+		}
+		if (BiomeTexture.width == BiomeTexture.height && BiomeTexture.width == res)
+		{
+			Color32[] pixels = BiomeTexture.GetPixels32();
+			int i = 0;
+			int num = 0;
+			for (; i < res; i++)
 			{
-				res = BiomeTexture.width;
-				this.num = 4;
-				src = (dst = new byte[this.num * res * res]);
-				Color32[] pixels = BiomeTexture.GetPixels32();
-				int i = 0;
-				int num = 0;
-				for (; i < res; i++)
+				int num2 = 0;
+				while (num2 < res)
 				{
-					int num2 = 0;
-					while (num2 < res)
-					{
-						Color32 color = pixels[num];
-						byte[] array = dst;
-						_ = res;
-						array[(0 + i) * res + num2] = color.r;
-						dst[(res + i) * res + num2] = color.g;
-						dst[(2 * res + i) * res + num2] = color.b;
-						dst[(3 * res + i) * res + num2] = color.a;
-						num2++;
-						num++;
-					}
+					Color32 color = pixels[num];
+					byte[] array = dst;
+					_ = res;
+					array[(0 + i) * res + num2] = color.r;
+					dst[(res + i) * res + num2] = color.g;
+					dst[(2 * res + i) * res + num2] = color.b;
+					dst[(3 * res + i) * res + num2] = color.a;
+					num2++;
+					num++;
 				}
-			}
-			else
-			{
-				Debug.LogError("Invalid biome texture: " + BiomeTexture.name);
 			}
 		}
 		else
 		{
-			res = terrain.terrainData.alphamapResolution;
-			this.num = 4;
-			src = (dst = new byte[this.num * res * res]);
+			Debug.LogError("Invalid biome texture: " + BiomeTexture.name);
 		}
 	}
 

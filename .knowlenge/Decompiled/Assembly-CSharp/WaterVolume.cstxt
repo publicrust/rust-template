@@ -74,6 +74,36 @@ public class WaterVolume : TriggerBase
 		return false;
 	}
 
+	public bool Test(Vector3 start, Vector3 end, float radius, out WaterLevel.WaterInfo info)
+	{
+		if (!waterEnabled)
+		{
+			info = default(WaterLevel.WaterInfo);
+			return false;
+		}
+		UpdateCachedTransform();
+		Vector3 vector = (start + end) * 0.5f;
+		float num = Mathf.Min(start.y, end.y) - radius;
+		if (cachedBounds.Distance(start) < radius || cachedBounds.Distance(end) < radius)
+		{
+			if (!CheckCutOffPlanes(vector))
+			{
+				info = default(WaterLevel.WaterInfo);
+				return false;
+			}
+			Vector3 vector2 = new Plane(cachedBounds.up, cachedBounds.position).ClosestPointOnPlane(vector);
+			float y = (vector2 + cachedBounds.up * cachedBounds.extents.y).y;
+			float y2 = (vector2 + -cachedBounds.up * cachedBounds.extents.y).y;
+			info.isValid = true;
+			info.currentDepth = Mathf.Max(0f, y - num);
+			info.overallDepth = Mathf.Max(0f, y - y2);
+			info.surfaceLevel = y;
+			return true;
+		}
+		info = default(WaterLevel.WaterInfo);
+		return false;
+	}
+
 	private bool CheckCutOffPlanes(Vector3 pos)
 	{
 		int num = cutOffPlanes.Length;

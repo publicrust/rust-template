@@ -1,0 +1,252 @@
+using Facepunch.BurstCloth;
+using Facepunch.BurstCloth.Jobs;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
+using UnityEngine;
+
+internal struct SimulatePositionsJob : IJob
+{
+	[ReadOnly]
+	public NativeArray<ColliderData> ColliderData;
+
+	[ReadOnly]
+	public NativeArray<ColliderState> ColliderState;
+
+	[ReadOnly]
+	public NativeArray<BoneData> BoneData;
+
+	public NativeArray<BoneState> BoneState;
+
+	public int TickRate;
+
+	public float DeltaTime;
+
+	public int IterationCount;
+
+	public float3 SimulationSpaceDelta;
+
+	public float3 Gravity;
+
+	public int StiffnessDepth;
+
+	public float LengthModifier;
+
+	public bool SiblingConstraints;
+
+	public bool EnableCollisions;
+
+	public float3 Origin;
+
+	public quaternion Rotation;
+
+	public float3 Up;
+
+	public float Radius;
+
+	public void Execute()
+	{
+		NativeArray<float3> newPositions = new NativeArray<float3>(BoneData.Length, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+		AdjustSimulationSpace();
+		for (int i = 0; i < IterationCount; i++)
+		{
+			MovePositions();
+			ApplyPositionConstraints(newPositions);
+			if (EnableCollisions && ColliderData.Length > 0)
+			{
+				ResolveCollisions();
+			}
+		}
+		ApplyRotationConstraints();
+		newPositions.Dispose();
+	}
+
+	private void AdjustSimulationSpace()
+	{
+		for (int i = 0; i < BoneData.Length; i++)
+		{
+			ref readonly BoneData @readonly = ref BoneData.GetReadonly(i);
+			ref BoneState reference = ref BoneState.Get(i);
+			if (@readonly.Depth != 0)
+			{
+				reference.Position += SimulationSpaceDelta;
+			}
+		}
+	}
+
+	private void MovePositions()
+	{
+		for (int i = 0; i < BoneData.Length; i++)
+		{
+			ref readonly BoneData @readonly = ref BoneData.GetReadonly(i);
+			ref BoneState reference = ref BoneState.Get(i);
+			if (@readonly.Depth != 0)
+			{
+				reference.Velocity += Gravity * @readonly.ResistanceInv;
+				reference.Velocity *= @readonly.DampingInv;
+				reference.Position += reference.Velocity * DeltaTime;
+			}
+		}
+	}
+
+	private void ApplyPositionConstraints(NativeArray<float3> newPositions)
+	{
+		for (int i = 0; i < BoneData.Length; i++)
+		{
+			ref readonly BoneData @readonly = ref BoneData.GetReadonly(i);
+			ref readonly BoneState readonly2 = ref BoneState.GetReadonly(i);
+			ref float3 reference = ref newPositions.Get(i);
+			reference = readonly2.Position;
+			if (@readonly.Depth == 0)
+			{
+				continue;
+			}
+			ref readonly BoneData readonly3 = ref BoneData.GetReadonly(@readonly.Parent);
+			ref readonly BoneState readonly4 = ref BoneState.GetReadonly(@readonly.Parent);
+			if (readonly3.Depth > StiffnessDepth)
+			{
+				float3 y = readonly4.Position + math.rotate(readonly4.Rotation, @readonly.LocalPosition);
+				reference = math.lerp(reference, y, @readonly.Stiffness);
+			}
+			float3 x = reference - readonly4.Position;
+			float x2 = math.length(x);
+			float3 @float = math.normalizesafe(x);
+			float3 x3 = readonly4.Position + @float * math.min(x2, @readonly.Length * LengthModifier);
+			float num = 1f;
+			if (SiblingConstraints && @readonly.Depth >= StiffnessDepth)
+			{
+				if (@readonly.LeftSibling >= 0)
+				{
+					ref readonly BoneState readonly5 = ref BoneState.GetReadonly(@readonly.LeftSibling);
+					float3 x4 = reference - readonly5.Position;
+					float x5 = math.length(x4);
+					float3 float2 = math.normalizesafe(x4);
+					x3 += readonly5.Position + float2 * math.min(x5, @readonly.LengthToLeft);
+					num += 1f;
+				}
+				if (@readonly.RightSibling >= 0)
+				{
+					ref readonly BoneState readonly6 = ref BoneState.GetReadonly(@readonly.RightSibling);
+					float3 x6 = reference - readonly6.Position;
+					float x7 = math.length(x6);
+					float3 float3 = math.normalizesafe(x6);
+					x3 += readonly6.Position + float3 * math.min(x7, @readonly.LengthToRight);
+					num += 1f;
+				}
+			}
+			x3 /= num;
+			reference = math.lerp(x3, reference, @readonly.Slackness);
+		}
+		for (int j = 0; j < BoneState.Length; j++)
+		{
+			BoneState.Get(j).Position = newPositions[j];
+		}
+	}
+
+	private void ResolveCollisions()
+	{
+		for (int i = 0; i < BoneData.Length; i++)
+		{
+			ref readonly BoneData @readonly = ref BoneData.GetReadonly(i);
+			ref BoneState reference = ref BoneState.Get(i);
+			if (@readonly.Depth != 0)
+			{
+				float3 @float = math.project(reference.Position - Origin, Up) + Origin;
+				float3 float2 = math.normalizesafe(reference.Position - @float);
+				float3 float3 = math.mul(Rotation, @readonly.DirectionFromOrigin);
+				float3 float4 = Slerp(float3, float2, math.max(math.dot(float2, float3), 0f));
+				float3 origin = @float + float4 * Radius;
+				float3 x = reference.Position - origin;
+				float3 direction = math.normalizesafe(x);
+				float maxDistance = math.length(x);
+				reference.Position = RayMarch(in origin, in direction, @readonly.CollisionRadius, maxDistance);
+			}
+		}
+	}
+
+	private void ApplyRotationConstraints()
+	{
+		for (int i = 0; i < BoneData.Length; i++)
+		{
+			ref readonly BoneData @readonly = ref BoneData.GetReadonly(i);
+			ref BoneState reference = ref BoneState.Get(i);
+			if (@readonly.Depth != 0)
+			{
+				if (@readonly.Child >= 0)
+				{
+					ref readonly BoneData readonly2 = ref BoneData.GetReadonly(@readonly.Child);
+					ref BoneState reference2 = ref BoneState.Get(@readonly.Child);
+					reference.Rotation = math.mul(reference.Rotation, FromToRotation(readonly2.LocalPosition, math.mul(math.inverse(reference.Rotation), reference2.Position - reference.Position)));
+				}
+				if (SiblingConstraints && @readonly.LeftSibling >= 0 && @readonly.RightSibling >= 0)
+				{
+					ref readonly BoneState readonly3 = ref BoneState.GetReadonly(@readonly.LeftSibling);
+					float3 leftPosition = @readonly.LeftPosition;
+					float3 to = math.mul(math.inverse(reference.Rotation), readonly3.Position - reference.Position);
+					quaternion q = FromToRotation(leftPosition, to);
+					ref readonly BoneState readonly4 = ref BoneState.GetReadonly(@readonly.RightSibling);
+					float3 rightPosition = @readonly.RightPosition;
+					float3 to2 = math.mul(math.inverse(reference.Rotation), readonly4.Position - reference.Position);
+					quaternion q2 = FromToRotation(rightPosition, to2);
+					reference.Rotation = math.mul(reference.Rotation, math.slerp(q, q2, 0.5f));
+				}
+			}
+		}
+	}
+
+	private float3 RayMarch(in float3 origin, in float3 direction, float radius, float maxDistance)
+	{
+		float num = 0f;
+		for (int i = 0; i < 8; i++)
+		{
+			float3 position = origin + direction * num;
+			float num2 = Scene(in position) - radius;
+			if (num2 < 0.0001f)
+			{
+				return position;
+			}
+			num += num2;
+			if (num > maxDistance)
+			{
+				break;
+			}
+		}
+		return origin + direction * maxDistance;
+	}
+
+	private float Scene(in float3 position)
+	{
+		float num = 100000f;
+		for (int i = 0; i < ColliderData.Length; i++)
+		{
+			ref readonly ColliderData @readonly = ref ColliderData.GetReadonly(i);
+			ref readonly ColliderState readonly2 = ref ColliderState.GetReadonly(i);
+			num = Union(num, Capsule(in position, in readonly2.PositionA, in readonly2.PositionB, @readonly.Radius));
+		}
+		return num;
+	}
+
+	private static float Union(float d1, float d2)
+	{
+		return math.min(d1, d2);
+	}
+
+	private static float Capsule(in float3 p, in float3 a, in float3 b, float r)
+	{
+		float3 @float = p - a;
+		float3 float2 = b - a;
+		float num = math.clamp(math.dot(@float, float2) / math.dot(float2, float2), 0f, 1f);
+		return math.length(@float - float2 * num) - r;
+	}
+
+	private static float3 Slerp(float3 a, float3 b, float t)
+	{
+		return Vector3.Slerp(a, b, t);
+	}
+
+	private static quaternion FromToRotation(float3 from, float3 to)
+	{
+		float angle = math.acos(math.clamp(math.dot(math.normalizesafe(from), math.normalizesafe(to)), -1f, 1f));
+		return quaternion.AxisAngle(math.normalizesafe(math.cross(from, to)), angle);
+	}
+}

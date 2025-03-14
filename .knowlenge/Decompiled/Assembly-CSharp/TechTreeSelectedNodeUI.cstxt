@@ -30,5 +30,9 @@ public class TechTreeSelectedNodeUI : MonoBehaviour
 
 	public Color ColorCantAfford;
 
+	public GameObject totalRequiredRoot;
+
+	public RustText totalRequiredText;
+
 	public ItemInformationPanel[] informationPanels;
 }

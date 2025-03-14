@@ -14,11 +14,15 @@ public class SleepingBagMapMarker : MonoBehaviour
 
 	public Sprite BeachTowelSprite;
 
+	public Sprite CamperSprite;
+
 	public Tooltip MarkerTooltip;
 
 	public GameObject LockRoot;
 
 	public TextMeshProUGUI LockTime;
+
+	public GameObject OccupiedRoot;
 
 	public Image CircleRim;
 

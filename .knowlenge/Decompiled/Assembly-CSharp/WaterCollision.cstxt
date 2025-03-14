@@ -53,6 +53,11 @@ public class WaterCollision : MonoBehaviour
 		return GamePhysics.CheckBounds<WaterVisibilityTrigger>(bounds, 262144, QueryTriggerInteraction.Collide);
 	}
 
+	public bool GetIgnore(Vector3 start, Vector3 end, float radius)
+	{
+		return GamePhysics.CheckCapsule<WaterVisibilityTrigger>(start, end, radius, 262144, QueryTriggerInteraction.Collide);
+	}
+
 	public bool GetIgnore(RaycastHit hit)
 	{
 		if (waterColliders.Contains(hit.collider))

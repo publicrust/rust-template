@@ -12,6 +12,11 @@ public class RadialSpawnPoint : BaseSpawnPoint
 		DropToGround(ref pos, ref rot);
 	}
 
+	public override bool HasPlayersIntersecting()
+	{
+		return BaseNetworkable.HasCloseConnections(base.transform.position, radius + 1f);
+	}
+
 	public override void ObjectSpawned(SpawnPointInstance instance)
 	{
 	}

@@ -1,6 +1,4 @@
-using UnityEngine;
-
-public class AmbienceZone : MonoBehaviour, IClientComponent
+public class AmbienceZone : TriggerBase, IClientComponentEx
 {
 	public AmbienceDefinitionList baseAmbience;
 
@@ -11,4 +9,10 @@ public class AmbienceZone : MonoBehaviour, IClientComponent
 	public bool overrideCrossfadeTime;
 
 	public float crossfadeTime = 1f;
+
+	public virtual void PreClientComponentCull(IPrefabProcessor p)
+	{
+		p.RemoveComponent(this);
+		p.NominateForDeletion(base.gameObject);
+	}
 }

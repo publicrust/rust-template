@@ -7,18 +7,32 @@ public class GenericSpawnPoint : BaseSpawnPoint
 
 	public bool randomRot;
 
+	[Range(1f, 180f)]
+	public float randomRotSnapDegrees = 1f;
+
 	public GameObjectRef spawnEffect;
 
 	public UnityEvent OnObjectSpawnedEvent = new UnityEvent();
 
 	public UnityEvent OnObjectRetiredEvent = new UnityEvent();
 
+	public Quaternion GetRandomRotation()
+	{
+		if (!randomRot)
+		{
+			return Quaternion.identity;
+		}
+		int max = Mathf.FloorToInt(360f / randomRotSnapDegrees);
+		int num = Random.Range(0, max);
+		return Quaternion.Euler(0f, (float)num * randomRotSnapDegrees, 0f);
+	}
+
 	public override void GetLocation(out Vector3 pos, out Quaternion rot)
 	{
 		pos = base.transform.position;
 		if (randomRot)
 		{
-			rot = Quaternion.Euler(0f, Random.Range(0f, 360f), 0f);
+			rot = base.transform.rotation * GetRandomRotation();
 		}
 		else
 		{

@@ -86,7 +86,7 @@ public class TriggerPlayerForce : TriggerBase, IServerComponent
 
 	private Vector3 GetPushVelocity(GameObject obj)
 	{
-		Vector3 vector = -(base.transform.position + triggerCollider.center - obj.transform.position);
+		Vector3 vector = -(triggerCollider.bounds.center - obj.transform.position);
 		vector.Normalize();
 		vector.y = 0.2f;
 		vector.Normalize();

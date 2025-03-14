@@ -8,6 +8,8 @@ public class UIFadeOut : MonoBehaviour
 
 	public CanvasGroup targetGroup;
 
+	public float fadeDelay;
+
 	private float timeStarted;
 
 	private void Start()
@@ -17,8 +19,9 @@ public class UIFadeOut : MonoBehaviour
 
 	private void Update()
 	{
-		targetGroup.alpha = Mathf.InverseLerp(timeStarted + secondsToFadeOut, timeStarted, Time.realtimeSinceStartup);
-		if (destroyOnFaded && Time.realtimeSinceStartup > timeStarted + secondsToFadeOut)
+		float num = timeStarted;
+		targetGroup.alpha = Mathf.InverseLerp(num + secondsToFadeOut, num, Time.realtimeSinceStartup - fadeDelay);
+		if (destroyOnFaded && Time.realtimeSinceStartup - fadeDelay > timeStarted + secondsToFadeOut)
 		{
 			GameManager.Destroy(base.gameObject);
 		}

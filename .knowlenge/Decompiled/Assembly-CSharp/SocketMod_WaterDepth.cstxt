@@ -10,6 +10,10 @@ public class SocketMod_WaterDepth : SocketMod
 
 	public bool AllowWaterVolumes;
 
+	public static Translate.Phrase TooDeepPhrase = new Translate.Phrase("error_toodeep", "Water is too deep");
+
+	public static Translate.Phrase TooShallowPhrase = new Translate.Phrase("error_shallow", "Water is too shallow");
+
 	public override bool DoCheck(Construction.Placement place)
 	{
 		Vector3 vector = place.position + place.rotation * worldPosition;
@@ -31,7 +35,14 @@ public class SocketMod_WaterDepth : SocketMod
 		{
 			return true;
 		}
-		Construction.lastPlacementError = "Failed Check: WaterDepth (" + hierachyName + ")";
+		if (overallWaterDepth <= MinimumWaterDepth)
+		{
+			Construction.lastPlacementError = TooShallowPhrase.translated;
+		}
+		else
+		{
+			Construction.lastPlacementError = TooDeepPhrase.translated;
+		}
 		return false;
 	}
 }

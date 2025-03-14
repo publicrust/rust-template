@@ -3,7 +3,7 @@ using UnityEngine;
 public class ModularVehicleShopFront : ShopFront
 {
 	[SerializeField]
-	private float maxUseDistance = 1.5f;
+	public float maxUseDistance = 1.5f;
 
 	public override bool CanBeLooted(BasePlayer player)
 	{
@@ -14,7 +14,7 @@ public class ModularVehicleShopFront : ShopFront
 		return false;
 	}
 
-	private bool WithinUseDistance(BasePlayer player)
+	public bool WithinUseDistance(BasePlayer player)
 	{
 		return Distance(player.eyes.position) <= maxUseDistance;
 	}

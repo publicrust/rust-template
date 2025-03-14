@@ -47,7 +47,10 @@ public class FlameJet : MonoBehaviour
 
 	public void LateUpdate()
 	{
-		UpdateLine();
+		if (on || currentColor.a > 0f)
+		{
+			UpdateLine();
+		}
 	}
 
 	public void SetOn(bool isOn)
@@ -64,11 +67,16 @@ public class FlameJet : MonoBehaviour
 	{
 		currentColor.a = Mathf.Lerp(currentColor.a, on ? 1f : 0f, Time.deltaTime * 40f);
 		line.SetColors(currentColor, endColor);
-		for (int i = 0; i < currentSegments.Length; i++)
+		if (lastWorldSegments == null)
+		{
+			lastWorldSegments = new Vector3[numSegments];
+		}
+		int num = currentSegments.Length;
+		for (int i = 0; i < num; i++)
 		{
 			float x = 0f;
 			float y = 0f;
-			if (lastWorldSegments != null && lastWorldSegments[i] != Vector3.zero)
+			if (lastWorldSegments != null && lastWorldSegments[i] != Vector3.zero && i > 0)
 			{
 				Vector3 a = base.transform.InverseTransformPoint(lastWorldSegments[i]);
 				float f = (float)i / (float)currentSegments.Length;
@@ -83,13 +91,9 @@ public class FlameJet : MonoBehaviour
 			}
 			Vector3 vector = new Vector3(x, y, (float)i * spacing);
 			currentSegments[i] = vector;
-			if (lastWorldSegments == null)
-			{
-				lastWorldSegments = new Vector3[numSegments];
-			}
 			lastWorldSegments[i] = base.transform.TransformPoint(vector);
 		}
-		line.SetVertexCount(numSegments);
+		line.positionCount = numSegments;
 		line.SetPositions(currentSegments);
 	}
 }

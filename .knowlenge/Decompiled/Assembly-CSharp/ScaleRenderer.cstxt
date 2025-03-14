@@ -33,7 +33,7 @@ public class ScaleRenderer : MonoBehaviour
 		{
 			GatherInitialValues();
 		}
-		if (ScaleDifferent(scale))
+		if (ScaleDifferent(scale) || (scale > 0f && !myRenderer.enabled))
 		{
 			SetRendererEnabled(scale != 0f);
 			SetScale_Internal(scale);

@@ -31,7 +31,7 @@ public class ValidBounds : SingletonComponent<ValidBounds>
 		}
 		if (TerrainMeta.Terrain != null)
 		{
-			if (vPos.y < TerrainMeta.Position.y)
+			if (World.Procedural && vPos.y < TerrainMeta.Position.y)
 			{
 				return false;
 			}

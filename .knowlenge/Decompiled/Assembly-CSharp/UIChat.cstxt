@@ -2,7 +2,7 @@ using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
 
-public class UIChat : SingletonComponent<UIChat>
+public class UIChat : PriorityListComponent<UIChat>
 {
 	public GameObject inputArea;
 

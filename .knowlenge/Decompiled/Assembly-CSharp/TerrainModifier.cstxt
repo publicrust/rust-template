@@ -9,12 +9,6 @@ public abstract class TerrainModifier : PrefabAttribute
 
 	public float Fade;
 
-	protected void OnDrawGizmosSelected()
-	{
-		Gizmos.color = new Color(0.5f, 0.5f, 0.5f, Opacity);
-		GizmosUtil.DrawWireCircleY(base.transform.position, base.transform.lossyScale.y * Radius);
-	}
-
 	public void Apply(Vector3 pos, float scale)
 	{
 		float opacity = Opacity;

@@ -1,13 +1,23 @@
 using System.Collections.Generic;
 using Facepunch;
-using TMPro;
+using Rust.UI;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 public class ItemStore : SingletonComponent<ItemStore>, VirtualScroll.IDataSource
 {
+	public static readonly Translate.Phrase CartEmptyPhrase = new Translate.Phrase("store.cart.empty", "Cart");
+
+	public static readonly Translate.Phrase CartSingularPhrase = new Translate.Phrase("store.cart.singular", "1 item");
+
+	public static readonly Translate.Phrase CartPluralPhrase = new Translate.Phrase("store.cart.plural", "{amount} items");
+
 	public GameObject ItemPrefab;
 
-	public RectTransform ItemParent;
+	[FormerlySerializedAs("ItemParent")]
+	public RectTransform LimitedItemParent;
+
+	public RectTransform GeneralItemParent;
 
 	public List<IPlayerItemDefinition> Cart = new List<IPlayerItemDefinition>();
 
@@ -21,7 +31,11 @@ public class ItemStore : SingletonComponent<ItemStore>, VirtualScroll.IDataSourc
 
 	public SoundDefinition AddToCartSound;
 
-	public TextMeshProUGUI TotalValue;
+	public RustText CartButtonLabel;
+
+	public RustText QuantityValue;
+
+	public RustText TotalValue;
 
 	public int GetItemCount()
 	{

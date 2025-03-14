@@ -9,8 +9,6 @@ public class TreeMarker : BaseEntity
 
 	public GameObjectRef spawnEffect;
 
-	public DeferredDecal myDecal;
-
 	private Vector3 initialPosition;
 
 	public bool SpherecastOnInit = true;

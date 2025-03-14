@@ -82,8 +82,6 @@ public class AITraversalArea : TriggerBase
 	public override void OnEntityEnter(BaseEntity ent)
 	{
 		base.OnEntityEnter(ent);
-		ent.GetComponent<HumanNPC>();
-		Debug.Log("Enter Traversal Area");
 	}
 
 	public AITraversalWaitPoint GetEntryPointNear(Vector3 pos)
@@ -128,8 +126,6 @@ public class AITraversalArea : TriggerBase
 	public override void OnEntityLeave(BaseEntity ent)
 	{
 		base.OnEntityLeave(ent);
-		ent.GetComponent<HumanNPC>();
-		Debug.Log("Leave Traversal Area");
 	}
 
 	public void OnDrawGizmos()

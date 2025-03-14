@@ -23,6 +23,8 @@ public class GameSetup : MonoBehaviour
 
 	public string loadSaveFile = "";
 
+	public string initializationCommands = "";
+
 	protected void Awake()
 	{
 		if (RunOnce)
@@ -38,6 +40,14 @@ public class GameSetup : MonoBehaviour
 			Bootstrap.Init_Tier0();
 			Bootstrap.Init_Systems();
 			Bootstrap.Init_Config();
+		}
+		if (initializationCommands.Length > 0)
+		{
+			string[] array = initializationCommands.Split(';');
+			foreach (string text in array)
+			{
+				ConsoleSystem.Run(ConsoleSystem.Option.Server, text.Trim());
+			}
 		}
 		StartCoroutine(DoGameSetup());
 	}

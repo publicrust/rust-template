@@ -11,6 +11,8 @@ public class ServerGib : BaseCombatEntity
 
 	public PhysicMaterial physicsMaterial;
 
+	public bool useContinuousCollision;
+
 	private MeshCollider meshCollider;
 
 	private Rigidbody rigidBody;
@@ -107,6 +109,7 @@ public class ServerGib : BaseCombatEntity
 		rigidbody.useGravity = true;
 		rigidbody.mass = Mathf.Clamp(meshCollider.bounds.size.magnitude * meshCollider.bounds.size.magnitude * 20f, 10f, 2000f);
 		rigidbody.interpolation = RigidbodyInterpolation.Interpolate;
+		rigidbody.collisionDetectionMode = (useContinuousCollision ? CollisionDetectionMode.Continuous : CollisionDetectionMode.Discrete);
 		if (base.isServer)
 		{
 			rigidbody.drag = 0.1f;

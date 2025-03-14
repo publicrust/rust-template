@@ -39,5 +39,7 @@ public class LifeInfographic : MonoBehaviour
 
 	public DamageSetting[] DamageDisplays;
 
+	public Texture2D defaultAvatarTexture;
+
 	public bool ShowDebugData;
 }

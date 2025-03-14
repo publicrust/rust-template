@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using Facepunch;
 using Network;
 using Oxide.Core;
+using ProtoBuf;
 using Rust;
 using UnityEngine;
 
@@ -35,6 +36,14 @@ public class CargoShip : BaseEntity
 
 	public Transform escapeBoatPoint;
 
+	public GameObjectRef microphonePrefab;
+
+	public Transform microphonePoint;
+
+	public GameObjectRef speakerPrefab;
+
+	public Transform[] speakerPoints;
+
 	public GameObject radiation;
 
 	public GameObjectRef mapMarkerEntityPrefab;
@@ -48,6 +57,8 @@ public class CargoShip : BaseEntity
 	public GameObject[] layouts;
 
 	public GameObjectRef playerTest;
+
+	private uint layoutChoice;
 
 	[ServerVar]
 	public static bool event_enabled = true;
@@ -64,38 +75,43 @@ public class CargoShip : BaseEntity
 	[ServerVar]
 	public static float loot_round_spacing_minutes = 10f;
 
-	private BaseEntity mapMarkerInstance;
+	public BaseEntity mapMarkerInstance;
 
-	private Vector3 currentVelocity = Vector3.zero;
+	public Vector3 currentVelocity = Vector3.zero;
 
-	private float currentThrottle;
+	public float currentThrottle;
 
-	private float currentTurnSpeed;
+	public float currentTurnSpeed;
 
-	private float turnScale;
+	public float turnScale;
 
-	private int lootRoundsPassed;
+	public int lootRoundsPassed;
 
-	private int hornCount;
+	public int hornCount;
 
-	private float currentRadiation;
+	public float currentRadiation;
 
-	private bool egressing;
+	public bool egressing;
 
 	public override float GetNetworkTime()
 	{
 		return Time.fixedTime;
 	}
 
-	public void UpdateLayoutFromFlags()
+	public override void Load(LoadInfo info)
 	{
-		if (HasFlag(Flags.Reserved1))
+		base.Load(info);
+		if (info.msg.simpleUint != null)
 		{
-			layouts[0].SetActive(value: true);
+			layoutChoice = info.msg.simpleUint.value;
 		}
-		else if (HasFlag(Flags.Reserved2))
+	}
+
+	public void RefreshActiveLayout()
+	{
+		for (int i = 0; i < layouts.Length; i++)
 		{
-			layouts[1].SetActive(value: true);
+			layouts[i].SetActive(layoutChoice == i);
 		}
 	}
 
@@ -172,19 +188,69 @@ public class CargoShip : BaseEntity
 
 	public void SpawnSubEntities()
 	{
-		BaseEntity baseEntity = GameManager.server.CreateEntity(escapeBoatPrefab.resourcePath, escapeBoatPoint.position, escapeBoatPoint.rotation);
-		if ((bool)baseEntity)
+		if (!Rust.Application.isLoadingSave)
 		{
-			baseEntity.enableSaving = false;
-			baseEntity.SetParent(this, worldPositionStays: true);
-			baseEntity.Spawn();
-			baseEntity.GetComponent<Rigidbody>().isKinematic = true;
-			RHIB component = baseEntity.GetComponent<RHIB>();
-			if ((bool)component)
+			BaseEntity baseEntity = GameManager.server.CreateEntity(escapeBoatPrefab.resourcePath, escapeBoatPoint.position, escapeBoatPoint.rotation);
+			if ((bool)baseEntity)
 			{
-				component.AddFuel(50);
+				baseEntity.SetParent(this, worldPositionStays: true);
+				baseEntity.Spawn();
+				RHIB component = baseEntity.GetComponent<RHIB>();
+				component.SetToKinematic();
+				if ((bool)component)
+				{
+					component.AddFuel(50);
+				}
 			}
 		}
+		MicrophoneStand microphoneStand = GameManager.server.CreateEntity(microphonePrefab.resourcePath, microphonePoint.position, microphonePoint.rotation) as MicrophoneStand;
+		if ((bool)microphoneStand)
+		{
+			microphoneStand.enableSaving = false;
+			microphoneStand.SetParent(this, worldPositionStays: true);
+			microphoneStand.Spawn();
+			microphoneStand.SpawnChildEntity();
+			IOEntity iOEntity = microphoneStand.ioEntity.Get(serverside: true);
+			Transform[] array = speakerPoints;
+			foreach (Transform transform in array)
+			{
+				IOEntity iOEntity2 = GameManager.server.CreateEntity(speakerPrefab.resourcePath, transform.position, transform.rotation) as IOEntity;
+				iOEntity2.enableSaving = false;
+				iOEntity2.SetParent(this, worldPositionStays: true);
+				iOEntity2.Spawn();
+				iOEntity.outputs[0].connectedTo.Set(iOEntity2);
+				iOEntity2.inputs[0].connectedTo.Set(iOEntity);
+				iOEntity = iOEntity2;
+			}
+			microphoneStand.ioEntity.Get(serverside: true).MarkDirtyForceUpdateOutputs();
+		}
+	}
+
+	protected override void OnChildAdded(BaseEntity child)
+	{
+		base.OnChildAdded(child);
+		if (base.isServer && Rust.Application.isLoadingSave && child is RHIB rHIB)
+		{
+			Vector3 localPosition = rHIB.transform.localPosition;
+			Vector3 b = base.transform.InverseTransformPoint(escapeBoatPoint.transform.position);
+			if (Vector3.Distance(localPosition, b) < 1f)
+			{
+				rHIB.SetToKinematic();
+			}
+		}
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		info.msg.simpleUint = Pool.Get<SimpleUInt>();
+		info.msg.simpleUint.value = layoutChoice;
+	}
+
+	public override void PostServerLoad()
+	{
+		base.PostServerLoad();
+		RefreshActiveLayout();
 	}
 
 	public void PlayHorn()
@@ -198,39 +264,19 @@ public class CargoShip : BaseEntity
 		}
 	}
 
-	public void PickLayout()
-	{
-		if (!HasFlag(Flags.Reserved1) && !HasFlag(Flags.Reserved2))
-		{
-			switch (UnityEngine.Random.Range(0, layouts.Length))
-			{
-			case 0:
-				SetFlag(Flags.Reserved1, b: true);
-				break;
-			case 1:
-				SetFlag(Flags.Reserved2, b: true);
-				break;
-			}
-		}
-	}
-
 	public override void Spawn()
 	{
 		if (!Rust.Application.isLoadingSave)
 		{
-			PickLayout();
+			layoutChoice = (uint)UnityEngine.Random.Range(0, layouts.Length);
+			SendNetworkUpdate();
+			RefreshActiveLayout();
 		}
 		base.Spawn();
 	}
 
 	public override void ServerInit()
 	{
-		GameObject[] array = layouts;
-		for (int i = 0; i < array.Length; i++)
-		{
-			array[i].SetActive(value: false);
-		}
-		UpdateLayoutFromFlags();
 		base.ServerInit();
 		Invoke(FindInitialNode, 2f);
 		InvokeRepeating(BuildingCheck, 1f, 5f);
@@ -367,6 +413,11 @@ public class CargoShip : BaseEntity
 	}
 
 	public override bool BlocksWaterFor(BasePlayer player)
+	{
+		return true;
+	}
+
+	public override bool SupportsChildDeployables()
 	{
 		return true;
 	}

@@ -1,6 +1,8 @@
 using System;
 using ConVar;
+using Facepunch.Rust;
 using Network;
+using Oxide.Core;
 using UnityEngine;
 
 public class TreeEntity : ResourceEntity, IPrefabPreProcess
@@ -25,8 +27,6 @@ public class TreeEntity : ResourceEntity, IPrefabPreProcess
 
 	private float treeDistanceUponFalling;
 
-	public static ListHashSet<TreeEntity> activeTreeList = new ListHashSet<TreeEntity>();
-
 	public GameObjectRef prefab;
 
 	public bool hasBonusGame = true;
@@ -38,8 +38,6 @@ public class TreeEntity : ResourceEntity, IPrefabPreProcess
 	public Collider serverCollider;
 
 	public Collider clientCollider;
-
-	public TreeMarkerData MarkerData;
 
 	public SoundDefinition smallCrackSoundDef;
 
@@ -57,6 +55,10 @@ public class TreeEntity : ResourceEntity, IPrefabPreProcess
 	private float lastHitTime;
 
 	private int lastHitMarkerIndex = -1;
+
+	private float nextBirdTime;
+
+	private uint birdCycleIndex;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -80,13 +82,12 @@ public class TreeEntity : ResourceEntity, IPrefabPreProcess
 	{
 		base.ServerInit();
 		lastDirection = ((UnityEngine.Random.Range(0, 2) != 0) ? 1 : (-1));
-		activeTreeList.Add(this);
+		TreeManager.OnTreeSpawned(this);
 	}
 
 	internal override void DoServerDestroy()
 	{
 		base.DoServerDestroy();
-		activeTreeList.Remove(this);
 		CleanupMarker();
 		TreeManager.OnTreeDestroyed(this);
 	}
@@ -97,7 +98,12 @@ public class TreeEntity : ResourceEntity, IPrefabPreProcess
 		{
 			return false;
 		}
-		if (MarkerData != null)
+		object obj = Interface.CallHook("OnTreeMarkerHit", this, info);
+		if (obj is bool)
+		{
+			return (bool)obj;
+		}
+		if (PrefabAttribute.server.Find<TreeMarkerData>(prefabID) != null)
 		{
 			if (new Bounds(xMarker.transform.position, Vector3.one * 0.2f).Contains(info.HitPositionWorld))
 			{
@@ -107,10 +113,6 @@ public class TreeEntity : ResourceEntity, IPrefabPreProcess
 		else
 		{
 			Vector3 lhs = Vector3Ex.Direction2D(base.transform.position, xMarker.transform.position);
-			if (MarkerData != null)
-			{
-				lhs = xMarker.transform.forward;
-			}
 			Vector3 attackNormal = info.attackNormal;
 			float num = Vector3.Dot(lhs, attackNormal);
 			float num2 = Vector3.Distance(xMarker.transform.position, info.HitPositionWorld);
@@ -143,11 +145,26 @@ public class TreeEntity : ResourceEntity, IPrefabPreProcess
 		return xMarker != null;
 	}
 
+	private void DoBirds()
+	{
+		if (!base.isClient && !(UnityEngine.Time.realtimeSinceStartup < nextBirdTime) && !(bounds.extents.y < 6f))
+		{
+			uint seed = (uint)(int)net.ID.Value + birdCycleIndex;
+			if (SeedRandom.Range(ref seed, 0, 2) == 0)
+			{
+				Effect.server.Run("assets/prefabs/npc/birds/birdemission.prefab", base.transform.position + Vector3.up * UnityEngine.Random.Range(bounds.extents.y * 0.65f, bounds.extents.y * 0.9f), Vector3.up);
+			}
+			birdCycleIndex++;
+			nextBirdTime = UnityEngine.Time.realtimeSinceStartup + 90f;
+		}
+	}
+
 	public override void OnAttacked(HitInfo info)
 	{
 		bool canGather = info.CanGather;
 		float num = UnityEngine.Time.time - lastHitTime;
 		lastHitTime = UnityEngine.Time.time;
+		DoBirds();
 		if (!hasBonusGame || !canGather || info.Initiator == null || (BonusActive() && !DidHitMarker(info)))
 		{
 			base.OnAttacked(info);
@@ -161,9 +178,10 @@ public class TreeEntity : ResourceEntity, IPrefabPreProcess
 		}
 		Vector3 vector = ((xMarker != null) ? xMarker.transform.position : info.HitPositionWorld);
 		CleanupMarker();
-		if (MarkerData != null)
+		TreeMarkerData treeMarkerData = PrefabAttribute.server.Find<TreeMarkerData>(prefabID);
+		if (treeMarkerData != null)
 		{
-			Vector3 nearbyPoint = MarkerData.GetNearbyPoint(base.transform.InverseTransformPoint(vector), ref lastHitMarkerIndex, out var normal);
+			Vector3 nearbyPoint = treeMarkerData.GetNearbyPoint(base.transform.InverseTransformPoint(vector), ref lastHitMarkerIndex, out var normal);
 			nearbyPoint = base.transform.TransformPoint(nearbyPoint);
 			Quaternion rot = QuaternionEx.LookRotationNormal(base.transform.TransformDirection(normal));
 			xMarker = GameManager.server.CreateEntity("assets/content/nature/treesprefabs/trees/effects/tree_marking_nospherecast.prefab", nearbyPoint, rot);
@@ -247,6 +265,7 @@ public class TreeEntity : ResourceEntity, IPrefabPreProcess
 		}
 		isKilled = true;
 		CleanupMarker();
+		Facepunch.Rust.Analytics.Server.TreeKilled(info.WeaponPrefab);
 		if (fallOnKilled)
 		{
 			Collider collider = GetCollider();
@@ -254,7 +273,12 @@ public class TreeEntity : ResourceEntity, IPrefabPreProcess
 			{
 				collider.enabled = false;
 			}
-			ClientRPC(null, "TreeFall", info.attackNormal);
+			Vector3 vector = info.attackNormal;
+			if (vector == Vector3.zero)
+			{
+				vector = Vector3Ex.Direction2D(base.transform.position, info.PointStart);
+			}
+			ClientRPC(null, "TreeFall", vector);
 			Invoke(DelayedKill, fallDuration + 1f);
 		}
 		else

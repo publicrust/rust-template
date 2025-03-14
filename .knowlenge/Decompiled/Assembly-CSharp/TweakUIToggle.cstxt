@@ -6,6 +6,10 @@ public class TweakUIToggle : TweakUIBase
 
 	public bool inverse;
 
+	public static string lastConVarChanged;
+
+	public static TimeSince timeSinceLastConVarChange;
+
 	protected override void Init()
 	{
 		base.Init();
@@ -37,6 +41,8 @@ public class TweakUIToggle : TweakUIBase
 			}
 			if (conVar.AsBool != flag)
 			{
+				lastConVarChanged = conVar.FullName;
+				timeSinceLastConVarChange = 0f;
 				conVar.Set(flag);
 			}
 		}

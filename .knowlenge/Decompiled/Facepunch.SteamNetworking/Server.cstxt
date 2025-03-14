@@ -1,6 +1,4 @@
 using System;
-using System.Diagnostics;
-using System.IO;
 using Network;
 using Steamworks;
 using Steamworks.Data;
@@ -12,17 +10,13 @@ public class Server : global::Network.Server, ISocketManager
 
 	private bool relay;
 
-	public override string ProtocolId
-	{
-		get
-		{
-			if (!relay)
-			{
-				return "sw";
-			}
-			return "sdr";
-		}
-	}
+	private const int bufferSize = 32;
+
+	private int[] lanePriorities = new int[3] { 1, 0, 1 };
+
+	private ushort[] laneWeights = new ushort[3] { 4, 1, 1 };
+
+	public override string ProtocolId => "sw";
 
 	public Server(bool enableSteamDatagramRelay)
 	{
@@ -36,121 +30,159 @@ public class Server : global::Network.Server, ISocketManager
 
 	public override bool Start()
 	{
-		if (manager != null)
+		lock (readLock)
 		{
-			throw new Exception("socket not null");
+			lock (writeLock)
+			{
+				lock (decryptLock)
+				{
+					if (manager != null)
+					{
+						throw new Exception("socket not null");
+					}
+					SteamNetworkingUtils.AllowWithoutAuth = 2;
+					SteamNetworkingUtils.Unencrypted = 2;
+					SteamNetworkingUtils.SendBufferSize = 4194304;
+					SteamNetworkingUtils.SendRateMax = 1048576;
+					SteamNetworkingUtils.SendRateMin = 1048576;
+					NetAddress netAddress = (string.IsNullOrEmpty(ip) ? NetAddress.AnyIp((ushort)port) : NetAddress.From(ip, (ushort)port));
+					Debug.Log($"Server Creating: {netAddress}");
+					if (relay)
+					{
+						if (SteamNetworkingSockets.GetFakeIP(0, out var address) == Result.OK)
+						{
+							Debug.Log($"Server Fake IP: {address}");
+						}
+						else
+						{
+							SteamNetworkingSockets.OnFakeIPResult += delegate(NetAddress fakeAddressCallback)
+							{
+								Debug.Log($"Server Fake IP: {fakeAddressCallback}");
+							};
+						}
+						manager = SteamNetworkingSockets.CreateRelaySocketFakeIP(0, this);
+					}
+					else
+					{
+						manager = SteamNetworkingSockets.CreateNormalSocket(netAddress, this);
+					}
+					Debug.Log($"Created Socket: {manager.Socket}");
+					MultithreadingInit();
+					return manager != null;
+				}
+			}
 		}
-		SteamNetworkingUtils.AllowWithoutAuth = 2;
-		SteamNetworkingUtils.Unencrypted = 2;
-		SteamNetworkingUtils.SendBufferSize = 2097152;
-		if (relay)
-		{
-			UnityEngine.Debug.Log($"Server Creating: {port}");
-			manager = SteamNetworkingSockets.CreateRelaySocket(port, this);
-		}
-		else
-		{
-			NetAddress netAddress = (string.IsNullOrEmpty(ip) ? NetAddress.AnyIp((ushort)port) : NetAddress.From(ip, (ushort)port));
-			UnityEngine.Debug.Log($"Server Creating: {netAddress}");
-			manager = SteamNetworkingSockets.CreateNormalSocket(netAddress, this);
-		}
-		UnityEngine.Debug.Log($"Created Socket: {manager.Socket}");
-		if (manager == null)
-		{
-			return false;
-		}
-		return true;
 	}
 
 	public override void Stop(string shutdownMsg)
 	{
-		if (manager != null)
+		lock (readLock)
 		{
-			Console.WriteLine("[SteamNetworking] Server Shutting Down (" + shutdownMsg + ")");
-			manager.Close();
-			manager = null;
-			base.Stop(shutdownMsg);
+			lock (writeLock)
+			{
+				lock (decryptLock)
+				{
+					if (manager != null)
+					{
+						Console.WriteLine("[SteamNetworking] Server Shutting Down (" + shutdownMsg + ")");
+						manager.Close();
+						manager = null;
+						base.Stop(shutdownMsg);
+					}
+				}
+			}
 		}
 	}
 
 	public override void Disconnect(global::Network.Connection cn)
 	{
-		if (manager != null)
+		lock (readLock)
 		{
-			((Steamworks.Data.Connection)(uint)cn.guid).Close();
-			OnDisconnected("Disconnected", cn);
+			lock (writeLock)
+			{
+				lock (decryptLock)
+				{
+					if (manager != null)
+					{
+						((Steamworks.Data.Connection)(uint)cn.guid).Close();
+						OnDisconnected("Disconnected", cn);
+					}
+				}
+			}
 		}
 	}
 
 	public override void Kick(global::Network.Connection cn, string message, bool logfile)
 	{
-		if (manager != null)
+		lock (readLock)
 		{
-			if (base.write.Start())
+			lock (writeLock)
 			{
-				base.write.PacketID(Message.Type.DisconnectReason);
-				base.write.String(message);
-				base.write.Send(new SendInfo(cn)
+				lock (decryptLock)
 				{
-					method = SendMethod.ReliableUnordered,
-					priority = Priority.Immediate
-				});
+					if (manager != null)
+					{
+						NetWrite netWrite = StartWrite();
+						netWrite.PacketID(Message.Type.DisconnectReason);
+						netWrite.String(message);
+						netWrite.SendImmediate(new SendInfo(cn)
+						{
+							method = SendMethod.ReliableUnordered,
+							priority = Priority.Immediate
+						});
+						string text = cn.ToString() + " kicked: " + message;
+						if (logfile)
+						{
+							DebugEx.LogWarning(text);
+						}
+						else
+						{
+							Console.WriteLine(text);
+						}
+						((Steamworks.Data.Connection)(uint)cn.guid).Close(linger: true, 0, message);
+						OnDisconnected("Kicked: " + message, cn);
+					}
+				}
 			}
-			string text = cn.ToString() + " kicked: " + message;
-			if (logfile)
-			{
-				DebugEx.LogWarning(text);
-			}
-			else
-			{
-				Console.WriteLine(text);
-			}
-			((Steamworks.Data.Connection)(uint)cn.guid).Close(linger: true, 0, message);
-			OnDisconnected("Kicked: " + message, cn);
 		}
 	}
 
-	public override void Cycle()
+	public override void Flush(global::Network.Connection cn)
 	{
-		base.Cycle();
-		Stopwatch obj = Pool.Get<Stopwatch>();
-		obj.Reset();
-		obj.Start();
-		while (manager.Receive(32, receiveToEnd: false) == 32 && !(obj.Elapsed.TotalMilliseconds > (double)global::Network.Server.MaxReceiveTime))
+		if (manager != null && cn != null)
 		{
+			((Steamworks.Data.Connection)(uint)cn.guid).Flush();
 		}
-		Pool.Free(ref obj);
 	}
 
-	public override void SendUnconnected(uint netAddr, ushort netPort, byte[] data, int size)
+	protected override bool Receive()
 	{
-	}
-
-	public override void Send(SendInfo sendinfo, MemoryStream data)
-	{
-		if (sendinfo.connections != null)
+		if (manager.Receive(32, receiveToEnd: false) == 32)
 		{
-			foreach (global::Network.Connection connection in sendinfo.connections)
+			return true;
+		}
+		return false;
+	}
+
+	public override void ProcessWrite(NetWrite write)
+	{
+		foreach (global::Network.Connection connection in write.connections)
+		{
+			ProcessWrite(write, connection);
+		}
+		Pool.Free(ref write);
+	}
+
+	private unsafe void ProcessWrite(NetWrite write, global::Network.Connection connection)
+	{
+		Record(connection, write);
+		ArraySegment<byte> arraySegment = Encrypt(connection, write);
+		fixed (byte* array = arraySegment.Array)
+		{
+			Result result = ((Steamworks.Data.Connection)(uint)connection.guid).SendMessage((IntPtr)array, arraySegment.Offset + arraySegment.Count, ToSteamSendType(write.method, write.priority), ToSteamLaneIndexServer(write.method, write.priority, write.channel));
+			if (result != Result.OK)
 			{
-				Send(sendinfo, data, connection);
-			}
-		}
-		if (sendinfo.connection != null)
-		{
-			Send(sendinfo, data, sendinfo.connection);
-		}
-	}
-
-	private unsafe void Send(SendInfo sendinfo, MemoryStream data, global::Network.Connection connection)
-	{
-		Record(connection, data);
-		Encrypt(connection, ref data);
-		fixed (byte* buffer = data.GetBuffer())
-		{
-			Result result = ((Steamworks.Data.Connection)(uint)connection.guid).SendMessage((IntPtr)buffer, (int)data.Length, ToSteamSendType(sendinfo.method, sendinfo.priority));
-			if (steamsendverify && result != Result.OK)
-			{
-				DebugEx.LogWarning(string.Concat(connection, " SendMessage failed: ", result));
+				Debug.LogWarning(string.Concat("SendMessage failed (", result, ")"));
 			}
 		}
 	}
@@ -162,6 +194,11 @@ public class Server : global::Network.Server, ISocketManager
 
 	public void OnConnected(Steamworks.Data.Connection cn, ConnectionInfo info)
 	{
+		Result result = cn.ConfigureConnectionLanes(lanePriorities, laneWeights);
+		if (result != Result.OK)
+		{
+			Debug.LogWarning(string.Concat("ConfigureConnectionLanes failed (", result, ")"));
+		}
 		uint id = cn.Id;
 		string ipaddress = info.Address.ToString();
 		global::Network.Connection connection = new global::Network.Connection();
@@ -188,7 +225,7 @@ public class Server : global::Network.Server, ISocketManager
 		{
 			return;
 		}
-		if (size > global::Network.Server.MaxPacketSize)
+		if (size > 10000000)
 		{
 			Kick(connection, "Packet Size", connection.connected);
 			return;
@@ -199,17 +236,30 @@ public class Server : global::Network.Server, ISocketManager
 			return;
 		}
 		connection.AddPacketsPerSecond();
-		base.read.Start(data, size);
-		Decrypt(connection, base.read);
-		byte b = base.read.PacketID();
+		NetRead netRead = Pool.Get<NetRead>();
+		netRead.Start(connection, data, size);
+		if (BaseNetwork.Multithreading)
+		{
+			EnqueueDecrypt(netRead);
+		}
+		else
+		{
+			ProcessDecrypt(netRead);
+		}
+	}
+
+	public override void ProcessRead(NetRead read)
+	{
+		byte b = read.PacketID();
 		b -= 140;
-		Message obj = StartMessage((Message.Type)b, connection);
+		Message obj = StartMessage((Message.Type)b, read);
 		if (callbackHandler != null)
 		{
 			callbackHandler.OnNetworkMessage(obj);
 		}
 		obj.Clear();
 		Pool.Free(ref obj);
+		Pool.Free(ref read);
 	}
 
 	public override string GetDebug(global::Network.Connection connection)
@@ -254,5 +304,10 @@ public class Server : global::Network.Server, ISocketManager
 			break;
 		}
 		return (ulong)num;
+	}
+
+	public override bool LimitConnectionsPerIP()
+	{
+		return !relay;
 	}
 }

@@ -1,6 +1,7 @@
 #define UNITY_ASSERTIONS
 using System;
 using ConVar;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using Rust;
@@ -33,6 +34,9 @@ public class HackableLockedCrate : LootContainer
 	public GameObjectRef landEffect;
 
 	public bool shouldDecay = true;
+
+	[NonSerialized]
+	public ulong OriginalHackerPlayer;
 
 	private BaseEntity mapMarkerInstance;
 
@@ -170,6 +174,7 @@ public class HackableLockedCrate : LootContainer
 			{
 				InvokeRepeating(LandCheck, 0f, 0.015f);
 			}
+			Facepunch.Rust.Analytics.Azure.OnEntitySpawned(this);
 		}
 		RefreshDecay();
 		isLootable = IsFullyHacked();
@@ -203,6 +208,8 @@ public class HackableLockedCrate : LootContainer
 	{
 		if (!IsBeingHacked() && Interface.CallHook("CanHackCrate", msg.player, this) == null)
 		{
+			Facepunch.Rust.Analytics.Azure.OnLockedCrateStarted(msg.player, this);
+			OriginalHackerPlayer = msg.player.userID;
 			StartHacking();
 		}
 	}
@@ -223,6 +230,7 @@ public class HackableLockedCrate : LootContainer
 		if (hackSeconds > requiredHackSeconds)
 		{
 			Interface.CallHook("OnCrateHackEnd", this);
+			Facepunch.Rust.Analytics.Azure.OnLockedCrateFinished(OriginalHackerPlayer, this);
 			RefreshDecay();
 			SetFlag(Flags.Reserved2, b: true);
 			isLootable = true;

@@ -17,7 +17,7 @@ public class ItemModSound : ItemMod
 		if (!Rust.Application.isLoadingSave && actionType == Type.OnAttachToWeapon && item.parentItem != null && item.parentItem.info.category == ItemCategory.Weapon)
 		{
 			BasePlayer ownerPlayer = item.parentItem.GetOwnerPlayer();
-			if (!(ownerPlayer == null))
+			if (!(ownerPlayer == null) && !ownerPlayer.IsNpc)
 			{
 				Effect.server.Run(effect.resourcePath, ownerPlayer, 0u, Vector3.zero, Vector3.zero);
 			}

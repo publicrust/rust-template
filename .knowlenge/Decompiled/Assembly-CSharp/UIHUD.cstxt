@@ -20,6 +20,8 @@ public class UIHUD : SingletonComponent<UIHUD>, IUIScreen
 
 	public RectTransform vitalsRect;
 
+	public Canvas healthCanvas;
+
 	public UICompass CompassWidget;
 
 	public GameObject KeyboardCaptureMode;

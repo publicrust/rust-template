@@ -11,6 +11,8 @@ public class PrefabInformation : PrefabAttribute
 
 	public Sprite sprite;
 
+	public bool shownOnDeathScreen;
+
 	protected override Type GetIndexedType()
 	{
 		return typeof(PrefabInformation);

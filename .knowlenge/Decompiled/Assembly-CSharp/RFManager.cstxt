@@ -152,39 +152,42 @@ public class RFManager
 		bool flag = broadcasterList.Count > 0;
 		bool flag2 = false;
 		bool flag3 = false;
-		foreach (IRFObject item in listenList)
+		for (int num = listenList.Count - 1; num >= 0; num--)
 		{
-			if (!BaseEntityEx.IsValidEntityReference(item))
+			IRFObject iRFObject = listenList[num];
+			if (!BaseEntityEx.IsValidEntityReference(iRFObject))
 			{
 				flag2 = true;
-				continue;
 			}
-			if (flag)
+			else
 			{
-				flag = false;
-				foreach (IRFObject item2 in broadcasterList)
+				if (flag)
 				{
-					if (!BaseEntityEx.IsValidEntityReference(item2))
+					flag = false;
+					foreach (IRFObject item in broadcasterList)
 					{
-						flag3 = true;
-					}
-					else if (Vector3.Distance(item2.GetPosition(), item.GetPosition()) <= item2.GetMaxRange())
-					{
-						flag = true;
-						break;
+						if (!BaseEntityEx.IsValidEntityReference(item))
+						{
+							flag3 = true;
+						}
+						else if (Vector3.Distance(item.GetPosition(), iRFObject.GetPosition()) <= item.GetMaxRange())
+						{
+							flag = true;
+							break;
+						}
 					}
 				}
+				iRFObject.RFSignalUpdate(flag);
 			}
-			item.RFSignalUpdate(flag);
 		}
 		if (flag2)
 		{
 			Debug.LogWarning("Found null entries in the RF listener list for frequency " + frequency + "... cleaning up.");
-			for (int num = listenList.Count - 1; num >= 0; num--)
+			for (int num2 = listenList.Count - 1; num2 >= 0; num2--)
 			{
-				if (listenList[num] == null)
+				if (listenList[num2] == null)
 				{
-					listenList.RemoveAt(num);
+					listenList.RemoveAt(num2);
 				}
 			}
 		}
@@ -193,11 +196,11 @@ public class RFManager
 			return;
 		}
 		Debug.LogWarning("Found null entries in the RF broadcaster list for frequency " + frequency + "... cleaning up.");
-		for (int num2 = broadcasterList.Count - 1; num2 >= 0; num2--)
+		for (int num3 = broadcasterList.Count - 1; num3 >= 0; num3--)
 		{
-			if (broadcasterList[num2] == null)
+			if (broadcasterList[num3] == null)
 			{
-				broadcasterList.RemoveAt(num2);
+				broadcasterList.RemoveAt(num3);
 			}
 		}
 	}

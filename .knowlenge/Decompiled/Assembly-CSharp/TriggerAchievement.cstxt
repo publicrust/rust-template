@@ -78,7 +78,7 @@ public class TriggerAchievement : TriggerBase
 			if (!string.IsNullOrEmpty(statToIncrease))
 			{
 				component.stats.Add(statToIncrease, 1);
-				component.stats.Save();
+				component.stats.Save(forceSteamSave: true);
 			}
 			triggeredPlayers.Add(component.userID);
 		}

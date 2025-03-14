@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
@@ -43,6 +44,10 @@ public class BuildingPrivlidge : StorageContainer
 	public List<ItemAmount> upkeepBuffer = new List<ItemAmount>();
 
 	public List<PlayerNameID> authorizedPlayers = new List<PlayerNameID>();
+
+	public const Flags Flag_MaxAuths = Flags.Reserved5;
+
+	public List<ItemDefinition> allowedConstructionItems = new List<ItemDefinition>();
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -359,6 +364,7 @@ public class BuildingPrivlidge : StorageContainer
 				continue;
 			}
 			base.inventory.Take(obj, itemAmount.itemid, num);
+			Facepunch.Rust.Analytics.Azure.AddPendingItems(this, itemAmount.itemDef.shortname, num, "upkeep", consumed: true, perEntity: true);
 			foreach (Item item in obj)
 			{
 				if (IsDebugging())
@@ -489,6 +495,26 @@ public class BuildingPrivlidge : StorageContainer
 
 	public override bool ItemFilter(Item item, int targetSlot)
 	{
+		bool flag = allowedConstructionItems.Contains(item.info);
+		if (!flag && targetSlot == -1)
+		{
+			int num = 0;
+			foreach (Item item2 in base.inventory.itemList)
+			{
+				if (!allowedConstructionItems.Contains(item2.info) && (item2.info != item.info || item2.amount == item2.MaxStackable()))
+				{
+					num++;
+				}
+			}
+			if (num >= 24)
+			{
+				return false;
+			}
+		}
+		if (targetSlot >= 24 && targetSlot <= 27)
+		{
+			return flag;
+		}
 		return base.ItemFilter(item, targetSlot);
 	}
 
@@ -530,6 +556,20 @@ public class BuildingPrivlidge : StorageContainer
 		if (base.isServer)
 		{
 			AddDelayedUpdate();
+		}
+	}
+
+	public bool AtMaxAuthCapacity()
+	{
+		return HasFlag(Flags.Reserved5);
+	}
+
+	public void UpdateMaxAuthCapacity()
+	{
+		BaseGameMode activeGameMode = BaseGameMode.GetActiveGameMode(serverside: true);
+		if ((bool)activeGameMode && activeGameMode.limitTeamAuths)
+		{
+			SetFlag(Flags.Reserved5, authorizedPlayers.Count >= activeGameMode.GetMaxRelationshipTeamSize());
 		}
 	}
 
@@ -583,11 +623,16 @@ public class BuildingPrivlidge : StorageContainer
 
 	public void AddPlayer(BasePlayer player)
 	{
-		authorizedPlayers.RemoveAll((PlayerNameID x) => x.userid == player.userID);
-		PlayerNameID playerNameID = new PlayerNameID();
-		playerNameID.userid = player.userID;
-		playerNameID.username = player.displayName;
-		authorizedPlayers.Add(playerNameID);
+		if (!AtMaxAuthCapacity())
+		{
+			authorizedPlayers.RemoveAll((PlayerNameID x) => x.userid == player.userID);
+			PlayerNameID playerNameID = new PlayerNameID();
+			playerNameID.userid = player.userID;
+			playerNameID.username = player.displayName;
+			authorizedPlayers.Add(playerNameID);
+			Facepunch.Rust.Analytics.Azure.OnEntityAuthChanged(this, player, authorizedPlayers.Select((PlayerNameID x) => x.userid), "added", player.userID);
+			UpdateMaxAuthCapacity();
+		}
 	}
 
 	[RPC_Server]
@@ -598,6 +643,8 @@ public class BuildingPrivlidge : StorageContainer
 		if (rpc2.player.CanInteract() && CanAdministrate(rpc2.player) && Interface.CallHook("OnCupboardDeauthorize", this, rpc.player) == null)
 		{
 			authorizedPlayers.RemoveAll((PlayerNameID x) => x.userid == rpc2.player.userID);
+			Facepunch.Rust.Analytics.Azure.OnEntityAuthChanged(this, rpc2.player, authorizedPlayers.Select((PlayerNameID x) => x.userid), "removed", rpc2.player.userID);
+			UpdateMaxAuthCapacity();
 			SendNetworkUpdate();
 		}
 	}
@@ -609,6 +656,7 @@ public class BuildingPrivlidge : StorageContainer
 		if (rpc.player.CanInteract() && CanAdministrate(rpc.player) && Interface.CallHook("OnCupboardClearList", this, rpc.player) == null)
 		{
 			authorizedPlayers.Clear();
+			UpdateMaxAuthCapacity();
 			SendNetworkUpdate();
 		}
 	}
@@ -618,7 +666,7 @@ public class BuildingPrivlidge : StorageContainer
 	public void RPC_Rotate(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
-		if (player.CanBuild() && (bool)player.GetHeldEntity() && player.GetHeldEntity().GetComponent<Hammer>() != null && (GetSlot(Slot.Lock) == null || !GetSlot(Slot.Lock).IsLocked()))
+		if (player.CanBuild() && (bool)player.GetHeldEntity() && player.GetHeldEntity().GetComponent<Hammer>() != null && (GetSlot(Slot.Lock) == null || !GetSlot(Slot.Lock).IsLocked()) && !HasAttachedStorageAdaptor())
 		{
 			base.transform.rotation = Quaternion.LookRotation(-base.transform.forward, base.transform.up);
 			SendNetworkUpdate();
@@ -635,6 +683,21 @@ public class BuildingPrivlidge : StorageContainer
 		}
 	}
 
+	public override int GetIdealSlot(BasePlayer player, Item item)
+	{
+		if (item != null && item.info != null && allowedConstructionItems.Contains(item.info))
+		{
+			for (int i = 24; i <= 27; i++)
+			{
+				if (base.inventory.GetSlot(i) == null)
+				{
+					return i;
+				}
+			}
+		}
+		return base.GetIdealSlot(player, item);
+	}
+
 	public override bool HasSlot(Slot slot)
 	{
 		if (slot == Slot.Lock)
@@ -642,5 +705,10 @@ public class BuildingPrivlidge : StorageContainer
 			return true;
 		}
 		return base.HasSlot(slot);
+	}
+
+	public override bool SupportsChildDeployables()
+	{
+		return true;
 	}
 }

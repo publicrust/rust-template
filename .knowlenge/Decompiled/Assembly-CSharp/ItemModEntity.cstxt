@@ -6,6 +6,16 @@ public class ItemModEntity : ItemMod
 
 	public string defaultBone;
 
+	public override void OnChanged(Item item)
+	{
+		HeldEntity heldEntity = item.GetHeldEntity() as HeldEntity;
+		if (heldEntity != null)
+		{
+			heldEntity.OnItemChanged(item);
+		}
+		base.OnChanged(item);
+	}
+
 	public override void OnItemCreated(Item item)
 	{
 		if (item.GetHeldEntity() == null)

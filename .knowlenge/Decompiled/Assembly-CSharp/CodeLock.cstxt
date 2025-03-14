@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
@@ -25,6 +26,16 @@ public class CodeLock : BaseLock
 	public GameObjectRef effectShock;
 
 	public bool hasCode;
+
+	public const Flags Flag_CodeEntryBlocked = Flags.Reserved11;
+
+	public static readonly Translate.Phrase blockwarning = new Translate.Phrase("codelock.blockwarning", "Further failed attempts will block code entry for some time");
+
+	[ServerVar]
+	public static float maxFailedAttempts = 8f;
+
+	[ServerVar]
+	public static float lockoutCooldown = 900f;
 
 	public bool hasGuestCode;
 
@@ -192,26 +203,24 @@ public class CodeLock : BaseLock
 		return base.OnRpcMessage(player, rpc, msg);
 	}
 
+	public bool IsCodeEntryBlocked()
+	{
+		return HasFlag(Flags.Reserved11);
+	}
+
 	public override void Load(LoadInfo info)
 	{
 		base.Load(info);
-		if (info.msg.codeLock == null)
+		if (info.msg.codeLock != null)
 		{
-			return;
-		}
-		hasCode = info.msg.codeLock.hasCode;
-		hasGuestCode = info.msg.codeLock.hasGuestCode;
-		if (info.msg.codeLock.pv != null)
-		{
-			code = info.msg.codeLock.pv.code;
-			whitelistPlayers = info.msg.codeLock.pv.users;
-			guestCode = info.msg.codeLock.pv.guestCode;
-			guestPlayers = info.msg.codeLock.pv.guestUsers;
-			if (guestCode == null || guestCode.Length != 4)
+			hasCode = info.msg.codeLock.hasCode;
+			hasGuestCode = info.msg.codeLock.hasGuestCode;
+			if (info.msg.codeLock.pv != null)
 			{
-				hasGuestCode = false;
-				guestCode = string.Empty;
-				guestPlayers.Clear();
+				code = info.msg.codeLock.pv.code;
+				whitelistPlayers = info.msg.codeLock.pv.users;
+				guestCode = info.msg.codeLock.pv.guestCode;
+				guestPlayers = info.msg.codeLock.pv.guestUsers;
 			}
 		}
 	}
@@ -261,12 +270,21 @@ public class CodeLock : BaseLock
 		return false;
 	}
 
+	public override bool CanUseNetworkCache(Connection connection)
+	{
+		return false;
+	}
+
 	public override void Save(SaveInfo info)
 	{
 		base.Save(info);
 		info.msg.codeLock = Facepunch.Pool.Get<ProtoBuf.CodeLock>();
 		info.msg.codeLock.hasGuestCode = guestCode.Length > 0;
 		info.msg.codeLock.hasCode = code.Length > 0;
+		if (!info.forDisk && info.forConnection != null)
+		{
+			info.msg.codeLock.hasAuth = whitelistPlayers.Contains(info.forConnection.userid) || guestPlayers.Contains(info.forConnection.userid);
+		}
 		if (info.forDisk)
 		{
 			info.msg.codeLock.pv = Facepunch.Pool.Get<ProtoBuf.CodeLock.Private>();
@@ -289,16 +307,13 @@ public class CodeLock : BaseLock
 		}
 		string text = rpc.read.String();
 		bool flag = rpc.read.Bit();
-		if (IsLocked() || text.Length != 4 || !text.IsNumeric() || (!hasCode && flag))
+		if (!IsLocked() && text.Length == 4 && text.IsNumeric() && !(!hasCode && flag) && Interface.CallHook("CanChangeCode", rpc.player, this, text, flag) == null)
 		{
-			return;
-		}
-		if (!hasCode && !flag)
-		{
-			SetFlag(Flags.Locked, b: true);
-		}
-		if (Interface.CallHook("CanChangeCode", rpc.player, this, text, flag) == null)
-		{
+			if (!hasCode && !flag)
+			{
+				SetFlag(Flags.Locked, b: true);
+			}
+			Facepunch.Rust.Analytics.Azure.OnCodelockChanged(rpc.player, this, flag ? guestCode : code, text, flag);
 			if (!flag)
 			{
 				code = text;
@@ -322,18 +337,11 @@ public class CodeLock : BaseLock
 	[RPC_Server.MaxDistance(3f)]
 	private void TryUnlock(RPCMessage rpc)
 	{
-		if (rpc.player.CanInteract() && IsLocked() && Interface.CallHook("CanUnlock", rpc.player, this) == null)
+		if (rpc.player.CanInteract() && IsLocked() && Interface.CallHook("CanUnlock", rpc.player, this) == null && !IsCodeEntryBlocked() && whitelistPlayers.Contains(rpc.player.userID))
 		{
-			if (whitelistPlayers.Contains(rpc.player.userID))
-			{
-				DoEffect(effectUnlocked.resourcePath);
-				SetFlag(Flags.Locked, b: false);
-				SendNetworkUpdate();
-			}
-			else
-			{
-				ClientRPCPlayer(null, rpc.player, "EnterUnlockCode");
-			}
+			DoEffect(effectUnlocked.resourcePath);
+			SetFlag(Flags.Locked, b: false);
+			SendNetworkUpdate();
 		}
 	}
 
@@ -349,11 +357,17 @@ public class CodeLock : BaseLock
 		}
 	}
 
+	public void ClearCodeEntryBlocked()
+	{
+		SetFlag(Flags.Reserved11, b: false);
+		wrongCodes = 0;
+	}
+
 	[RPC_Server]
 	[RPC_Server.MaxDistance(3f)]
 	private void UnlockWithCode(RPCMessage rpc)
 	{
-		if (!rpc.player.CanInteract() || !IsLocked())
+		if (!rpc.player.CanInteract() || !IsLocked() || IsCodeEntryBlocked())
 		{
 			return;
 		}
@@ -366,7 +380,7 @@ public class CodeLock : BaseLock
 		bool flag2 = text == code;
 		if (!(text == code) && (!hasGuestCode || !(text == guestCode)))
 		{
-			if (UnityEngine.Time.realtimeSinceStartup > lastWrongTime + 10f)
+			if (UnityEngine.Time.realtimeSinceStartup > lastWrongTime + 60f)
 			{
 				wrongCodes = 0;
 			}
@@ -374,6 +388,15 @@ public class CodeLock : BaseLock
 			DoEffect(effectShock.resourcePath);
 			rpc.player.Hurt((float)(wrongCodes + 1) * 5f, DamageType.ElectricShock, this, useProtection: false);
 			wrongCodes++;
+			if (wrongCodes > 5)
+			{
+				rpc.player.ShowToast(GameTip.Styles.Red_Normal, blockwarning);
+			}
+			if ((float)wrongCodes >= maxFailedAttempts)
+			{
+				SetFlag(Flags.Reserved11, b: true);
+				Invoke(ClearCodeEntryBlocked, lockoutCooldown);
+			}
 			lastWrongTime = UnityEngine.Time.realtimeSinceStartup;
 			return;
 		}
@@ -384,12 +407,21 @@ public class CodeLock : BaseLock
 			{
 				DoEffect(effectCodeChanged.resourcePath);
 				whitelistPlayers.Add(rpc.player.userID);
+				wrongCodes = 0;
 			}
+			Facepunch.Rust.Analytics.Azure.OnCodeLockEntered(rpc.player, this, isGuest: false);
 		}
 		else if (flag && !guestPlayers.Contains(rpc.player.userID))
 		{
 			DoEffect(effectCodeChanged.resourcePath);
 			guestPlayers.Add(rpc.player.userID);
+			Facepunch.Rust.Analytics.Azure.OnCodeLockEntered(rpc.player, this, isGuest: true);
 		}
+	}
+
+	public override void PostServerLoad()
+	{
+		base.PostServerLoad();
+		SetFlag(Flags.Reserved11, b: false);
 	}
 }

@@ -24,6 +24,8 @@ public sealed class ByteQuadtree
 
 		public Vector2 Coords => new Vector2(x, y);
 
+		public int Depth => source.levels - level - 1;
+
 		public Element Parent
 		{
 			get

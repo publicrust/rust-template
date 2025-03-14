@@ -1,12 +1,9 @@
-using UnityStandardAssets.ImageEffects;
+using UnityEngine;
+using UnityEngine.Rendering.PostProcessing;
 
-public class RadiationOverlay : ImageEffectLayer
+public class RadiationOverlay : MonoBehaviour
 {
 	public SoundDefinition[] geigerSounds;
 
-	private Sound sound;
-
-	private ColorCorrectionCurves colourCorrection;
-
-	private NoiseAndGrain noiseAndGrain;
+	public PostProcessVolume postProcessVolume;
 }

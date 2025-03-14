@@ -43,23 +43,20 @@ public class SolarPanel : IOEntity
 		}
 		else
 		{
-			Vector3 normalized = (TOD_Sky.Instance.Components.Sun.transform.position - sunSampler.transform.position).normalized;
-			float value = Vector3.Dot(sunSampler.transform.forward, normalized);
+			Vector3 sunDirection = TOD_Sky.Instance.SunDirection;
+			float value = Vector3.Dot(sunSampler.transform.forward, sunDirection);
 			float num2 = Mathf.InverseLerp(dot_minimum, dot_maximum, value);
-			if (num2 > 0f && !IsVisible(sunSampler.transform.position + normalized * 100f, 101f))
+			if (num2 > 0f && !IsVisible(sunSampler.transform.position + sunDirection * 100f, 101f))
 			{
 				num2 = 0f;
 			}
 			num = Mathf.FloorToInt((float)maximalPowerOutput * num2 * base.healthFraction);
 		}
-		if (Interface.CallHook("OnSolarPanelSunUpdate", this, num) == null)
+		bool num3 = currentEnergy != num;
+		currentEnergy = num;
+		if (num3 && Interface.CallHook("OnSolarPanelSunUpdate", this, num) == null)
 		{
-			bool num3 = currentEnergy != num;
-			currentEnergy = num;
-			if (num3)
-			{
-				MarkDirty();
-			}
+			MarkDirty();
 		}
 	}
 

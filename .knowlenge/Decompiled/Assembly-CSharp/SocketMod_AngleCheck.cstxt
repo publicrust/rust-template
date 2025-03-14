@@ -8,6 +8,8 @@ public class SocketMod_AngleCheck : SocketMod
 
 	public float withinDegrees = 45f;
 
+	public static Translate.Phrase ErrorPhrase = new Translate.Phrase("error_anglecheck", "Invalid angle");
+
 	private void OnDrawGizmosSelected()
 	{
 		Gizmos.matrix = base.transform.localToWorldMatrix;
@@ -21,7 +23,7 @@ public class SocketMod_AngleCheck : SocketMod
 		{
 			return true;
 		}
-		Construction.lastPlacementError = "Failed Check: AngleCheck (" + hierachyName + ")";
+		Construction.lastPlacementError = ErrorPhrase.translated;
 		return false;
 	}
 }

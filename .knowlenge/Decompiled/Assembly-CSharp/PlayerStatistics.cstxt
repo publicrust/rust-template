@@ -1,3 +1,5 @@
+using ConVar;
+
 public class PlayerStatistics
 {
 	public SteamStatistics steam;
@@ -7,6 +9,8 @@ public class PlayerStatistics
 	public CombatLog combat;
 
 	public BasePlayer forPlayer;
+
+	private TimeSince lastSteamSave;
 
 	public PlayerStatistics(BasePlayer player)
 	{
@@ -23,9 +27,13 @@ public class PlayerStatistics
 		combat.Init();
 	}
 
-	public void Save()
+	public void Save(bool forceSteamSave = false)
 	{
-		steam.Save();
+		if (Server.official && (forceSteamSave || (float)lastSteamSave > 60f))
+		{
+			lastSteamSave = 0f;
+			steam.Save();
+		}
 		server.Save();
 		combat.Save();
 	}

@@ -8,11 +8,11 @@ public class AStarNode
 
 	public float H;
 
-	public BasePathNode Node;
+	public IAIPathNode Node;
 
 	public float F => G + H;
 
-	public AStarNode(float g, float h, AStarNode parent, BasePathNode node)
+	public AStarNode(float g, float h, AStarNode parent, IAIPathNode node)
 	{
 		G = g;
 		H = h;
@@ -20,7 +20,7 @@ public class AStarNode
 		Node = node;
 	}
 
-	public void Update(float g, float h, AStarNode parent, BasePathNode node)
+	public void Update(float g, float h, AStarNode parent, IAIPathNode node)
 	{
 		G = g;
 		H = h;
@@ -28,7 +28,7 @@ public class AStarNode
 		Node = node;
 	}
 
-	public bool Satisfies(BasePathNode node)
+	public bool Satisfies(IAIPathNode node)
 	{
 		return Node == node;
 	}

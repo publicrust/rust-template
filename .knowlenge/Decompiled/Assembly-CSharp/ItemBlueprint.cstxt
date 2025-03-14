@@ -14,6 +14,8 @@ public class ItemBlueprint : MonoBehaviour
 
 	public bool isResearchable = true;
 
+	public bool forceShowInConveyorFilter;
+
 	public Rarity rarity;
 
 	[Header("Workbench")]

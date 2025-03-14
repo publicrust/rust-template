@@ -11,9 +11,9 @@ public class EventSchedule : BaseMonoBehaviour
 	[Tooltip("The maximum amount of hours between events")]
 	public float maxmumHoursBetween = 24f;
 
-	private float hoursRemaining;
+	public float hoursRemaining;
 
-	private long lastRun;
+	public long lastRun;
 
 	private void OnEnable()
 	{
@@ -29,7 +29,7 @@ public class EventSchedule : BaseMonoBehaviour
 		}
 	}
 
-	private void RunSchedule()
+	public virtual void RunSchedule()
 	{
 		if (!Rust.Application.isLoading && ConVar.Server.events)
 		{

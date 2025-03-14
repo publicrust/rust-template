@@ -1,4 +1,5 @@
 using System;
+using UnityEngine;
 
 public class ElectricalDFlipFlop : IOEntity
 {
@@ -90,13 +91,14 @@ public class ElectricalDFlipFlop : IOEntity
 	{
 		if (ShouldUpdateOutputs() && ensureOutputsUpdated)
 		{
+			int num = Mathf.Max(0, currentEnergy - 1);
 			if (outputs[0].connectedTo.Get() != null)
 			{
-				outputs[0].connectedTo.Get().UpdateFromInput(IsOn() ? currentEnergy : 0, outputs[0].connectedToSlot);
+				outputs[0].connectedTo.Get().UpdateFromInput(IsOn() ? num : 0, outputs[0].connectedToSlot);
 			}
 			if (outputs[1].connectedTo.Get() != null)
 			{
-				outputs[1].connectedTo.Get().UpdateFromInput((!IsOn()) ? currentEnergy : 0, outputs[1].connectedToSlot);
+				outputs[1].connectedTo.Get().UpdateFromInput((!IsOn()) ? num : 0, outputs[1].connectedToSlot);
 			}
 		}
 	}

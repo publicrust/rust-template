@@ -16,6 +16,8 @@ public class CameraEx : MonoBehaviour
 
 	public float ambientIntensity;
 
+	public ReflectionProbe reflectionProbe;
+
 	internal Color old_ambientLight;
 
 	internal Color old_ambientGroundColor;

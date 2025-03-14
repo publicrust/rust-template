@@ -9,38 +9,34 @@ public class TerrainWaterMap : TerrainMap<short>
 
 	public override void Setup()
 	{
-		if (WaterTexture != null)
+		res = terrain.terrainData.heightmapResolution;
+		src = (dst = new short[res * res]);
+		normY = TerrainMeta.Size.x / TerrainMeta.Size.y / (float)res;
+		if (!(WaterTexture != null))
 		{
-			if (WaterTexture.width == WaterTexture.height)
+			return;
+		}
+		if (WaterTexture.width == WaterTexture.height && WaterTexture.width == res)
+		{
+			Color32[] pixels = WaterTexture.GetPixels32();
+			int i = 0;
+			int num = 0;
+			for (; i < res; i++)
 			{
-				res = WaterTexture.width;
-				src = (dst = new short[res * res]);
-				Color32[] pixels = WaterTexture.GetPixels32();
-				int i = 0;
-				int num = 0;
-				for (; i < res; i++)
+				int num2 = 0;
+				while (num2 < res)
 				{
-					int num2 = 0;
-					while (num2 < res)
-					{
-						Color32 c = pixels[num];
-						dst[i * res + num2] = BitUtility.DecodeShort(c);
-						num2++;
-						num++;
-					}
+					Color32 c = pixels[num];
+					dst[i * res + num2] = BitUtility.DecodeShort(c);
+					num2++;
+					num++;
 				}
-			}
-			else
-			{
-				Debug.LogError("Invalid water texture: " + WaterTexture.name);
 			}
 		}
 		else
 		{
-			res = terrain.terrainData.heightmapResolution;
-			src = (dst = new short[res * res]);
+			Debug.LogError("Invalid water texture: " + WaterTexture.name);
 		}
-		normY = TerrainMeta.Size.x / TerrainMeta.Size.y / (float)res;
 	}
 
 	public void GenerateTextures()

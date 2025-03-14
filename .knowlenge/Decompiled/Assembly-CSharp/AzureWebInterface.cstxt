@@ -1,0 +1,233 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Threading.Tasks;
+using Network;
+using UnityEngine;
+
+public class AzureWebInterface
+{
+	public static readonly AzureWebInterface client = new AzureWebInterface(isClient: true);
+
+	public static readonly AzureWebInterface server = new AzureWebInterface(isClient: false);
+
+	public bool IsClient;
+
+	public int MaxRetries = 1;
+
+	public int FlushSize = 1000;
+
+	public TimeSpan FlushDelay = TimeSpan.FromSeconds(30.0);
+
+	private DateTime nextFlush;
+
+	private List<EventRecord> pending = new List<EventRecord>();
+
+	private HttpClient HttpClient = new HttpClient();
+
+	private static readonly MediaTypeHeaderValue JsonContentType = new MediaTypeHeaderValue("application/json")
+	{
+		CharSet = Encoding.UTF8.WebName
+	};
+
+	public int PendingCount => pending.Count;
+
+	public AzureWebInterface(bool isClient)
+	{
+		IsClient = isClient;
+	}
+
+	public void EnqueueEvent(EventRecord point)
+	{
+		DateTime utcNow = DateTime.UtcNow;
+		pending.Add(point);
+		if (pending.Count > FlushSize || utcNow > nextFlush)
+		{
+			nextFlush = utcNow.Add(FlushDelay);
+			List<EventRecord> toUpload = pending;
+			Task.Run(async delegate
+			{
+				await UploadAsync(toUpload);
+			});
+			pending = Pool.GetList<EventRecord>();
+		}
+	}
+
+	private void SerializeEvents(List<EventRecord> records, MemoryStream stream)
+	{
+		int num = 0;
+		using StreamWriter streamWriter = new StreamWriter(stream, Encoding.UTF8, 1024, leaveOpen: true);
+		streamWriter.Write("[");
+		foreach (EventRecord record in records)
+		{
+			SerializeEvent(record, streamWriter, num);
+			num++;
+		}
+		streamWriter.Write("]");
+		streamWriter.Flush();
+	}
+
+	private void SerializeEvent(EventRecord record, StreamWriter writer, int index)
+	{
+		if (index > 0)
+		{
+			writer.Write(',');
+		}
+		writer.Write("{\"Timestamp\":\"");
+		writer.Write(record.Timestamp.ToString("o"));
+		writer.Write("\",\"Data\":{");
+		bool flag = true;
+		foreach (EventRecordField datum in record.Data)
+		{
+			if (flag)
+			{
+				flag = false;
+			}
+			else
+			{
+				writer.Write(',');
+			}
+			writer.Write("\"");
+			writer.Write(datum.Key1);
+			if (datum.Key2 != null)
+			{
+				writer.Write(datum.Key2);
+			}
+			writer.Write("\":");
+			if (!datum.IsObject)
+			{
+				writer.Write('"');
+			}
+			if (datum.String != null)
+			{
+				if (datum.IsObject)
+				{
+					writer.Write(datum.String);
+				}
+				else
+				{
+					string @string = datum.String;
+					int length = datum.String.Length;
+					for (int i = 0; i < length; i++)
+					{
+						char c = @string[i];
+						switch (c)
+						{
+						case '"':
+						case '\\':
+							writer.Write('\\');
+							writer.Write(c);
+							break;
+						case '\n':
+							writer.Write("\\n");
+							break;
+						case '\r':
+							writer.Write("\\r");
+							break;
+						case '\t':
+							writer.Write("\\t");
+							break;
+						default:
+							writer.Write(c);
+							break;
+						}
+					}
+				}
+			}
+			else if (datum.Float.HasValue)
+			{
+				writer.Write(datum.Float.Value);
+			}
+			else if (datum.Number.HasValue)
+			{
+				writer.Write(datum.Number.Value);
+			}
+			else if (datum.Guid.HasValue)
+			{
+				writer.Write(datum.Guid.Value.ToString("N"));
+			}
+			else if (datum.Vector.HasValue)
+			{
+				writer.Write('(');
+				Vector3 value = datum.Vector.Value;
+				writer.Write(value.x);
+				writer.Write(',');
+				writer.Write(value.y);
+				writer.Write(',');
+				writer.Write(value.z);
+				writer.Write(')');
+			}
+			if (!datum.IsObject)
+			{
+				writer.Write("\"");
+			}
+		}
+		writer.Write('}');
+		writer.Write('}');
+	}
+
+	private async Task UploadAsync(List<EventRecord> records)
+	{
+		MemoryStream stream = Pool.Get<MemoryStream>();
+		stream.Position = 0L;
+		stream.SetLength(0L);
+		try
+		{
+			SerializeEvents(records, stream);
+			for (int attempt = 0; attempt < MaxRetries; attempt++)
+			{
+				try
+				{
+					using ByteArrayContent content = new ByteArrayContent(stream.GetBuffer(), 0, (int)stream.Length);
+					content.Headers.ContentType = JsonContentType;
+					if (!string.IsNullOrEmpty(AnalyticsSecret))
+					{
+						content.Headers.Add(AnalyticsHeader, AnalyticsSecret);
+					}
+					else
+					{
+						content.Headers.Add(AnalyticsHeader, AnalyticsPublicKey);
+					}
+					if (!IsClient)
+					{
+						content.Headers.Add("X-SERVER-IP", Net.sv.ip);
+						content.Headers.Add("X-SERVER-PORT", Net.sv.port.ToString());
+					}
+					(await HttpClient.PostAsync(IsClient ? ClientAnalyticsUrl : ServerAnalyticsUrl, content)).EnsureSuccessStatusCode();
+					break;
+				}
+				catch (Exception ex)
+				{
+					if (!(ex is HttpRequestException))
+					{
+						Debug.LogException(ex);
+					}
+				}
+			}
+		}
+		catch (Exception ex2)
+		{
+			if (IsClient)
+			{
+				Debug.LogWarning(ex2.ToString());
+			}
+			else
+			{
+				Debug.LogException(ex2);
+			}
+		}
+		finally
+		{
+			foreach (EventRecord record in records)
+			{
+				EventRecord obj = record;
+				Pool.Free(ref obj);
+			}
+			Pool.FreeList(ref records);
+			Pool.FreeMemoryStream(ref stream);
+		}
+	}
+}

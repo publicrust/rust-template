@@ -6,6 +6,12 @@ public abstract class BaseScreenShake : MonoBehaviour
 {
 	public static List<BaseScreenShake> list = new List<BaseScreenShake>();
 
+	internal static float punchFadeScale = 0f;
+
+	internal static float bobScale = 0f;
+
+	internal static float animPunchMagnitude = 10f;
+
 	public float length = 2f;
 
 	internal float timeTaken;

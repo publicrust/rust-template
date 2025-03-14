@@ -14,6 +14,8 @@ public class TeamMemberElement : MonoBehaviour
 
 	public Color deadColor;
 
+	public Color woundedColor;
+
 	public GameObject hoverOverlay;
 
 	public RawImage memberIcon;
@@ -21,6 +23,8 @@ public class TeamMemberElement : MonoBehaviour
 	public RawImage leaderIcon;
 
 	public RawImage deadIcon;
+
+	public RawImage woundedIcon;
 
 	public int teamIndex;
 }

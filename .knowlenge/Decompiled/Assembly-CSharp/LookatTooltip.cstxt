@@ -17,4 +17,6 @@ public class LookatTooltip : MonoBehaviour
 	public CanvasGroup canvasGroup;
 
 	public CanvasGroup infoGroup;
+
+	public CanvasGroup minimiseGroup;
 }

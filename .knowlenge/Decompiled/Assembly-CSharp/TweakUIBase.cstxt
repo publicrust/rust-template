@@ -20,6 +20,10 @@ public class TweakUIBase : MonoBehaviour
 		{
 			Debug.LogWarning("TweakUI Convar Missing: " + convarName, base.gameObject);
 		}
+		else
+		{
+			conVar.OnValueChanged += OnConVarChanged;
+		}
 	}
 
 	public virtual void OnApplyClicked()
@@ -38,11 +42,24 @@ public class TweakUIBase : MonoBehaviour
 		}
 	}
 
+	protected virtual void OnConVarChanged(ConsoleSystem.Command obj)
+	{
+		ResetToConvar();
+	}
+
 	public virtual void ResetToConvar()
 	{
 	}
 
 	protected virtual void SetConvarValue()
 	{
+	}
+
+	private void OnDestroy()
+	{
+		if (conVar != null)
+		{
+			conVar.OnValueChanged -= OnConVarChanged;
+		}
 	}
 }

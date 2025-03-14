@@ -35,6 +35,10 @@ public class MeshData
 		{
 			normals = Facepunch.Pool.GetList<Vector3>();
 		}
+		if (tangents == null)
+		{
+			tangents = Facepunch.Pool.GetList<Vector4>();
+		}
 		if (uv == null)
 		{
 			uv = Facepunch.Pool.GetList<Vector2>();

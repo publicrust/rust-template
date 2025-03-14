@@ -34,7 +34,8 @@ public static class SteamNewsSource
 		List<Story> list = new List<Story>();
 		foreach (Value item in array)
 		{
-			string @string = item.Obj.GetString("contents", "Missing URL");
+			string @string = item.Obj.GetString("contents", "Missing Contents");
+			@string = @string.Replace("\\n", "\n").Replace("\\r", "").Replace("\\\"", "\"");
 			list.Add(new Story
 			{
 				name = item.Obj.GetString("title", "Missing Title"),

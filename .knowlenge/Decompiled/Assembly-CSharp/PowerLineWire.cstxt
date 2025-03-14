@@ -106,7 +106,10 @@ public class PowerLineWire : MonoBehaviour
 				PowerLineWireConnectionHelper component2 = powerLineWireSpan.end.GetComponent<PowerLineWireConnectionHelper>();
 				powerLineWireConnection.inOffset = component2.connections[j].inOffset;
 				powerLineWireConnection.outOffset = component.connections[j].outOffset;
-				powerLineWireSpan.connections.Add(powerLineWireConnection);
+				if (!component.connections[j].hidden && !component2.connections[j].hidden)
+				{
+					powerLineWireSpan.connections.Add(powerLineWireConnection);
+				}
 			}
 			powerLineWireSpan.Init(this);
 		}

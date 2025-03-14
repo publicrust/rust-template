@@ -25,6 +25,4 @@ public class LaserBeam : MonoBehaviour
 	public bool isFirstPerson;
 
 	public Transform emissionOverride;
-
-	private MaterialPropertyBlock block;
 }

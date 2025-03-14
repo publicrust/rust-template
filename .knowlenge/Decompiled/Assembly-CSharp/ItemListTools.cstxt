@@ -22,6 +22,12 @@ public class ItemListTools : MonoBehaviour
 	{
 		CacheAllItems();
 		Refresh();
+		searchInputText.InputField.ActivateInputField();
+	}
+
+	private void OnOpenDevTools()
+	{
+		searchInputText.InputField.ActivateInputField();
 	}
 
 	private void CacheAllItems()
@@ -89,6 +95,10 @@ public class ItemListTools : MonoBehaviour
 
 	public void FilterItems(string searchText)
 	{
+		if (itemButton == null)
+		{
+			return;
+		}
 		for (int i = 0; i < itemButton.transform.parent.childCount; i++)
 		{
 			Transform child = itemButton.transform.parent.GetChild(i);

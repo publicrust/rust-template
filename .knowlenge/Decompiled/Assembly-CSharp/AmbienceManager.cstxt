@@ -30,4 +30,6 @@ public class AmbienceManager : SingletonComponent<AmbienceManager>, IClientCompo
 	public float localEmitterRange = 30f;
 
 	public List<AmbienceZone> currentAmbienceZones = new List<AmbienceZone>();
+
+	public bool isUnderwater;
 }

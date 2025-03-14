@@ -78,7 +78,7 @@ public class DevMovePlayer : BaseMonoBehaviour
 			destination = Waypoints[waypointIndex].position;
 			Vector3 normalized = (destination - base.transform.position).normalized;
 			float running = Mathf.Sin(Time.time + randRun);
-			float speed = player.GetSpeed(running, 0f);
+			float speed = player.GetSpeed(running, 0f, 0f);
 			Vector3 position = base.transform.position;
 			float range = 1f;
 			LayerMask mask = 1537286401;

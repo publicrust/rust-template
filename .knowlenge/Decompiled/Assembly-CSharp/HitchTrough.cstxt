@@ -35,17 +35,6 @@ public class HitchTrough : StorageContainer
 
 	public float caloriesToDecaySeconds = 36f;
 
-	public float decayDelayThinkMinutes = 1f;
-
-	[NonSerialized]
-	public float cachedCalories;
-
-	public override void ServerInit()
-	{
-		base.ServerInit();
-		InvokeRandomized(DelayAnimalDecay, decayDelayThinkMinutes * 60f, decayDelayThinkMinutes * 60f, decayDelayThinkMinutes);
-	}
-
 	public Item GetFoodItem()
 	{
 		foreach (Item item in base.inventory.itemList)
@@ -56,11 +45,6 @@ public class HitchTrough : StorageContainer
 			}
 		}
 		return null;
-	}
-
-	public bool HasFood()
-	{
-		return GetFoodItem() != null;
 	}
 
 	public bool ValidHitchPosition(Vector3 pos)
@@ -151,61 +135,11 @@ public class HitchTrough : StorageContainer
 			}
 			hitch.SetOccupiedBy(horse);
 			horse.SetHitch(this);
-			horse.transform.rotation = hitch.spot.transform.rotation;
-			horse.transform.position = hitch.spot.transform.position;
+			horse.transform.SetPositionAndRotation(hitch.spot.position, hitch.spot.rotation);
 			horse.DismountAllPlayers();
 			return true;
 		}
 		return false;
-	}
-
-	public void EnableDisableAnimalDecay()
-	{
-	}
-
-	public void DelayAnimalDecay()
-	{
-		if (NumHitched() == 0)
-		{
-			return;
-		}
-		if (cachedCalories <= 0f)
-		{
-			Item foodItem = GetFoodItem();
-			if (foodItem == null)
-			{
-				return;
-			}
-			float ifType = foodItem.info.GetComponent<ItemModConsumable>().GetIfType(MetabolismAttribute.Type.Calories);
-			if (ifType > 0f)
-			{
-				cachedCalories += ifType;
-				foodItem.UseItem();
-			}
-		}
-		if (cachedCalories == 0f)
-		{
-			return;
-		}
-		float num = Mathf.Min(decayDelayThinkMinutes * 60f / caloriesToDecaySeconds, cachedCalories);
-		cachedCalories -= num;
-		float amount = num * caloriesToDecaySeconds;
-		bool flag = false;
-		HitchSpot[] array = hitchSpots;
-		for (int i = 0; i < array.Length; i++)
-		{
-			RidableHorse horse = array[i].GetHorse();
-			if (horse != null)
-			{
-				horse.AddDecayDelay(amount);
-				horse.ApplyDungCalories(num);
-				if (!flag && UnityEngine.Random.Range(0, 2) == 0)
-				{
-					flag = true;
-					horse.DoEatEvent();
-				}
-			}
-		}
 	}
 
 	public override void Save(SaveInfo info)

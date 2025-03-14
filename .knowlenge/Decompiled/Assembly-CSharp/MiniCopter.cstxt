@@ -3,24 +3,19 @@ using System;
 using ConVar;
 using Facepunch;
 using Network;
-using Oxide.Core;
 using ProtoBuf;
 using Rust;
 using UnityEngine;
 using UnityEngine.Assertions;
 
-public class MiniCopter : BaseHelicopterVehicle
+public class MiniCopter : BaseHelicopterVehicle, IEngineControllerUser, IEntity, SamSite.ISamSiteTarget
 {
 	[Header("Fuel")]
 	public GameObjectRef fuelStoragePrefab;
 
-	public Transform fuelStoragePoint;
-
 	public float fuelPerSec = 0.25f;
 
 	public float fuelGaugeMax = 100f;
-
-	public EntityFuelSystem fuelSystem;
 
 	public float cachedFuelFraction;
 
@@ -57,8 +52,6 @@ public class MiniCopter : BaseHelicopterVehicle
 
 	public Animator animator;
 
-	public const Flags Flag_EngineStart = Flags.Reserved4;
-
 	public float maxRotorSpeed = 10f;
 
 	public float timeUntilMaxRotorSpeed = 7f;
@@ -79,18 +72,20 @@ public class MiniCopter : BaseHelicopterVehicle
 
 	public GameObject preventBuildingObject;
 
-	[ServerVar(Help = "Population active on the server")]
+	[ServerVar(Help = "Population active on the server", ShowInAdminUI = true)]
 	public static float population = 0f;
 
-	[ServerVar(Help = "How long before a minicopter is killed while outside")]
+	[ServerVar(Help = "How long before a minicopter loses all its health while outside")]
 	public static float outsidedecayminutes = 480f;
 
-	[ServerVar(Help = "How long before a minicopter is killed while indoors")]
+	[ServerVar(Help = "How long before a minicopter loses all its health while indoors")]
 	public static float insidedecayminutes = 2880f;
+
+	public VehicleEngineController<MiniCopter> engineController;
 
 	public bool isPushing;
 
-	public float lastEngineTime;
+	public float lastEngineOnTime;
 
 	public float cachedPitch;
 
@@ -98,18 +93,58 @@ public class MiniCopter : BaseHelicopterVehicle
 
 	public float cachedRoll;
 
+	public bool IsStartingUp
+	{
+		get
+		{
+			if (engineController != null)
+			{
+				return engineController.IsStarting;
+			}
+			return false;
+		}
+	}
+
+	public VehicleEngineController<MiniCopter>.EngineState CurEngineState
+	{
+		get
+		{
+			if (engineController == null)
+			{
+				return VehicleEngineController<MiniCopter>.EngineState.Off;
+			}
+			return engineController.CurEngineState;
+		}
+	}
+
+	public SamSite.SamTargetType SAMTargetType => SamSite.targetTypeVehicle;
+
 	public float GetFuelFraction()
 	{
 		if (base.isServer)
 		{
-			cachedFuelFraction = Mathf.Clamp01((float)fuelSystem.GetFuelAmount() / fuelGaugeMax);
+			cachedFuelFraction = Mathf.Clamp01((float)GetFuelSystem().GetFuelAmount() / fuelGaugeMax);
 		}
 		return cachedFuelFraction;
 	}
 
 	public override EntityFuelSystem GetFuelSystem()
 	{
-		return fuelSystem;
+		return engineController.FuelSystem;
+	}
+
+	public override int StartingFuelUnits()
+	{
+		return 100;
+	}
+
+	protected override void OnChildAdded(BaseEntity child)
+	{
+		base.OnChildAdded(child);
+		if (base.isServer && isSpawned)
+		{
+			GetFuelSystem().CheckNewChild(child);
+		}
 	}
 
 	[RPC_Server]
@@ -122,19 +157,14 @@ public class MiniCopter : BaseHelicopterVehicle
 			BasePlayer driver = GetDriver();
 			if ((!(driver != null) || !(driver != player)) && (!IsSafe() || !(player != creatorEntity)))
 			{
-				fuelSystem.LootFuel(player);
+				engineController.FuelSystem.LootFuel(player);
 			}
 		}
 	}
 
-	public bool IsStartingUp()
-	{
-		return HasFlag(Flags.Reserved4);
-	}
-
 	public override void InitShared()
 	{
-		fuelSystem = new EntityFuelSystem(this, base.isServer);
+		engineController = new VehicleEngineController<MiniCopter>(this, base.isServer, 5f, fuelStoragePrefab, waterSample, Flags.Reserved4);
 	}
 
 	public override float GetServiceCeiling()
@@ -142,12 +172,21 @@ public class MiniCopter : BaseHelicopterVehicle
 		return HotAirBalloon.serviceCeiling;
 	}
 
+	public bool IsValidSAMTarget(bool staticRespawn)
+	{
+		if (staticRespawn)
+		{
+			return true;
+		}
+		return !InSafeZone();
+	}
+
 	public override void PilotInput(InputState inputState, BasePlayer player)
 	{
 		base.PilotInput(inputState, player);
-		if (!IsOn() && !IsStartingUp() && HasDriver() && inputState.IsDown(BUTTON.FORWARD) && fuelSystem.HasFuel())
+		if (!IsOn() && !IsStartingUp && inputState.IsDown(BUTTON.FORWARD) && !inputState.WasDown(BUTTON.FORWARD))
 		{
-			EngineStartup();
+			engineController.TryStartEngine(player);
 		}
 		currentInputState.groundControl = inputState.IsDown(BUTTON.DUCK);
 		if (currentInputState.groundControl)
@@ -180,7 +219,7 @@ public class MiniCopter : BaseHelicopterVehicle
 		{
 			return;
 		}
-		if (IsMounted())
+		if (HasDriver())
 		{
 			float num = Vector3.Dot(Vector3.up, base.transform.right);
 			float num2 = Vector3.Dot(Vector3.up, base.transform.forward);
@@ -267,36 +306,10 @@ public class MiniCopter : BaseHelicopterVehicle
 		}
 	}
 
-	public void EngineStartup()
-	{
-		if (!Waterlogged() && Interface.CallHook("OnEngineStart", this, GetDriver()) == null)
-		{
-			Invoke(EngineOn, 5f);
-			SetFlag(Flags.Reserved4, b: true);
-		}
-	}
-
-	public void EngineOn()
-	{
-		SetFlag(Flags.On, b: true);
-		SetFlag(Flags.Reserved4, b: false);
-		Interface.CallHook("OnEngineStarted", this, GetDriver());
-	}
-
-	public void EngineOff()
-	{
-		if (IsOn() || IsStartingUp())
-		{
-			CancelInvoke(EngineOn);
-			SetFlag(Flags.On, b: false);
-			SetFlag(Flags.Reserved4, b: false);
-			lastEngineTime = UnityEngine.Time.time;
-		}
-	}
-
 	public override void ServerInit()
 	{
 		base.ServerInit();
+		lastEngineOnTime = UnityEngine.Time.realtimeSinceStartup;
 		rigidBody.inertiaTensor = rigidBody.inertiaTensor;
 		preventBuildingObject.SetActive(value: true);
 		InvokeRandomized(UpdateNetwork, 0f, 0.2f, 0.05f);
@@ -305,22 +318,11 @@ public class MiniCopter : BaseHelicopterVehicle
 
 	public void DecayTick()
 	{
-		if (base.healthFraction != 0f && !IsOn() && !(UnityEngine.Time.time < lastEngineTime + 600f))
+		if (base.healthFraction != 0f && !IsOn() && !(UnityEngine.Time.time < lastEngineOnTime + 600f))
 		{
 			float num = 1f / (IsOutside() ? outsidedecayminutes : insidedecayminutes);
 			Hurt(MaxHealth() * num, DamageType.Decay, this, useProtection: false);
 		}
-	}
-
-	public override void SpawnSubEntities()
-	{
-		base.SpawnSubEntities();
-		fuelSystem.SpawnFuelStorage(fuelStoragePrefab, fuelStoragePoint);
-	}
-
-	public bool Waterlogged()
-	{
-		return WaterLevel.Test(waterSample.transform.position, waves: true, this);
 	}
 
 	public override bool ShouldApplyHoverForce()
@@ -333,27 +335,37 @@ public class MiniCopter : BaseHelicopterVehicle
 		return IsOn();
 	}
 
+	public bool MeetsEngineRequirements()
+	{
+		if (engineController.IsOff)
+		{
+			return HasDriver();
+		}
+		if (!HasDriver())
+		{
+			return UnityEngine.Time.time <= lastPlayerInputTime + 1f;
+		}
+		return true;
+	}
+
+	public void OnEngineStartFailed()
+	{
+	}
+
+	public override void OnFlagsChanged(Flags old, Flags next)
+	{
+		base.OnFlagsChanged(old, next);
+		if (base.isServer && CurEngineState == VehicleEngineController<MiniCopter>.EngineState.Off)
+		{
+			lastEngineOnTime = UnityEngine.Time.time;
+		}
+	}
+
 	public override void VehicleFixedUpdate()
 	{
 		base.VehicleFixedUpdate();
-		if (isSpawned)
-		{
-			if ((IsOn() || IsStartingUp()) && ((UnityEngine.Time.time > lastPlayerInputTime + 1f && !HasDriver()) || !fuelSystem.HasFuel() || Waterlogged()))
-			{
-				EngineOff();
-			}
-			if (IsOn())
-			{
-				fuelSystem.TryUseFuel(UnityEngine.Time.fixedDeltaTime, fuelPerSec);
-			}
-			if (!HasDriver())
-			{
-				_ = currentInputState.throttle <= 0f;
-			}
-			else
-				_ = 0;
-			_ = leftWheel.forwardFriction;
-		}
+		engineController.CheckEngineState();
+		engineController.TickFuel(fuelPerSec);
 	}
 
 	public void UpdateNetwork()
@@ -381,7 +393,7 @@ public class MiniCopter : BaseHelicopterVehicle
 	{
 		base.Save(info);
 		info.msg.miniCopter = Facepunch.Pool.Get<Minicopter>();
-		info.msg.miniCopter.fuelStorageID = fuelSystem.fuelStorageInstance.uid;
+		info.msg.miniCopter.fuelStorageID = engineController.FuelSystem.fuelStorageInstance.uid;
 		info.msg.miniCopter.fuelFraction = GetFuelFraction();
 		info.msg.miniCopter.pitch = currentInputState.pitch;
 		info.msg.miniCopter.roll = currentInputState.roll;
@@ -405,8 +417,6 @@ public class MiniCopter : BaseHelicopterVehicle
 
 	public override void DoPushAction(BasePlayer player)
 	{
-		player.metabolism.calories.Subtract(3f);
-		player.metabolism.SendChangesToClient();
 		Vector3 vector = Vector3Ex.Direction2D(player.transform.position, base.transform.position);
 		Vector3 vector2 = player.eyes.BodyForward();
 		vector2.y = 0.25f;
@@ -414,10 +424,6 @@ public class MiniCopter : BaseHelicopterVehicle
 		float num = rigidBody.mass * 2f;
 		rigidBody.AddForceAtPosition(vector2 * num, position, ForceMode.Impulse);
 		rigidBody.AddForce(Vector3.up * 3f, ForceMode.Impulse);
-		if (rigidBody.IsSleeping())
-		{
-			rigidBody.WakeUp();
-		}
 		isPushing = true;
 		Invoke(DisablePushing, 0.5f);
 	}
@@ -437,7 +443,7 @@ public class MiniCopter : BaseHelicopterVehicle
 		base.Load(info);
 		if (info.msg.miniCopter != null)
 		{
-			fuelSystem.fuelStorageInstance.uid = info.msg.miniCopter.fuelStorageID;
+			engineController.FuelSystem.fuelStorageInstance.uid = info.msg.miniCopter.fuelStorageID;
 			cachedFuelFraction = info.msg.miniCopter.fuelFraction;
 			cachedPitch = RemapValue(info.msg.miniCopter.pitch, 0.5f);
 			cachedRoll = RemapValue(info.msg.miniCopter.roll, 0.2f);
@@ -445,12 +451,22 @@ public class MiniCopter : BaseHelicopterVehicle
 		}
 	}
 
-	protected override bool CanPushNow(BasePlayer pusher)
+	public override bool CanPushNow(BasePlayer pusher)
 	{
-		if (base.CanPushNow(pusher))
+		if (base.CanPushNow(pusher) && pusher.IsOnGround())
 		{
-			return pusher.IsOnGround();
+			return !pusher.isMounted;
 		}
+		return false;
+	}
+
+	public override float InheritedVelocityScale()
+	{
+		return 1f;
+	}
+
+	public override bool InheritedVelocityDirection()
+	{
 		return false;
 	}
 
@@ -496,5 +512,15 @@ public class MiniCopter : BaseHelicopterVehicle
 			}
 		}
 		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	void IEngineControllerUser.Invoke(Action action, float time)
+	{
+		Invoke(action, time);
+	}
+
+	void IEngineControllerUser.CancelInvoke(Action action)
+	{
+		CancelInvoke(action);
 	}
 }

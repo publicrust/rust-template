@@ -1,6 +1,6 @@
 using UnityEngine;
 
-public class UI_LocalVoice : SingletonComponent<UI_LocalVoice>
+public class UI_LocalVoice : PriorityListComponent<UI_LocalVoice>
 {
 	public CanvasGroup voiceCanvas;
 

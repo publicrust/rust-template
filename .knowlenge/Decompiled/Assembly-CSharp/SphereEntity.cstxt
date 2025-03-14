@@ -36,12 +36,12 @@ public class SphereEntity : BaseEntity
 		lerpSpeed = speed;
 	}
 
-	protected void UpdateScale()
+	public void UpdateScale()
 	{
 		base.transform.localScale = new Vector3(currentRadius, currentRadius, currentRadius);
 	}
 
-	protected void Update()
+	public void Update()
 	{
 		if (currentRadius != lerpRadius && base.isServer)
 		{

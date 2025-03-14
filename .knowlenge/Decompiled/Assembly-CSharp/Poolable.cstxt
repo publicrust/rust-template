@@ -69,7 +69,7 @@ public class Poolable : MonoBehaviour, IClientComponent, IPrefabPostProcess
 			{
 				return 100;
 			}
-			return 10;
+			return 1;
 		}
 	}
 

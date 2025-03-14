@@ -6,7 +6,7 @@ public class EntityComponent<T> : EntityComponentBase where T : BaseEntity
 	[NonSerialized]
 	public T _baseEntity;
 
-	protected T baseEntity
+	public T baseEntity
 	{
 		get
 		{

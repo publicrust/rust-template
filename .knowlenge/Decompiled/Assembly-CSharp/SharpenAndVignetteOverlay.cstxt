@@ -1,4 +1,7 @@
-public class SharpenAndVignetteOverlay : ImageEffectLayer
+using UnityEngine;
+using UnityEngine.Rendering.PostProcessing;
+
+public class SharpenAndVignetteOverlay : MonoBehaviour
 {
-	public CC_SharpenAndVignette sharpenAndVignette;
+	public PostProcessVolume postProcessVolume;
 }

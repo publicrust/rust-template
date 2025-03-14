@@ -7,7 +7,7 @@ public class MenuTip : MonoBehaviour
 
 	public LoadingScreen screen;
 
-	public static Translate.Phrase[] MenuTips = new Translate.Phrase[32]
+	public static Translate.Phrase[] MenuTips = new Translate.Phrase[33]
 	{
 		new TokenisedPhrase("menutip_bag", "Don't forget to create a sleeping bag! You can pick which one to respawn at on the death screen."),
 		new TokenisedPhrase("menutip_baggive", "You can give a sleeping bag to a steam friend."),
@@ -40,7 +40,8 @@ public class MenuTip : MonoBehaviour
 		new TokenisedPhrase("menutip_thirdsplit", "You can split stacks of items into a third by holding Shift and [Middle Mouse] dragging"),
 		new TokenisedPhrase("menutip_removeitemquickcraft", "You can cancel crafting an item by right clicking the item in the quick craft menu"),
 		new TokenisedPhrase("menutip_quickcraftmulti", "[Middle Mouse] an item in quick craft menu will add 5x to your crafting queue"),
-		new TokenisedPhrase("menutip_inputsplit", "You can split items by the exact amount by right clicking the split bar")
+		new TokenisedPhrase("menutip_inputsplit", "You can split items by the exact amount by right clicking the split bar"),
+		new TokenisedPhrase("menutip_gestures", "Cheer on your friends by pressing [+gestures] to open the gesture menu")
 	};
 
 	private int currentTipIndex;

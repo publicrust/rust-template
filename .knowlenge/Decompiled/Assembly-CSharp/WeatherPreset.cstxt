@@ -198,6 +198,29 @@ public class WeatherPreset : ScriptableObject
 		Max(ref Clouds.Brightness, other.Clouds.Brightness);
 	}
 
+	public void Min(WeatherPreset other)
+	{
+		Min(ref Wind, other.Wind);
+		Min(ref Rain, other.Rain);
+		Min(ref Thunder, other.Thunder);
+		Min(ref Rainbow, other.Rainbow);
+		Min(ref Atmosphere.RayleighMultiplier, other.Atmosphere.RayleighMultiplier);
+		Min(ref Atmosphere.MieMultiplier, other.Atmosphere.MieMultiplier);
+		Min(ref Atmosphere.Brightness, other.Atmosphere.Brightness);
+		Min(ref Atmosphere.Contrast, other.Atmosphere.Contrast);
+		Min(ref Atmosphere.Directionality, other.Atmosphere.Directionality);
+		Min(ref Atmosphere.Fogginess, other.Atmosphere.Fogginess);
+		Min(ref Clouds.Size, other.Clouds.Size);
+		Min(ref Clouds.Opacity, other.Clouds.Opacity);
+		Min(ref Clouds.Coverage, other.Clouds.Coverage);
+		Min(ref Clouds.Sharpness, other.Clouds.Sharpness);
+		Min(ref Clouds.Coloring, other.Clouds.Coloring);
+		Min(ref Clouds.Attenuation, other.Clouds.Attenuation);
+		Min(ref Clouds.Saturation, other.Clouds.Saturation);
+		Min(ref Clouds.Scattering, other.Clouds.Scattering);
+		Min(ref Clouds.Brightness, other.Clouds.Brightness);
+	}
+
 	private void Fade(ref float x, float a, float b, float t)
 	{
 		x = Mathf.SmoothStep(a, b, t);
@@ -214,5 +237,13 @@ public class WeatherPreset : ScriptableObject
 	private void Max(ref float x, float other)
 	{
 		x = Mathf.Max(x, other);
+	}
+
+	private void Min(ref float x, float other)
+	{
+		if (other >= 0f)
+		{
+			x = Mathf.Min(x, other);
+		}
 	}
 }

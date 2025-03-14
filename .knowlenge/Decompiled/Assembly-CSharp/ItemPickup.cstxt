@@ -24,6 +24,16 @@ public class ItemPickup : DroppedItem
 		}
 	}
 
+	internal override void DoServerDestroy()
+	{
+		if (item != null)
+		{
+			item.Remove();
+			item = null;
+		}
+		base.DoServerDestroy();
+	}
+
 	public override void PostServerLoad()
 	{
 		base.PostServerLoad();

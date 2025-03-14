@@ -1,5 +1,6 @@
 public enum LODDistanceMode
 {
 	XYZ,
-	XZ
+	XZ,
+	Y
 }

@@ -34,7 +34,7 @@ public class EnvSync : PointEntity
 	public override void Load(LoadInfo info)
 	{
 		base.Load(info);
-		if (info.msg.environment != null && (bool)TOD_Sky.Instance)
+		if (info.msg.environment != null && (bool)TOD_Sky.Instance && base.isServer)
 		{
 			TOD_Sky.Instance.Cycle.DateTime = DateTime.FromBinary(info.msg.environment.dateTime);
 		}

@@ -21,7 +21,8 @@ public class ConstructionSocket : Socket_Base
 		FloorFrame,
 		WindowDressing,
 		DoorDressing,
-		Elevator
+		Elevator,
+		DoubleDoorDressing
 	}
 
 	public Type socketType;

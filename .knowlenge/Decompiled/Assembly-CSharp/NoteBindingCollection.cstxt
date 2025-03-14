@@ -27,6 +27,30 @@ public class NoteBindingCollection : ScriptableObject
 
 		public int NoteSoundPositionTarget;
 
+		public int[] AdditionalMidiTargets;
+
+		public float PitchOffset;
+
+		public bool MatchMidiCode(int code)
+		{
+			if (MidiNoteNumber == code)
+			{
+				return true;
+			}
+			if (AdditionalMidiTargets != null)
+			{
+				int[] additionalMidiTargets = AdditionalMidiTargets;
+				for (int i = 0; i < additionalMidiTargets.Length; i++)
+				{
+					if (additionalMidiTargets[i] == code)
+					{
+						return true;
+					}
+				}
+			}
+			return false;
+		}
+
 		public string ToNoteString()
 		{
 			return string.Format("{0}{1}{2}", Note, (Type == InstrumentKeyController.NoteType.Sharp) ? "#" : string.Empty, NoteOctave);
@@ -91,6 +115,12 @@ public class NoteBindingCollection : ScriptableObject
 
 	public int ShiftedOctave = 1;
 
+	public bool UseClosestMidiNote = true;
+
+	private const float MidiNoteUpOctaveShift = 2f;
+
+	private const float MidiNoteDownOctaveShift = 0.1f;
+
 	public bool FindNoteData(Notes note, int octave, InstrumentKeyController.NoteType type, out NoteData data, out int noteIndex)
 	{
 		for (int i = 0; i < BaseBindings.Length; i++)
@@ -121,5 +151,22 @@ public class NoteBindingCollection : ScriptableObject
 		}
 		noteIndex = -1;
 		return false;
+	}
+
+	public NoteData CreateMidiBinding(NoteData basedOn, int octave, int midiCode)
+	{
+		NoteData result = basedOn;
+		result.NoteOctave = octave;
+		result.MidiNoteNumber = midiCode;
+		int num = octave - basedOn.NoteOctave;
+		if (octave > basedOn.NoteOctave)
+		{
+			result.PitchOffset = (float)num * 2f;
+		}
+		else
+		{
+			result.PitchOffset = 1f - Mathf.Abs((float)num * 0.1f);
+		}
+		return result;
 	}
 }

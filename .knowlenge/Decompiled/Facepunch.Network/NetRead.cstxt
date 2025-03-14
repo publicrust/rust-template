@@ -1,24 +1,30 @@
 using System;
 using System.IO;
 using System.Text;
+using Facepunch;
 using Facepunch.Extend;
+using Network;
 using UnityEngine;
 
-public class NetRead : Stream
+public class NetRead : Stream, Pool.IPooled
 {
-	private MemoryStream _stream;
+	public byte[] Data;
 
-	public byte[] Data = new byte[3145728];
+	private int _length;
 
-	public long _length;
+	private int _position;
 
-	public long _position;
+	public ulong guid;
 
-	private const int bufferSize = 1048576;
+	public string ipaddress;
 
-	private static byte[] byteBuffer = new byte[1048576];
+	public Connection connection;
 
-	private static char[] charBuffer = new char[1048576];
+	private const int bufferSize = 8388608;
+
+	private static byte[] byteBuffer = new byte[8388608];
+
+	private static char[] charBuffer = new char[8388608];
 
 	public int Unread => (int)(Length - Position);
 
@@ -36,34 +42,67 @@ public class NetRead : Stream
 		}
 		set
 		{
-			_position = value;
+			_position = (int)value;
 		}
 	}
 
 	public override bool CanSeek => true;
 
-	public MemoryStream GetStreamForDecryption()
+	public void EnterPool()
 	{
-		if (_stream == null)
+		connection = null;
+		if (Data != null)
 		{
-			_stream = new MemoryStream(Data, 0, Data.Length, writable: true, publiclyVisible: true);
+			BaseNetwork.ArrayPool.Return(Data);
+			Data = null;
 		}
-		_stream.SetLength(Length);
-		return _stream;
 	}
 
-	public unsafe bool Start(IntPtr data, int length)
+	public void LeavePool()
 	{
-		if (length > Data.Length)
+	}
+
+	public bool Start(ulong guid, string ipaddress, IntPtr data, int length)
+	{
+		connection = null;
+		this.guid = guid;
+		this.ipaddress = ipaddress;
+		return Init(data, length);
+	}
+
+	public bool Start(Connection connection, IntPtr data, int length)
+	{
+		this.connection = connection;
+		guid = connection.guid;
+		ipaddress = connection.ipaddress;
+		return Init(data, length);
+	}
+
+	public bool Start(Connection connection, ulong guid, IntPtr data, int length)
+	{
+		this.connection = connection;
+		this.guid = guid;
+		ipaddress = connection.ipaddress;
+		return Init(data, length);
+	}
+
+	public bool Start(Connection connection, ulong guid, string ipaddress, IntPtr data, int length)
+	{
+		this.connection = connection;
+		this.guid = guid;
+		this.ipaddress = ipaddress;
+		return Init(data, length);
+	}
+
+	private unsafe bool Init(IntPtr data, int length)
+	{
+		if (length > 6291456)
 		{
-			throw new Exception($"Packet was too large (max is {Data.Length})");
+			throw new Exception($"Packet was too large (max is {6291456})");
 		}
+		EnsureCapacity(length);
 		SetLength(length);
 		Position = 0L;
-		if (_stream != null)
-		{
-			_stream.SetLength(length);
-		}
 		fixed (byte* data2 = Data)
 		{
 			Buffer.MemoryCopy((void*)data, data2, Data.Length, length);
@@ -83,7 +122,7 @@ public class NetRead : Stream
 
 	private string StringInternal(int maxLength, bool allowNewLine)
 	{
-		int num = BytesWithSize(byteBuffer, 1048576u);
+		int num = BytesWithSize(byteBuffer, 8388608u);
 		if (num <= 0)
 		{
 			return string.Empty;
@@ -104,7 +143,7 @@ public class NetRead : Stream
 		return new string(charBuffer, 0, num2);
 	}
 
-	public string StringRaw(uint maxLength = 1048576u)
+	public string StringRaw(uint maxLength = 8388608u)
 	{
 		int num = BytesWithSize(byteBuffer, maxLength);
 		if (num <= 0)
@@ -135,9 +174,19 @@ public class NetRead : Stream
 		return true;
 	}
 
-	public uint EntityID()
+	public NetworkableId EntityID()
 	{
-		return UInt32();
+		return new NetworkableId(UInt64());
+	}
+
+	public ItemContainerId ItemContainerID()
+	{
+		return new ItemContainerId(UInt64());
+	}
+
+	public ItemId ItemID()
+	{
+		return new ItemId(UInt64());
 	}
 
 	public uint GroupID()
@@ -193,14 +242,46 @@ public class NetRead : Stream
 		return result;
 	}
 
+	private void EnsureCapacity(int spaceRequired)
+	{
+		if (Data == null)
+		{
+			int num = ((spaceRequired <= 2048) ? 2048 : spaceRequired);
+			int num2 = Mathf.NextPowerOfTwo(num);
+			if (num2 > 8388608)
+			{
+				throw new Exception($"Preventing NetWrite buffer from growing too large (requiredLength={num})");
+			}
+			Data = BaseNetwork.ArrayPool.Rent(num2);
+		}
+		else if (Data.Length - _position < spaceRequired)
+		{
+			int num3 = _position + spaceRequired;
+			int num4 = Mathf.NextPowerOfTwo(Math.Max(num3, Data.Length));
+			if (num4 > 8388608)
+			{
+				throw new Exception($"Preventing NetWrite buffer from growing too large (requiredLength={num3})");
+			}
+			byte[] array = BaseNetwork.ArrayPool.Rent(num4);
+			Buffer.BlockCopy(Data, 0, array, 0, _length);
+			BaseNetwork.ArrayPool.Return(Data);
+			Data = array;
+		}
+	}
+
 	public override void SetLength(long value)
 	{
-		_length = value;
+		_length = (int)value;
 	}
 
 	public byte PacketID()
 	{
-		return UInt8();
+		return Read<byte>();
+	}
+
+	public byte PeekPacketID()
+	{
+		return Peek<byte>();
 	}
 
 	public bool Bit()
@@ -273,11 +354,16 @@ public class NetRead : Stream
 		return Read<Ray>();
 	}
 
+	public Color Color()
+	{
+		return Read<Color>();
+	}
+
 	public unsafe override int Read(byte[] buffer, int offset, int count)
 	{
 		if (_position + count > _length)
 		{
-			count = (int)(_length - _position);
+			count = _length - _position;
 		}
 		fixed (byte* data = Data)
 		{
@@ -294,7 +380,7 @@ public class NetRead : Stream
 	{
 		if (origin == SeekOrigin.Current)
 		{
-			_position += offset;
+			_position += (int)offset;
 			return _position;
 		}
 		throw new NotImplementedException();
@@ -306,9 +392,18 @@ public class NetRead : Stream
 		{
 			return default(T);
 		}
-		T result = Data.ReadUnsafe<T>((int)_position);
+		T result = Data.ReadUnsafe<T>(_position);
 		_position += sizeof(T);
 		return result;
+	}
+
+	public unsafe T Peek<T>() where T : unmanaged
+	{
+		if (Unread < sizeof(T))
+		{
+			return default(T);
+		}
+		return Data.ReadUnsafe<T>(_position);
 	}
 
 	public override void Flush()

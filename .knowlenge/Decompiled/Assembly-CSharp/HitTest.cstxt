@@ -51,6 +51,31 @@ public class HitTest
 
 	public string HitMaterial;
 
+	public void CopyFrom(HitTest other, bool copyHitInfo = false)
+	{
+		type = other.type;
+		AttackRay = other.AttackRay;
+		Radius = other.Radius;
+		Forgiveness = other.Forgiveness;
+		MaxDistance = other.MaxDistance;
+		RayHit = other.RayHit;
+		damageProperties = other.damageProperties;
+		ignoreEntity = other.ignoreEntity;
+		if (copyHitInfo)
+		{
+			HitEntity = other.HitEntity;
+			HitPoint = other.HitPoint;
+			HitNormal = other.HitNormal;
+			HitDistance = other.HitDistance;
+			HitTransform = other.HitTransform;
+			HitPart = other.HitPart;
+			HitMaterial = other.HitMaterial;
+			MultiHit = other.MultiHit;
+			BestHit = other.BestHit;
+			DidHit = other.DidHit;
+		}
+	}
+
 	public Vector3 HitPointWorld()
 	{
 		if (HitEntity != null)

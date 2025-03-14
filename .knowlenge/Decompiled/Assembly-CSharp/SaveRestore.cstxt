@@ -10,6 +10,7 @@ using ConVar;
 using Facepunch;
 using Facepunch.Math;
 using Network;
+using Newtonsoft.Json;
 using Oxide.Core;
 using ProtoBuf;
 using Rust;
@@ -18,8 +19,13 @@ using UnityEngine.Assertions;
 
 public class SaveRestore : SingletonComponent<SaveRestore>
 {
+	public class SaveExtraData
+	{
+		public string WipeId;
+	}
+
 	[CompilerGenerated]
-	private sealed class <DoAutomatedSave>d__14 : IEnumerator<object>, IEnumerator, IDisposable
+	private sealed class <DoAutomatedSave>d__19 : IEnumerator<object>, IEnumerator, IDisposable
 	{
 		private int <>1__state;
 
@@ -50,7 +56,7 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 		}
 
 		[DebuggerHidden]
-		public <DoAutomatedSave>d__14(int <>1__state)
+		public <DoAutomatedSave>d__19(int <>1__state)
 		{
 			this.<>1__state = <>1__state;
 		}
@@ -131,15 +137,13 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 
 	public static bool IsSaving = false;
 
-	public bool timedSave = true;
-
-	public int timedSavePause;
-
 	public static DateTime SaveCreatedTime;
 
 	private static MemoryStream SaveBuffer = new MemoryStream(33554432);
 
-	internal static void ClearMapEntities()
+	public static string WipeId { get; private set; }
+
+	public static void ClearMapEntities()
 	{
 		BaseEntity[] array = UnityEngine.Object.FindObjectsOfType<BaseEntity>();
 		if (array.Length == 0)
@@ -191,12 +195,17 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 					UnityEngine.Debug.LogWarning("Invalid save (missing header)");
 					return false;
 				}
+				if (binaryReader.PeekChar() == 74)
+				{
+					binaryReader.ReadChar();
+					WipeId = JsonConvert.DeserializeObject<SaveExtraData>(binaryReader.ReadString()).WipeId;
+				}
 				if (binaryReader.PeekChar() == 68)
 				{
 					binaryReader.ReadChar();
 					SaveCreatedTime = Epoch.ToDateTime(binaryReader.ReadInt32());
 				}
-				if (binaryReader.ReadUInt32() != 201)
+				if (binaryReader.ReadUInt32() != 237)
 				{
 					if (allowOutOfDateSaves)
 					{
@@ -211,7 +220,7 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 				Assert.IsTrue(BaseEntity.saveList.Count == 0, "BaseEntity.saveList isn't empty!");
 				Network.Net.sv.Reset();
 				Rust.Application.isLoadingSave = true;
-				HashSet<uint> hashSet = new HashSet<uint>();
+				HashSet<NetworkableId> hashSet = new HashSet<NetworkableId>();
 				while (fileStream.Position < fileStream.Length)
 				{
 					RCon.Update();
@@ -231,15 +240,15 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 					}
 					if (entData.basePlayer != null && dictionary.Any((KeyValuePair<BaseEntity, ProtoBuf.Entity> x) => x.Value.basePlayer != null && x.Value.basePlayer.userid == entData.basePlayer.userid))
 					{
-						UnityEngine.Debug.LogWarning("Skipping entity " + entData.baseNetworkable.uid + " - it's a player " + entData.basePlayer.userid + " who is in the save multiple times");
+						UnityEngine.Debug.LogWarning(string.Concat("Skipping entity ", entData.baseNetworkable.uid, " - it's a player ", entData.basePlayer.userid, " who is in the save multiple times"));
 						continue;
 					}
-					if (entData.baseNetworkable.uid != 0 && hashSet.Contains(entData.baseNetworkable.uid))
+					if (entData.baseNetworkable.uid.IsValid && hashSet.Contains(entData.baseNetworkable.uid))
 					{
-						UnityEngine.Debug.LogWarning("Skipping entity " + entData.baseNetworkable.uid + " " + StringPool.Get(entData.baseNetworkable.prefabID) + " - uid is used multiple times");
+						UnityEngine.Debug.LogWarning(string.Concat("Skipping entity ", entData.baseNetworkable.uid, " ", StringPool.Get(entData.baseNetworkable.prefabID), " - uid is used multiple times"));
 						continue;
 					}
-					if (entData.baseNetworkable.uid != 0)
+					if (entData.baseNetworkable.uid.IsValid)
 					{
 						hashSet.Add(entData.baseNetworkable.uid);
 					}
@@ -291,6 +300,7 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 					RCon.Update();
 					if (key2.IsValid())
 					{
+						key2.UpdateNetworkGroup();
 						key2.PostServerLoad();
 					}
 				}
@@ -302,6 +312,7 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 				SingletonComponent<SpawnHandler>.Instance.EnforceLimits();
 				DebugEx.Log("\tdone.");
 			}
+			InitializeWipeId();
 			Rust.Application.isLoadingSave = false;
 			return true;
 		}
@@ -418,6 +429,14 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 		DebugEx.Log("\tdone.");
 	}
 
+	public static void InitializeWipeId()
+	{
+		if (WipeId == null)
+		{
+			WipeId = Guid.NewGuid().ToString("N");
+		}
+	}
+
 	public static IEnumerator Save(string strFilename, bool AndWait = false)
 	{
 		if (Rust.Application.isQuitting)
@@ -469,9 +488,14 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 			writer.Write((sbyte)65);
 			writer.Write((sbyte)86);
 			writer.Write((sbyte)82);
+			InitializeWipeId();
+			SaveExtraData saveExtraData = new SaveExtraData();
+			saveExtraData.WipeId = WipeId;
+			writer.Write((sbyte)74);
+			writer.Write(JsonConvert.SerializeObject(saveExtraData));
 			writer.Write((sbyte)68);
 			writer.Write(Epoch.FromDateTime(SaveCreatedTime));
-			writer.Write(201u);
+			writer.Write(237u);
 			BaseNetworkable.SaveInfo saveInfo = default(BaseNetworkable.SaveInfo);
 			saveInfo.forDisk = true;
 			if (!AndWait)
@@ -512,39 +536,91 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 			yield return CoroutineEx.waitForEndOfFrame;
 		}
 		timerDisk.Start();
+		using (TimeWarning.New("SaveBackup", 100))
+		{
+			ShiftSaveBackups(strFilename);
+		}
 		using (TimeWarning.New("SaveDisk", 100))
 		{
 			try
 			{
-				if (File.Exists(strFilename + ".new"))
+				string text = strFilename + ".new";
+				if (File.Exists(text))
 				{
-					File.Delete(strFilename + ".new");
+					File.Delete(text);
 				}
 				try
 				{
-					File.WriteAllBytes(strFilename + ".new", SaveBuffer.ToArray());
+					using FileStream destination = File.OpenWrite(text);
+					SaveBuffer.Position = 0L;
+					SaveBuffer.CopyTo(destination);
 				}
 				catch (Exception ex)
 				{
-					UnityEngine.Debug.LogWarning("Couldn't write save file! We got an exception: " + ex);
-					if (File.Exists(strFilename + ".new"))
+					UnityEngine.Debug.LogError("Couldn't write save file! We got an exception: " + ex);
+					if (File.Exists(text))
 					{
-						File.Delete(strFilename + ".new");
+						File.Delete(text);
 					}
+					yield break;
 				}
-				if (File.Exists(strFilename))
-				{
-					File.Delete(strFilename);
-				}
-				File.Move(strFilename + ".new", strFilename);
+				File.Copy(text, strFilename, overwrite: true);
+				File.Delete(text);
 			}
 			catch (Exception ex2)
 			{
-				UnityEngine.Debug.LogWarning("Error when saving to disk: " + ex2);
+				UnityEngine.Debug.LogError("Error when saving to disk: " + ex2);
+				yield break;
 			}
 		}
 		timerDisk.Stop();
 		UnityEngine.Debug.LogFormat("Saved {0} ents, cache({1}), write({2}), disk({3}).", iEnts.ToString("N0"), timerCache.Elapsed.TotalSeconds.ToString("0.00"), timerWrite.Elapsed.TotalSeconds.ToString("0.00"), timerDisk.Elapsed.TotalSeconds.ToString("0.00"));
+	}
+
+	private static void ShiftSaveBackups(string fileName)
+	{
+		int num = Mathf.Max(ConVar.Server.saveBackupCount, 2);
+		if (!File.Exists(fileName))
+		{
+			return;
+		}
+		try
+		{
+			int num2 = 0;
+			for (int j = 1; j <= num && File.Exists(fileName + "." + j); j++)
+			{
+				num2++;
+			}
+			string text = GetBackupName(num2 + 1);
+			for (int num3 = num2; num3 > 0; num3--)
+			{
+				string text2 = GetBackupName(num3);
+				if (num3 == num)
+				{
+					File.Delete(text2);
+				}
+				else if (File.Exists(text2))
+				{
+					if (File.Exists(text))
+					{
+						File.Delete(text);
+					}
+					File.Move(text2, text);
+				}
+				text = text2;
+			}
+			File.Copy(fileName, text, overwrite: true);
+		}
+		catch (Exception ex)
+		{
+			UnityEngine.Debug.LogError("Error while backing up old saves: " + ex.Message);
+			UnityEngine.Debug.LogException(ex);
+			throw;
+		}
+		string GetBackupName(int i)
+		{
+			return $"{fileName}.{i}";
+		}
 	}
 
 	private void Start()
@@ -557,18 +633,15 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 		while (true)
 		{
 			yield return CoroutineEx.waitForSeconds(ConVar.Server.saveinterval);
-			if (timedSave && timedSavePause <= 0)
-			{
-				yield return StartCoroutine(DoAutomatedSave());
-			}
+			yield return StartCoroutine(DoAutomatedSave());
 		}
 	}
 
-	[IteratorStateMachine(typeof(<DoAutomatedSave>d__14))]
+	[IteratorStateMachine(typeof(<DoAutomatedSave>d__19))]
 	private IEnumerator DoAutomatedSave(bool AndWait = false)
 	{
 		Interface.CallHook("OnServerSave");
-		return new <DoAutomatedSave>d__14(0)
+		return new <DoAutomatedSave>d__19(0)
 		{
 			<>4__this = this,
 			AndWait = AndWait

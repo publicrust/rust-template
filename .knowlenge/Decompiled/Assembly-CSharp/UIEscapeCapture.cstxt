@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using UnityEngine.Events;
 
 public class UIEscapeCapture : ListComponent<UIEscapeCapture>
@@ -7,7 +6,7 @@ public class UIEscapeCapture : ListComponent<UIEscapeCapture>
 
 	public static bool EscapePressed()
 	{
-		using (IEnumerator<UIEscapeCapture> enumerator = ListComponent<UIEscapeCapture>.InstanceList.GetEnumerator())
+		using (ListHashSet<UIEscapeCapture>.Enumerator enumerator = ListComponent<UIEscapeCapture>.InstanceList.GetEnumerator())
 		{
 			if (enumerator.MoveNext())
 			{

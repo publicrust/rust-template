@@ -11,7 +11,7 @@ public class ProtectionProperties : ScriptableObject
 	[Range(0f, 100f)]
 	public float density = 1f;
 
-	[ArrayIndexIsEnumRanged(enumType = typeof(DamageType), min = -4f, max = 1f)]
+	[ArrayIndexIsEnumRanged(enumType = typeof(DamageType), min = -4f, max = 3f)]
 	public float[] amounts = new float[25];
 
 	public void OnValidate()

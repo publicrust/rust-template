@@ -1,5 +1,6 @@
 using TMPro;
 using UnityEngine;
+using UnityEngine.UI;
 
 public class VitalInfo : MonoBehaviour, IClientComponent, IVitalNotice
 {
@@ -14,8 +15,13 @@ public class VitalInfo : MonoBehaviour, IClientComponent, IVitalNotice
 		DecayProtected,
 		Decaying,
 		SafeZone,
-		Buffed
+		Buffed,
+		Pet
 	}
+
+	public HudElement Element;
+
+	public Image InfoImage;
 
 	public Vital VitalType;
 

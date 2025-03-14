@@ -6,7 +6,7 @@ public class RANDSwitch : ElectricalBlocker
 
 	public override int GetPassthroughAmount(int outputSlot = 0)
 	{
-		return GetCurrentEnergy() * (IsOn() ? 1 : 0);
+		return base.GetPassthroughAmount(outputSlot) * ((!IsOn()) ? 1 : 0);
 	}
 
 	public override void UpdateBlocked()
@@ -34,10 +34,13 @@ public class RANDSwitch : ElectricalBlocker
 			rand = RandomRoll();
 			UpdateBlocked();
 		}
-		if (inputSlot == 2 && inputAmount > 0)
+		if (inputSlot == 2)
 		{
-			rand = false;
-			UpdateBlocked();
+			if (inputAmount > 0)
+			{
+				rand = false;
+				UpdateBlocked();
+			}
 		}
 		else
 		{

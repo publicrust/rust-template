@@ -1,6 +1,6 @@
 using UnityEngine;
 
-public class PathSpeedZone : MonoBehaviour
+public class PathSpeedZone : MonoBehaviour, IAIPathSpeedZone
 {
 	public Bounds bounds;
 

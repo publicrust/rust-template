@@ -10,6 +10,8 @@ public class ScreenRotate : BaseScreenShake
 
 	public AnimationCurve ViewmodelEffect;
 
+	public float scale = 1f;
+
 	public bool useViewModelEffect = true;
 
 	public override void Setup()
@@ -24,11 +26,11 @@ public class ScreenRotate : BaseScreenShake
 		zero.z = Roll.Evaluate(delta);
 		if ((bool)cam)
 		{
-			cam.rotation *= Quaternion.Euler(zero);
+			cam.rotation *= Quaternion.Euler(zero * scale);
 		}
 		if ((bool)vm && useViewModelEffect)
 		{
-			vm.rotation *= Quaternion.Euler(zero * -1f * (1f - ViewmodelEffect.Evaluate(delta)));
+			vm.rotation *= Quaternion.Euler(zero * scale * -1f * (1f - ViewmodelEffect.Evaluate(delta)));
 		}
 	}
 }

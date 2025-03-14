@@ -14,7 +14,7 @@ public class ModularCarCentralLockingSwitch : VehicleModuleButtonComponent
 	{
 		if (parentModule.Vehicle is ModularCar modularCar)
 		{
-			modularCar.carLock.ToggleCentralLocking();
+			modularCar.CarLock.ToggleCentralLocking();
 		}
 	}
 }

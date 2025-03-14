@@ -18,9 +18,9 @@ public class UIMixingTableItem : MonoBehaviour
 		{
 			return;
 		}
-		ItemIcon.sprite = recipe.ProducedItem.iconSprite;
-		TextItemNameAndQuantity.text = recipe.ProducedItemCount + " x " + recipe.ProducedItem.displayName.translated;
-		ItemTooltip.Text = recipe.ProducedItem.displayDescription.translated;
+		ItemIcon.sprite = recipe.DisplayIcon;
+		TextItemNameAndQuantity.text = recipe.ProducedItemCount + " x " + recipe.DisplayName;
+		ItemTooltip.Text = recipe.DisplayDescription;
 		for (int i = 0; i < Ingredients.Length; i++)
 		{
 			if (i >= recipe.Ingredients.Length)

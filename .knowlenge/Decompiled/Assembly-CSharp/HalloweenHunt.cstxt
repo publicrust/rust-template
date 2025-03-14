@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using ConVar;
+using Facepunch.Rust;
 using UnityEngine;
 
 public class HalloweenHunt : EggHuntEvent
@@ -18,12 +19,14 @@ public class HalloweenHunt : EggHuntEvent
 				if ((bool)basePlayer)
 				{
 					basePlayer.ChatMessage("You placed " + (i + 1) + " of " + topHunters.Count + " with " + topHunters[i].numEggs + " candies collected.");
+					Analytics.Server.ReportCandiesCollectedByPlayer(topHunters[i].numEggs);
 				}
 				else
 				{
 					Debug.LogWarning("EggHuntEvent Printwinners could not find player with id :" + eggHunter2.userid);
 				}
 			}
+			Analytics.Server.ReportPlayersParticipatedInHalloweenEvent(topHunters.Count);
 			for (int j = 0; j < placementAwards.Length && j < topHunters.Count; j++)
 			{
 				BasePlayer basePlayer2 = BasePlayer.FindByID(topHunters[j].userid);

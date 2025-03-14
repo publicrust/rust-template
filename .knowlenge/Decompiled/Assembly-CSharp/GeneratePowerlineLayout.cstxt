@@ -41,7 +41,7 @@ public class GeneratePowerlineLayout : ProceduralComponent
 		List<PathFinder.Point> list7 = new List<PathFinder.Point>();
 		foreach (PathList road in TerrainMeta.Path.Roads)
 		{
-			if (road.ProcgenStartNode == null || road.ProcgenEndNode == null || !road.IsExtraWide)
+			if (road.ProcgenStartNode == null || road.ProcgenEndNode == null || road.Hierarchy != 0)
 			{
 				continue;
 			}

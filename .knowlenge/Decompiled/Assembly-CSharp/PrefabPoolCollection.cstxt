@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Globalization;
 using UnityEngine;
 
 public class PrefabPoolCollection
@@ -25,12 +26,22 @@ public class PrefabPoolCollection
 		return null;
 	}
 
-	public void Clear()
+	public void Clear(string filter = null)
 	{
-		foreach (KeyValuePair<uint, PrefabPool> item in storage)
+		if (string.IsNullOrEmpty(filter))
 		{
-			item.Value.Clear();
+			foreach (KeyValuePair<uint, PrefabPool> item in storage)
+			{
+				item.Value.Clear();
+			}
+			return;
 		}
-		storage.Clear();
+		foreach (KeyValuePair<uint, PrefabPool> item2 in storage)
+		{
+			if (StringPool.Get(item2.Key).Contains(filter, CompareOptions.IgnoreCase))
+			{
+				item2.Value.Clear();
+			}
+		}
 	}
 }

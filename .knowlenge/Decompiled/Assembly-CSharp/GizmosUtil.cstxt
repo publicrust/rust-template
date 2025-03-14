@@ -207,12 +207,16 @@ public static class GizmosUtil
 		MeshRenderer[] componentsInChildren = transform.GetComponentsInChildren<MeshRenderer>();
 		foreach (MeshRenderer meshRenderer in componentsInChildren)
 		{
-			if (meshRenderer.enabled)
+			if (!meshRenderer.enabled)
 			{
-				MeshFilter component = meshRenderer.GetComponent<MeshFilter>();
-				if ((bool)component)
+				continue;
+			}
+			MeshFilter component = meshRenderer.GetComponent<MeshFilter>();
+			if ((bool)component)
+			{
+				Transform transform2 = meshRenderer.transform;
+				if (transform2 != null && component != null && component.sharedMesh != null && component.sharedMesh.normals != null && component.sharedMesh.normals.Length != 0)
 				{
-					Transform transform2 = meshRenderer.transform;
 					Gizmos.DrawMesh(component.sharedMesh, transform2.position, transform2.rotation, transform2.lossyScale);
 				}
 			}

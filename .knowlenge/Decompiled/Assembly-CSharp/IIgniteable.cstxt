@@ -1,6 +1,8 @@
+using UnityEngine;
+
 public interface IIgniteable
 {
-	void Ignite();
+	void Ignite(Vector3 fromPos);
 
 	bool CanIgnite();
 }

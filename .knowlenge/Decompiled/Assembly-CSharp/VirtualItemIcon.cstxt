@@ -15,6 +15,8 @@ public class VirtualItemIcon : MonoBehaviour
 
 	public Text amountText;
 
+	public Text hoverText;
+
 	public CanvasGroup iconContents;
 
 	public Tooltip ToolTip;

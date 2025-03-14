@@ -10,5 +10,9 @@ public class HorseRagdoll : AnimalRagdoll
 
 	public HorseBreed overrideBreed;
 
+	public GameObject singleSaddle;
+
+	public GameObject doubleSaddle;
+
 	public GameObjectRef breedSource;
 }

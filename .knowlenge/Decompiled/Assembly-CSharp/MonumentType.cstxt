@@ -7,5 +7,7 @@ public enum MonumentType
 	Radtown,
 	Lighthouse,
 	WaterWell,
-	Roadside
+	Roadside,
+	Mountain,
+	Lake
 }

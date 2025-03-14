@@ -26,6 +26,10 @@ public class AmbienceEmitter : MonoBehaviour, IClientComponent, IComparable<Ambi
 
 	public float deactivateTime = float.PositiveInfinity;
 
+	public bool playUnderwater = true;
+
+	public bool playAbovewater = true;
+
 	public TerrainTopology.Enum currentTopology { get; private set; }
 
 	public TerrainBiome.Enum currentBiome { get; private set; }

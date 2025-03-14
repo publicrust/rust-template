@@ -9,11 +9,11 @@ public class NPCShopKeeper : NPCPlayer
 
 	public InvisibleVendingMachine machine;
 
-	private float greetDir;
+	public float greetDir;
 
-	private Vector3 initialFacingDir;
+	public Vector3 initialFacingDir;
 
-	private BasePlayer lastWavedAtPlayer;
+	public BasePlayer lastWavedAtPlayer;
 
 	public InvisibleVendingMachine GetVendingMachine()
 	{

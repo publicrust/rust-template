@@ -2,7 +2,7 @@ using UnityEngine;
 
 public class ItemMod : MonoBehaviour
 {
-	private ItemMod[] siblingMods;
+	protected ItemMod[] siblingMods;
 
 	public virtual void ModInit()
 	{

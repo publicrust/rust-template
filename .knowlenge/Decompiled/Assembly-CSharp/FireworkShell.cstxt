@@ -17,4 +17,6 @@ public class FireworkShell : BaseMonoBehaviour, IClientComponent
 	public float inaccuracyDegrees;
 
 	public LightEx explosionLight;
+
+	public float lifetime = 8f;
 }

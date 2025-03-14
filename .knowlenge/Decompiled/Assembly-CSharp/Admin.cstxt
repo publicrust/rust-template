@@ -2,18 +2,28 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text;
 using ConVar;
 using Facepunch;
 using Facepunch.Extend;
 using Facepunch.Math;
 using Network;
+using Newtonsoft.Json;
 using ProtoBuf;
 using Rust;
 using UnityEngine;
+using UnityEngine.Scripting;
 
 [Factory("global")]
 public class Admin : ConsoleSystem
 {
+	private enum ChangeGradeMode
+	{
+		Upgrade,
+		Downgrade
+	}
+
+	[Preserve]
 	public struct PlayerInfo
 	{
 		public string SteamID;
@@ -37,6 +47,7 @@ public class Admin : ConsoleSystem
 		public float Health;
 	}
 
+	[Preserve]
 	public struct ServerInfoOutput
 	{
 		public string Hostname;
@@ -61,6 +72,8 @@ public class Admin : ConsoleSystem
 
 		public int Memory;
 
+		public int MemoryUsageSystem;
+
 		public int Collections;
 
 		public int NetworkIn;
@@ -70,17 +83,79 @@ public class Admin : ConsoleSystem
 		public bool Restarting;
 
 		public string SaveCreatedTime;
+
+		public int Version;
+
+		public string Protocol;
 	}
+
+	[Preserve]
+	public struct ServerConvarInfo
+	{
+		public string FullName;
+
+		public string Value;
+
+		public string Help;
+	}
+
+	[Preserve]
+	public struct ServerUGCInfo
+	{
+		public NetworkableId entityId;
+
+		public uint[] crcs;
+
+		public UGCType contentType;
+
+		public uint entityPrefabID;
+
+		public string shortPrefabName;
+
+		public ulong[] playerIds;
+
+		public ServerUGCInfo(IUGCBrowserEntity fromEntity)
+		{
+			entityId = fromEntity.UgcEntity.net.ID;
+			crcs = fromEntity.GetContentCRCs;
+			contentType = fromEntity.ContentType;
+			entityPrefabID = fromEntity.UgcEntity.prefabID;
+			shortPrefabName = fromEntity.UgcEntity.ShortPrefabName;
+			playerIds = fromEntity.EditingHistory.ToArray();
+		}
+	}
+
+	private struct EntityAssociation
+	{
+		public BaseEntity TargetEntity;
+
+		public EntityAssociationType AssociationType;
+	}
+
+	private enum EntityAssociationType
+	{
+		Owner,
+		Auth,
+		LockGuest
+	}
+
+	[ReplicatedVar(Help = "Controls whether the in-game admin UI is displayed to admins")]
+	public static bool allowAdminUI = true;
 
 	[ServerVar(Help = "Print out currently connected clients")]
 	public static void status(Arg arg)
 	{
 		string @string = arg.GetString(0);
+		if (@string == "--json")
+		{
+			@string = arg.GetString(1);
+		}
+		bool flag = arg.HasArg("--json");
 		string text = string.Empty;
-		if (@string.Length == 0)
+		if (!flag && @string.Length == 0)
 		{
 			text = text + "hostname: " + ConVar.Server.hostname + "\n";
-			text = text + "version : " + 2271 + " secure (secure mode enabled, connected to Steam3)\n";
+			text = text + "version : " + 2388 + " secure (secure mode enabled, connected to Steam3)\n";
 			text = text + "map     : " + ConVar.Server.level + "\n";
 			text += $"players : {BasePlayer.activePlayerList.Count()} ({ConVar.Server.maxplayers} max) ({SingletonComponent<ServerMgr>.Instance.connectionQueue.Queued} queued) ({SingletonComponent<ServerMgr>.Instance.connectionQueue.Joining} joining)\n\n";
 		}
@@ -128,7 +203,14 @@ public class Admin : ConsoleSystem
 				textTable.AddRow(activePlayer.UserIDString, ex.Message.QuoteSafe());
 			}
 		}
-		arg.ReplyWith(text + textTable.ToString());
+		if (flag)
+		{
+			arg.ReplyWith(textTable.ToJson());
+		}
+		else
+		{
+			arg.ReplyWith(text + textTable.ToString());
+		}
 	}
 
 	[ServerVar(Help = "Print out stats of currently connected clients")]
@@ -192,7 +274,7 @@ public class Admin : ConsoleSystem
 			}
 			action(uInt, arg2);
 		}
-		arg.ReplyWith(table.ToString());
+		arg.ReplyWith(arg.HasArg("--json") ? table.ToJson() : table.ToString());
 	}
 
 	[ServerVar]
@@ -210,6 +292,42 @@ public class Admin : ConsoleSystem
 		else
 		{
 			basePlayer.Hurt(1000f, DamageType.Suicide, basePlayer, useProtection: false);
+		}
+	}
+
+	[ServerVar]
+	public static void injureplayer(Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.GetPlayerOrSleeper(arg, 0);
+		if (!basePlayer)
+		{
+			basePlayer = BasePlayer.FindBotClosestMatch(arg.GetString(0));
+		}
+		if (!basePlayer)
+		{
+			arg.ReplyWith("Player not found");
+		}
+		else
+		{
+			ConVar.Global.InjurePlayer(basePlayer);
+		}
+	}
+
+	[ServerVar]
+	public static void recoverplayer(Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.GetPlayerOrSleeper(arg, 0);
+		if (!basePlayer)
+		{
+			basePlayer = BasePlayer.FindBotClosestMatch(arg.GetString(0));
+		}
+		if (!basePlayer)
+		{
+			arg.ReplyWith("Player not found");
+		}
+		else
+		{
+			ConVar.Global.RecoverPlayer(basePlayer);
 		}
 	}
 
@@ -288,6 +406,12 @@ public class Admin : ConsoleSystem
 			return;
 		}
 		ServerUsers.Set(uInt, ServerUsers.UserGroup.Moderator, @string, string2, -1L);
+		BasePlayer basePlayer = BasePlayer.FindByID(uInt);
+		if (basePlayer != null)
+		{
+			basePlayer.SetPlayerFlag(BasePlayer.PlayerFlags.IsAdmin, b: true);
+			basePlayer.SendNetworkUpdate();
+		}
 		arg.ReplyWith("Added moderator " + @string + ", steamid " + uInt);
 	}
 
@@ -302,6 +426,11 @@ public class Admin : ConsoleSystem
 			arg.ReplyWith("This doesn't appear to be a 64bit steamid: " + uInt);
 			return;
 		}
+		if (arg.Connection != null && arg.Connection.authLevel < 2)
+		{
+			arg.ReplyWith("Moderators cannot run ownerid");
+			return;
+		}
 		ServerUsers.User user = ServerUsers.Get(uInt);
 		if (user != null && user.group == ServerUsers.UserGroup.Owner)
 		{
@@ -309,6 +438,12 @@ public class Admin : ConsoleSystem
 			return;
 		}
 		ServerUsers.Set(uInt, ServerUsers.UserGroup.Owner, @string, string2, -1L);
+		BasePlayer basePlayer = BasePlayer.FindByID(uInt);
+		if (basePlayer != null)
+		{
+			basePlayer.SetPlayerFlag(BasePlayer.PlayerFlags.IsAdmin, b: true);
+			basePlayer.SendNetworkUpdate();
+		}
 		arg.ReplyWith("Added owner " + @string + ", steamid " + uInt);
 	}
 
@@ -328,6 +463,12 @@ public class Admin : ConsoleSystem
 			return;
 		}
 		ServerUsers.Remove(uInt);
+		BasePlayer basePlayer = BasePlayer.FindByID(uInt);
+		if (basePlayer != null)
+		{
+			basePlayer.SetPlayerFlag(BasePlayer.PlayerFlags.IsAdmin, b: false);
+			basePlayer.SendNetworkUpdate();
+		}
 		arg.ReplyWith("Removed Moderator: " + uInt);
 	}
 
@@ -347,6 +488,12 @@ public class Admin : ConsoleSystem
 			return;
 		}
 		ServerUsers.Remove(uInt);
+		BasePlayer basePlayer = BasePlayer.FindByID(uInt);
+		if (basePlayer != null)
+		{
+			basePlayer.SetPlayerFlag(BasePlayer.PlayerFlags.IsAdmin, b: false);
+			basePlayer.SendNetworkUpdate();
+		}
 		arg.ReplyWith("Removed Owner: " + uInt);
 	}
 
@@ -437,6 +584,56 @@ public class Admin : ConsoleSystem
 		}
 	}
 
+	[ServerVar(Help = "Adds skip queue permissions to a SteamID")]
+	public static void skipqueueid(Arg arg)
+	{
+		ulong uInt = arg.GetUInt64(0, 0uL);
+		string @string = arg.GetString(1, "unnamed");
+		string string2 = arg.GetString(2, "no reason");
+		if (uInt < 70000000000000000L)
+		{
+			arg.ReplyWith("This doesn't appear to be a 64bit steamid: " + uInt);
+			return;
+		}
+		ServerUsers.User user = ServerUsers.Get(uInt);
+		if (user != null && (user.group == ServerUsers.UserGroup.Owner || user.group == ServerUsers.UserGroup.Moderator || user.group == ServerUsers.UserGroup.SkipQueue))
+		{
+			arg.ReplyWith($"User {uInt} will already skip the queue ({user.group})");
+			return;
+		}
+		if (user != null && user.group == ServerUsers.UserGroup.Banned)
+		{
+			arg.ReplyWith($"User {uInt} is banned");
+			return;
+		}
+		ServerUsers.Set(uInt, ServerUsers.UserGroup.SkipQueue, @string, string2, -1L);
+		arg.ReplyWith($"Added skip queue permission for {@string} ({uInt})");
+	}
+
+	[ServerVar(Help = "Removes skip queue permission from a SteamID")]
+	public static void removeskipqueue(Arg arg)
+	{
+		ulong uInt = arg.GetUInt64(0, 0uL);
+		if (uInt < 70000000000000000L)
+		{
+			arg.ReplyWith("This doesn't appear to be a 64bit steamid: " + uInt);
+			return;
+		}
+		ServerUsers.User user = ServerUsers.Get(uInt);
+		if (user != null && (user.group == ServerUsers.UserGroup.Owner || user.group == ServerUsers.UserGroup.Moderator))
+		{
+			arg.ReplyWith($"User is a {user.group}, cannot remove skip queue permission with this command");
+			return;
+		}
+		if (user == null || user.group != ServerUsers.UserGroup.SkipQueue)
+		{
+			arg.ReplyWith("User does not have skip queue permission");
+			return;
+		}
+		ServerUsers.Remove(uInt);
+		arg.ReplyWith("Removed skip queue permission: " + uInt);
+	}
+
 	[ServerVar(Help = "Print out currently connected clients etc")]
 	public static void players(Arg arg)
 	{
@@ -462,7 +659,7 @@ public class Admin : ConsoleSystem
 			string text5 = activePlayer.GetQueuedUpdateCount(BasePlayer.NetworkQueue.UpdateDistance).ToString();
 			textTable.AddRow(userIDString, text2, text3, string.Empty, text4, string.Empty, text5);
 		}
-		arg.ReplyWith(textTable.ToString());
+		arg.ReplyWith(arg.HasArg("--json") ? textTable.ToJson() : textTable.ToString());
 	}
 
 	[ServerVar(Help = "Sends a message in chat")]
@@ -499,7 +696,7 @@ public class Admin : ConsoleSystem
 		arg.ReplyWith(text);
 	}
 
-	[ServerVar(Help = "Show user info for players on server in range of the player.")]
+	[ServerVar(Help = "Show user info for sleeping players on server in range of the player.")]
 	public static void sleepingusersinrange(Arg arg)
 	{
 		BasePlayer fromPlayer = ArgEx.Player(arg);
@@ -524,6 +721,62 @@ public class Admin : ConsoleSystem
 		}
 		Facepunch.Pool.FreeList(ref obj);
 		text += $"{num} sleeping users within {range}m\n";
+		arg.ReplyWith(text);
+	}
+
+	[ServerVar(Help = "Show user info for players on server in range of the player.")]
+	public static void usersinrange(Arg arg)
+	{
+		BasePlayer fromPlayer = ArgEx.Player(arg);
+		if (fromPlayer == null)
+		{
+			return;
+		}
+		float range = arg.GetFloat(0);
+		string text = "<slot:userid:\"name\">\n";
+		int num = 0;
+		List<BasePlayer> obj = Facepunch.Pool.GetList<BasePlayer>();
+		foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+		{
+			obj.Add(activePlayer);
+		}
+		obj.RemoveAll((BasePlayer p) => p.Distance2D(fromPlayer) > range);
+		obj.Sort((BasePlayer player, BasePlayer basePlayer) => (!(player.Distance2D(fromPlayer) < basePlayer.Distance2D(fromPlayer))) ? 1 : (-1));
+		foreach (BasePlayer item in obj)
+		{
+			text += $"{item.userID}:{item.displayName}:{item.Distance2D(fromPlayer)}m\n";
+			num++;
+		}
+		Facepunch.Pool.FreeList(ref obj);
+		text += $"{num} users within {range}m\n";
+		arg.ReplyWith(text);
+	}
+
+	[ServerVar(Help = "Show user info for players on server in range of the supplied player (eg. Jim 50)")]
+	public static void usersinrangeofplayer(Arg arg)
+	{
+		BasePlayer targetPlayer = ArgEx.GetPlayerOrSleeper(arg, 0);
+		if (targetPlayer == null)
+		{
+			return;
+		}
+		float range = arg.GetFloat(1);
+		string text = "<slot:userid:\"name\">\n";
+		int num = 0;
+		List<BasePlayer> obj = Facepunch.Pool.GetList<BasePlayer>();
+		foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+		{
+			obj.Add(activePlayer);
+		}
+		obj.RemoveAll((BasePlayer p) => p.Distance2D(targetPlayer) > range);
+		obj.Sort((BasePlayer player, BasePlayer basePlayer) => (!(player.Distance2D(targetPlayer) < basePlayer.Distance2D(targetPlayer))) ? 1 : (-1));
+		foreach (BasePlayer item in obj)
+		{
+			text += $"{item.userID}:{item.displayName}:{item.Distance2D(targetPlayer)}m\n";
+			num++;
+		}
+		Facepunch.Pool.FreeList(ref obj);
+		text += $"{num} users within {range}m of {targetPlayer.displayName}\n";
 		arg.ReplyWith(text);
 	}
 
@@ -589,9 +842,26 @@ public class Admin : ConsoleSystem
 	[ServerVar]
 	public static void clientperf(Arg arg)
 	{
+		string @string = arg.GetString(0, "legacy");
+		int @int = arg.GetInt(1, UnityEngine.Random.Range(int.MinValue, int.MaxValue));
 		foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
 		{
-			activePlayer.ClientRPCPlayer(null, activePlayer, "GetPerformanceReport");
+			activePlayer.ClientRPCPlayer(null, activePlayer, "GetPerformanceReport", @string, @int);
+		}
+	}
+
+	[ServerVar]
+	public static void clientperf_frametime(Arg arg)
+	{
+		ClientFrametimeRequest value = new ClientFrametimeRequest
+		{
+			request_id = arg.GetInt(0, UnityEngine.Random.Range(int.MinValue, int.MaxValue)),
+			start_frame = arg.GetInt(1),
+			max_frames = arg.GetInt(2, 1000)
+		};
+		foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+		{
+			activePlayer.ClientRPCPlayer(null, activePlayer, "GetPerformanceReport_Frametime", JsonConvert.SerializeObject(value));
 		}
 	}
 
@@ -669,7 +939,7 @@ public class Admin : ConsoleSystem
 			}
 			num = player.userID;
 		}
-		RelationshipManager.PlayerTeam playerTeam = RelationshipManager.Instance.FindPlayersTeam(num);
+		RelationshipManager.PlayerTeam playerTeam = RelationshipManager.ServerInstance.FindPlayersTeam(num);
 		if (playerTeam == null)
 		{
 			return "Player is not in a team";
@@ -684,48 +954,170 @@ public class Admin : ConsoleSystem
 			bool flag = Network.Net.sv.connections.FirstOrDefault((Connection c) => c.connected && c.userid == memberId) != null;
 			textTable.AddRow(memberId.ToString(), GetPlayerName(memberId), flag ? "x" : "", (memberId == playerTeam.teamLeader) ? "x" : "");
 		}
-		return textTable.ToString();
+		if (!arg.HasArg("--json"))
+		{
+			return textTable.ToString();
+		}
+		return textTable.ToJson();
+	}
+
+	[ServerVar]
+	public static void authradius(Arg arg)
+	{
+		float @float = arg.GetFloat(0, -1f);
+		if (@float < 0f)
+		{
+			arg.ReplyWith("Format is 'authradius {radius} [user]'");
+		}
+		else
+		{
+			SetAuthInRadius(ArgEx.GetPlayer(arg, 1) ?? ArgEx.Player(arg), @float, auth: true);
+		}
+	}
+
+	[ServerVar]
+	public static void deauthradius(Arg arg)
+	{
+		float @float = arg.GetFloat(0, -1f);
+		if (@float < 0f)
+		{
+			arg.ReplyWith("Format is 'deauthradius {radius} [user]'");
+		}
+		else
+		{
+			SetAuthInRadius(ArgEx.GetPlayer(arg, 1) ?? ArgEx.Player(arg), @float, auth: false);
+		}
+	}
+
+	private static void SetAuthInRadius(BasePlayer player, float radius, bool auth)
+	{
+		List<BaseEntity> list = new List<BaseEntity>();
+		Vis.Entities(player.transform.position, radius, list);
+		foreach (BaseEntity item in list)
+		{
+			if (item.isServer && !SetUserAuthorized(item, player.userID, auth))
+			{
+				SetUserAuthorized(item.GetSlot(BaseEntity.Slot.Lock), player.userID, auth);
+			}
+		}
+	}
+
+	private static bool SetUserAuthorized(BaseEntity entity, ulong userId, bool state)
+	{
+		if (entity == null)
+		{
+			return false;
+		}
+		if (entity is CodeLock codeLock)
+		{
+			if (state)
+			{
+				codeLock.whitelistPlayers.Add(userId);
+			}
+			else
+			{
+				codeLock.whitelistPlayers.Remove(userId);
+				codeLock.guestPlayers.Remove(userId);
+			}
+			codeLock.SendNetworkUpdate();
+		}
+		else if (entity is AutoTurret autoTurret)
+		{
+			if (state)
+			{
+				autoTurret.authorizedPlayers.Add(new PlayerNameID
+				{
+					ShouldPool = false,
+					userid = userId,
+					username = ""
+				});
+			}
+			else
+			{
+				autoTurret.authorizedPlayers.RemoveAll((PlayerNameID x) => x.userid == userId);
+			}
+			autoTurret.SendNetworkUpdate();
+		}
+		else
+		{
+			if (!(entity is BuildingPrivlidge buildingPrivlidge))
+			{
+				return false;
+			}
+			if (state)
+			{
+				buildingPrivlidge.authorizedPlayers.Add(new PlayerNameID
+				{
+					ShouldPool = false,
+					userid = userId,
+					username = ""
+				});
+			}
+			else
+			{
+				buildingPrivlidge.authorizedPlayers.RemoveAll((PlayerNameID x) => x.userid == userId);
+			}
+			buildingPrivlidge.SendNetworkUpdate();
+		}
+		return true;
 	}
 
 	[ServerVar]
 	public static void entid(Arg arg)
 	{
-		BaseEntity baseEntity = BaseNetworkable.serverEntities.Find(arg.GetUInt(1)) as BaseEntity;
-		if (!(baseEntity == null) && !(baseEntity is BasePlayer))
+		BaseEntity baseEntity = BaseNetworkable.serverEntities.Find(ArgEx.GetEntityID(arg, 1)) as BaseEntity;
+		if (baseEntity == null || baseEntity is BasePlayer)
 		{
-			string @string = arg.GetString(0);
-			if (ArgEx.Player(arg) != null)
-			{
-				Debug.Log("[ENTCMD] " + ArgEx.Player(arg).displayName + "/" + ArgEx.Player(arg).userID + " used *" + @string + "* on ent: " + baseEntity.name);
-			}
-			switch (@string)
-			{
-			case "kill":
-				baseEntity.AdminKill();
-				break;
-			case "lock":
-				baseEntity.SetFlag(BaseEntity.Flags.Locked, b: true);
-				break;
-			case "unlock":
-				baseEntity.SetFlag(BaseEntity.Flags.Locked, b: false);
-				break;
-			case "debug":
-				baseEntity.SetFlag(BaseEntity.Flags.Debugging, b: true);
-				break;
-			case "undebug":
-				baseEntity.SetFlag(BaseEntity.Flags.Debugging, b: false);
-				break;
-			case "who":
-				arg.ReplyWith("Owner ID: " + baseEntity.OwnerID);
-				break;
-			case "auth":
-				arg.ReplyWith(AuthList(baseEntity));
-				break;
-			default:
-				arg.ReplyWith("Unknown command");
-				break;
-			}
+			return;
 		}
+		string @string = arg.GetString(0);
+		if (ArgEx.Player(arg) != null)
+		{
+			Debug.Log("[ENTCMD] " + ArgEx.Player(arg).displayName + "/" + ArgEx.Player(arg).userID + " used *" + @string + "* on ent: " + baseEntity.name);
+		}
+		switch (@string)
+		{
+		case "kill":
+			baseEntity.AdminKill();
+			return;
+		case "lock":
+			baseEntity.SetFlag(BaseEntity.Flags.Locked, b: true);
+			return;
+		case "unlock":
+			baseEntity.SetFlag(BaseEntity.Flags.Locked, b: false);
+			return;
+		case "debug":
+			baseEntity.SetFlag(BaseEntity.Flags.Debugging, b: true);
+			return;
+		case "undebug":
+			baseEntity.SetFlag(BaseEntity.Flags.Debugging, b: false);
+			return;
+		case "who":
+			arg.ReplyWith(baseEntity.Admin_Who());
+			return;
+		case "auth":
+			arg.ReplyWith(AuthList(baseEntity));
+			return;
+		case "upgrade":
+			arg.ReplyWith(ChangeGrade(baseEntity, arg.GetInt(2, 1), 0, BuildingGrade.Enum.None, arg.GetFloat(3)));
+			return;
+		case "downgrade":
+			arg.ReplyWith(ChangeGrade(baseEntity, 0, arg.GetInt(2, 1), BuildingGrade.Enum.None, arg.GetFloat(3)));
+			return;
+		case "setgrade":
+			arg.ReplyWith(ChangeGrade(baseEntity, 0, 0, (BuildingGrade.Enum)arg.GetInt(2), arg.GetFloat(3)));
+			return;
+		case "repair":
+			RunInRadius(arg.GetFloat(2), baseEntity, delegate(BaseCombatEntity entity)
+			{
+				if (entity.repair.enabled)
+				{
+					entity.SetHealth(entity.MaxHealth());
+				}
+			});
+			break;
+		}
+		arg.ReplyWith("Unknown command");
 	}
 
 	private static string AuthList(BaseEntity ent)
@@ -737,11 +1129,15 @@ public class Admin : ConsoleSystem
 			{
 				if (!(ent is AutoTurret autoTurret))
 				{
-					if (ent is CodeLock codeLock)
+					if (!(ent is CodeLock codeLock))
 					{
-						return CodeLockAuthList(codeLock);
+						if (ent is BaseVehicleModule vehicleModule)
+						{
+							return CodeLockAuthList(vehicleModule);
+						}
+						goto IL_0055;
 					}
-					goto IL_0042;
+					return CodeLockAuthList(codeLock);
 				}
 				authorizedPlayers = autoTurret.authorizedPlayers;
 			}
@@ -762,8 +1158,8 @@ public class Admin : ConsoleSystem
 			}
 			return textTable.ToString();
 		}
-		goto IL_0042;
-		IL_0042:
+		goto IL_0055;
+		IL_0055:
 		return "Entity has no auth list";
 	}
 
@@ -788,7 +1184,28 @@ public class Admin : ConsoleSystem
 		return textTable.ToString();
 	}
 
-	private static string GetPlayerName(ulong steamId)
+	private static string CodeLockAuthList(BaseVehicleModule vehicleModule)
+	{
+		if (!vehicleModule.IsOnAVehicle)
+		{
+			return "Nobody is authed to this entity";
+		}
+		ModularCar modularCar = vehicleModule.Vehicle as ModularCar;
+		if (modularCar == null || !modularCar.IsLockable || modularCar.CarLock.WhitelistPlayers.Count == 0)
+		{
+			return "Nobody is authed to this entity";
+		}
+		TextTable textTable = new TextTable();
+		textTable.AddColumn("steamID");
+		textTable.AddColumn("username");
+		foreach (ulong whitelistPlayer in modularCar.CarLock.WhitelistPlayers)
+		{
+			textTable.AddRow(whitelistPlayer.ToString(), GetPlayerName(whitelistPlayer));
+		}
+		return textTable.ToString();
+	}
+
+	public static string GetPlayerName(ulong steamId)
 	{
 		BasePlayer basePlayer = BasePlayer.allPlayerList.FirstOrDefault((BasePlayer p) => p.userID == steamId);
 		string text;
@@ -805,6 +1222,60 @@ public class Admin : ConsoleSystem
 			text = basePlayer.displayName;
 		}
 		return text;
+	}
+
+	public static string ChangeGrade(BaseEntity entity, int increaseBy = 0, int decreaseBy = 0, BuildingGrade.Enum targetGrade = BuildingGrade.Enum.None, float radius = 0f)
+	{
+		if (entity as BuildingBlock == null)
+		{
+			return $"'{entity}' is not a building block";
+		}
+		RunInRadius(radius, entity, delegate(BuildingBlock block)
+		{
+			BuildingGrade.Enum grade = block.grade;
+			if (targetGrade > BuildingGrade.Enum.None && targetGrade < BuildingGrade.Enum.Count)
+			{
+				grade = targetGrade;
+			}
+			else
+			{
+				grade = (BuildingGrade.Enum)Mathf.Min((int)(grade + increaseBy), 4);
+				grade = (BuildingGrade.Enum)Mathf.Max((int)(grade - decreaseBy), 0);
+			}
+			if (grade != block.grade)
+			{
+				block.ChangeGrade(grade);
+			}
+		});
+		int count = Facepunch.Pool.GetList<BuildingBlock>().Count;
+		return $"Upgraded/downgraded '{count}' building block(s)";
+	}
+
+	private static bool RunInRadius<T>(float radius, BaseEntity initial, Action<T> callback, Func<T, bool> filter = null) where T : BaseEntity
+	{
+		List<T> list = Facepunch.Pool.GetList<T>();
+		radius = Mathf.Clamp(radius, 0f, 200f);
+		if (radius > 0f)
+		{
+			Vis.Entities(initial.transform.position, radius, list, 2097152);
+		}
+		else if (initial is T item)
+		{
+			list.Add(item);
+		}
+		foreach (T item2 in list)
+		{
+			try
+			{
+				callback(item2);
+			}
+			catch (Exception arg)
+			{
+				Debug.LogError($"Exception while running callback in radius: {arg}");
+				return false;
+			}
+		}
+		return true;
 	}
 
 	[ServerVar(Help = "Get a list of players")]
@@ -846,11 +1317,14 @@ public class Admin : ConsoleSystem
 		result.Map = ConVar.Server.level;
 		result.Framerate = Performance.report.frameRate;
 		result.Memory = (int)Performance.report.memoryAllocations;
+		result.MemoryUsageSystem = (int)Performance.report.memoryUsageSystem;
 		result.Collections = (int)Performance.report.memoryCollections;
 		result.NetworkIn = (int)((Network.Net.sv != null) ? Network.Net.sv.GetStat(null, BaseNetwork.StatTypeLong.BytesReceived_LastSecond) : 0);
 		result.NetworkOut = (int)((Network.Net.sv != null) ? Network.Net.sv.GetStat(null, BaseNetwork.StatTypeLong.BytesSent_LastSecond) : 0);
 		result.Restarting = SingletonComponent<ServerMgr>.Instance.Restarting;
 		result.SaveCreatedTime = SaveRestore.SaveCreatedTime.ToString();
+		result.Version = 2388;
+		result.Protocol = Protocol.printable;
 		return result;
 	}
 
@@ -858,5 +1332,349 @@ public class Admin : ConsoleSystem
 	public static BuildInfo BuildInfo()
 	{
 		return Facepunch.BuildInfo.Current;
+	}
+
+	[ServerVar]
+	public static void AdminUI_FullRefresh(Arg arg)
+	{
+		AdminUI_RequestPlayerList(arg);
+		AdminUI_RequestServerInfo(arg);
+		AdminUI_RequestServerConvars(arg);
+		AdminUI_RequestUGCList(arg);
+	}
+
+	[ServerVar]
+	public static void AdminUI_RequestPlayerList(Arg arg)
+	{
+		if (allowAdminUI)
+		{
+			ConsoleNetwork.SendClientCommand(arg.Connection, "AdminUI_ReceivePlayerList", JsonConvert.SerializeObject(playerlist()));
+		}
+	}
+
+	[ServerVar]
+	public static void AdminUI_RequestServerInfo(Arg arg)
+	{
+		if (allowAdminUI)
+		{
+			ConsoleNetwork.SendClientCommand(arg.Connection, "AdminUI_ReceiveServerInfo", JsonConvert.SerializeObject(ServerInfo()));
+		}
+	}
+
+	[ServerVar]
+	public static void AdminUI_RequestServerConvars(Arg arg)
+	{
+		if (!allowAdminUI)
+		{
+			return;
+		}
+		List<ServerConvarInfo> obj = Facepunch.Pool.GetList<ServerConvarInfo>();
+		Command[] all = Index.All;
+		foreach (Command command in all)
+		{
+			if (command.Server && command.Variable && command.ServerAdmin && command.ShowInAdminUI)
+			{
+				obj.Add(new ServerConvarInfo
+				{
+					FullName = command.FullName,
+					Value = command.GetOveride?.Invoke(),
+					Help = command.Description
+				});
+			}
+		}
+		ConsoleNetwork.SendClientCommand(arg.Connection, "AdminUI_ReceiveCommands", JsonConvert.SerializeObject(obj));
+		Facepunch.Pool.FreeList(ref obj);
+	}
+
+	[ServerVar]
+	public static void AdminUI_RequestUGCList(Arg arg)
+	{
+		if (!allowAdminUI)
+		{
+			return;
+		}
+		List<ServerUGCInfo> obj = Facepunch.Pool.GetList<ServerUGCInfo>();
+		uint[] array = null;
+		ulong[] array2 = null;
+		foreach (BaseNetworkable serverEntity in BaseNetworkable.serverEntities)
+		{
+			array = null;
+			array2 = null;
+			UGCType uGCType = UGCType.ImageJpg;
+			if (serverEntity.TryGetComponent<IUGCBrowserEntity>(out var component))
+			{
+				array = component.GetContentCRCs;
+				array2 = component.EditingHistory.ToArray();
+				uGCType = component.ContentType;
+			}
+			if (array == null || array.Length == 0)
+			{
+				continue;
+			}
+			bool flag = false;
+			uint[] array3 = array;
+			for (int i = 0; i < array3.Length; i++)
+			{
+				if (array3[i] != 0)
+				{
+					flag = true;
+					break;
+				}
+			}
+			if (uGCType == UGCType.PatternBoomer)
+			{
+				flag = true;
+			}
+			if (flag)
+			{
+				obj.Add(new ServerUGCInfo
+				{
+					entityId = serverEntity.net.ID,
+					crcs = array,
+					contentType = uGCType,
+					entityPrefabID = serverEntity.prefabID,
+					shortPrefabName = serverEntity.ShortPrefabName,
+					playerIds = array2
+				});
+			}
+		}
+		ConsoleNetwork.SendClientCommand(arg.Connection, "AdminUI_ReceiveUGCList", JsonConvert.SerializeObject(obj));
+		Facepunch.Pool.FreeList(ref obj);
+	}
+
+	[ServerVar]
+	public static void AdminUI_RequestUGCContent(Arg arg)
+	{
+		if (allowAdminUI && !(ArgEx.Player(arg) == null))
+		{
+			uint uInt = arg.GetUInt(0);
+			NetworkableId entityID = ArgEx.GetEntityID(arg, 1);
+			FileStorage.Type @int = (FileStorage.Type)arg.GetInt(2);
+			uint uInt2 = arg.GetUInt(3);
+			byte[] array = FileStorage.server.Get(uInt, @int, entityID, uInt2);
+			if (array != null)
+			{
+				SendInfo sendInfo = new SendInfo(arg.Connection);
+				sendInfo.channel = 2;
+				sendInfo.method = SendMethod.Reliable;
+				SendInfo sendInfo2 = sendInfo;
+				ArgEx.Player(arg).ClientRPCEx(sendInfo2, null, "AdminReceivedUGC", uInt, (uint)array.Length, array, uInt2, (byte)@int);
+			}
+		}
+	}
+
+	[ServerVar]
+	public static void AdminUI_DeleteUGCContent(Arg arg)
+	{
+		if (!allowAdminUI)
+		{
+			return;
+		}
+		NetworkableId entityID = ArgEx.GetEntityID(arg, 0);
+		BaseNetworkable baseNetworkable = BaseNetworkable.serverEntities.Find(entityID);
+		if (baseNetworkable != null)
+		{
+			FileStorage.server.RemoveAllByEntity(entityID);
+			if (baseNetworkable.TryGetComponent<IUGCBrowserEntity>(out var component))
+			{
+				component.ClearContent();
+			}
+		}
+	}
+
+	[ServerVar]
+	public static void AdminUI_RequestFireworkPattern(Arg arg)
+	{
+		if (allowAdminUI)
+		{
+			NetworkableId entityID = ArgEx.GetEntityID(arg, 0);
+			BaseNetworkable baseNetworkable = BaseNetworkable.serverEntities.Find(entityID);
+			if (baseNetworkable != null && baseNetworkable is PatternFirework patternFirework)
+			{
+				SendInfo sendInfo = new SendInfo(arg.Connection);
+				sendInfo.channel = 2;
+				sendInfo.method = SendMethod.Reliable;
+				SendInfo sendInfo2 = sendInfo;
+				ArgEx.Player(arg).ClientRPCEx(sendInfo2, null, "AdminReceivedPatternFirework", entityID, patternFirework.Design.ToProtoBytes());
+			}
+		}
+	}
+
+	[ServerVar]
+	public static void clearugcentity(Arg arg)
+	{
+		NetworkableId entityID = ArgEx.GetEntityID(arg, 0);
+		BaseNetworkable baseNetworkable = BaseNetworkable.serverEntities.Find(entityID);
+		if (baseNetworkable != null && baseNetworkable.TryGetComponent<IUGCBrowserEntity>(out var component))
+		{
+			component.ClearContent();
+			arg.ReplyWith($"Cleared content on {baseNetworkable.ShortPrefabName}/{entityID}");
+		}
+		else
+		{
+			arg.ReplyWith($"Could not find UGC entity with id {entityID}");
+		}
+	}
+
+	[ServerVar]
+	public static void clearugcentitiesinrange(Arg arg)
+	{
+		Vector3 vector = arg.GetVector3(0);
+		float @float = arg.GetFloat(1);
+		int num = 0;
+		foreach (BaseNetworkable serverEntity in BaseNetworkable.serverEntities)
+		{
+			if (serverEntity.TryGetComponent<IUGCBrowserEntity>(out var component) && Vector3.Distance(serverEntity.transform.position, vector) <= @float)
+			{
+				component.ClearContent();
+				num++;
+			}
+		}
+		arg.ReplyWith($"Cleared {num} UGC entities within {@float}m of {vector}");
+	}
+
+	[ServerVar]
+	public static void getugcinfo(Arg arg)
+	{
+		NetworkableId entityID = ArgEx.GetEntityID(arg, 0);
+		BaseNetworkable baseNetworkable = BaseNetworkable.serverEntities.Find(entityID);
+		if (baseNetworkable != null && baseNetworkable.TryGetComponent<IUGCBrowserEntity>(out var component))
+		{
+			ServerUGCInfo serverUGCInfo = new ServerUGCInfo(component);
+			arg.ReplyWith(JsonConvert.SerializeObject(serverUGCInfo));
+		}
+		else
+		{
+			arg.ReplyWith($"Invalid entity id: {entityID}");
+		}
+	}
+
+	[ServerVar(Help = "Returns all entities that the provided player is authed to (TC's, locks, etc), supports --json")]
+	public static void authcount(Arg arg)
+	{
+		BasePlayer playerOrSleeper = ArgEx.GetPlayerOrSleeper(arg, 0);
+		if (playerOrSleeper == null)
+		{
+			arg.ReplyWith("Please provide a valid player, unable to find '" + arg.GetString(0) + "'");
+			return;
+		}
+		string text = arg.GetString(1);
+		if (text == "--json")
+		{
+			text = string.Empty;
+		}
+		List<EntityAssociation> obj = Facepunch.Pool.GetList<EntityAssociation>();
+		FindEntityAssociationsForPlayer(playerOrSleeper, useOwnerId: false, useAuth: true, text, obj);
+		TextTable textTable = new TextTable();
+		textTable.AddColumns("Prefab name", "Position", "ID", "Type");
+		foreach (EntityAssociation item in obj)
+		{
+			textTable.AddRow(item.TargetEntity.ShortPrefabName, item.TargetEntity.transform.position.ToString(), item.TargetEntity.net.ID.ToString(), item.AssociationType.ToString());
+		}
+		Facepunch.Pool.FreeList(ref obj);
+		if (arg.HasArg("--json"))
+		{
+			arg.ReplyWith(textTable.ToJson());
+			return;
+		}
+		StringBuilder stringBuilder = new StringBuilder();
+		stringBuilder.AppendLine("Found entities " + playerOrSleeper.displayName + " is authed to");
+		stringBuilder.AppendLine(textTable.ToString());
+		arg.ReplyWith(stringBuilder.ToString());
+	}
+
+	[ServerVar(Help = "Returns all entities that the provided player has placed, supports --json")]
+	public static void entcount(Arg arg)
+	{
+		BasePlayer playerOrSleeper = ArgEx.GetPlayerOrSleeper(arg, 0);
+		if (playerOrSleeper == null)
+		{
+			arg.ReplyWith("Please provide a valid player, unable to find '" + arg.GetString(0) + "'");
+			return;
+		}
+		string text = arg.GetString(1);
+		if (text == "--json")
+		{
+			text = string.Empty;
+		}
+		List<EntityAssociation> obj = Facepunch.Pool.GetList<EntityAssociation>();
+		FindEntityAssociationsForPlayer(playerOrSleeper, useOwnerId: true, useAuth: false, text, obj);
+		TextTable textTable = new TextTable();
+		textTable.AddColumns("Prefab name", "Position", "ID");
+		foreach (EntityAssociation item in obj)
+		{
+			textTable.AddRow(item.TargetEntity.ShortPrefabName, item.TargetEntity.transform.position.ToString(), item.TargetEntity.net.ID.ToString());
+		}
+		Facepunch.Pool.FreeList(ref obj);
+		if (arg.HasArg("--json"))
+		{
+			arg.ReplyWith(textTable.ToJson());
+			return;
+		}
+		StringBuilder stringBuilder = new StringBuilder();
+		stringBuilder.AppendLine("Found entities associated with " + playerOrSleeper.displayName);
+		stringBuilder.AppendLine(textTable.ToString());
+		arg.ReplyWith(stringBuilder.ToString());
+	}
+
+	private static void FindEntityAssociationsForPlayer(BasePlayer ply, bool useOwnerId, bool useAuth, string filter, List<EntityAssociation> results)
+	{
+		results.Clear();
+		foreach (BaseNetworkable serverEntity in BaseNetworkable.serverEntities)
+		{
+			EntityAssociationType entityAssociationType = EntityAssociationType.Owner;
+			if (!(serverEntity is BaseEntity baseEntity))
+			{
+				continue;
+			}
+			bool flag = false;
+			if (useOwnerId && baseEntity.OwnerID == ply.userID)
+			{
+				flag = true;
+			}
+			if (useAuth && !flag)
+			{
+				if (!flag && baseEntity is BuildingPrivlidge buildingPrivlidge && buildingPrivlidge.IsAuthed(ply.userID))
+				{
+					flag = true;
+				}
+				if (!flag && baseEntity is KeyLock keyLock && keyLock.HasLockPermission(ply))
+				{
+					flag = true;
+				}
+				else if (baseEntity is CodeLock codeLock)
+				{
+					if (codeLock.whitelistPlayers.Contains(ply.userID))
+					{
+						flag = true;
+					}
+					else if (codeLock.guestPlayers.Contains(ply.userID))
+					{
+						flag = true;
+						entityAssociationType = EntityAssociationType.LockGuest;
+					}
+				}
+				if (!flag && baseEntity is ModularCar { IsLockable: not false } modularCar && modularCar.CarLock.HasLockPermission(ply))
+				{
+					flag = true;
+				}
+				if (flag && entityAssociationType == EntityAssociationType.Owner)
+				{
+					entityAssociationType = EntityAssociationType.Auth;
+				}
+			}
+			if (flag && !string.IsNullOrEmpty(filter) && !serverEntity.ShortPrefabName.Contains(filter, CompareOptions.IgnoreCase))
+			{
+				flag = false;
+			}
+			if (flag)
+			{
+				results.Add(new EntityAssociation
+				{
+					TargetEntity = baseEntity,
+					AssociationType = entityAssociationType
+				});
+			}
+		}
 	}
 }

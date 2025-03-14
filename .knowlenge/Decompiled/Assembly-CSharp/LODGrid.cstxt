@@ -9,4 +9,6 @@ public class LODGrid : SingletonComponent<LODGrid>, IClientComponent
 	public const float MaxRefreshDistance = 500f;
 
 	public static float TreeMeshDistance = 500f;
+
+	public const float MinTimeBetweenRefreshes = 1f;
 }

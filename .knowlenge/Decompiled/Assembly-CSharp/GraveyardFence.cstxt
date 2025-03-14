@@ -24,7 +24,7 @@ public class GraveyardFence : SimpleBuildingBlock
 		Pool.FreeList(ref obj);
 	}
 
-	public void UpdatePillars()
+	public virtual void UpdatePillars()
 	{
 		BoxCollider[] array = pillars;
 		foreach (BoxCollider boxCollider in array)

@@ -1,14 +1,7 @@
-using UnityStandardAssets.ImageEffects;
+using UnityEngine;
+using UnityEngine.Rendering.PostProcessing;
 
-public class BlurManager : ImageEffectLayer
+public class BlurManager : MonoBehaviour
 {
-	public BlurOptimized blur;
-
-	public ColorCorrectionCurves color;
-
-	public float maxBlurScale;
-
-	internal float blurAmount = 1f;
-
-	internal float desaturationAmount = 0.6f;
+	public PostProcessVolume postProcessVolume;
 }

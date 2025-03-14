@@ -11,4 +11,16 @@ public class AtmosphereVolumeRenderer : MonoBehaviour
 	public bool HeightFog = true;
 
 	public AtmosphereVolume Volume;
+
+	private static bool isSupported
+	{
+		get
+		{
+			if (Application.platform != 0)
+			{
+				return Application.platform != RuntimePlatform.OSXPlayer;
+			}
+			return false;
+		}
+	}
 }

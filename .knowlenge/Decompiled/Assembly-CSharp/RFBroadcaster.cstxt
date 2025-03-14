@@ -3,6 +3,7 @@ using System;
 using ConVar;
 using Network;
 using Oxide.Core;
+using Rust;
 using UnityEngine;
 using UnityEngine.Assertions;
 
@@ -27,7 +28,7 @@ public class RFBroadcaster : IOEntity, IRFObject
 			if (rpc == 2778616053u && player != null)
 			{
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
-				if (Global.developer > 2)
+				if (ConVar.Global.developer > 2)
 				{
 					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - ServerSetFrequency "));
 				}
@@ -92,29 +93,44 @@ public class RFBroadcaster : IOEntity, IRFObject
 	[RPC_Server.IsVisible(3f)]
 	public void ServerSetFrequency(RPCMessage msg)
 	{
-		if (!(msg.player == null) && msg.player.CanBuild() && playerUsable && !(UnityEngine.Time.time < nextChangeTime))
+		if (!CanChangeFrequency(msg.player) || UnityEngine.Time.time < nextChangeTime)
 		{
-			nextChangeTime = UnityEngine.Time.time + 2f;
-			int num = msg.read.Int32();
-			if (RFManager.IsReserved(num))
-			{
-				RFManager.ReserveErrorPrint(msg.player);
-			}
-			else if (Interface.CallHook("OnRfFrequencyChange", this, num, msg.player) == null)
-			{
-				RFManager.ChangeFrequency(frequency, num, this, isListener: false, IsPowered());
-				frequency = num;
-				MarkDirty();
-				SendNetworkUpdate();
-				Interface.CallHook("OnRfFrequencyChanged", this, num, msg.player);
-			}
+			return;
 		}
+		nextChangeTime = UnityEngine.Time.time + 2f;
+		int num = msg.read.Int32();
+		if (RFManager.IsReserved(num))
+		{
+			RFManager.ReserveErrorPrint(msg.player);
+			return;
+		}
+		RFManager.ChangeFrequency(frequency, num, this, isListener: false, IsPowered());
+		if (Interface.CallHook("OnRfFrequencyChange", this, num, msg.player) == null)
+		{
+			frequency = num;
+			MarkDirty();
+			SendNetworkUpdate();
+			Hurt(MaxHealth() * 0.01f, DamageType.Decay, this);
+			Interface.CallHook("OnRfFrequencyChanged", this, num, msg.player);
+		}
+	}
+
+	public override bool CanUseNetworkCache(Connection connection)
+	{
+		if (!playerUsable)
+		{
+			return base.CanUseNetworkCache(connection);
+		}
+		return false;
 	}
 
 	public override void Save(SaveInfo info)
 	{
 		base.Save(info);
-		info.msg.ioEntity.genericInt1 = frequency;
+		if (info.forDisk || CanChangeFrequency(info.forConnection?.player as BasePlayer))
+		{
+			info.msg.ioEntity.genericInt1 = frequency;
+		}
 	}
 
 	public override void IOStateChanged(int inputAmount, int inputSlot)
@@ -151,5 +167,14 @@ public class RFBroadcaster : IOEntity, IRFObject
 		{
 			frequency = info.msg.ioEntity.genericInt1;
 		}
+	}
+
+	private bool CanChangeFrequency(BasePlayer player)
+	{
+		if (playerUsable && player != null)
+		{
+			return player.CanBuild();
+		}
+		return false;
 	}
 }

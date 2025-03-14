@@ -29,20 +29,20 @@ public class SpawnFilter
 		return GetFactor(normX, normZ) > 0.5f;
 	}
 
-	public float GetFactor(Vector3 worldPos)
+	public float GetFactor(Vector3 worldPos, bool checkPlacementMap = true)
 	{
 		float normX = TerrainMeta.NormalizeX(worldPos.x);
 		float normZ = TerrainMeta.NormalizeZ(worldPos.z);
-		return GetFactor(normX, normZ);
+		return GetFactor(normX, normZ, checkPlacementMap);
 	}
 
-	public float GetFactor(float normX, float normZ)
+	public float GetFactor(float normX, float normZ, bool checkPlacementMap = true)
 	{
 		if (TerrainMeta.TopologyMap == null)
 		{
 			return 0f;
 		}
-		if (TerrainMeta.PlacementMap != null && TerrainMeta.PlacementMap.GetBlocked(normX, normZ))
+		if (checkPlacementMap && TerrainMeta.PlacementMap != null && TerrainMeta.PlacementMap.GetBlocked(normX, normZ))
 		{
 			return 0f;
 		}

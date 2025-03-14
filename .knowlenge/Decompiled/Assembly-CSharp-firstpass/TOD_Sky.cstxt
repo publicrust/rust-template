@@ -12,9 +12,52 @@ using UnityEngine.Rendering;
 [RequireComponent(typeof(TOD_Components))]
 public class TOD_Sky : MonoBehaviour
 {
-	private static List<TOD_Sky> instances = new List<TOD_Sky>();
+	public class ReflectionProbeState
+	{
+		public ReflectionProbe Probe;
 
-	private int probeRenderID = -1;
+		public GameObject ProbeInstance;
+
+		public int ProbeRenderID = -1;
+
+		public void InitializePrimary(Vector3 position, GameObject prefab)
+		{
+			if (!ProbeInstance)
+			{
+				if (!prefab)
+				{
+					ProbeInstance = new GameObject();
+					ProbeInstance.name = "Primary Reflection Probe";
+					ProbeInstance.transform.position = position;
+					Probe = ProbeInstance.AddComponent<ReflectionProbe>();
+					Probe.size = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+				}
+				else
+				{
+					ProbeInstance = UnityEngine.Object.Instantiate(prefab);
+					ProbeInstance.name = "Primary Reflection Probe";
+					ProbeInstance.transform.position = position;
+					Probe = ProbeInstance.GetComponent<ReflectionProbe>();
+					Probe.size = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+				}
+			}
+		}
+
+		public void InitializeSecondary(Vector3 position)
+		{
+			if (!ProbeInstance)
+			{
+				ProbeInstance = new GameObject();
+				ProbeInstance.name = "Secondary Reflection Probe";
+				ProbeInstance.transform.position = position;
+				Probe = ProbeInstance.AddComponent<ReflectionProbe>();
+				Probe.size = new Vector3(0f, 0f, 0f);
+				Probe.importance = 0;
+			}
+		}
+	}
+
+	private static List<TOD_Sky> instances = new List<TOD_Sky>();
 
 	[Tooltip("Auto: Use the player settings.\nLinear: Force linear color space.\nGamma: Force gamma color space.")]
 	public TOD_ColorSpaceType ColorSpace;
@@ -62,6 +105,20 @@ public class TOD_Sky : MonoBehaviour
 	public TOD_AmbientParameters Ambient;
 
 	public TOD_ReflectionParameters Reflection;
+
+	private ReflectionProbeState ReflectionCur = new ReflectionProbeState();
+
+	private ReflectionProbeState ReflectionSrc = new ReflectionProbeState();
+
+	private ReflectionProbeState ReflectionDst = new ReflectionProbeState();
+
+	public static float ReflectionUpdateSpeed = 1f;
+
+	public static int ReflectionResolution = 64;
+
+	public static float ReflectionUpdateInterval = 1f;
+
+	public static ReflectionProbeTimeSlicingMode ReflectionTimeSlicing = ReflectionProbeTimeSlicingMode.IndividualFaces;
 
 	private float timeSinceLightUpdate = float.MaxValue;
 
@@ -161,9 +218,9 @@ public class TOD_Sky : MonoBehaviour
 
 	public Color LightColor => Components.LightSource.color;
 
-	public Color SunRayColor { get; private set; }
+	public Color SunRayColor { get; set; }
 
-	public Color MoonRayColor { get; private set; }
+	public Color MoonRayColor { get; set; }
 
 	public Color SunSkyColor { get; private set; }
 
@@ -185,11 +242,9 @@ public class TOD_Sky : MonoBehaviour
 
 	public Color MoonHaloColor { get; private set; }
 
-	public ReflectionProbe Probe { get; private set; }
+	public ReflectionProbe Probe => ReflectionCur.Probe;
 
-	public GameObject ProbeInstance { get; private set; }
-
-	public MonoBehaviour ProbeEx { get; private set; }
+	public GameObject ProbeInstance => ReflectionCur.ProbeInstance;
 
 	public Vector3 OrbitalToUnity(float radius, float theta, float phi)
 	{
@@ -280,58 +335,72 @@ public class TOD_Sky : MonoBehaviour
 
 	public void RenderToCubemap(RenderTexture targetTexture = null)
 	{
-		if (!Reflection.ProbePrefab && !Probe)
+		ReflectionCur.InitializePrimary(Components.DomeTransform.position, Reflection.ProbePrefab);
+		if (ReflectionCur.ProbeRenderID < 0 || ReflectionCur.Probe.IsFinishedRendering(ReflectionCur.ProbeRenderID))
 		{
-			Probe = new GameObject().AddComponent<ReflectionProbe>();
-			Probe.name = base.gameObject.name + " Reflection Probe";
-			Probe.mode = ReflectionProbeMode.Realtime;
+			UpdateProbeProperties(ReflectionCur.Probe);
+			ReflectionCur.ProbeRenderID = ReflectionCur.Probe.RenderProbe(targetTexture);
 		}
-		if (probeRenderID < 0 || Probe.IsFinishedRendering(probeRenderID))
+		else
 		{
-			UpdateProbeProperties();
-			probeRenderID = Probe.RenderProbe(targetTexture);
+			UpdateProbeProperties(ReflectionCur.Probe);
 		}
 	}
 
 	public void RenderToProbe()
 	{
-		if (!ProbeInstance)
+		ReflectionCur.InitializePrimary(Components.DomeTransform.position, Reflection.ProbePrefab);
+		if (ReflectionCur.ProbeRenderID < 0 || ReflectionUpdateInterval == 0f)
 		{
-			ProbeInstance = UnityEngine.Object.Instantiate(Reflection.ProbePrefab);
-			ProbeInstance.name = base.gameObject.name + " Reflection Probe";
-			ProbeInstance.transform.position = Components.DomeTransform.position;
-			Probe = ProbeInstance.GetComponent<ReflectionProbe>();
-			ProbeEx = (MonoBehaviour)ProbeInstance.GetComponent(Type.GetType("ReflectionProbeEx,Assembly-CSharp", throwOnError: false, ignoreCase: false));
+			UpdateProbeProperties(ReflectionCur.Probe);
+			ReflectionCur.ProbeRenderID = ReflectionCur.Probe.RenderProbe();
 		}
-		if ((bool)ProbeInstance && !ProbeEx.enabled)
+		else if (ReflectionDst.ProbeRenderID < 0 || ReflectionDst.Probe.IsFinishedRendering(ReflectionDst.ProbeRenderID))
 		{
-			RenderToCubemap();
-		}
-		else
-		{
-			UpdateProbeProperties();
+			ReflectionSrc.InitializeSecondary(Components.DomeTransform.position);
+			ReflectionDst.InitializeSecondary(Components.DomeTransform.position);
+			UpdateProbeProperties(ReflectionCur.Probe);
+			UpdateProbeProperties(ReflectionSrc.Probe);
+			UpdateProbeProperties(ReflectionDst.Probe);
+			TOD_Util.Swap(ref ReflectionSrc, ref ReflectionDst);
+			ReflectionDst.ProbeRenderID = ReflectionDst.Probe.RenderProbe();
 		}
 	}
 
-	private void UpdateProbeProperties()
+	public bool ReflectionIsUpdating()
 	{
-		float num = float.MaxValue;
-		Probe.mode = ReflectionProbeMode.Realtime;
-		Probe.transform.position = Components.DomeTransform.position;
-		Probe.size = new Vector3(num, num, num);
-		Probe.intensity = RenderSettings.reflectionIntensity;
-		Probe.clearFlags = Reflection.ClearFlags;
-		Probe.cullingMask = Reflection.CullingMask;
-		Probe.refreshMode = ReflectionProbeRefreshMode.ViaScripting;
-		Probe.timeSlicingMode = Reflection.TimeSlicing;
-		Probe.resolution = Mathf.ClosestPowerOfTwo(Reflection.Resolution);
+		if (ReflectionDst.ProbeRenderID > 0)
+		{
+			return !ReflectionDst.Probe.IsFinishedRendering(ReflectionDst.ProbeRenderID);
+		}
+		return false;
+	}
+
+	private void UpdateProbeBlending(float lerp)
+	{
+		if (ReflectionCur.ProbeRenderID >= 0 && ReflectionSrc.ProbeRenderID >= 0 && ReflectionDst.ProbeRenderID >= 0)
+		{
+			ReflectionProbe.BlendCubemap(ReflectionSrc.Probe.realtimeTexture, ReflectionDst.Probe.realtimeTexture, lerp, ReflectionCur.Probe.realtimeTexture);
+		}
+	}
+
+	private void UpdateProbeProperties(ReflectionProbe probe)
+	{
+		probe.mode = ReflectionProbeMode.Realtime;
+		probe.transform.position = Components.DomeTransform.position;
+		probe.intensity = RenderSettings.reflectionIntensity;
+		probe.clearFlags = Reflection.ClearFlags;
+		probe.cullingMask = Reflection.CullingMask;
+		probe.refreshMode = ReflectionProbeRefreshMode.ViaScripting;
+		probe.timeSlicingMode = ReflectionTimeSlicing;
+		probe.resolution = Mathf.ClosestPowerOfTwo(ReflectionResolution);
 		if (Components.Camera != null)
 		{
-			Probe.backgroundColor = Components.Camera.BackgroundColor;
+			probe.backgroundColor = Components.Camera.BackgroundColor;
 			if (!Reflection.ProbePrefab)
 			{
-				Probe.nearClipPlane = Components.Camera.NearClipPlane;
-				Probe.farClipPlane = Components.Camera.FarClipPlane;
+				probe.nearClipPlane = Components.Camera.NearClipPlane;
+				probe.farClipPlane = Components.Camera.FarClipPlane;
 			}
 		}
 	}
@@ -434,6 +503,11 @@ public class TOD_Sky : MonoBehaviour
 		}
 	}
 
+	public void DelayReflectionUpdate()
+	{
+		timeSinceReflectionUpdate = 0f;
+	}
+
 	public void LoadParameters(string xml)
 	{
 		using StringReader input = new StringReader(xml);
@@ -530,26 +604,31 @@ public class TOD_Sky : MonoBehaviour
 
 	private void UpdateRenderSettings()
 	{
-		if (!Headless)
+		if (Headless)
 		{
-			UpdateFog();
-			if (!Application.isPlaying || timeSinceAmbientUpdate >= Ambient.UpdateInterval)
+			return;
+		}
+		UpdateFog();
+		if (!Application.isPlaying || timeSinceAmbientUpdate >= Ambient.UpdateInterval)
+		{
+			timeSinceAmbientUpdate = 0f;
+			UpdateAmbient();
+		}
+		else
+		{
+			timeSinceAmbientUpdate += Time.deltaTime;
+		}
+		if (!Application.isPlaying || timeSinceReflectionUpdate >= ReflectionUpdateInterval)
+		{
+			timeSinceReflectionUpdate = 0f;
+			UpdateReflection();
+		}
+		else if (!ReflectionIsUpdating())
+		{
+			timeSinceReflectionUpdate += Time.deltaTime * ReflectionUpdateSpeed;
+			if (Application.isPlaying)
 			{
-				timeSinceAmbientUpdate = 0f;
-				UpdateAmbient();
-			}
-			else
-			{
-				timeSinceAmbientUpdate += Time.deltaTime;
-			}
-			if (!Application.isPlaying || timeSinceReflectionUpdate >= Reflection.UpdateInterval)
-			{
-				timeSinceReflectionUpdate = 0f;
-				UpdateReflection();
-			}
-			else
-			{
-				timeSinceReflectionUpdate += Time.deltaTime;
+				UpdateProbeBlending((ReflectionUpdateInterval > 0f) ? (timeSinceReflectionUpdate / ReflectionUpdateInterval) : 1f);
 			}
 		}
 	}
@@ -838,10 +917,6 @@ public class TOD_Sky : MonoBehaviour
 		if ((bool)Probe)
 		{
 			UnityEngine.Object.Destroy(Probe.gameObject);
-		}
-		if ((bool)ProbeEx)
-		{
-			UnityEngine.Object.Destroy(ProbeEx.gameObject);
 		}
 		instances.Remove(this);
 		Initialized = false;

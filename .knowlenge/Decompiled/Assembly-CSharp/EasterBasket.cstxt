@@ -55,9 +55,9 @@ public class EasterBasket : AttackEntity
 		return base.OnRpcMessage(player, rpc, msg);
 	}
 
-	public override Vector3 GetInheritedVelocity(BasePlayer player)
+	public override Vector3 GetInheritedVelocity(BasePlayer player, Vector3 direction)
 	{
-		return player.GetInheritedProjectileVelocity();
+		return player.GetInheritedProjectileVelocity(direction);
 	}
 
 	public Item GetAmmo()
@@ -143,7 +143,7 @@ public class EasterBasket : AttackEntity
 				ServerProjectile component = baseEntity.GetComponent<ServerProjectile>();
 				if ((bool)component)
 				{
-					component.InitializeVelocity(GetInheritedVelocity(player) + vector2 * component.speed);
+					component.InitializeVelocity(GetInheritedVelocity(player, vector2) + vector2 * component.speed);
 				}
 				baseEntity.Spawn();
 				GetOwnerItem()?.LoseCondition(UnityEngine.Random.Range(1f, 2f));

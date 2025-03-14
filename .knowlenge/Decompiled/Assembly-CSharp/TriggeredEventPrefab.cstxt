@@ -5,16 +5,33 @@ public class TriggeredEventPrefab : TriggeredEvent
 {
 	public GameObjectRef targetPrefab;
 
+	public bool shouldBroadcastSpawn;
+
+	public Translate.Phrase spawnPhrase;
+
 	private void RunEvent()
 	{
-		if (Interface.CallHook("OnEventTrigger", this) == null)
+		if (Interface.CallHook("OnEventTrigger", this) != null)
 		{
-			Debug.Log("[event] " + targetPrefab.resourcePath);
-			BaseEntity baseEntity = GameManager.server.CreateEntity(targetPrefab.resourcePath);
-			if ((bool)baseEntity)
+			return;
+		}
+		Debug.Log("[event] " + targetPrefab.resourcePath);
+		BaseEntity baseEntity = GameManager.server.CreateEntity(targetPrefab.resourcePath);
+		if (!baseEntity)
+		{
+			return;
+		}
+		baseEntity.SendMessage("TriggeredEventSpawn", SendMessageOptions.DontRequireReceiver);
+		baseEntity.Spawn();
+		if (!shouldBroadcastSpawn)
+		{
+			return;
+		}
+		foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+		{
+			if ((bool)activePlayer && activePlayer.IsConnected)
 			{
-				baseEntity.SendMessage("TriggeredEventSpawn", SendMessageOptions.DontRequireReceiver);
-				baseEntity.Spawn();
+				activePlayer.ShowToast(GameTip.Styles.Server_Event, spawnPhrase);
 			}
 		}
 	}

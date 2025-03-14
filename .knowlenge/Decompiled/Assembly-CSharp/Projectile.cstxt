@@ -76,6 +76,9 @@ public class Projectile : BaseMonoBehaviour
 
 	public bool createDecals = true;
 
+	[Header("Effects")]
+	public bool doDefaultHitEffects = true;
+
 	[Header("Audio")]
 	public SoundDefinition flybySound;
 

@@ -1,6 +1,4 @@
-using UnityEngine;
-
-public class Screenshot : MonoBehaviour
+public class Screenshot : SingletonComponent<Screenshot>
 {
 	public string screenshotPath;
 

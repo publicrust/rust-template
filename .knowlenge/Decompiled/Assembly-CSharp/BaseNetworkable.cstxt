@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Network.Visibility;
 using Oxide.Core;
@@ -64,13 +65,18 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 
 	public abstract class EntityRealm : IEnumerable<BaseNetworkable>, IEnumerable
 	{
-		public ListDictionary<uint, BaseNetworkable> entityList = new ListDictionary<uint, BaseNetworkable>();
+		public ListDictionary<NetworkableId, BaseNetworkable> entityList = new ListDictionary<NetworkableId, BaseNetworkable>();
 
 		public int Count => entityList.Count;
 
 		protected abstract Manager visibilityManager { get; }
 
-		public BaseNetworkable Find(uint uid)
+		public bool Contains(NetworkableId uid)
+		{
+			return entityList.Contains(uid);
+		}
+
+		public BaseNetworkable Find(NetworkableId uid)
 		{
 			BaseNetworkable val = null;
 			if (!entityList.TryGetValue(uid, out val))
@@ -172,11 +178,14 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 	[NonSerialized]
 	public readonly List<BaseEntity> children = new List<BaseEntity>();
 
+	[NonSerialized]
+	public bool canTriggerParent = true;
+
 	public int creationFrame;
 
 	public bool isSpawned;
 
-	private MemoryStream _NetworkCache;
+	public MemoryStream _NetworkCache;
 
 	public static Queue<MemoryStream> EntityMemoryStreamPool = new Queue<MemoryStream>();
 
@@ -200,7 +209,7 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 
 	private const bool isServersideEntity = true;
 
-	private static List<Connection> connectionsInSphereList = new List<Connection>();
+	public static List<Connection> connectionsInSphereList = new List<Connection>();
 
 	public bool limitNetworking
 	{
@@ -418,7 +427,7 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 		}
 	}
 
-	protected List<Connection> GetSubscribers()
+	public List<Connection> GetSubscribers()
 	{
 		if (net == null)
 		{
@@ -457,18 +466,16 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 		}
 	}
 
-	private void TerminateOnClient(DestroyMode mode)
+	public void TerminateOnClient(DestroyMode mode)
 	{
 		if (net != null && net.group != null && Network.Net.sv.IsConnected())
 		{
 			LogEntry(LogEntryType.Network, 2, "Term {0}", mode);
-			if (Network.Net.sv.write.Start())
-			{
-				Network.Net.sv.write.PacketID(Message.Type.EntityDestroy);
-				Network.Net.sv.write.EntityID(net.ID);
-				Network.Net.sv.write.UInt8((byte)mode);
-				Network.Net.sv.write.Send(new SendInfo(net.group.subscribers));
-			}
+			NetWrite netWrite = Network.Net.sv.StartWrite();
+			netWrite.PacketID(Message.Type.EntityDestroy);
+			netWrite.EntityID(net.ID);
+			netWrite.UInt8((byte)mode);
+			netWrite.Send(new SendInfo(net.group.subscribers));
 		}
 	}
 
@@ -487,6 +494,7 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 	internal virtual void DoServerDestroy()
 	{
 		isSpawned = false;
+		Facepunch.Rust.Analytics.Azure.OnEntityDestroyed(this);
 	}
 
 	public virtual bool ShouldNetworkTo(BasePlayer player)
@@ -503,37 +511,37 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 		return player.net.subscriber.IsSubscribed(net.group);
 	}
 
-	protected void SendNetworkGroupChange()
+	public void SendNetworkGroupChange()
 	{
 		if (isSpawned && Network.Net.sv.IsConnected())
 		{
 			if (net.group == null)
 			{
 				Debug.LogWarning(ToString() + " changed its network group to null");
+				return;
 			}
-			else if (Network.Net.sv.write.Start())
-			{
-				Network.Net.sv.write.PacketID(Message.Type.GroupChange);
-				Network.Net.sv.write.EntityID(net.ID);
-				Network.Net.sv.write.GroupID(net.group.ID);
-				Network.Net.sv.write.Send(new SendInfo(net.group.subscribers));
-			}
+			NetWrite netWrite = Network.Net.sv.StartWrite();
+			netWrite.PacketID(Message.Type.GroupChange);
+			netWrite.EntityID(net.ID);
+			netWrite.GroupID(net.group.ID);
+			netWrite.Send(new SendInfo(net.group.subscribers));
 		}
 	}
 
-	protected void SendAsSnapshot(Connection connection, bool justCreated = false)
+	public void SendAsSnapshot(Connection connection, bool justCreated = false)
 	{
-		if (Interface.CallHook("OnEntitySnapshot", this, connection) == null && Network.Net.sv.write.Start())
+		if (Interface.CallHook("OnEntitySnapshot", this, connection) == null)
 		{
+			NetWrite netWrite = Network.Net.sv.StartWrite();
 			connection.validate.entityUpdates++;
 			SaveInfo saveInfo = default(SaveInfo);
 			saveInfo.forConnection = connection;
 			saveInfo.forDisk = false;
 			SaveInfo saveInfo2 = saveInfo;
-			Network.Net.sv.write.PacketID(Message.Type.Entities);
-			Network.Net.sv.write.UInt32(connection.validate.entityUpdates);
-			ToStreamForNetwork(Network.Net.sv.write, saveInfo2);
-			Network.Net.sv.write.Send(new SendInfo(connection));
+			netWrite.PacketID(Message.Type.Entities);
+			netWrite.UInt32(connection.validate.entityUpdates);
+			ToStreamForNetwork(netWrite, saveInfo2);
+			netWrite.Send(new SendInfo(connection));
 		}
 	}
 
@@ -590,7 +598,7 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 		base.gameObject.SendOnSendNetworkUpdate(this as BaseEntity);
 	}
 
-	protected void SendNetworkUpdate_Position()
+	public void SendNetworkUpdate_Position()
 	{
 		if (Rust.Application.isLoading || Rust.Application.isLoadingSave || IsDestroyed || net == null || !isSpawned)
 		{
@@ -600,28 +608,29 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 		{
 			LogEntry(LogEntryType.Network, 2, "SendNetworkUpdate_Position");
 			List<Connection> subscribers = GetSubscribers();
-			if (subscribers != null && subscribers.Count > 0 && Network.Net.sv.write.Start())
+			if (subscribers != null && subscribers.Count > 0)
 			{
-				Network.Net.sv.write.PacketID(Message.Type.EntityPosition);
-				Network.Net.sv.write.EntityID(net.ID);
-				Network.Net.sv.write.Vector3(GetNetworkPosition());
-				Network.Net.sv.write.Vector3(GetNetworkRotation().eulerAngles);
-				Network.Net.sv.write.Float(GetNetworkTime());
-				uint uid = parentEntity.uid;
-				if (uid != 0)
+				NetWrite netWrite = Network.Net.sv.StartWrite();
+				netWrite.PacketID(Message.Type.EntityPosition);
+				netWrite.EntityID(net.ID);
+				netWrite.Vector3(GetNetworkPosition());
+				netWrite.Vector3(GetNetworkRotation().eulerAngles);
+				netWrite.Float(GetNetworkTime());
+				NetworkableId uid = parentEntity.uid;
+				if (uid.IsValid)
 				{
-					Network.Net.sv.write.EntityID(uid);
+					netWrite.EntityID(uid);
 				}
 				SendInfo sendInfo = new SendInfo(subscribers);
 				sendInfo.method = SendMethod.ReliableUnordered;
 				sendInfo.priority = Priority.Immediate;
 				SendInfo info = sendInfo;
-				Network.Net.sv.write.Send(info);
+				netWrite.Send(info);
 			}
 		}
 	}
 
-	private void ToStream(Stream stream, SaveInfo saveInfo)
+	public void ToStream(Stream stream, SaveInfo saveInfo)
 	{
 		using (saveInfo.msg = Facepunch.Pool.Get<ProtoBuf.Entity>())
 		{
@@ -756,14 +765,14 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 
 	public bool EqualNetID(BaseNetworkable other)
 	{
-		if (other != null && other.net != null && net != null)
+		if (!other.IsRealNull() && other.net != null && net != null)
 		{
 			return other.net.ID == net.ID;
 		}
 		return false;
 	}
 
-	public bool EqualNetID(uint otherID)
+	public bool EqualNetID(NetworkableId otherID)
 	{
 		if (net != null)
 		{
@@ -777,6 +786,10 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 		if (children.Count > 0)
 		{
 			children.Clear();
+		}
+		if (this is ILootableEntity lootableEntity)
+		{
+			lootableEntity.LastLootedBy = 0uL;
 		}
 	}
 
@@ -846,13 +859,11 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 		if (Network.Net.sv.IsConnected())
 		{
 			LogEntry(LogEntryType.Network, 2, "LeaveVisibility");
-			if (Network.Net.sv.write.Start())
-			{
-				Network.Net.sv.write.PacketID(Message.Type.EntityDestroy);
-				Network.Net.sv.write.EntityID(net.ID);
-				Network.Net.sv.write.UInt8(0);
-				Network.Net.sv.write.Send(new SendInfo(connections));
-			}
+			NetWrite netWrite = Network.Net.sv.StartWrite();
+			netWrite.PacketID(Message.Type.EntityDestroy);
+			netWrite.EntityID(net.ID);
+			netWrite.UInt8(0);
+			netWrite.Send(new SendInfo(connections));
 		}
 	}
 
@@ -919,7 +930,7 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 	{
 	}
 
-	public void InitLoad(uint entityID)
+	public void InitLoad(NetworkableId entityID)
 	{
 		net = Network.Net.sv.CreateNetworkable(entityID);
 		serverEntities.RegisterID(this);
@@ -979,5 +990,64 @@ public abstract class BaseNetworkable : BaseMonoBehaviour, IPrefabPostProcess, I
 			}
 		}
 		return connectionsInSphereList;
+	}
+
+	public static void GetCloseConnections(Vector3 position, float distance, List<BasePlayer> players)
+	{
+		if (Network.Net.sv == null || Network.Net.sv.visibility == null)
+		{
+			return;
+		}
+		float num = distance * distance;
+		Group group = Network.Net.sv.visibility.GetGroup(position);
+		if (group == null)
+		{
+			return;
+		}
+		List<Connection> subscribers = group.subscribers;
+		for (int i = 0; i < subscribers.Count; i++)
+		{
+			Connection connection = subscribers[i];
+			if (connection.active)
+			{
+				BasePlayer basePlayer = connection.player as BasePlayer;
+				if (!(basePlayer == null) && !(basePlayer.SqrDistance(position) > num))
+				{
+					players.Add(basePlayer);
+				}
+			}
+		}
+	}
+
+	public static bool HasCloseConnections(Vector3 position, float distance)
+	{
+		if (Network.Net.sv == null)
+		{
+			return false;
+		}
+		if (Network.Net.sv.visibility == null)
+		{
+			return false;
+		}
+		float num = distance * distance;
+		Group group = Network.Net.sv.visibility.GetGroup(position);
+		if (group == null)
+		{
+			return false;
+		}
+		List<Connection> subscribers = group.subscribers;
+		for (int i = 0; i < subscribers.Count; i++)
+		{
+			Connection connection = subscribers[i];
+			if (connection.active)
+			{
+				BasePlayer basePlayer = connection.player as BasePlayer;
+				if (!(basePlayer == null) && !(basePlayer.SqrDistance(position) > num))
+				{
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 }

@@ -1,5 +1,6 @@
 using System;
 using Facepunch;
+using Facepunch.Rust;
 using Oxide.Core;
 using ProtoBuf;
 using UnityEngine;
@@ -46,6 +47,10 @@ public class MiningQuarry : BaseResourceExtractor
 	public float processRate = 5f;
 
 	public float workToAdd = 15f;
+
+	public float workPerFuel = 1000f;
+
+	public float pendingWork;
 
 	public GameObjectRef bucketDropEffect;
 
@@ -110,6 +115,16 @@ public class MiningQuarry : BaseResourceExtractor
 		}
 		SpawnChildEntities();
 		engineSwitchPrefab.instance.SetFlag(Flags.On, HasFlag(Flags.On));
+		if (base.isServer)
+		{
+			ItemContainer inventory = fuelStoragePrefab.instance.GetComponent<StorageContainer>().inventory;
+			inventory.canAcceptItem = (Func<Item, int, bool>)Delegate.Combine(inventory.canAcceptItem, new Func<Item, int, bool>(CanAcceptItem));
+		}
+	}
+
+	public bool CanAcceptItem(Item item, int targetSlot)
+	{
+		return item.info.shortname == "diesel_barrel";
 	}
 
 	public void UpdateStaticDeposit()
@@ -133,18 +148,19 @@ public class MiningQuarry : BaseResourceExtractor
 			}
 			else if (staticType == QuarryType.Basic)
 			{
-				_linkedDeposit.Add(ItemManager.FindItemDefinition("metal.ore"), 1f, 1000, 2f, ResourceDepositManager.ResourceDeposit.surveySpawnType.ITEM);
-				_linkedDeposit.Add(ItemManager.FindItemDefinition("stones"), 1f, 1000, 0.3f, ResourceDepositManager.ResourceDeposit.surveySpawnType.ITEM);
+				_linkedDeposit.Add(ItemManager.FindItemDefinition("metal.ore"), 1f, 1000, 1f, ResourceDepositManager.ResourceDeposit.surveySpawnType.ITEM);
+				_linkedDeposit.Add(ItemManager.FindItemDefinition("stones"), 1f, 1000, 0.2f, ResourceDepositManager.ResourceDeposit.surveySpawnType.ITEM);
 			}
 			else if (staticType == QuarryType.Sulfur)
 			{
-				_linkedDeposit.Add(ItemManager.FindItemDefinition("sulfur.ore"), 1f, 1000, 2f, ResourceDepositManager.ResourceDeposit.surveySpawnType.ITEM);
+				_linkedDeposit.Add(ItemManager.FindItemDefinition("sulfur.ore"), 1f, 1000, 1f, ResourceDepositManager.ResourceDeposit.surveySpawnType.ITEM);
 			}
 			else if (staticType == QuarryType.HQM)
 			{
-				_linkedDeposit.Add(ItemManager.FindItemDefinition("hq.metal.ore"), 1f, 1000, 30f, ResourceDepositManager.ResourceDeposit.surveySpawnType.ITEM);
+				_linkedDeposit.Add(ItemManager.FindItemDefinition("hq.metal.ore"), 1f, 1000, 20f, ResourceDepositManager.ResourceDeposit.surveySpawnType.ITEM);
 			}
-			_linkedDeposit.Add(ItemManager.FindItemDefinition("crude.oil"), 1f, 1000, 10f, ResourceDepositManager.ResourceDeposit.surveySpawnType.ITEM, liquid: true);
+			_linkedDeposit.Add(ItemManager.FindItemDefinition("crude.oil"), 1f, 1000, 16.666666f, ResourceDepositManager.ResourceDeposit.surveySpawnType.ITEM, liquid: true);
+			_linkedDeposit.Add(ItemManager.FindItemDefinition("lowgradefuel"), 1f, 1000, 5.882353f, ResourceDepositManager.ResourceDeposit.surveySpawnType.ITEM, liquid: true);
 		}
 	}
 
@@ -168,18 +184,31 @@ public class MiningQuarry : BaseResourceExtractor
 		{
 			return;
 		}
+		if (!FuelCheck())
+		{
+			SetOn(isOn: false);
+		}
+		float num = Mathf.Min(workToAdd, pendingWork);
+		pendingWork -= num;
 		foreach (ResourceDepositManager.ResourceDeposit.ResourceDepositEntry resource in _linkedDeposit._resources)
 		{
 			if ((!canExtractLiquid && resource.isLiquid) || (!canExtractSolid && !resource.isLiquid))
 			{
 				continue;
 			}
-			resource.workDone += workToAdd;
-			if (!(resource.workDone < resource.workNeeded))
+			float workNeeded = resource.workNeeded;
+			int num2 = Mathf.FloorToInt(resource.workDone / workNeeded);
+			resource.workDone += num;
+			int num3 = Mathf.FloorToInt(resource.workDone / workNeeded);
+			if (resource.workDone > workNeeded)
 			{
-				int num = Mathf.FloorToInt(resource.workDone / resource.workNeeded);
-				resource.workDone -= (float)num * resource.workNeeded;
-				Item item = ItemManager.Create(resource.type, num, 0uL);
+				resource.workDone %= workNeeded;
+			}
+			if (num2 != num3)
+			{
+				int iAmount = num3 - num2;
+				Item item = ItemManager.Create(resource.type, iAmount, 0uL);
+				Facepunch.Rust.Analytics.Azure.OnQuarryItem(Facepunch.Rust.Analytics.Azure.ResourceMode.Produced, item.info.shortname, item.amount, this);
 				if (Interface.CallHook("OnQuarryGather", this, item) != null)
 				{
 					item.Remove();
@@ -191,22 +220,24 @@ public class MiningQuarry : BaseResourceExtractor
 				}
 			}
 		}
-		if (!FuelCheck())
-		{
-			SetOn(isOn: false);
-		}
 	}
 
 	public bool FuelCheck()
 	{
-		Item item = fuelStoragePrefab.instance.GetComponent<StorageContainer>().inventory.FindItemsByItemName("lowgradefuel");
+		if (pendingWork > 0f)
+		{
+			return true;
+		}
+		Item item = fuelStoragePrefab.instance.GetComponent<StorageContainer>().inventory.FindItemsByItemName("diesel_barrel");
+		object obj = Interface.CallHook("OnQuarryConsumeFuel", this, item);
+		if (obj is Item)
+		{
+			item = (Item)obj;
+		}
 		if (item != null && item.amount >= 1)
 		{
-			object obj = Interface.CallHook("OnQuarryConsumeFuel", this, item);
-			if (obj is Item)
-			{
-				item = (Item)obj;
-			}
+			pendingWork += workPerFuel;
+			Facepunch.Rust.Analytics.Azure.OnQuarryItem(Facepunch.Rust.Analytics.Azure.ResourceMode.Consumed, item.info.shortname, 1, this);
 			item.UseItem();
 			return true;
 		}

@@ -2,13 +2,14 @@
 using System;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
 using UnityEngine;
 using UnityEngine.Assertions;
 
-public class LootableCorpse : BaseCorpse
+public class LootableCorpse : BaseCorpse, LootPanel.IHasLootPanel
 {
 	public string lootPanelName = "generic";
 
@@ -21,17 +22,26 @@ public class LootableCorpse : BaseCorpse
 	[NonSerialized]
 	public ItemContainer[] containers;
 
+	[NonSerialized]
+	private bool firstLooted;
+
 	public virtual string playerName
 	{
 		get
 		{
-			return _playerName;
+			return NameHelper.Get(playerSteamID, _playerName);
 		}
 		set
 		{
 			_playerName = value;
 		}
 	}
+
+	public Translate.Phrase LootPanelTitle => playerName;
+
+	public Translate.Phrase LootPanelName => "N/A";
+
+	public bool blockBagDrop { get; set; }
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -77,6 +87,12 @@ public class LootableCorpse : BaseCorpse
 		return base.OnRpcMessage(player, rpc, msg);
 	}
 
+	public override void ResetState()
+	{
+		firstLooted = false;
+		base.ResetState();
+	}
+
 	public override void ServerInit()
 	{
 		base.ServerInit();
@@ -85,7 +101,12 @@ public class LootableCorpse : BaseCorpse
 	internal override void DoServerDestroy()
 	{
 		base.DoServerDestroy();
-		DropItems();
+		if (!blockBagDrop)
+		{
+			PreDropItems();
+			DropItems();
+		}
+		blockBagDrop = false;
 		if (containers != null)
 		{
 			ItemContainer[] array = containers;
@@ -132,23 +153,45 @@ public class LootableCorpse : BaseCorpse
 		return true;
 	}
 
+	public override bool OnStartBeingLooted(BasePlayer baseEntity)
+	{
+		if (!firstLooted)
+		{
+			if (playerSteamID <= 10000000)
+			{
+				Facepunch.Rust.Analytics.Azure.OnFirstLooted(this, baseEntity);
+			}
+			firstLooted = true;
+		}
+		return base.OnStartBeingLooted(baseEntity);
+	}
+
+	protected virtual bool CanLootContainer(ItemContainer c, int index)
+	{
+		return true;
+	}
+
 	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
 	private void RPC_LootCorpse(RPCMessage rpc)
 	{
 		BasePlayer player = rpc.player;
-		if ((bool)player && player.CanInteract() && CanLoot() && containers != null && Interface.CallHook("CanLootEntity", player, this) == null && player.inventory.loot.StartLootingEntity(this))
+		if (!player || !player.CanInteract() || !CanLoot() || containers == null || Interface.CallHook("CanLootEntity", player, this) != null || !player.inventory.loot.StartLootingEntity(this))
 		{
-			SetFlag(Flags.Open, b: true);
-			ItemContainer[] array = containers;
-			foreach (ItemContainer container in array)
-			{
-				player.inventory.loot.AddContainer(container);
-			}
-			player.inventory.loot.SendImmediate();
-			ClientRPCPlayer(null, player, "RPC_ClientLootCorpse");
-			SendNetworkUpdate();
+			return;
 		}
+		SetFlag(Flags.Open, b: true);
+		for (int i = 0; i < containers.Length; i++)
+		{
+			ItemContainer itemContainer = containers[i];
+			if (CanLootContainer(itemContainer, i))
+			{
+				player.inventory.loot.AddContainer(itemContainer);
+			}
+		}
+		player.inventory.loot.SendImmediate();
+		ClientRPCPlayer(null, player, "RPC_ClientLootCorpse");
+		SendNetworkUpdate();
 	}
 
 	public void PlayerStoppedLooting(BasePlayer player)
@@ -159,9 +202,13 @@ public class LootableCorpse : BaseCorpse
 		SendNetworkUpdate();
 	}
 
+	protected virtual void PreDropItems()
+	{
+	}
+
 	public void DropItems()
 	{
-		if (containers != null)
+		if (!Global.disableBagDropping && containers != null)
 		{
 			DroppedItemContainer droppedItemContainer = ItemContainer.Drop("assets/prefabs/misc/item drop/item_drop_backpack.prefab", base.transform.position, Quaternion.identity, containers);
 			if (droppedItemContainer != null)

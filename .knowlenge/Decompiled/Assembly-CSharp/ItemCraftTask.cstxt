@@ -30,4 +30,6 @@ public class ItemCraftTask
 	public float workSecondsComplete;
 
 	public float worksecondsRequired;
+
+	public BaseEntity workbenchEntity;
 }

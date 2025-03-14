@@ -11,4 +11,6 @@ public class GunModInformationPanel : ItemInformationPanel
 	public ItemTextValue recoilDisplay;
 
 	public ItemTextValue zoomDisplay;
+
+	public ItemTextValue ammoDisplay;
 }

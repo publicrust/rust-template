@@ -1,10 +1,10 @@
-using TMPro;
+using Rust.UI;
 using UnityEngine;
 using UnityEngine.UI;
 
 public class ConsoleUI : SingletonComponent<ConsoleUI>
 {
-	public TextMeshProUGUI text;
+	public RustText text;
 
 	public InputField outputField;
 

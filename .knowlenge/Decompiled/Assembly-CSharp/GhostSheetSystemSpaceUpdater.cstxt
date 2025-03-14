@@ -1,7 +1,6 @@
 using EZhex1991.EZSoftBone;
 using UnityEngine;
 
-[RequireComponent(typeof(EZSoftBone))]
 public class GhostSheetSystemSpaceUpdater : MonoBehaviour, IClientComponent
 {
 	private EZSoftBone[] ezSoftBones;

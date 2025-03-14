@@ -3,7 +3,7 @@ using System.Linq;
 using Rust;
 using UnityEngine;
 
-public class TriggerHurtEx : TriggerBase, IServerComponent
+public class TriggerHurtEx : TriggerBase, IServerComponent, IHurtTrigger
 {
 	public enum HurtType
 	{

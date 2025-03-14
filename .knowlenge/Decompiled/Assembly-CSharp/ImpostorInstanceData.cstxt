@@ -72,6 +72,7 @@ public class ImpostorInstanceData
 		if (Batch != null)
 		{
 			Batch.Positions[BatchIndex] = PositionAndScale();
+			Batch.IsDirty = true;
 		}
 	}
 }

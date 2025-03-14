@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Threading;
 using Facepunch;
 using Network;
 using Network.Visibility;
@@ -9,11 +10,29 @@ public abstract class Server : BaseNetwork
 {
 	public static ulong MaxPacketsPerSecond = 1500uL;
 
-	public static int MaxPacketSize = 5000000;
-
 	public static int MaxConnectionsPerIP = 5;
 
-	public static float MaxReceiveTime = 20f;
+	public static int MaxReceiveTime = 20;
+
+	public static int MaxReadQueueLength = 5000;
+
+	public static int MaxWriteQueueLength = 5000;
+
+	public static int MaxDecryptQueueLength = 5000;
+
+	public static int MaxReadQueueBytes = 524288000;
+
+	public static int MaxWriteQueueBytes = 524288000;
+
+	public static int MaxDecryptQueueBytes = 524288000;
+
+	public static int MaxMainThreadWait = 100;
+
+	public static int MaxReadThreadWait = 100;
+
+	public static int MaxWriteThreadWait = 100;
+
+	public static int MaxDecryptThreadWait = 100;
 
 	public string ip = "";
 
@@ -29,7 +48,7 @@ public abstract class Server : BaseNetwork
 
 	public bool debug;
 
-	internal uint lastValueGiven = 1024u;
+	internal ulong lastValueGiven = 1024uL;
 
 	public List<Connection> connections = new List<Connection>();
 
@@ -37,11 +56,29 @@ public abstract class Server : BaseNetwork
 
 	private Dictionary<string, List<Connection>> connectionsByIP = new Dictionary<string, List<Connection>>();
 
+	protected override int MaxReceiveTimeValue => MaxReceiveTime;
+
+	protected override int MaxReadQueueLengthValue => MaxReadQueueLength;
+
+	protected override int MaxWriteQueueLengthValue => MaxWriteQueueLength;
+
+	protected override int MaxDecryptQueueLengthValue => MaxDecryptQueueLength;
+
+	protected override int MaxReadQueueBytesValue => MaxReadQueueBytes;
+
+	protected override int MaxWriteQueueBytesValue => MaxWriteQueueBytes;
+
+	protected override int MaxDecryptQueueBytesValue => MaxDecryptQueueBytes;
+
+	protected override int MaxMainThreadWaitValue => MaxMainThreadWait;
+
+	protected override int MaxReadThreadWaitValue => MaxReadThreadWait;
+
+	protected override int MaxWriteThreadWaitValue => MaxWriteThreadWait;
+
+	protected override int MaxDecryptThreadWaitValue => MaxDecryptThreadWait;
+
 	public virtual string ProtocolId => "none";
-
-	public virtual bool AllowPassthroughMessages => false;
-
-	public abstract bool IsConnected();
 
 	public void Reset()
 	{
@@ -57,7 +94,7 @@ public abstract class Server : BaseNetwork
 	{
 	}
 
-	public virtual void Cycle()
+	public virtual void Flush(Connection cn)
 	{
 	}
 
@@ -65,42 +102,65 @@ public abstract class Server : BaseNetwork
 
 	public abstract void Kick(Connection cn, string message, bool logfile = false);
 
-	public uint TakeUID()
+	public ulong GetLastUIDGiven()
 	{
-		if (lastValueGiven > 4294967263u)
+		return lastValueGiven;
+	}
+
+	public ulong TakeUID()
+	{
+		if (lastValueGiven == ulong.MaxValue)
 		{
-			Debug.LogError("TakeUID - hitting ceiling limit!" + lastValueGiven);
+			Debug.LogError("TakeUID - ran out of available UIDs! Cannot continue running this save file.");
+			Stop("Stopping Server");
+			while (true)
+			{
+				Thread.Sleep(100);
+			}
+		}
+		if (lastValueGiven > 18446744073709550615uL)
+		{
+			Debug.LogError("TakeUID - hitting ceiling limit! " + lastValueGiven);
+		}
+		else if (lastValueGiven > 18446744072859551615uL && lastValueGiven % 100000 == 0L)
+		{
+			Debug.LogError("TakeUID - approaching ceiling limit! " + lastValueGiven);
 		}
 		lastValueGiven++;
 		return lastValueGiven;
 	}
 
-	public void ReturnUID(uint uid)
+	public void ReturnUID(ulong uid)
 	{
+	}
+
+	public void RegisterUID(ulong uid)
+	{
+		if (uid > lastValueGiven)
+		{
+			lastValueGiven = uid;
+		}
 	}
 
 	internal void ResetUIDs()
 	{
-		lastValueGiven = 1024u;
+		lastValueGiven = 1024uL;
 	}
 
 	public Networkable CreateNetworkable()
 	{
 		Networkable networkable = Pool.Get<Networkable>();
-		networkable.ID = TakeUID();
+		networkable.ID = new NetworkableId(TakeUID());
 		networkable.sv = this;
 		return networkable;
 	}
 
-	public Networkable CreateNetworkable(uint uid)
+	public Networkable CreateNetworkable(NetworkableId uid)
 	{
 		Networkable networkable = Pool.Get<Networkable>();
 		networkable.ID = uid;
 		networkable.sv = this;
-		if (uid > lastValueGiven)
-		{
-			lastValueGiven = uid;
-		}
+		RegisterUID(uid.Value);
 		return networkable;
 	}
 
@@ -120,7 +180,7 @@ public abstract class Server : BaseNetwork
 			{
 				callbackHandler.OnDisconnected(strReason, cn);
 			}
-			Interface.CallHook("OnClientDisconnect", cn, strReason);
+			Interface.CallHook("OnClientDisconnected", cn, strReason);
 			RemoveConnection(cn);
 		}
 	}
@@ -134,53 +194,69 @@ public abstract class Server : BaseNetwork
 		return null;
 	}
 
-	protected virtual void OnNewConnection()
+	protected virtual void OnNewConnection(ulong guid, string ipaddress)
 	{
+		if (!string.IsNullOrEmpty(ipaddress) && !(ipaddress == "UNASSIGNED_SYSTEM_ADDRESS"))
+		{
+			Connection connection = new Connection();
+			connection.guid = guid;
+			connection.ipaddress = ipaddress;
+			connection.active = true;
+			OnNewConnection(connection);
+		}
 	}
 
 	protected virtual void OnNewConnection(Connection connection)
 	{
-		connection.connectionTime = Time.realtimeSinceStartup;
+		connection.connectionTime = TimeEx.realtimeSinceStartup;
 		connections.Add(connection);
 		connectionByGUID.Add(connection.guid, connection);
-		if (!connectionsByIP.TryGetValue(connection.ipaddress, out var value))
+		if (LimitConnectionsPerIP())
 		{
-			connectionsByIP.Add(connection.ipaddress, value = Pool.GetList<Connection>());
+			string key = connection.IPAddressWithoutPort();
+			if (!connectionsByIP.TryGetValue(key, out var value))
+			{
+				connectionsByIP.Add(key, value = Pool.GetList<Connection>());
+			}
+			value.Add(connection);
+			if (value.Count > MaxConnectionsPerIP)
+			{
+				Kick(connection, "Too many connections from this IP");
+				return;
+			}
 		}
-		value.Add(connection);
-		if (value.Count > MaxConnectionsPerIP)
-		{
-			Kick(connection, "Too many connections from this IP");
-		}
-		else if (base.write.Start())
-		{
-			base.write.PacketID(Message.Type.RequestUserInformation);
-			base.write.Send(new SendInfo(connection));
-		}
+		NetWrite netWrite = StartWrite();
+		netWrite.PacketID(Message.Type.RequestUserInformation);
+		netWrite.Send(new SendInfo(connection));
 	}
 
 	protected void RemoveConnection(Connection connection)
 	{
-		if (connectionsByIP.TryGetValue(connection.ipaddress, out var value))
+		if (LimitConnectionsPerIP())
 		{
-			value.Remove(connection);
-		}
-		if (value != null && value.Count == 0)
-		{
-			connectionsByIP.Remove(connection.ipaddress);
-			Pool.FreeList(ref value);
+			string key = connection.IPAddressWithoutPort();
+			if (connectionsByIP.TryGetValue(key, out var value))
+			{
+				value.Remove(connection);
+			}
+			if (value != null && value.Count == 0)
+			{
+				connectionsByIP.Remove(key);
+				Pool.FreeList(ref value);
+			}
 		}
 		connectionByGUID.Remove(connection.guid);
 		connections.Remove(connection);
 		connection.OnDisconnected();
 	}
 
+	public virtual bool LimitConnectionsPerIP()
+	{
+		return true;
+	}
+
 	public virtual int GetAveragePing(Connection connection)
 	{
 		return 0;
-	}
-
-	public virtual void SendUnconnected(uint netAddr, ushort netPort, byte[] steamResponseBuffer, int packetSize)
-	{
 	}
 }

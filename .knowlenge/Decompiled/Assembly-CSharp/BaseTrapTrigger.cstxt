@@ -24,10 +24,10 @@ public class BaseTrapTrigger : TriggerBase
 		return baseEntity.gameObject;
 	}
 
-	public override void OnObjectAdded(GameObject obj)
+	internal override void OnObjectAdded(GameObject obj, Collider col)
 	{
-		Interface.CallHook("OnTrapSnapped", this, obj);
-		base.OnObjectAdded(obj);
+		Interface.CallHook("OnTrapSnapped", this, obj, col);
+		base.OnObjectAdded(obj, col);
 		_trap.ObjectEntered(obj);
 	}
 

@@ -12,12 +12,15 @@ public class ConversationData : ScriptableObject
 			NONE,
 			HASHEALTH,
 			HASSCRAP,
-			PROVIDERBUSY
+			PROVIDERBUSY,
+			MISSIONCOMPLETE,
+			MISSIONATTEMPTED,
+			CANACCEPT
 		}
 
 		public ConditionType conditionType;
 
-		public int conditionAmount;
+		public uint conditionAmount;
 
 		public bool inverse;
 
@@ -37,6 +40,18 @@ public class ConversationData : ScriptableObject
 			else if (conditionType == ConditionType.PROVIDERBUSY)
 			{
 				flag = provider.ProviderBusy();
+			}
+			else if (conditionType == ConditionType.MISSIONCOMPLETE)
+			{
+				flag = player.HasCompletedMission(conditionAmount);
+			}
+			else if (conditionType == ConditionType.MISSIONATTEMPTED)
+			{
+				flag = player.HasAttemptedMission(conditionAmount);
+			}
+			else if (conditionType == ConditionType.CANACCEPT)
+			{
+				flag = player.CanAcceptMission(conditionAmount);
 			}
 			if (!inverse)
 			{

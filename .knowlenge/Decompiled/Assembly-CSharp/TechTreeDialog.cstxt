@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using Rust.UI;
 using UnityEngine;
 
 public class TechTreeDialog : UIDialog, IInventoryChanged
@@ -24,6 +25,8 @@ public class TechTreeDialog : UIDialog, IInventoryChanged
 	public float gridSize = 64f;
 
 	public GameObjectRef unlockEffect;
+
+	public RustText scrapCount;
 
 	private Vector2 startPos = Vector2.zero;
 

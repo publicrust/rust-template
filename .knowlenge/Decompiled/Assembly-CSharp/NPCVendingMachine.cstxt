@@ -1,3 +1,4 @@
+using Facepunch.Rust;
 using Oxide.Core;
 using UnityEngine;
 
@@ -148,6 +149,11 @@ public class NPCVendingMachine : VendingMachine
 
 	public void RefreshStock()
 	{
+	}
+
+	protected override void RecordSaleAnalytics(Item itemSold)
+	{
+		Facepunch.Rust.Analytics.Server.VendingMachineTransaction(vendingOrders, itemSold.info, itemSold.amount);
 	}
 
 	protected override bool CanRotate()

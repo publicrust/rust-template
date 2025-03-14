@@ -1,6 +1,4 @@
 using System;
-using System.Diagnostics;
-using System.IO;
 using Facepunch;
 using Facepunch.Network.Raknet;
 using Network;
@@ -12,8 +10,6 @@ public class Server : Network.Server
 
 	public override string ProtocolId => "rak";
 
-	public override bool AllowPassthroughMessages => true;
-
 	public override bool IsConnected()
 	{
 		return peer != null;
@@ -21,67 +17,102 @@ public class Server : Network.Server
 
 	public override bool Start()
 	{
-		peer = Peer.CreateServer(ip, port, 1024);
-		if (peer == null)
+		lock (readLock)
 		{
-			return false;
+			lock (writeLock)
+			{
+				lock (decryptLock)
+				{
+					peer = Peer.CreateServer(ip, port, 1024);
+					if (peer == null)
+					{
+						return false;
+					}
+					MultithreadingInit();
+					return true;
+				}
+			}
 		}
-		return true;
 	}
 
 	public override void Stop(string shutdownMsg)
 	{
-		if (peer == null)
+		lock (readLock)
 		{
-			return;
-		}
-		Console.WriteLine("[Raknet] Server Shutting Down (" + shutdownMsg + ")");
-		using (TimeWarning.New("ServerStop"))
-		{
-			peer.Close();
-			peer = null;
-			base.Stop(shutdownMsg);
+			lock (writeLock)
+			{
+				lock (decryptLock)
+				{
+					if (peer == null)
+					{
+						return;
+					}
+					Console.WriteLine("[Raknet] Server Shutting Down (" + shutdownMsg + ")");
+					using (TimeWarning.New("ServerStop"))
+					{
+						peer.Close();
+						peer = null;
+						base.Stop(shutdownMsg);
+					}
+				}
+			}
 		}
 	}
 
 	public override void Disconnect(Connection cn)
 	{
-		if (peer != null)
+		lock (readLock)
 		{
-			peer.Kick(cn);
-			OnDisconnected("Disconnected", cn);
+			lock (writeLock)
+			{
+				lock (decryptLock)
+				{
+					if (peer != null)
+					{
+						peer.Kick(cn);
+						OnDisconnected("Disconnected", cn);
+					}
+				}
+			}
 		}
 	}
 
 	public override void Kick(Connection cn, string message, bool logfile)
 	{
-		if (peer != null)
+		lock (readLock)
 		{
-			if (base.write.Start())
+			lock (writeLock)
 			{
-				base.write.PacketID(Message.Type.DisconnectReason);
-				base.write.String(message);
-				base.write.Send(new SendInfo(cn)
+				lock (decryptLock)
 				{
-					method = SendMethod.ReliableUnordered,
-					priority = Priority.Immediate
-				});
+					if (peer != null)
+					{
+						NetWrite netWrite = StartWrite();
+						netWrite.PacketID(Message.Type.DisconnectReason);
+						netWrite.String(message);
+						netWrite.SendImmediate(new SendInfo(cn)
+						{
+							method = SendMethod.ReliableUnordered,
+							priority = Priority.Immediate
+						});
+						string text = cn.ToString() + " kicked: " + message;
+						if (logfile)
+						{
+							DebugEx.LogWarning(text);
+						}
+						else
+						{
+							Console.WriteLine(text);
+						}
+						peer.Kick(cn);
+						OnDisconnected("Kicked: " + message, cn);
+					}
+				}
 			}
-			string text = cn.ToString() + " kicked: " + message;
-			if (logfile)
-			{
-				DebugEx.LogWarning(text);
-			}
-			else
-			{
-				Console.WriteLine(text);
-			}
-			peer.Kick(cn);
-			OnDisconnected("Kicked: " + message, cn);
 		}
 	}
 
-	internal bool HandleRaknetPacket(byte type, Connection connection)
+	internal bool HandleRaknetPacket(byte type, NetRead read)
 	{
 		if (type >= 140)
 		{
@@ -92,24 +123,24 @@ public class Server : Network.Server
 		case 19:
 			using (TimeWarning.New("OnNewConnection", 20))
 			{
-				OnNewConnection();
+				OnNewConnection(read.guid, read.ipaddress);
 			}
 			return true;
 		case 21:
-			if (connection != null)
+			if (read.connection != null)
 			{
 				using (TimeWarning.New("OnDisconnected", 20))
 				{
-					OnDisconnected("Disconnected", connection);
+					OnDisconnected("Disconnected", read.connection);
 				}
 			}
 			return true;
 		case 22:
-			if (connection != null)
+			if (read.connection != null)
 			{
 				using (TimeWarning.New("OnDisconnected (timed out)", 20))
 				{
-					OnDisconnected("Timed Out", connection);
+					OnDisconnected("Timed Out", read.connection);
 				}
 			}
 			return true;
@@ -118,31 +149,53 @@ public class Server : Network.Server
 		}
 	}
 
-	internal void UnconnectedPacket()
+	private void HandleMessage()
 	{
-		base.read.Start(peer.RawData(), peer.incomingBytesUnread);
-		byte type = base.read.PacketID();
-		if (callbackHandler == null || !callbackHandler.OnUnconnectedMessage(type, base.read, peer.incomingAddressInt, (int)peer.incomingPort))
+		if (peer.incomingBytesUnread > 10000000)
 		{
-			HandleRaknetPacket(type, null);
+			return;
+		}
+		Connection connection = FindConnection(peer.incomingGUID);
+		if (connection != null)
+		{
+			if (connection.GetPacketsPerSecond() >= Network.Server.MaxPacketsPerSecond)
+			{
+				Kick(connection, "Packet Flooding", connection.connected);
+				return;
+			}
+			connection.AddPacketsPerSecond();
+		}
+		NetRead netRead = Pool.Get<NetRead>();
+		if (connection != null)
+		{
+			netRead.Start(connection, peer.RawData(), peer.incomingBytesUnread);
+		}
+		else
+		{
+			netRead.Start(peer.incomingGUID, peer.incomingAddress, peer.RawData(), peer.incomingBytesUnread);
+		}
+		if (BaseNetwork.Multithreading)
+		{
+			EnqueueDecrypt(netRead);
+		}
+		else
+		{
+			ProcessDecrypt(netRead);
 		}
 	}
 
-	internal void ConnectedPacket(Connection connection)
+	public override void ProcessRead(NetRead read)
 	{
-		if (connection.GetPacketsPerSecond() >= Network.Server.MaxPacketsPerSecond)
+		byte b = read.PacketID();
+		if (HandleRaknetPacket(b, read))
 		{
-			Kick(connection, "Packet Flooding", connection.connected);
+			Pool.Free(ref read);
 			return;
 		}
-		connection.AddPacketsPerSecond();
-		base.read.Start(peer.RawData(), peer.incomingBytesUnread);
-		Decrypt(connection, base.read);
-		byte b = base.read.PacketID();
-		if (!HandleRaknetPacket(b, connection))
+		if (read.connection != null)
 		{
 			b -= 140;
-			Message obj = StartMessage((Message.Type)b, connection);
+			Message obj = StartMessage((Message.Type)b, read);
 			if (callbackHandler != null)
 			{
 				callbackHandler.OnNetworkMessage(obj);
@@ -150,59 +203,17 @@ public class Server : Network.Server
 			obj.Clear();
 			Pool.Free(ref obj);
 		}
+		Pool.Free(ref read);
 	}
 
-	public override void Cycle()
+	protected override bool Receive()
 	{
-		base.Cycle();
-		if (!IsConnected())
+		if (peer.Receive())
 		{
-			return;
+			HandleMessage();
+			return true;
 		}
-		Stopwatch obj = Pool.Get<Stopwatch>();
-		obj.Reset();
-		obj.Start();
-		while (peer.Receive())
-		{
-			if (peer.incomingBytesUnread > Network.Server.MaxPacketSize)
-			{
-				continue;
-			}
-			Connection connection = FindConnection(peer.incomingGUID);
-			if (connection == null)
-			{
-				using (TimeWarning.New("UnconnectedPacket", 20))
-				{
-					UnconnectedPacket();
-				}
-			}
-			else
-			{
-				using (TimeWarning.New("ConnectedPacket", 20))
-				{
-					ConnectedPacket(connection);
-				}
-			}
-			if (obj.Elapsed.TotalMilliseconds > (double)Network.Server.MaxReceiveTime)
-			{
-				break;
-			}
-		}
-		Pool.Free(ref obj);
-	}
-
-	protected override void OnNewConnection()
-	{
-		ulong incomingGUID = peer.incomingGUID;
-		string incomingAddress = peer.incomingAddress;
-		if (!string.IsNullOrEmpty(incomingAddress) && !(incomingAddress == "UNASSIGNED_SYSTEM_ADDRESS"))
-		{
-			Connection connection = new Connection();
-			connection.guid = incomingGUID;
-			connection.ipaddress = incomingAddress;
-			connection.active = true;
-			OnNewConnection(connection);
-		}
+		return false;
 	}
 
 	public override string GetDebug(Connection connection)
@@ -236,38 +247,21 @@ public class Server : Network.Server
 		return peer.GetStat(connection, type);
 	}
 
-	public unsafe override void SendUnconnected(uint netAddr, ushort netPort, byte[] data, int size)
+	public override void ProcessWrite(NetWrite write)
 	{
-		fixed (byte* data2 = data)
+		foreach (Connection connection in write.connections)
 		{
-			peer.SendUnconnectedMessage(data2, size, netAddr, netPort);
+			ProcessWrite(write, connection);
 		}
+		Pool.Free(ref write);
 	}
 
-	public override void Send(SendInfo sendinfo, MemoryStream data)
+	private void ProcessWrite(NetWrite write, Connection connection)
 	{
-		if (sendinfo.connections != null)
-		{
-			foreach (Connection connection in sendinfo.connections)
-			{
-				Send(sendinfo, data, connection);
-			}
-		}
-		if (sendinfo.connection != null)
-		{
-			Send(sendinfo, data, sendinfo.connection);
-		}
-	}
-
-	private void Send(SendInfo sendinfo, MemoryStream data, Connection connection)
-	{
-		if (peer != null)
-		{
-			Record(connection, data);
-			Encrypt(connection, ref data);
-			peer.SendStart();
-			peer.WriteBytes(data);
-			peer.SendTo(connection.guid, sendinfo.priority, sendinfo.method, sendinfo.channel);
-		}
+		Record(connection, write);
+		ArraySegment<byte> arraySegment = Encrypt(connection, write);
+		peer.SendStart();
+		peer.WriteBytes(arraySegment.Array, 0, arraySegment.Offset + arraySegment.Count);
+		peer.SendTo(connection.guid, write.priority, write.method, write.channel);
 	}
 }

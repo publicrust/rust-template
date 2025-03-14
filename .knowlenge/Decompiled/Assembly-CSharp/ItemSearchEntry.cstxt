@@ -10,8 +10,4 @@ public class ItemSearchEntry : MonoBehaviour
 	public RawImage image;
 
 	public RawImage bpImage;
-
-	private ItemDefinition itemInfo;
-
-	private AddSellOrderManager manager;
 }

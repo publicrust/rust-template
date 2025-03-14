@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using ConVar;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
@@ -111,44 +112,47 @@ public class Planner : HeldEntity
 			AntiHack.NoteAdminHack(ownerPlayer);
 			return;
 		}
-		Construction.Target target = default(Construction.Target);
-		BaseEntity baseEntity = null;
-		if (msg.entity != 0)
+		BaseGameMode.CanBuildResult? canBuildResult = BaseGameMode.GetActiveGameMode(serverside: true)?.CanBuildEntity(ownerPlayer, construction);
+		if (canBuildResult.HasValue)
 		{
-			baseEntity = BaseNetworkable.serverEntities.Find(msg.entity) as BaseEntity;
-			if (!baseEntity)
+			if (canBuildResult.Value.Phrase != null)
+			{
+				ownerPlayer.ShowToast((!canBuildResult.Value.Result) ? GameTip.Styles.Red_Normal : GameTip.Styles.Blue_Long, canBuildResult.Value.Phrase, canBuildResult.Value.Arguments);
+			}
+			if (!canBuildResult.Value.Result)
+			{
+				return;
+			}
+		}
+		Construction.Target target = default(Construction.Target);
+		if (msg.entity.IsValid)
+		{
+			target.entity = BaseNetworkable.serverEntities.Find(msg.entity) as BaseEntity;
+			if (target.entity == null)
 			{
 				ownerPlayer.ChatMessage("Couldn't find entity " + msg.entity);
 				return;
 			}
-			msg.position = baseEntity.transform.TransformPoint(msg.position);
-			msg.normal = baseEntity.transform.TransformDirection(msg.normal);
-			msg.rotation = baseEntity.transform.rotation * msg.rotation;
-			if (msg.socket == 0)
-			{
-				if ((bool)deployable && deployable.setSocketParent && baseEntity.Distance(msg.position) > 1f)
-				{
-					ownerPlayer.ChatMessage("Parent too far away: " + baseEntity.Distance(msg.position));
-					return;
-				}
-				if (baseEntity is Door)
-				{
-					ownerPlayer.ChatMessage("Can't deploy on door");
-					return;
-				}
-			}
-			target.entity = baseEntity;
+			msg.position = target.entity.transform.TransformPoint(msg.position);
+			msg.normal = target.entity.transform.TransformDirection(msg.normal);
+			msg.rotation = target.entity.transform.rotation * msg.rotation;
 			if (msg.socket != 0)
 			{
 				string text = StringPool.Get(msg.socket);
-				if (text != "" && target.entity != null)
+				if (text != "")
 				{
 					target.socket = FindSocket(text, target.entity.prefabID);
 				}
-				else
+				if (target.socket == null)
 				{
-					ownerPlayer.ChatMessage("Invalid Socket!");
+					ownerPlayer.ChatMessage("Couldn't find socket " + msg.socket);
+					return;
 				}
+			}
+			else if (target.entity is Door)
+			{
+				ownerPlayer.ChatMessage("Can't deploy on door");
+				return;
 			}
 		}
 		target.ray = msg.ray;
@@ -162,15 +166,14 @@ public class Planner : HeldEntity
 		{
 			return;
 		}
-		if ((bool)deployable && deployable.placeEffect.isValid)
+		if (target.entity != null && deployable != null && deployable.setSocketParent)
 		{
-			if ((bool)baseEntity && msg.socket != 0)
+			Vector3 position = ((target.socket != null) ? target.GetWorldPosition() : target.position);
+			float num = target.entity.Distance(position);
+			if (num > 1f)
 			{
-				Effect.server.Run(deployable.placeEffect.resourcePath, baseEntity.transform.TransformPoint(target.socket.worldPosition), baseEntity.transform.up);
-			}
-			else
-			{
-				Effect.server.Run(deployable.placeEffect.resourcePath, msg.position, msg.normal);
+				ownerPlayer.ChatMessage("Parent too far away: " + num);
+				return;
 			}
 		}
 		DoBuild(target, construction);
@@ -195,13 +198,45 @@ public class Planner : HeldEntity
 				ownerPlayer.ChatMessage("Target socket is occupied. (" + target.socket.socketName + ")");
 				return;
 			}
+			if (target.onTerrain)
+			{
+				ownerPlayer.ChatMessage("Target on terrain is not allowed when attaching to socket. (" + target.socket.socketName + ")");
+				return;
+			}
+		}
+		Vector3 vector = ((target.entity != null && target.socket != null) ? target.GetWorldPosition() : target.position);
+		if (AntiHack.TestIsBuildingInsideSomething(target, vector))
+		{
+			ownerPlayer.ChatMessage("Can't deploy inside objects");
+			return;
 		}
 		if (ConVar.AntiHack.eye_protection >= 2)
 		{
 			Vector3 center = ownerPlayer.eyes.center;
 			Vector3 position = ownerPlayer.eyes.position;
 			Vector3 origin = target.ray.origin;
-			Vector3 p = ((target.entity != null && target.socket != null) ? target.GetWorldPosition() : target.position);
+			Vector3 p = vector;
+			int num = 2097152;
+			int num2 = (ConVar.AntiHack.build_terraincheck ? 10551296 : 2162688);
+			float num3 = ConVar.AntiHack.build_losradius;
+			float padding = ConVar.AntiHack.build_losradius + 0.01f;
+			int layerMask = num2;
+			if (target.socket != null)
+			{
+				num3 = 0f;
+				padding = 0.5f;
+				layerMask = num;
+			}
+			if (component.isSleepingBag)
+			{
+				num3 = ConVar.AntiHack.build_losradius_sleepingbag;
+				padding = ConVar.AntiHack.build_losradius_sleepingbag + 0.01f;
+				layerMask = num2;
+			}
+			if (num3 > 0f)
+			{
+				p += target.normal.normalized * num3;
+			}
 			if (target.entity != null)
 			{
 				DeployShell deployShell = PrefabAttribute.server.Find<DeployShell>(target.entity.prefabID);
@@ -210,9 +245,7 @@ public class Planner : HeldEntity
 					p += target.normal.normalized * deployShell.LineOfSightPadding();
 				}
 			}
-			int num = 2097152;
-			int num2 = (ConVar.AntiHack.build_terraincheck ? 10551296 : 2162688);
-			if (!GamePhysics.LineOfSight(padding: (target.socket != null) ? 0.5f : 0.01f, layerMask: (target.socket != null) ? num : num2, p0: center, p1: position, p2: origin, p3: p))
+			if (!GamePhysics.LineOfSightRadius(center, position, layerMask, num3) || !GamePhysics.LineOfSightRadius(position, origin, layerMask, num3) || !GamePhysics.LineOfSightRadius(origin, p, layerMask, num3, 0f, padding))
 			{
 				ownerPlayer.ChatMessage("Line of sight blocked.");
 				return;
@@ -230,9 +263,9 @@ public class Planner : HeldEntity
 		}
 		Interface.CallHook("OnEntityBuilt", this, gameObject);
 		Deployable deployable = GetDeployable();
+		BaseEntity baseEntity = GameObjectEx.ToBaseEntity(gameObject);
 		if (deployable != null)
 		{
-			BaseEntity baseEntity = GameObjectEx.ToBaseEntity(gameObject);
 			if (deployable.setSocketParent && target.entity != null && target.entity.SupportsChildDeployables() && (bool)baseEntity)
 			{
 				baseEntity.SetParent(target.entity, worldPositionStays: true);
@@ -254,7 +287,22 @@ public class Planner : HeldEntity
 			{
 				modDeployable.OnDeployed(baseEntity, ownerPlayer);
 			}
-			baseEntity.OnDeployed(baseEntity.GetParentEntity(), ownerPlayer);
+			baseEntity.OnDeployed(baseEntity.GetParentEntity(), ownerPlayer, GetOwnerItem());
+			if (deployable.placeEffect.isValid)
+			{
+				if ((bool)target.entity && target.socket != null)
+				{
+					Effect.server.Run(deployable.placeEffect.resourcePath, target.entity.transform.TransformPoint(target.socket.worldPosition), target.entity.transform.up);
+				}
+				else
+				{
+					Effect.server.Run(deployable.placeEffect.resourcePath, target.position, target.normal);
+				}
+			}
+		}
+		if (baseEntity != null)
+		{
+			Facepunch.Rust.Analytics.Azure.OnEntityBuilt(baseEntity, ownerPlayer);
 		}
 		PayForPlacement(ownerPlayer, component);
 	}

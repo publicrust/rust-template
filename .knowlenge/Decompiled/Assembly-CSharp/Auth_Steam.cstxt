@@ -49,7 +49,7 @@ public static class Auth_Steam
 			}
 			else if (connection.authStatus != "ok")
 			{
-				ConnectionAuth.Reject(connection, "Steam Auth Error: " + connection.authStatus);
+				ConnectionAuth.Reject(connection, "Steam Auth Failed", "Steam Auth Error: " + connection.authStatus);
 				PlatformService.Instance.EndPlayerSession(connection.userid);
 			}
 			else

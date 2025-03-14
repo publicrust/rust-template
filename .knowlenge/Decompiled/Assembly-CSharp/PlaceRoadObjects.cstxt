@@ -26,7 +26,7 @@ public class PlaceRoadObjects : ProceduralComponent
 		}
 		foreach (PathList item2 in roads)
 		{
-			if (!item2.IsExtraNarrow)
+			if (item2.Hierarchy < 2)
 			{
 				PathList.BasicObject[] start = Start;
 				foreach (PathList.BasicObject obj in start)

@@ -67,11 +67,19 @@ public class PlantProperties : ScriptableObject
 	[Header("Harvesting")]
 	public BaseEntity.Menu.Option pickOption;
 
+	public BaseEntity.Menu.Option pickAllOption;
+
+	public BaseEntity.Menu.Option eatOption;
+
 	public ItemDefinition pickupItem;
 
 	public BaseEntity.Menu.Option cloneOption;
 
+	public BaseEntity.Menu.Option cloneAllOption;
+
 	public BaseEntity.Menu.Option removeDyingOption;
+
+	public BaseEntity.Menu.Option removeDyingAllOption;
 
 	public ItemDefinition removeDyingItem;
 

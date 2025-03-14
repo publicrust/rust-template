@@ -7,7 +7,7 @@ public class VehicleVendor : NPCTalking
 
 	public VehicleSpawner vehicleSpawner;
 
-	public override string GetConversationStartSpeech()
+	public override string GetConversationStartSpeech(BasePlayer player)
 	{
 		if (ProviderBusy())
 		{

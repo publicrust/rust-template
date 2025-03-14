@@ -19,18 +19,23 @@ public class SpawnPointInstance : MonoBehaviour
 		}
 	}
 
+	public void Retire()
+	{
+		if (!ObjectEx.IsUnityNull(parentSpawnPointUser))
+		{
+			parentSpawnPointUser.ObjectRetired(this);
+		}
+		if ((bool)parentSpawnPoint)
+		{
+			parentSpawnPoint.ObjectRetired(this);
+		}
+	}
+
 	protected void OnDestroy()
 	{
 		if (!Rust.Application.isQuitting)
 		{
-			if (!ObjectEx.IsUnityNull(parentSpawnPointUser))
-			{
-				parentSpawnPointUser.ObjectRetired(this);
-			}
-			if ((bool)parentSpawnPoint)
-			{
-				parentSpawnPoint.ObjectRetired(this);
-			}
+			Retire();
 		}
 	}
 }

@@ -14,6 +14,7 @@ public class ParticleSystemContainer : MonoBehaviour, IPrefabPreProcess
 
 	public bool precached;
 
+	[HideInInspector]
 	public ParticleSystemGroup[] particleGroups;
 
 	public void Play()

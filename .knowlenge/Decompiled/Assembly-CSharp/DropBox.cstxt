@@ -22,4 +22,9 @@ public class DropBox : Mailbox
 	{
 		return Vector3.Dot(base.transform.forward, (player.transform.position - base.transform.position).normalized) >= 0.7f;
 	}
+
+	public override bool SupportsChildDeployables()
+	{
+		return true;
+	}
 }

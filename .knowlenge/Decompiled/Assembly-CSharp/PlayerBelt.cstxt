@@ -1,3 +1,4 @@
+using Facepunch.Rust;
 using Oxide.Core;
 using UnityEngine;
 
@@ -23,8 +24,14 @@ public class PlayerBelt
 		}
 		using (TimeWarning.New("PlayerBelt.DropActive"))
 		{
-			activeItem.Drop(position, velocity);
-			player.svActiveItemID = 0u;
+			DroppedItem droppedItem = activeItem.Drop(position, velocity) as DroppedItem;
+			if (droppedItem != null)
+			{
+				droppedItem.DropReason = DroppedItem.DropReasonEnum.Death;
+				droppedItem.DroppedBy = player.userID;
+				Facepunch.Rust.Analytics.Azure.OnItemDropped(player, droppedItem, DroppedItem.DropReasonEnum.Death);
+			}
+			player.svActiveItemID = default(ItemId);
 			player.SendNetworkUpdate();
 		}
 	}

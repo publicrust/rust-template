@@ -1,7 +1,7 @@
 using System;
 using UnityEngine;
 
-public class Buoyancy : ListComponent<Buoyancy>
+public class Buoyancy : ListComponent<Buoyancy>, IServerComponent
 {
 	private struct BuoyancyPointData
 	{
@@ -22,21 +22,23 @@ public class Buoyancy : ListComponent<Buoyancy>
 
 	public float buoyancyScale = 1f;
 
-	public float submergedFraction;
-
 	public bool doEffects = true;
-
-	public bool clientSide;
-
-	public Action<bool> SubmergedChanged;
 
 	public float flowMovementScale = 1f;
 
-	private float timeInWater;
-
 	public float requiredSubmergedFraction;
 
+	public bool useUnderwaterDrag;
+
+	[Range(0f, 3f)]
+	public float underwaterDrag = 2f;
+
+	public Action<bool> SubmergedChanged;
+
 	public BaseEntity forEntity;
+
+	[NonSerialized]
+	public float submergedFraction;
 
 	private BuoyancyPointData[] pointData;
 
@@ -50,6 +52,14 @@ public class Buoyancy : ListComponent<Buoyancy>
 
 	private float[] pointWaterHeightArray;
 
+	private float defaultDrag;
+
+	private float defaultAngularDrag;
+
+	private float timeInWater;
+
+	public float? ArtificialHeight;
+
 	public float waveHeightScale = 0.5f;
 
 	public float timeOutOfWater { get; private set; }
@@ -59,39 +69,72 @@ public class Buoyancy : ListComponent<Buoyancy>
 		return "assets/bundled/prefabs/fx/impacts/physics/water-enter-exit.prefab";
 	}
 
+	private void Awake()
+	{
+		InvokeRandomized(CheckSleepState, 0.5f, 5f, 1f);
+	}
+
 	public void Sleep()
 	{
+		if (rigidBody != null)
+		{
+			rigidBody.Sleep();
+		}
 		base.enabled = false;
-		InvokeRandomized(CheckForWake, 0.5f, 0.5f, 0.1f);
 	}
 
 	public void Wake()
 	{
+		if (rigidBody != null)
+		{
+			rigidBody.WakeUp();
+		}
 		base.enabled = true;
-		CancelInvoke(CheckForWake);
-		CancelInvoke(Sleep);
 	}
 
-	public void CheckForWake()
+	public void CheckSleepState()
 	{
-		Vector3 position = base.transform.position;
-		WaterLevel.WaterInfo waterInfo = WaterLevel.GetWaterInfo(position, waves: true, forEntity);
-		bool num = waterInfo.surfaceLevel > (position - Vector3.up * 0.2f).y || waterInfo.currentDepth > 0.1f;
-		bool flag = !rigidBody.IsSleeping();
-		if (num && flag)
+		if (!(base.transform == null) && !(rigidBody == null))
 		{
-			Wake();
+			bool flag = BaseNetworkable.HasCloseConnections(base.transform.position, 100f);
+			if (base.enabled && (rigidBody.IsSleeping() || (!flag && timeInWater > 6f)))
+			{
+				Invoke(Sleep, 0f);
+			}
+			else if (!base.enabled && (!rigidBody.IsSleeping() || (flag && timeInWater > 0f)))
+			{
+				Invoke(Wake, 0f);
+			}
 		}
 	}
 
 	protected void DoCycle()
 	{
-		bool flag = submergedFraction > 0f;
+		bool num = submergedFraction > 0f;
 		BuoyancyFixedUpdate();
-		bool flag2 = submergedFraction > 0f;
-		if (SubmergedChanged != null && flag != flag2)
+		bool flag = submergedFraction > 0f;
+		if (num == flag)
 		{
-			SubmergedChanged(flag2);
+			return;
+		}
+		if (useUnderwaterDrag && rigidBody != null)
+		{
+			if (flag)
+			{
+				defaultDrag = rigidBody.drag;
+				defaultAngularDrag = rigidBody.angularDrag;
+				rigidBody.drag = underwaterDrag;
+				rigidBody.angularDrag = underwaterDrag;
+			}
+			else
+			{
+				rigidBody.drag = defaultDrag;
+				rigidBody.angularDrag = defaultAngularDrag;
+			}
+		}
+		if (SubmergedChanged != null)
+		{
+			SubmergedChanged(flag);
 		}
 	}
 
@@ -169,11 +212,6 @@ public class Buoyancy : ListComponent<Buoyancy>
 		{
 			return;
 		}
-		if (rigidBody.IsSleeping())
-		{
-			Invoke(Sleep, 0f);
-			return;
-		}
 		if (buoyancyScale == 0f)
 		{
 			Invoke(Sleep, 0f);
@@ -205,9 +243,14 @@ public class Buoyancy : ListComponent<Buoyancy>
 			Vector2 posUV = pointPositionUVArray[j];
 			float terrainHeight = pointTerrainHeightArray[j];
 			float waterHeight = pointWaterHeightArray[j];
-			WaterLevel.WaterInfo buoyancyWaterInfo = WaterLevel.GetBuoyancyWaterInfo(position2, posUV, terrainHeight, waterHeight, forEntity);
+			if (ArtificialHeight.HasValue)
+			{
+				waterHeight = ArtificialHeight.Value;
+			}
+			bool doDeepwaterChecks = !ArtificialHeight.HasValue;
+			WaterLevel.WaterInfo buoyancyWaterInfo = WaterLevel.GetBuoyancyWaterInfo(position2, posUV, terrainHeight, waterHeight, doDeepwaterChecks, forEntity);
 			bool flag = false;
-			if (position2.y < buoyancyWaterInfo.surfaceLevel)
+			if (position2.y < buoyancyWaterInfo.surfaceLevel && buoyancyWaterInfo.isValid)
 			{
 				flag = true;
 				num++;
@@ -230,14 +273,7 @@ public class Buoyancy : ListComponent<Buoyancy>
 			{
 				string strName = ((waterImpacts != null && waterImpacts.Length != 0 && waterImpacts[0].isValid) ? waterImpacts[0].resourcePath : DefaultWaterImpact());
 				Vector3 vector = new Vector3(UnityEngine.Random.Range(-0.25f, 0.25f), 0f, UnityEngine.Random.Range(-0.25f, 0.25f));
-				if (clientSide)
-				{
-					Effect.client.Run(strName, position2 + vector, Vector3.up);
-				}
-				else
-				{
-					Effect.server.Run(strName, position2 + vector, Vector3.up);
-				}
+				Effect.server.Run(strName, position2 + vector, Vector3.up);
 				buoyancyPoint.nexSplashTime = Time.time + 0.25f;
 			}
 			buoyancyPoint.wasSubmergedLastFrame = flag;
@@ -255,10 +291,6 @@ public class Buoyancy : ListComponent<Buoyancy>
 		{
 			timeOutOfWater += Time.fixedDeltaTime;
 			timeInWater = 0f;
-		}
-		if (timeOutOfWater > 3f && base.enabled)
-		{
-			Invoke(Sleep, 0f);
 		}
 	}
 }

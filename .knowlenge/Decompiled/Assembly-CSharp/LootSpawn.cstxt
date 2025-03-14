@@ -102,6 +102,7 @@ public class LootSpawn : ScriptableObject
 				return;
 			}
 		}
-		Debug.LogWarning("SubCategoryIntoContainer: This should never happen!", this);
+		string text = ((container.entityOwner != null) ? container.entityOwner.name : "Unknown");
+		Debug.LogWarning($"SubCategoryIntoContainer for loot '{base.name}' for entity '{text}' ended with randomWeight ({num2}) < totalWeight ({num}). This should never happen! ", this);
 	}
 }

@@ -10,9 +10,9 @@ public class OverlayMeshPaintableSource : MeshPaintableSource
 	[NonSerialized]
 	public Texture2D baseTexture;
 
-	public override void UpdateMaterials(MaterialPropertyBlock block, Texture2D textureOverride = null)
+	public override void UpdateMaterials(MaterialPropertyBlock block, Texture2D textureOverride = null, bool forEditing = false, bool isSelected = false)
 	{
-		base.UpdateMaterials(block, textureOverride);
+		base.UpdateMaterials(block, textureOverride, forEditing, isSelected);
 		if (baseTexture != null)
 		{
 			float num = (float)baseTexture.width / (float)baseTexture.height;
@@ -35,6 +35,10 @@ public class OverlayMeshPaintableSource : MeshPaintableSource
 			}
 			block.SetTexture(baseTextureName, baseTexture);
 			block.SetVector(STPrefixed.Get(baseTextureName), new Vector4(num3, num4, z, w));
+		}
+		else
+		{
+			block.SetTexture(baseTextureName, Texture2D.blackTexture);
 		}
 	}
 }

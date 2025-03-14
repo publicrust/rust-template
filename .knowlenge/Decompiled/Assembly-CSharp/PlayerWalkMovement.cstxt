@@ -18,6 +18,10 @@ public class PlayerWalkMovement : BaseMovement
 
 	public float capsuleCenterDucked = 1f;
 
+	public float capsuleHeightCrawling = 0.5f;
+
+	public float capsuleCenterCrawling = 0.5f;
+
 	public float gravityTestRadius = 0.2f;
 
 	public float gravityMultiplier = 2.5f;

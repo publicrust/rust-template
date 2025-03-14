@@ -1,7 +1,7 @@
 using UnityEngine;
 using UnityEngine.UI;
 
-public class PhotoPanel : MonoBehaviour, IPhotoReceiver
+public class PhotoPanel : MonoBehaviour, IImageReceiver
 {
 	public RawImage Image;
 

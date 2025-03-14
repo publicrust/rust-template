@@ -36,8 +36,25 @@ public class DirectionProperties : PrefabAttribute
 		Vector3 target = worldToLocalMatrix.MultiplyPoint3x4(info.HitPositionWorld);
 		OBB oBB = new OBB(worldPosition, worldRotation, bounds);
 		Vector3 position = initiatorPlayer.eyes.position;
-		Vector3 target2 = tx.TransformPoint(oBB.position);
-		if (!hitEntity.IsVisible(position, target2))
+		WeakpointProperties[] array = PrefabAttribute.server.FindAll<WeakpointProperties>(hitEntity.prefabID);
+		if (array != null && array.Length != 0)
+		{
+			bool flag = false;
+			WeakpointProperties[] array2 = array;
+			foreach (WeakpointProperties weakpointProperties in array2)
+			{
+				if ((!weakpointProperties.BlockWhenRoofAttached || CheckWeakpointRoof(hitEntity)) && IsWeakspotVisible(hitEntity, position, tx.TransformPoint(weakpointProperties.worldPosition)))
+				{
+					flag = true;
+					break;
+				}
+			}
+			if (!flag)
+			{
+				return false;
+			}
+		}
+		else if (!IsWeakspotVisible(hitEntity, position, tx.TransformPoint(oBB.position)))
 		{
 			return false;
 		}
@@ -46,5 +63,33 @@ public class DirectionProperties : PrefabAttribute
 			return oBB.Contains(target);
 		}
 		return false;
+	}
+
+	private bool CheckWeakpointRoof(BaseEntity hitEntity)
+	{
+		foreach (EntityLink entityLink in hitEntity.GetEntityLinks())
+		{
+			if (!(entityLink.socket is NeighbourSocket))
+			{
+				continue;
+			}
+			foreach (EntityLink connection in entityLink.connections)
+			{
+				if (connection.owner is BuildingBlock buildingBlock && (buildingBlock.ShortPrefabName == "roof" || buildingBlock.ShortPrefabName == "roof.triangle"))
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	private bool IsWeakspotVisible(BaseEntity hitEntity, Vector3 playerEyes, Vector3 weakspotPos)
+	{
+		if (!hitEntity.IsVisible(playerEyes, weakspotPos))
+		{
+			return false;
+		}
+		return true;
 	}
 }

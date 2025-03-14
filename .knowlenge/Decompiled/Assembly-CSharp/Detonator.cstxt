@@ -158,6 +158,7 @@ public class Detonator : HeldEntity, IRFObject
 			{
 				return;
 			}
+			Item ownerItem = GetOwnerItem();
 			RFManager.ChangeFrequency(frequency, num, this, isListener: false, IsOn());
 			frequency = num;
 			SendNetworkUpdate();
@@ -172,6 +173,7 @@ public class Detonator : HeldEntity, IRFObject
 				item.instanceData.dataInt = frequency;
 				item.MarkDirty();
 			}
+			ownerItem?.LoseCondition(ownerItem.maxCondition * 0.01f);
 			Interface.CallHook("OnRfFrequencyChanged", this, num, msg.player);
 		}
 	}

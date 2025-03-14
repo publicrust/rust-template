@@ -8,6 +8,8 @@ using UnityEngine.Assertions;
 
 public class ElectricSwitch : IOEntity
 {
+	public bool isToggleSwitch;
+
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
 		using (TimeWarning.New("ElectricSwitch.OnRpcMessage"))

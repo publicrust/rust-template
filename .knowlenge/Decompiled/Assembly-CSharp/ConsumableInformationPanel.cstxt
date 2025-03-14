@@ -14,4 +14,6 @@ public class ConsumableInformationPanel : ItemInformationPanel
 	public GameObject GeneticsGameObject;
 
 	public ItemTextValue durationValue;
+
+	public ItemTextValue baitValue;
 }

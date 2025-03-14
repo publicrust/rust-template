@@ -10,6 +10,8 @@ public class PowerLineWireConnectionDef
 
 	public float radius = 0.01f;
 
+	public bool hidden;
+
 	public PowerLineWireConnectionDef()
 	{
 	}

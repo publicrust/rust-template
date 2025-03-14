@@ -288,7 +288,7 @@ public static class ImageProcessing
 
 	public static bool IsValidPNG(byte[] data, int maxWidth, int maxHeight)
 	{
-		if (data.Length < 29)
+		if (data == null || data.Length < 29)
 		{
 			return false;
 		}
@@ -412,5 +412,17 @@ public static class ImageProcessing
 		{
 			return false;
 		}
+	}
+
+	public static bool IsClear(Color32[] data)
+	{
+		for (int i = 0; i < data.Length; i++)
+		{
+			if (data[i].a > 5)
+			{
+				return false;
+			}
+		}
+		return true;
 	}
 }

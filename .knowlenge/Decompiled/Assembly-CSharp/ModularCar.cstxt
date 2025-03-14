@@ -12,7 +12,7 @@ using Rust.Modular;
 using UnityEngine;
 using UnityEngine.Assertions;
 
-public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUser, TakeCollisionDamage.ICanRestoreVelocity, IVehicleLockUser
+public class ModularCar : BaseModularVehicle, TakeCollisionDamage.ICanRestoreVelocity, CarPhysics<ModularCar>.ICar, IVehicleLockUser, VehicleChassisVisuals<ModularCar>.IClientWheelUser
 {
 	private class DriverSeatInputs
 	{
@@ -26,42 +26,16 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 	}
 
 	[Serializable]
-	public class Wheel
-	{
-		public WheelCollider wheelCollider;
-
-		public Transform visualWheel;
-
-		public Transform visualWheelSteering;
-
-		public bool steerWheel;
-
-		public bool brakeWheel = true;
-
-		public bool powerWheel = true;
-
-		public bool visualPowerWheel = true;
-
-		public ParticleSystem snowFX;
-
-		public ParticleSystem sandFX;
-
-		public ParticleSystem dirtFX;
-
-		public ParticleSystem waterFX;
-
-		public ParticleSystem snowSpinFX;
-
-		public ParticleSystem sandSpinFX;
-
-		public ParticleSystem dirtSpinFX;
-
-		public ParticleSystem asphaltSpinFX;
-	}
-
-	[Serializable]
 	public class SpawnSettings
 	{
+		public enum AdminBonus
+		{
+			None,
+			T1PlusFuel,
+			T2PlusFuel,
+			T3PlusFuel
+		}
+
 		[Tooltip("Must be true to use any of these settings.")]
 		public bool useSpawnSettings;
 
@@ -73,40 +47,21 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 
 		[Tooltip("Max health  % at spawn for any modules that spawn with this chassis.")]
 		public float maxStartHealthPercent = 0.5f;
-	}
 
-	public enum EngineState
-	{
-		Off,
-		Starting,
-		On
+		public AdminBonus adminBonus;
 	}
 
 	public static HashSet<ModularCar> allCarsList = new HashSet<ModularCar>();
 
 	public readonly ListDictionary<BaseMountable, DriverSeatInputs> driverSeatInputs = new ListDictionary<BaseMountable, DriverSeatInputs>();
 
-	public ModularCarPhysics carPhysics;
+	public CarPhysics<ModularCar> carPhysics;
 
 	public VehicleTerrainHandler serverTerrainHandler;
 
-	private const float MIN_TIME_BETWEEN_COLLISION_FX = 0.25f;
+	private CarWheel[] wheels;
 
-	private const float MIN_COLLISION_FORCE = 20000f;
-
-	private const float MAX_COLLISION_FORCE = 2500000f;
-
-	public float nextCollisionFXTime;
-
-	private const float MIN_TIME_BETWEEN_COLLISION_DAMAGE = 0.33f;
-
-	private const float MIN_COLLISION_DAMAGE = 1f;
-
-	private const float MAX_COLLISION_DAMAGE = 200f;
-
-	public float nextCollisionDamageTime;
-
-	public float lastEngineTime;
+	public float lastEngineOnTime;
 
 	private const float DECAY_TICK_TIME = 60f;
 
@@ -118,6 +73,14 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 
 	public Quaternion prevRotation;
 
+	private Bounds collisionCheckBounds;
+
+	private Vector3 lastGoodPos;
+
+	private Quaternion lastGoodRot;
+
+	private bool lastPosWasBad;
+
 	public float deathDamageCounter;
 
 	private const float DAMAGE_TO_GIB = 600f;
@@ -125,8 +88,6 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 	public TimeSince timeSinceDeath;
 
 	private const float IMMUNE_TIME = 1f;
-
-	public Dictionary<BaseEntity, float> damageSinceLastTick = new Dictionary<BaseEntity, float>();
 
 	public readonly Vector3 groundedCOMMultiplier = new Vector3(0.25f, 0.3f, 0.25f);
 
@@ -137,21 +98,16 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 	[Header("Modular Car")]
 	public ModularCarChassisVisuals chassisVisuals;
 
-	public Wheel wheelFL;
+	public VisualCarWheel wheelFL;
 
-	public Wheel wheelFR;
+	public VisualCarWheel wheelFR;
 
-	public Wheel wheelRL;
+	public VisualCarWheel wheelRL;
 
-	public Wheel wheelRR;
-
-	public ItemDefinition carKeyDefinition;
+	public VisualCarWheel wheelRR;
 
 	[SerializeField]
-	public Collider mainServerCollider;
-
-	[SerializeField]
-	public ModularCarSettings carSettings;
+	public CarSettings carSettings;
 
 	[SerializeField]
 	public float hurtTriggerMinSpeed = 1f;
@@ -168,49 +124,43 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 	[SerializeField]
 	public ProtectionProperties mortalProtection;
 
-	[Header("Spawn")]
+	[SerializeField]
+	private BoxCollider mainChassisCollider;
+
 	[SerializeField]
 	public SpawnSettings spawnSettings;
-
-	[Header("Fuel")]
-	[SerializeField]
-	public GameObjectRef fuelStoragePrefab;
-
-	[SerializeField]
-	public Transform fuelStoragePoint;
-
-	[Header("Audio/FX")]
-	[SerializeField]
-	public ModularCarAudio carAudio;
-
-	[SerializeField]
-	public GameObjectRef collisionEffect;
 
 	[SerializeField]
 	[HideInInspector]
 	public MeshRenderer[] damageShowingRenderers;
 
-	[ServerVar(Help = "Population active on the server")]
+	[ServerVar(Help = "Population active on the server", ShowInAdminUI = true)]
 	public static float population = 3f;
 
-	[ServerVar(Help = "How many minutes before a ModularCar is killed while outside")]
-	public static float outsidedecayminutes = 216f;
-
-	public const BUTTON MouseSteerButton = BUTTON.DUCK;
+	[ServerVar(Help = "How many minutes before a ModularCar loses all its health while outside")]
+	public static float outsidedecayminutes = 864f;
 
 	public const BUTTON RapidSteerButton = BUTTON.SPRINT;
 
-	public EngineState lastSetEngineState;
-
-	public ModularCarLock carLock;
+	public VehicleEngineController<GroundVehicle>.EngineState lastSetEngineState;
 
 	public float cachedFuelFraction;
 
-	public EntityFuelSystem fuelSystem;
+	public override bool AlwaysAllowBradleyTargeting => true;
 
-	private const Flags FLAG_ENGINE_START = Flags.Reserved1;
+	public VehicleTerrainHandler.Surface OnSurface
+	{
+		get
+		{
+			if (serverTerrainHandler == null)
+			{
+				return VehicleTerrainHandler.Surface.Default;
+			}
+			return serverTerrainHandler.OnSurface;
+		}
+	}
 
-	public float DriveWheelVelocity
+	public override float DriveWheelVelocity
 	{
 		get
 		{
@@ -250,23 +200,9 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 
 	public float MaxSteerAngle => carSettings.maxSteerAngle;
 
-	public override bool IsLockable => carLock.HasALock;
+	public override bool IsLockable => CarLock.HasALock;
 
-	public EngineState CurEngineState
-	{
-		get
-		{
-			if (HasFlag(Flags.Reserved1))
-			{
-				return EngineState.Starting;
-			}
-			if (HasFlag(Flags.On))
-			{
-				return EngineState.On;
-			}
-			return EngineState.Off;
-		}
-	}
+	public ModularCarCodeLock CarLock { get; private set; }
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -301,34 +237,85 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 				}
 				return true;
 			}
+			if (rpc == 1382140449 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_OpenFuelWithKeycode "));
+				}
+				using (TimeWarning.New("RPC_OpenFuelWithKeycode"))
+				{
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg3 = rPCMessage;
+							RPC_OpenFuelWithKeycode(msg3);
+						}
+					}
+					catch (Exception exception2)
+					{
+						Debug.LogException(exception2);
+						player.Kick("RPC Error in RPC_OpenFuelWithKeycode");
+					}
+				}
+				return true;
+			}
+			if (rpc == 2818660542u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_TryMountWithKeycode "));
+				}
+				using (TimeWarning.New("RPC_TryMountWithKeycode"))
+				{
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg4 = rPCMessage;
+							RPC_TryMountWithKeycode(msg4);
+						}
+					}
+					catch (Exception exception3)
+					{
+						Debug.LogException(exception3);
+						player.Kick("RPC Error in RPC_TryMountWithKeycode");
+					}
+				}
+				return true;
+			}
 		}
 		return base.OnRpcMessage(player, rpc, msg);
-	}
-
-	public void OnCollisionEnter(Collision collision)
-	{
-		if (base.isServer)
-		{
-			ProcessCollision(collision);
-		}
 	}
 
 	public override void ServerInit()
 	{
 		base.ServerInit();
-		carPhysics = new ModularCarPhysics(this, base.transform, rigidBody, carSettings);
+		carPhysics = new CarPhysics<ModularCar>(this, base.transform, rigidBody, carSettings);
 		serverTerrainHandler = new VehicleTerrainHandler(this);
 		if (!Rust.Application.isLoadingSave)
 		{
 			SpawnPreassignedModules();
 		}
-		lastEngineTime = UnityEngine.Time.realtimeSinceStartup;
+		lastEngineOnTime = UnityEngine.Time.realtimeSinceStartup;
 		allCarsList.Add(this);
-		InvokeRandomized(UpdateNetwork, 0f, 0.15f, 0.02f);
+		collisionCheckBounds = new Bounds(mainChassisCollider.center, new Vector3(mainChassisCollider.size.x - 0.5f, 0.05f, mainChassisCollider.size.z - 0.5f));
+		InvokeRandomized(UpdateClients, 0f, 0.15f, 0.02f);
 		InvokeRandomized(DecayTick, UnityEngine.Random.Range(30f, 60f), 60f, 6f);
 	}
 
-	internal override void DoServerDestroy()
+	public override void DoServerDestroy()
 	{
 		base.DoServerDestroy();
 		allCarsList.Remove(this);
@@ -337,34 +324,11 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 	public override void PostServerLoad()
 	{
 		base.PostServerLoad();
-		carLock.EnableCentralLockingIfNoDriver();
+		CarLock.PostServerLoad();
 		if (IsDead())
 		{
 			Kill();
 		}
-	}
-
-	public float GetPlayerDamageMultiplier()
-	{
-		return Mathf.Abs(GetSpeed()) * 1f;
-	}
-
-	public void OnHurtTriggerOccupant(BaseEntity hurtEntity, DamageType damageType, float damageTotal)
-	{
-		if (!base.isClient && !hurtEntity.IsDestroyed)
-		{
-			Vector3 vector = hurtEntity.GetWorldVelocity() - base.Velocity;
-			Vector3 position = ClosestPoint(hurtEntity.transform.position);
-			Vector3 vector2 = hurtEntity.RealisticMass * vector;
-			rigidBody.AddForceAtPosition(vector2 * 1.25f, position, ForceMode.Impulse);
-			QueueCollisionDamage(this, vector2.magnitude * 0.75f / UnityEngine.Time.deltaTime);
-			carPhysics.SetTempDrag(2.25f, 1f);
-		}
-	}
-
-	public override float GetComfort()
-	{
-		return 0f;
 	}
 
 	public float GetSteerInput()
@@ -391,46 +355,41 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		return false;
 	}
 
-	public bool IsOnRoad()
-	{
-		if (serverTerrainHandler == null)
-		{
-			return false;
-		}
-		return serverTerrainHandler.CurrentGroundQuality == VehicleTerrainHandler.GroundQuality.Road;
-	}
-
-	public bool IsOnIce()
-	{
-		if (serverTerrainHandler == null)
-		{
-			return false;
-		}
-		return serverTerrainHandler.IsOnIce;
-	}
-
 	public override void VehicleFixedUpdate()
 	{
 		base.VehicleFixedUpdate();
-		if (base.isClient || !isSpawned)
-		{
-			return;
-		}
 		float speed = GetSpeed();
 		carPhysics.FixedUpdate(UnityEngine.Time.fixedDeltaTime, speed);
-		if (CurEngineState != 0 && !CanRunEngines())
-		{
-			StopEngines();
-		}
+		engineController.CheckEngineState();
 		hurtTriggerFront.gameObject.SetActive(speed > hurtTriggerMinSpeed);
 		hurtTriggerRear.gameObject.SetActive(speed < 0f - hurtTriggerMinSpeed);
-		if (serverTerrainHandler != null)
+		serverTerrainHandler.FixedUpdate();
+		float num = Mathf.Abs(speed);
+		if (lastPosWasBad || num > 15f)
 		{
-			serverTerrainHandler.FixedUpdate();
+			if (GamePhysics.CheckOBB(new OBB(mainChassisCollider.transform, collisionCheckBounds), 1218511105, QueryTriggerInteraction.Ignore))
+			{
+				rigidBody.position = lastGoodPos;
+				rigidBody.rotation = lastGoodRot;
+				base.transform.position = lastGoodPos;
+				base.transform.rotation = lastGoodRot;
+				rigidBody.velocity = Vector3.zero;
+				rigidBody.angularVelocity = Vector3.zero;
+				lastPosWasBad = true;
+			}
+			else
+			{
+				lastGoodPos = rigidBody.position;
+				lastGoodRot = rigidBody.rotation;
+				lastPosWasBad = false;
+			}
 		}
-		SetFlag(Flags.Reserved7, rigidBody.position == prevPosition && rigidBody.rotation == prevRotation);
-		prevPosition = rigidBody.position;
-		prevRotation = rigidBody.rotation;
+		else
+		{
+			lastGoodPos = rigidBody.position;
+			lastGoodRot = rigidBody.rotation;
+			lastPosWasBad = false;
+		}
 		if (IsMoving())
 		{
 			Vector3 cOMMultiplier = GetCOMMultiplier();
@@ -440,22 +399,20 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 				prevCOMMultiplier = cOMMultiplier;
 			}
 		}
-		if (!(UnityEngine.Time.time >= nextCollisionDamageTime))
-		{
-			return;
-		}
-		nextCollisionDamageTime = UnityEngine.Time.time + 0.33f;
-		foreach (KeyValuePair<BaseEntity, float> item in damageSinceLastTick)
-		{
-			DoCollisionDamage(item.Key, item.Value);
-		}
-		damageSinceLastTick.Clear();
+	}
+
+	protected override bool DetermineIfStationary()
+	{
+		bool result = rigidBody.position == prevPosition && rigidBody.rotation == prevRotation;
+		prevPosition = rigidBody.position;
+		prevRotation = rigidBody.rotation;
+		return result;
 	}
 
 	public override void PlayerServerInput(InputState inputState, BasePlayer player)
 	{
 		MountPointInfo playerSeatInfo = GetPlayerSeatInfo(player);
-		if (!playerSeatInfo.isDriver)
+		if (playerSeatInfo == null || !playerSeatInfo.isDriver)
 		{
 			return;
 		}
@@ -506,14 +463,9 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		{
 			base.AttachedModuleEntities[i].PlayerServerInput(inputState, player);
 		}
-		if (!IsOn())
+		if (engineController.IsOff && ((inputState.IsDown(BUTTON.FORWARD) && !inputState.WasDown(BUTTON.FORWARD)) || (inputState.IsDown(BUTTON.BACKWARD) && !inputState.WasDown(BUTTON.BACKWARD))))
 		{
-			bool num2 = inputState.IsDown(BUTTON.FORWARD) && !inputState.WasDown(BUTTON.FORWARD);
-			bool flag = inputState.IsDown(BUTTON.BACKWARD) && !inputState.WasDown(BUTTON.BACKWARD) && !inputState.IsDown(BUTTON.FORWARD);
-			if (num2 || flag)
-			{
-				TryStartEngines(player);
-			}
+			engineController.TryStartEngine(player);
 		}
 	}
 
@@ -531,16 +483,7 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 				attachedModuleEntity.OnPlayerDismountedVehicle(player);
 			}
 		}
-		carLock.EnableCentralLockingIfNoDriver();
-	}
-
-	public override void SpawnSubEntities()
-	{
-		base.SpawnSubEntities();
-		if (!Rust.Application.isLoadingSave)
-		{
-			fuelSystem.SpawnFuelStorage(fuelStoragePrefab, fuelStoragePoint, mainServerCollider);
-		}
+		CarLock.CheckEnableCentralLocking();
 	}
 
 	public override void Save(SaveInfo info)
@@ -551,32 +494,23 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		info.msg.modularCar.driveWheelVel = DriveWheelVelocity;
 		info.msg.modularCar.throttleInput = GetThrottleInput();
 		info.msg.modularCar.brakeInput = GetBrakeInput();
-		info.msg.modularCar.fuelStorageID = fuelSystem.fuelStorageInstance.uid;
+		info.msg.modularCar.fuelStorageID = GetFuelSystem().fuelStorageInstance.uid;
 		info.msg.modularCar.fuelFraction = GetFuelFraction();
-		info.msg.modularCar.lockID = carLock.LockID;
+		CarLock.Save(info);
 	}
 
 	public override void Hurt(HitInfo info)
 	{
-		if (!IsDead())
+		if (!IsDead() && info.damageTypes.Get(DamageType.Decay) == 0f)
 		{
-			float num = info.damageTypes.Get(DamageType.Explosion) + info.damageTypes.Get(DamageType.AntiVehicle);
-			if (num > 3f)
-			{
-				float explosionForce = Mathf.Min(num * 650f, 150000f);
-				rigidBody.AddExplosionForce(explosionForce, info.HitPositionWorld, 1f, 2.5f);
-			}
-			if (info.damageTypes.Get(DamageType.Decay) == 0f)
-			{
-				PropagateDamageToModules(info, 0.5f / (float)base.NumAttachedModules, 0.9f / (float)base.NumAttachedModules, null);
-			}
+			PropagateDamageToModules(info, 0.5f / (float)base.NumAttachedModules, 0.9f / (float)base.NumAttachedModules, null);
 		}
 		base.Hurt(info);
 	}
 
-	public bool TryUseFuel(float seconds, float fuelUsedPerSecond)
+	public void TickFuel(float fuelUsedPerSecond)
 	{
-		return fuelSystem.TryUseFuel(seconds, fuelUsedPerSecond);
+		engineController.TickFuel(fuelUsedPerSecond);
 	}
 
 	public override bool MountEligable(BasePlayer player)
@@ -590,16 +524,7 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		{
 			return true;
 		}
-		return PlayerCanOpenThis(player, ModularCarLock.LockType.Door);
-	}
-
-	public bool CanRunEngines()
-	{
-		if (HasAnyWorkingEngines() && HasDriver() && fuelSystem.HasFuel() && !waterlogged)
-		{
-			return !IsDead();
-		}
-		return false;
+		return PlayerCanUseThis(player, ModularCarCodeLock.LockType.Door);
 	}
 
 	public override bool IsComplete()
@@ -624,11 +549,6 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		{
 			Hurt(damage, DamageType.Decay);
 		}
-	}
-
-	public override float GetSteering(BasePlayer player)
-	{
-		return SteerAngle;
 	}
 
 	public float GetAdjustedDriveForce(float absSpeed, float topSpeed)
@@ -658,14 +578,41 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		return GetMaxDriveForce() > 0f;
 	}
 
-	public bool AdminFixUp(int tier)
+	public override bool MeetsEngineRequirements()
 	{
-		if (IsDead())
+		if (HasAnyWorkingEngines())
+		{
+			return HasDriver();
+		}
+		return false;
+	}
+
+	public override void OnEngineStartFailed()
+	{
+		bool arg = !HasAnyWorkingEngines() || engineController.IsWaterlogged();
+		ClientRPC(null, "EngineStartFailed", arg);
+	}
+
+	public CarWheel[] GetWheels()
+	{
+		if (wheels == null)
+		{
+			wheels = new CarWheel[4] { wheelFL, wheelFR, wheelRL, wheelRR };
+		}
+		return wheels;
+	}
+
+	public float GetWheelsMidPos()
+	{
+		return (wheels[0].wheelCollider.transform.localPosition.z - wheels[2].wheelCollider.transform.localPosition.z) * 0.5f;
+	}
+
+	public override bool AdminFixUp(int tier)
+	{
+		if (!base.AdminFixUp(tier))
 		{
 			return false;
 		}
-		fuelSystem.AdminFillFuel();
-		SetHealth(MaxHealth());
 		foreach (BaseVehicleModule attachedModuleEntity in base.AttachedModuleEntities)
 		{
 			attachedModuleEntity.AdminFixUp(tier);
@@ -752,9 +699,9 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		{
 			attachedModuleEntity.repair.enabled = false;
 		}
-		if (carLock != null)
+		if (CarLock != null)
 		{
-			carLock.RemoveLock();
+			CarLock.RemoveLock();
 		}
 		timeSinceDeath = 0f;
 		if (vehicle.carwrecks)
@@ -776,7 +723,7 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 
 	public void RemoveLock()
 	{
-		carLock.RemoveLock();
+		CarLock.RemoveLock();
 	}
 
 	public void RestoreVelocity(Vector3 vel)
@@ -788,13 +735,6 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		}
 	}
 
-	public override void DoPushAction(BasePlayer player)
-	{
-		player.metabolism.calories.Subtract(3f);
-		player.metabolism.SendChangesToClient();
-		carPhysics.PushCar(player);
-	}
-
 	public override Vector3 GetCOMMultiplier()
 	{
 		if (carPhysics == null || !carPhysics.IsGrounded() || !IsOn())
@@ -804,64 +744,21 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		return groundedCOMMultiplier;
 	}
 
-	public void TryStartEngines(BasePlayer player)
-	{
-		if (!IsDead() && CurEngineState == EngineState.Off && player.net != null)
-		{
-			if (!CanRunEngines())
-			{
-				bool arg = !HasAnyWorkingEngines() || waterlogged;
-				ClientRPC(null, "EngineStartFailed", arg);
-			}
-			else if (Interface.CallHook("OnEngineStart", this, player) == null)
-			{
-				CancelEngineStart();
-				SetFlag(Flags.Reserved1, b: true);
-				SetFlag(Flags.On, b: false);
-				Invoke(FinishStartingEngine, carSettings.engineStartupTime);
-			}
-		}
-	}
-
-	public void FinishStartingEngine()
-	{
-		if (!IsDead() && CurEngineState != EngineState.On)
-		{
-			SetFlag(Flags.On, b: true);
-			SetFlag(Flags.Reserved1, b: false);
-			Interface.CallHook("OnEngineStarted", this);
-		}
-	}
-
-	public void CancelEngineStart()
-	{
-		CancelInvoke(FinishStartingEngine);
-	}
-
-	public void StopEngines()
-	{
-		if (CurEngineState != 0)
-		{
-			CancelEngineStart();
-			SetFlag(Flags.On, b: false);
-			SetFlag(Flags.Reserved1, b: false);
-		}
-	}
-
-	public void UpdateNetwork()
+	public void UpdateClients()
 	{
 		if (HasDriver())
 		{
-			SendNetworkUpdate();
-			byte b = (byte)((GetThrottleInput() + 1f) * 7f);
-			byte b2 = (byte)(GetBrakeInput() * 15f);
-			ClientRPC(null, "ModularCarUpdate", SteerAngle, (byte)(b + (b2 << 4)), DriveWheelVelocity, (byte)(GetFuelFraction() * 255f));
+			byte num = (byte)((GetThrottleInput() + 1f) * 7f);
+			byte b = (byte)(GetBrakeInput() * 15f);
+			byte arg = (byte)(num + (b << 4));
+			byte arg2 = (byte)(GetFuelFraction() * 255f);
+			ClientRPC(null, "ModularCarUpdate", SteerAngle, arg, DriveWheelVelocity, arg2);
 		}
 	}
 
 	public void DecayTick()
 	{
-		if (base.IsDestroyed || IsOn() || immuneToDecay || UnityEngine.Time.time < lastEngineTime + 600f)
+		if (base.IsDestroyed || IsOn() || immuneToDecay || UnityEngine.Time.time < lastEngineOnTime + 600f)
 		{
 			return;
 		}
@@ -882,55 +779,12 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		DoDecayDamage(num3 * num);
 	}
 
-	public void ProcessCollision(Collision collision)
+	protected override void DoCollisionDamage(BaseEntity hitEntity, float damage)
 	{
-		if (base.isClient || collision == null || collision.gameObject == null || collision.gameObject == null)
+		if (hitEntity == null)
 		{
 			return;
 		}
-		ContactPoint contact = collision.GetContact(0);
-		BaseEntity baseEntity = null;
-		if (contact.otherCollider.attachedRigidbody == rigidBody)
-		{
-			baseEntity = GameObjectEx.ToBaseEntity(contact.otherCollider);
-		}
-		else if (contact.thisCollider.attachedRigidbody == rigidBody)
-		{
-			baseEntity = GameObjectEx.ToBaseEntity(contact.thisCollider);
-		}
-		if (baseEntity != null)
-		{
-			float forceMagnitude = collision.impulse.magnitude / UnityEngine.Time.fixedDeltaTime;
-			if (QueueCollisionDamage(baseEntity, forceMagnitude) > 0f)
-			{
-				ShowCollisionFX(collision);
-			}
-		}
-	}
-
-	private float QueueCollisionDamage(BaseEntity hitEntity, float forceMagnitude)
-	{
-		float num = Mathf.InverseLerp(20000f, 2500000f, forceMagnitude);
-		if (num > 0f)
-		{
-			float num2 = Mathf.Lerp(1f, 200f, num);
-			if (damageSinceLastTick.TryGetValue(hitEntity, out var value))
-			{
-				if (value < num2)
-				{
-					damageSinceLastTick[hitEntity] = num2;
-				}
-			}
-			else
-			{
-				damageSinceLastTick[hitEntity] = num2;
-			}
-		}
-		return num;
-	}
-
-	public void DoCollisionDamage(BaseEntity hitEntity, float damage)
-	{
 		if (hitEntity is BaseVehicleModule baseVehicleModule)
 		{
 			baseVehicleModule.Hurt(damage, DamageType.Collision, this, useProtection: false);
@@ -953,20 +807,6 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 				}
 			}
 			Hurt(damage, DamageType.Collision, this, useProtection: false);
-		}
-	}
-
-	public void ShowCollisionFX(Collision collision)
-	{
-		if (!(UnityEngine.Time.time < nextCollisionFXTime))
-		{
-			nextCollisionFXTime = UnityEngine.Time.time + 0.25f;
-			if (collisionEffect.isValid)
-			{
-				Vector3 point = collision.GetContact(0).point;
-				point += (base.transform.position - point) * 0.25f;
-				Effect.server.Run(collisionEffect.resourcePath, point, base.transform.up);
-			}
 		}
 	}
 
@@ -997,6 +837,23 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 			}
 		}
 		Interface.CallHook("OnVehicleModulesAssigned", this, modularCarPresetConfig.socketItemDefs);
+		Invoke(HandleAdminBonus, 0f);
+	}
+
+	private void HandleAdminBonus()
+	{
+		switch (spawnSettings.adminBonus)
+		{
+		case SpawnSettings.AdminBonus.T1PlusFuel:
+			AdminFixUp(1);
+			break;
+		case SpawnSettings.AdminBonus.T2PlusFuel:
+			AdminFixUp(2);
+			break;
+		case SpawnSettings.AdminBonus.T3PlusFuel:
+			AdminFixUp(3);
+			break;
+		}
 	}
 
 	[RPC_Server]
@@ -1005,7 +862,47 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		BasePlayer player = msg.player;
 		if (!(player == null) && CanBeLooted(player))
 		{
-			fuelSystem.LootFuel(player);
+			GetFuelSystem().LootFuel(player);
+		}
+	}
+
+	[RPC_Server]
+	public void RPC_OpenFuelWithKeycode(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (player == null)
+		{
+			return;
+		}
+		string codeEntered = msg.read.String();
+		if (CarLock.TryOpenWithCode(player, codeEntered))
+		{
+			if (CanBeLooted(player))
+			{
+				GetFuelSystem().LootFuel(player);
+			}
+		}
+		else
+		{
+			ClientRPC(null, "CodeEntryFailed");
+		}
+	}
+
+	[RPC_Server]
+	public void RPC_TryMountWithKeycode(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (!(player == null))
+		{
+			string codeEntered = msg.read.String();
+			if (CarLock.TryOpenWithCode(player, codeEntered))
+			{
+				WantsMount(player);
+			}
+			else
+			{
+				ClientRPC(null, "CodeEntryFailed");
+			}
 		}
 	}
 
@@ -1030,8 +927,10 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 	public override void InitShared()
 	{
 		base.InitShared();
-		fuelSystem = new EntityFuelSystem(this, base.isServer);
-		carLock = new ModularCarLock(this, base.isServer);
+		if (CarLock == null)
+		{
+			CarLock = new ModularCarCodeLock(this, base.isServer);
+		}
 	}
 
 	public override float MaxHealth()
@@ -1073,11 +972,20 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 	public override void Load(LoadInfo info)
 	{
 		base.Load(info);
-		if (info.msg.modularCar != null)
+		if (info.msg.modularCar == null)
 		{
-			carLock.LockID = info.msg.modularCar.lockID;
-			fuelSystem.fuelStorageInstance.uid = info.msg.modularCar.fuelStorageID;
-			cachedFuelFraction = info.msg.modularCar.fuelFraction;
+			return;
+		}
+		engineController.FuelSystem.fuelStorageInstance.uid = info.msg.modularCar.fuelStorageID;
+		cachedFuelFraction = info.msg.modularCar.fuelFraction;
+		bool hasALock = CarLock.HasALock;
+		CarLock.Load(info);
+		if (CarLock.HasALock != hasALock)
+		{
+			for (int i = 0; i < base.AttachedModuleEntities.Count; i++)
+			{
+				base.AttachedModuleEntities[i].RefreshConditionals(canGib: true);
+			}
 		}
 	}
 
@@ -1090,7 +998,7 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		}
 	}
 
-	public float GetThrottleInput()
+	public override float GetThrottleInput()
 	{
 		if (base.isServer)
 		{
@@ -1105,7 +1013,7 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		return 0f;
 	}
 
-	public float GetBrakeInput()
+	public override float GetBrakeInput()
 	{
 		if (base.isServer)
 		{
@@ -1134,32 +1042,29 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 	{
 		if (base.isServer)
 		{
-			Item fuelItem = fuelSystem.GetFuelItem();
-			if (fuelItem == null || fuelItem.amount < 1)
-			{
-				cachedFuelFraction = 0f;
-			}
-			else
-			{
-				cachedFuelFraction = Mathf.Clamp01((float)fuelItem.amount / (float)fuelItem.MaxStackable());
-			}
+			return engineController.FuelSystem.GetFuelFraction();
 		}
 		return cachedFuelFraction;
 	}
 
 	public bool PlayerHasUnlockPermission(BasePlayer player)
 	{
-		return carLock.PlayerHasUnlockPermission(player);
+		return CarLock.HasLockPermission(player);
 	}
 
-	public bool PlayerCanOpenThis(BasePlayer player, ModularCarLock.LockType lockType)
+	public bool KeycodeEntryBlocked(BasePlayer player)
 	{
-		return carLock.PlayerCanOpenThis(player, lockType);
+		return CarLock.CodeEntryBlocked(player);
+	}
+
+	public override bool PlayerCanUseThis(BasePlayer player, ModularCarCodeLock.LockType lockType)
+	{
+		return CarLock.PlayerCanUseThis(player, lockType);
 	}
 
 	public bool PlayerCanDestroyLock(BasePlayer player, BaseVehicleModule viaModule)
 	{
-		return carLock.PlayerCanDestroyLock(viaModule);
+		return CarLock.PlayerCanDestroyLock(viaModule);
 	}
 
 	public override bool CanBeLooted(BasePlayer player)
@@ -1168,7 +1073,11 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		{
 			return false;
 		}
-		if (!PlayerCanOpenThis(player, ModularCarLock.LockType.Storage))
+		if (PlayerIsMounted(player))
+		{
+			return true;
+		}
+		if (!PlayerCanUseThis(player, ModularCarCodeLock.LockType.General))
 		{
 			return false;
 		}
@@ -1181,32 +1090,38 @@ public class ModularCar : BaseModularVehicle, TriggerHurtNotChild.IHurtTriggerUs
 		{
 			return false;
 		}
-		if (pusher.isMounted || !pusher.IsOnGround())
+		if (pusher.InSafeZone() && !CarLock.HasLockPermission(pusher))
 		{
 			return false;
 		}
-		if (pusher.InSafeZone() && !carLock.PlayerHasUnlockPermission(pusher))
-		{
-			return false;
-		}
-		return !pusher.IsStandingOnEntity(this, 8192);
+		return true;
 	}
 
 	public bool RefreshEngineState()
 	{
-		if (lastSetEngineState == CurEngineState)
+		if (lastSetEngineState == base.CurEngineState)
 		{
 			return false;
 		}
-		if (base.isServer && CurEngineState == EngineState.Off)
+		if (base.isServer && base.CurEngineState == VehicleEngineController<GroundVehicle>.EngineState.Off)
 		{
-			lastEngineTime = UnityEngine.Time.time;
+			lastEngineOnTime = UnityEngine.Time.time;
 		}
 		foreach (BaseVehicleModule attachedModuleEntity in base.AttachedModuleEntities)
 		{
-			attachedModuleEntity.OnEngineStateChanged(lastSetEngineState, CurEngineState);
+			attachedModuleEntity.OnEngineStateChanged(lastSetEngineState, base.CurEngineState);
 		}
-		lastSetEngineState = CurEngineState;
+		if (base.isServer && Rust.GameInfo.HasAchievements && NumMounted() >= 5)
+		{
+			foreach (MountPointInfo allMountPoint in base.allMountPoints)
+			{
+				if (allMountPoint.mountable != null && allMountPoint.mountable.GetMounted() != null)
+				{
+					allMountPoint.mountable.GetMounted().GiveAchievement("BATTLE_BUS");
+				}
+			}
+		}
+		lastSetEngineState = base.CurEngineState;
 		return true;
 	}
 

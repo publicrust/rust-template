@@ -6,11 +6,14 @@ using Facepunch;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
+using Rust;
 using UnityEngine;
 using UnityEngine.Assertions;
 
 public class ComputerStation : BaseMountable
 {
+	public const Flags Flag_HasFullControl = Flags.Reserved2;
+
 	[Header("Computer")]
 	public GameObjectRef menuPrefab;
 
@@ -18,7 +21,7 @@ public class ComputerStation : BaseMountable
 
 	public EntityRef currentlyControllingEnt;
 
-	public Dictionary<string, uint> controlBookmarks = new Dictionary<string, uint>();
+	public List<string> controlBookmarks = new List<string>();
 
 	public Transform leftHandIKPosition;
 
@@ -30,7 +33,15 @@ public class ComputerStation : BaseMountable
 
 	public SoundDefinition onLoopSoundDef;
 
-	private float nextAddTime;
+	public bool isStatic;
+
+	public float autoGatherRadius;
+
+	public ulong currentPlayerID;
+
+	public float nextAddTime;
+
+	public static readonly char[] BookmarkSplit = new char[1] { ';' };
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -39,7 +50,7 @@ public class ComputerStation : BaseMountable
 			if (rpc == 481778085 && player != null)
 			{
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
-				if (Global.developer > 2)
+				if (ConVar.Global.developer > 2)
 				{
 					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - AddBookmark "));
 				}
@@ -68,7 +79,7 @@ public class ComputerStation : BaseMountable
 			if (rpc == 552248427 && player != null)
 			{
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
-				if (Global.developer > 2)
+				if (ConVar.Global.developer > 2)
 				{
 					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - BeginControllingBookmark "));
 				}
@@ -97,7 +108,7 @@ public class ComputerStation : BaseMountable
 			if (rpc == 2498687923u && player != null)
 			{
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
-				if (Global.developer > 2)
+				if (ConVar.Global.developer > 2)
 				{
 					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - DeleteBookmark "));
 				}
@@ -126,7 +137,7 @@ public class ComputerStation : BaseMountable
 			if (rpc == 2139261430 && player != null)
 			{
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
-				if (Global.developer > 2)
+				if (ConVar.Global.developer > 2)
 				{
 					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - Server_DisconnectControl "));
 				}
@@ -156,6 +167,16 @@ public class ComputerStation : BaseMountable
 		return base.OnRpcMessage(player, rpc, msg);
 	}
 
+	public bool AllowPings()
+	{
+		BaseEntity baseEntity = currentlyControllingEnt.Get(base.isServer);
+		if (baseEntity != null && baseEntity is IRemoteControllable { CanPing: not false })
+		{
+			return true;
+		}
+		return false;
+	}
+
 	public static bool IsValidIdentifier(string str)
 	{
 		if (string.IsNullOrEmpty(str))
@@ -178,13 +199,46 @@ public class ComputerStation : BaseMountable
 		base.DestroyShared();
 	}
 
-	public void SetPlayerSecondaryGroupFor(BaseEntity ent)
+	public override void ServerInit()
 	{
-		BasePlayer mounted = _mounted;
-		if ((bool)mounted)
+		base.ServerInit();
+		Invoke(GatherStaticCameras, 5f);
+	}
+
+	public void GatherStaticCameras()
+	{
+		if (Rust.Application.isLoadingSave)
 		{
-			mounted.net.SwitchSecondaryGroup(ent ? ent.net.group : null);
+			Invoke(GatherStaticCameras, 1f);
 		}
+		else
+		{
+			if (!isStatic || !(autoGatherRadius > 0f))
+			{
+				return;
+			}
+			List<BaseEntity> obj = Facepunch.Pool.GetList<BaseEntity>();
+			Vis.Entities(base.transform.position, autoGatherRadius, obj, 256, QueryTriggerInteraction.Ignore);
+			foreach (BaseEntity item in obj)
+			{
+				IRemoteControllable component = item.GetComponent<IRemoteControllable>();
+				if (component != null)
+				{
+					CCTV_RC component2 = item.GetComponent<CCTV_RC>();
+					if (!(component2 == null) && component2.IsStatic() && !controlBookmarks.Contains(component.GetIdentifier()))
+					{
+						ForceAddBookmark(component.GetIdentifier());
+					}
+				}
+			}
+			Facepunch.Pool.FreeList(ref obj);
+		}
+	}
+
+	public override void PostServerLoad()
+	{
+		base.PostServerLoad();
+		GatherStaticCameras();
 	}
 
 	public void StopControl(BasePlayer ply)
@@ -196,16 +250,20 @@ public class ComputerStation : BaseMountable
 			{
 				return;
 			}
-			baseEntity.GetComponent<IRemoteControllable>().StopControl();
-			if ((bool)ply)
-			{
-				ply.net.SwitchSecondaryGroup(null);
-			}
+			baseEntity.GetComponent<IRemoteControllable>().StopControl(new CameraViewerId(currentPlayerID, 0L));
 		}
-		currentlyControllingEnt.uid = 0u;
+		if ((bool)ply)
+		{
+			ply.net.SwitchSecondaryGroup(null);
+		}
+		currentlyControllingEnt.uid = default(NetworkableId);
+		currentPlayerID = 0uL;
+		SetFlag(Flags.Reserved2, b: false, recursive: false, networkupdate: false);
 		SendNetworkUpdate();
 		SendControlBookmarks(ply);
 		CancelInvoke(ControlCheck);
+		CancelInvoke(CheckCCTVAchievement);
+		Interface.CallHook("OnBookmarkControlEnded", this, ply, baseEntity);
 	}
 
 	public bool IsPlayerAdmin(BasePlayer player)
@@ -217,20 +275,19 @@ public class ComputerStation : BaseMountable
 	public void DeleteBookmark(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
-		if (!IsPlayerAdmin(player))
+		if (!IsPlayerAdmin(player) || isStatic)
 		{
 			return;
 		}
 		string text = msg.read.String();
-		if (IsValidIdentifier(text) && controlBookmarks.ContainsKey(text) && Interface.CallHook("OnBookmarkDelete", this, player, text) == null)
+		if (IsValidIdentifier(text) && controlBookmarks.Contains(text) && Interface.CallHook("OnBookmarkDelete", this, player, text) == null)
 		{
-			uint num = controlBookmarks[text];
 			controlBookmarks.Remove(text);
 			SendControlBookmarks(player);
-			if (num == currentlyControllingEnt.uid)
+			BaseEntity baseEntity = currentlyControllingEnt.Get(serverside: true);
+			if (baseEntity != null && baseEntity.TryGetComponent<IRemoteControllable>(out var component) && component.GetIdentifier() == text)
 			{
-				currentlyControllingEnt.Set(null);
-				SendNetworkUpdate();
+				StopControl(player);
 			}
 		}
 	}
@@ -254,36 +311,85 @@ public class ComputerStation : BaseMountable
 			return;
 		}
 		string text = msg.read.String();
-		if (!IsValidIdentifier(text) || !controlBookmarks.ContainsKey(text))
+		if (!IsValidIdentifier(text) || !controlBookmarks.Contains(text))
 		{
 			return;
 		}
-		uint uid = controlBookmarks[text];
-		BaseNetworkable baseNetworkable = BaseNetworkable.serverEntities.Find(uid);
-		if (baseNetworkable == null)
+		IRemoteControllable remoteControllable = RemoteControlEntity.FindByID(text);
+		if (remoteControllable == null)
 		{
 			return;
 		}
-		IRemoteControllable component = baseNetworkable.GetComponent<IRemoteControllable>();
-		if (component.CanControl() && !(component.GetIdentifier() != text) && Interface.CallHook("OnBookmarkControl", this, player, text, component) == null)
+		BaseEntity ent = remoteControllable.GetEnt();
+		if (ent == null)
+		{
+			Debug.LogWarning("RC identifier " + text + " was found but has a null or destroyed entity, this should never happen");
+		}
+		else if (remoteControllable.CanControl(player.userID) && !(Vector3.Distance(base.transform.position, ent.transform.position) >= remoteControllable.MaxRange) && Interface.CallHook("OnBookmarkControl", this, player, text, remoteControllable) == null)
 		{
 			BaseEntity baseEntity = currentlyControllingEnt.Get(serverside: true);
 			if ((bool)baseEntity)
 			{
-				baseEntity.GetComponent<IRemoteControllable>()?.StopControl();
+				IRemoteControllable component = baseEntity.GetComponent<IRemoteControllable>();
+				component?.StopControl(new CameraViewerId(currentPlayerID, 0L));
+				Interface.CallHook("OnBookmarkControlEnded", this, player, component);
 			}
-			player.net.SwitchSecondaryGroup(baseNetworkable.net.group);
-			currentlyControllingEnt.uid = baseNetworkable.net.ID;
+			player.net.SwitchSecondaryGroup(ent.net.group);
+			currentlyControllingEnt.uid = ent.net.ID;
+			currentPlayerID = player.userID;
+			bool b = remoteControllable.InitializeControl(new CameraViewerId(currentPlayerID, 0L));
+			SetFlag(Flags.Reserved2, b, recursive: false, networkupdate: false);
 			SendNetworkUpdateImmediate();
 			SendControlBookmarks(player);
-			component.InitializeControl(player);
+			if (Rust.GameInfo.HasAchievements && remoteControllable.GetEnt() is CCTV_RC)
+			{
+				InvokeRepeating(CheckCCTVAchievement, 1f, 3f);
+			}
 			InvokeRepeating(ControlCheck, 0f, 0f);
+			Interface.CallHook("OnBookmarkControlStarted", this, player, text, remoteControllable);
+		}
+	}
+
+	public void CheckCCTVAchievement()
+	{
+		if (!(_mounted != null))
+		{
+			return;
+		}
+		BaseEntity baseEntity = currentlyControllingEnt.Get(serverside: true);
+		if (!(baseEntity != null) || !(baseEntity is CCTV_RC cCTV_RC))
+		{
+			return;
+		}
+		foreach (Connection subscriber in _mounted.net.secondaryGroup.subscribers)
+		{
+			if (!subscriber.active)
+			{
+				continue;
+			}
+			BasePlayer basePlayer = subscriber.player as BasePlayer;
+			if (!(basePlayer == null))
+			{
+				Vector3 vector = basePlayer.CenterPoint();
+				float num = Vector3.Dot((vector - cCTV_RC.pitch.position).normalized, cCTV_RC.pitch.forward);
+				Vector3 vector2 = cCTV_RC.pitch.InverseTransformPoint(vector);
+				if (num > 0.6f && vector2.magnitude < 10f)
+				{
+					_mounted.GiveAchievement("BIG_BROTHER");
+					CancelInvoke(CheckCCTVAchievement);
+					break;
+				}
+			}
 		}
 	}
 
 	public bool CanAddBookmark(BasePlayer player)
 	{
 		if (!IsPlayerAdmin(player))
+		{
+			return false;
+		}
+		if (isStatic)
 		{
 			return false;
 		}
@@ -299,11 +405,31 @@ public class ComputerStation : BaseMountable
 		return true;
 	}
 
+	public void ForceAddBookmark(string identifier)
+	{
+		if (controlBookmarks.Count >= 128 || !IsValidIdentifier(identifier) || controlBookmarks.Contains(identifier))
+		{
+			return;
+		}
+		IRemoteControllable remoteControllable = RemoteControlEntity.FindByID(identifier);
+		if (remoteControllable != null)
+		{
+			if (remoteControllable.GetEnt() == null)
+			{
+				Debug.LogWarning("RC identifier " + identifier + " was found but has a null or destroyed entity, this should never happen");
+			}
+			else
+			{
+				controlBookmarks.Add(identifier);
+			}
+		}
+	}
+
 	[RPC_Server]
 	public void AddBookmark(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
-		if (!IsPlayerAdmin(player))
+		if (!IsPlayerAdmin(player) || isStatic)
 		{
 			return;
 		}
@@ -319,49 +445,9 @@ public class ComputerStation : BaseMountable
 		}
 		nextAddTime = UnityEngine.Time.realtimeSinceStartup + 1f;
 		string text = msg.read.String();
-		if (!IsValidIdentifier(text))
+		if (Interface.CallHook("OnBookmarkAdd", this, player, text) == null)
 		{
-			return;
-		}
-		foreach (KeyValuePair<string, uint> controlBookmark in controlBookmarks)
-		{
-			if (controlBookmark.Key == text)
-			{
-				return;
-			}
-		}
-		uint num = 0u;
-		bool flag = false;
-		foreach (IRemoteControllable allControllable in RemoteControlEntity.allControllables)
-		{
-			if (allControllable != null && allControllable.GetIdentifier() == text)
-			{
-				if (!(allControllable.GetEnt() == null))
-				{
-					num = allControllable.GetEnt().net.ID;
-					flag = true;
-					break;
-				}
-				Debug.LogWarning("Computer station added bookmark with missing ent, likely a static CCTV (wipe the server)");
-			}
-		}
-		if (!flag)
-		{
-			return;
-		}
-		BaseNetworkable baseNetworkable = BaseNetworkable.serverEntities.Find(num);
-		if (baseNetworkable == null)
-		{
-			return;
-		}
-		IRemoteControllable component = baseNetworkable.GetComponent<IRemoteControllable>();
-		if (component != null && Interface.CallHook("OnBookmarkAdd", this, player, text) == null)
-		{
-			string identifier = component.GetIdentifier();
-			if (text == identifier)
-			{
-				controlBookmarks.Add(text, num);
-			}
+			ForceAddBookmark(text);
 			SendControlBookmarks(player);
 		}
 	}
@@ -370,12 +456,13 @@ public class ComputerStation : BaseMountable
 	{
 		bool flag = false;
 		BaseEntity baseEntity = currentlyControllingEnt.Get(base.isServer);
-		if ((bool)baseEntity)
+		if ((bool)baseEntity && (bool)_mounted)
 		{
 			IRemoteControllable component = baseEntity.GetComponent<IRemoteControllable>();
-			if (component != null && component.CanControl())
+			if (component != null && component.CanControl(_mounted.userID) && Vector3.Distance(base.transform.position, baseEntity.transform.position) < component.MaxRange)
 			{
 				flag = true;
+				_mounted.net.SwitchSecondaryGroup(baseEntity.net.group);
 			}
 		}
 		if (!flag)
@@ -386,15 +473,7 @@ public class ComputerStation : BaseMountable
 
 	public string GenerateControlBookmarkString()
 	{
-		string text = "";
-		foreach (KeyValuePair<string, uint> controlBookmark in controlBookmarks)
-		{
-			text += controlBookmark.Key;
-			text += ":";
-			text += controlBookmark.Value;
-			text += ";";
-		}
-		return text;
+		return string.Join(";", controlBookmarks);
 	}
 
 	public void SendControlBookmarks(BasePlayer player)
@@ -411,6 +490,7 @@ public class ComputerStation : BaseMountable
 
 	public override void OnPlayerMounted()
 	{
+		base.OnPlayerMounted();
 		BasePlayer mounted = _mounted;
 		if ((bool)mounted)
 		{
@@ -429,9 +509,9 @@ public class ComputerStation : BaseMountable
 	public override void PlayerServerInput(InputState inputState, BasePlayer player)
 	{
 		base.PlayerServerInput(inputState, player);
-		if (currentlyControllingEnt.IsValid(serverside: true) && Interface.CallHook("OnBookmarkInput", this, player, inputState) == null)
+		if (HasFlag(Flags.Reserved2) && currentlyControllingEnt.IsValid(serverside: true) && Interface.CallHook("OnBookmarkInput", this, player, inputState) == null)
 		{
-			currentlyControllingEnt.Get(serverside: true).GetComponent<IRemoteControllable>().UserInput(inputState, player);
+			currentlyControllingEnt.Get(serverside: true).GetComponent<IRemoteControllable>().UserInput(inputState, new CameraViewerId(player.userID, 0L));
 		}
 	}
 
@@ -466,21 +546,13 @@ public class ComputerStation : BaseMountable
 			{
 				return;
 			}
-			string[] array = info.msg.computerStation.bookmarks.Split(';');
-			for (int i = 0; i < array.Length; i++)
+			string[] array = info.msg.computerStation.bookmarks.Split(BookmarkSplit, StringSplitOptions.RemoveEmptyEntries);
+			foreach (string text in array)
 			{
-				string[] array2 = array[i].Split(':');
-				if (array2.Length >= 2)
+				if (IsValidIdentifier(text))
 				{
-					string text = array2[0];
-					uint.TryParse(array2[1], out var result);
-					if (IsValidIdentifier(text))
-					{
-						controlBookmarks.Add(text, result);
-					}
-					continue;
+					controlBookmarks.Add(text);
 				}
-				break;
 			}
 		}
 	}

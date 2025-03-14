@@ -130,10 +130,18 @@ public class RFReceiver : IOEntity, IRFObject
 		}
 	}
 
+	public override bool CanUseNetworkCache(Connection connection)
+	{
+		return false;
+	}
+
 	public override void Save(SaveInfo info)
 	{
 		base.Save(info);
-		info.msg.ioEntity.genericInt1 = frequency;
+		if (info.forDisk || CanChangeFrequency(info.forConnection?.player as BasePlayer))
+		{
+			info.msg.ioEntity.genericInt1 = frequency;
+		}
 	}
 
 	public override void Load(LoadInfo info)
@@ -143,5 +151,14 @@ public class RFReceiver : IOEntity, IRFObject
 		{
 			frequency = info.msg.ioEntity.genericInt1;
 		}
+	}
+
+	private bool CanChangeFrequency(BasePlayer player)
+	{
+		if (player != null)
+		{
+			return player.CanBuild();
+		}
+		return false;
 	}
 }

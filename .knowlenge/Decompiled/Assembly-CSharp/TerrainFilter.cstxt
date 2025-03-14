@@ -5,6 +5,8 @@ public class TerrainFilter : PrefabAttribute
 {
 	public SpawnFilter Filter;
 
+	public bool CheckPlacementMap = true;
+
 	protected void OnDrawGizmosSelected()
 	{
 		Gizmos.color = new Color(0.5f, 0.5f, 0.5f, 1f);
@@ -14,7 +16,7 @@ public class TerrainFilter : PrefabAttribute
 
 	public bool Check(Vector3 pos)
 	{
-		return Filter.GetFactor(pos) > 0f;
+		return Filter.GetFactor(pos, CheckPlacementMap) > 0f;
 	}
 
 	protected override Type GetIndexedType()

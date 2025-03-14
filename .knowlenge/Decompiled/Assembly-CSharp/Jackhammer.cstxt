@@ -7,6 +7,8 @@ using UnityEngine.Assertions;
 
 public class Jackhammer : BaseMelee
 {
+	public float HotspotBonusScale = 1f;
+
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
 		using (TimeWarning.New("Jackhammer.OnRpcMessage"))

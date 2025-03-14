@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using UnityEngine;
@@ -10,6 +11,8 @@ using UnityEngine.Assertions;
 
 public class Recycler : StorageContainer
 {
+	public Animator Animator;
+
 	public float recycleEfficiency = 0.5f;
 
 	public SoundDefinition grindingLoopDef;
@@ -67,6 +70,53 @@ public class Recycler : StorageContainer
 		base.ResetState();
 	}
 
+	private bool CanBeRecycled(Item item)
+	{
+		object obj = Interface.CallHook("CanBeRecycled", item, this);
+		if (obj is bool)
+		{
+			return (bool)obj;
+		}
+		if (item != null)
+		{
+			return item.info.Blueprint != null;
+		}
+		return false;
+	}
+
+	public override void ServerInit()
+	{
+		base.ServerInit();
+		ItemContainer itemContainer = base.inventory;
+		itemContainer.canAcceptItem = (Func<Item, int, bool>)Delegate.Combine(itemContainer.canAcceptItem, new Func<Item, int, bool>(RecyclerItemFilter));
+	}
+
+	public bool RecyclerItemFilter(Item item, int targetSlot)
+	{
+		int num = Mathf.CeilToInt((float)base.inventory.capacity * 0.5f);
+		if (targetSlot == -1)
+		{
+			bool flag = false;
+			for (int i = 0; i < num; i++)
+			{
+				if (!base.inventory.SlotTaken(item, i))
+				{
+					flag = true;
+					break;
+				}
+			}
+			if (!flag)
+			{
+				return false;
+			}
+		}
+		if (targetSlot < num)
+		{
+			return CanBeRecycled(item);
+		}
+		return true;
+	}
+
 	[RPC_Server]
 	[RPC_Server.MaxDistance(3f)]
 	private void SVSwitch(RPCMessage msg)
@@ -103,12 +153,12 @@ public class Recycler : StorageContainer
 			}
 			if (slot.CanStack(newItem))
 			{
-				if (slot.amount + newItem.amount <= slot.info.stackable)
+				if (slot.amount + newItem.amount <= slot.MaxStackable())
 				{
 					num = i;
 					break;
 				}
-				int num2 = Mathf.Min(slot.info.stackable - slot.amount, newItem.amount);
+				int num2 = Mathf.Min(slot.MaxStackable() - slot.amount, newItem.amount);
 				newItem.UseItem(num2);
 				slot.amount += num2;
 				slot.MarkDirty();
@@ -158,21 +208,18 @@ public class Recycler : StorageContainer
 			if (num2 < 6)
 			{
 				Item slot = base.inventory.GetSlot(num2);
-				if (slot == null)
+				if (!CanBeRecycled(slot))
 				{
-					goto IL_034f;
+					num2++;
+					continue;
 				}
-				if (Interface.CallHook("OnRecycleItem", this, slot) != null)
+				if (Interface.CallHook("OnItemRecycle", slot, this) != null)
 				{
 					if (!HasRecyclable())
 					{
 						StopRecycling();
 					}
 					break;
-				}
-				if (!(slot.info.Blueprint != null))
-				{
-					goto IL_034f;
 				}
 				if (slot.hasCondition)
 				{
@@ -181,35 +228,42 @@ public class Recycler : StorageContainer
 				int num3 = 1;
 				if (slot.amount > 1)
 				{
-					num3 = Mathf.CeilToInt(Mathf.Min(slot.amount, (float)slot.info.stackable * 0.1f));
+					num3 = Mathf.CeilToInt(Mathf.Min(slot.amount, (float)slot.MaxStackable() * 0.1f));
+				}
+				object obj = Interface.CallHook("OnItemRecycleAmount", slot, num3, this);
+				if (obj is int)
+				{
+					num3 = (int)obj;
 				}
 				if (slot.info.Blueprint.scrapFromRecycle > 0)
 				{
 					int num4 = slot.info.Blueprint.scrapFromRecycle * num3;
-					if (slot.info.stackable == 1 && slot.hasCondition)
+					if (slot.MaxStackable() == 1 && slot.hasCondition)
 					{
 						num4 = Mathf.CeilToInt((float)num4 * slot.conditionNormalized);
 					}
 					if (num4 >= 1)
 					{
-						Item newItem = ItemManager.CreateByName("scrap", num4, 0uL);
-						MoveItemToOutput(newItem);
+						Item item = ItemManager.CreateByName("scrap", num4, 0uL);
+						Facepunch.Rust.Analytics.Azure.OnRecyclerItemProduced(item.info.shortname, item.amount, this, slot);
+						MoveItemToOutput(item);
 					}
 				}
 				if (!string.IsNullOrEmpty(slot.info.Blueprint.RecycleStat))
 				{
-					List<BasePlayer> obj = Facepunch.Pool.GetList<BasePlayer>();
-					Vis.Entities(base.transform.position, 3f, obj, 131072);
-					foreach (BasePlayer item in obj)
+					List<BasePlayer> obj2 = Facepunch.Pool.GetList<BasePlayer>();
+					Vis.Entities(base.transform.position, 3f, obj2, 131072);
+					foreach (BasePlayer item3 in obj2)
 					{
-						if (item.IsAlive() && !item.IsSleeping() && item.inventory.loot.entitySource == this)
+						if (item3.IsAlive() && !item3.IsSleeping() && item3.inventory.loot.entitySource == this)
 						{
-							item.stats.Add(slot.info.Blueprint.RecycleStat, num3, (Stats)5);
-							item.stats.Save();
+							item3.stats.Add(slot.info.Blueprint.RecycleStat, num3, (Stats)5);
+							item3.stats.Save();
 						}
 					}
-					Facepunch.Pool.FreeList(ref obj);
+					Facepunch.Pool.FreeList(ref obj2);
 				}
+				Facepunch.Rust.Analytics.Azure.OnItemRecycled(slot.info.shortname, num3, this);
 				slot.UseItem(num3);
 				foreach (ItemAmount ingredient in slot.info.Blueprint.ingredients)
 				{
@@ -241,8 +295,9 @@ public class Recycler : StorageContainer
 					for (int j = 0; j < num7; j++)
 					{
 						int num8 = ((num6 > ingredient.itemDef.stackable) ? ingredient.itemDef.stackable : num6);
-						Item newItem2 = ItemManager.Create(ingredient.itemDef, num8, 0uL);
-						if (!MoveItemToOutput(newItem2))
+						Item item2 = ItemManager.Create(ingredient.itemDef, num8, 0uL);
+						Facepunch.Rust.Analytics.Azure.OnRecyclerItemProduced(item2.info.shortname, item2.amount, this, slot);
+						if (!MoveItemToOutput(item2))
 						{
 							flag = true;
 						}
@@ -259,8 +314,6 @@ public class Recycler : StorageContainer
 				StopRecycling();
 			}
 			break;
-			IL_034f:
-			num2++;
 		}
 	}
 
@@ -284,5 +337,17 @@ public class Recycler : StorageContainer
 			SetFlag(Flags.On, b: false);
 			SendNetworkUpdateImmediate();
 		}
+	}
+
+	public void PlayAnim()
+	{
+	}
+
+	public void StopAnim()
+	{
+	}
+
+	private void ToggleAnim(bool toggle)
+	{
 	}
 }

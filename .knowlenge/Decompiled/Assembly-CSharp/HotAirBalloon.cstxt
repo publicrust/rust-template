@@ -10,7 +10,7 @@ using Rust;
 using UnityEngine;
 using UnityEngine.Assertions;
 
-public class HotAirBalloon : BaseCombatEntity
+public class HotAirBalloon : BaseCombatEntity, SamSite.ISamSiteTarget
 {
 	protected const Flags Flag_HasFuel = Flags.Reserved6;
 
@@ -45,16 +45,12 @@ public class HotAirBalloon : BaseCombatEntity
 	[Header("Fuel")]
 	public GameObjectRef fuelStoragePrefab;
 
-	public Transform fuelStoragePoint;
-
 	public float fuelPerSec = 0.25f;
 
 	[Header("Storage")]
 	public GameObjectRef storageUnitPrefab;
 
-	public Transform storageUnitPoint;
-
-	public EntityRef storageUnitInstance;
+	public EntityRef<StorageContainer> storageUnitInstance;
 
 	[Header("Damage")]
 	public DamageRenderer damageRenderer;
@@ -65,10 +61,10 @@ public class HotAirBalloon : BaseCombatEntity
 
 	public EntityFuelSystem fuelSystem;
 
-	[ServerVar(Help = "Population active on the server")]
+	[ServerVar(Help = "Population active on the server", ShowInAdminUI = true)]
 	public static float population = 1f;
 
-	[ServerVar(Help = "How long before a HAB is killed while outside")]
+	[ServerVar(Help = "How long before a HAB loses all its health while outside")]
 	public static float outsidedecayminutes = 180f;
 
 	public float windForce = 30000f;
@@ -91,6 +87,10 @@ public class HotAirBalloon : BaseCombatEntity
 	public float avgTerrainHeight;
 
 	public bool grounded;
+
+	public bool IsFullyInflated => inflationLevel >= 1f;
+
+	public SamSite.SamTargetType SAMTargetType => SamSite.targetTypeVehicle;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -167,7 +167,7 @@ public class HotAirBalloon : BaseCombatEntity
 
 	public override void InitShared()
 	{
-		fuelSystem = new EntityFuelSystem(this, base.isServer);
+		fuelSystem = new EntityFuelSystem(base.isServer, fuelStoragePrefab, children);
 	}
 
 	public override void Load(LoadInfo info)
@@ -193,6 +193,44 @@ public class HotAirBalloon : BaseCombatEntity
 		return WaterLevel.Test(engineHeight.position, waves: true, this);
 	}
 
+	protected override void OnChildAdded(BaseEntity child)
+	{
+		base.OnChildAdded(child);
+		if (base.isServer)
+		{
+			if (isSpawned)
+			{
+				fuelSystem.CheckNewChild(child);
+			}
+			if (child.prefabID == storageUnitPrefab.GetEntity().prefabID)
+			{
+				storageUnitInstance.Set((StorageContainer)child);
+			}
+		}
+	}
+
+	internal override void DoServerDestroy()
+	{
+		if (vehicle.vehiclesdroploot && storageUnitInstance.IsValid(base.isServer))
+		{
+			storageUnitInstance.Get(base.isServer).DropItems();
+		}
+		base.DoServerDestroy();
+	}
+
+	public bool IsValidSAMTarget(bool staticRespawn)
+	{
+		if (staticRespawn)
+		{
+			return IsFullyInflated;
+		}
+		if (IsFullyInflated)
+		{
+			return !BaseVehicle.InSafeZone(triggers, base.transform.position);
+		}
+		return false;
+	}
+
 	public override float GetNetworkTime()
 	{
 		return UnityEngine.Time.fixedTime;
@@ -204,18 +242,6 @@ public class HotAirBalloon : BaseCombatEntity
 		SetFlag(Flags.On, b: false);
 	}
 
-	public void SpawnSubEntities()
-	{
-		if (!Rust.Application.isLoadingSave)
-		{
-			BaseEntity baseEntity = GameManager.server.CreateEntity(storageUnitPrefab.resourcePath, storageUnitPoint.localPosition, storageUnitPoint.localRotation);
-			baseEntity.Spawn();
-			baseEntity.SetParent(this);
-			storageUnitInstance.Set(baseEntity);
-			fuelSystem.SpawnFuelStorage(fuelStoragePrefab, fuelStoragePoint);
-		}
-	}
-
 	[RPC_Server]
 	public void RPC_OpenFuel(RPCMessage msg)
 	{
@@ -224,12 +250,6 @@ public class HotAirBalloon : BaseCombatEntity
 		{
 			fuelSystem.LootFuel(player);
 		}
-	}
-
-	public override void Spawn()
-	{
-		base.Spawn();
-		SpawnSubEntities();
 	}
 
 	public override void Save(SaveInfo info)
@@ -259,7 +279,7 @@ public class HotAirBalloon : BaseCombatEntity
 
 	public void DecayTick()
 	{
-		if (base.healthFraction != 0f && inflationLevel != 1f && !(UnityEngine.Time.time < lastBlastTime + 600f))
+		if (base.healthFraction != 0f && !IsFullyInflated && !(UnityEngine.Time.time < lastBlastTime + 600f))
 		{
 			float num = 1f / outsidedecayminutes;
 			if (IsOutside())
@@ -302,8 +322,24 @@ public class HotAirBalloon : BaseCombatEntity
 			List<Collider> obj = Facepunch.Pool.GetList<Collider>();
 			GamePhysics.OverlapSphere(groundSample.transform.position, 1.25f, obj, 1218511105);
 			grounded = obj.Count > 0;
+			CheckGlobal(flags);
 			Facepunch.Pool.FreeList(ref obj);
 		}
+	}
+
+	public override void OnFlagsChanged(Flags old, Flags next)
+	{
+		base.OnFlagsChanged(old, next);
+		if (base.isServer)
+		{
+			CheckGlobal(next);
+		}
+	}
+
+	private void CheckGlobal(Flags flags)
+	{
+		bool wants = flags.HasFlag(Flags.On) || flags.HasFlag(Flags.Reserved2) || flags.HasFlag(Flags.Reserved1) || !grounded;
+		EnableGlobalBroadcast(wants);
 	}
 
 	protected void FixedUpdate()
@@ -321,14 +357,17 @@ public class HotAirBalloon : BaseCombatEntity
 			fuelSystem.TryUseFuel(UnityEngine.Time.fixedDeltaTime, fuelPerSec);
 		}
 		SetFlag(Flags.Reserved6, fuelSystem.HasFuel());
+		bool flag = (IsFullyInflated && myRigidbody.velocity.y < 0f) || myRigidbody.velocity.y < 0.75f;
 		GameObject[] array = killTriggers;
-		foreach (GameObject obj in array)
+		foreach (GameObject gameObject in array)
 		{
-			bool active = (inflationLevel == 1f && myRigidbody.velocity.y < 0f) || myRigidbody.velocity.y < 0.75f;
-			obj.SetActive(active);
+			if (gameObject.activeSelf != flag)
+			{
+				gameObject.SetActive(flag);
+			}
 		}
 		float num = inflationLevel;
-		if (IsOn() && inflationLevel < 1f)
+		if (IsOn() && !IsFullyInflated)
 		{
 			inflationLevel = Mathf.Clamp01(inflationLevel + UnityEngine.Time.fixedDeltaTime / 10f);
 		}
@@ -338,7 +377,7 @@ public class HotAirBalloon : BaseCombatEntity
 		}
 		if (num != inflationLevel)
 		{
-			if (inflationLevel == 1f)
+			if (IsFullyInflated)
 			{
 				bounds = raisedBounds;
 			}
@@ -351,14 +390,18 @@ public class HotAirBalloon : BaseCombatEntity
 			SendNetworkUpdate();
 			_ = inflationLevel;
 		}
+		bool flag2 = !myRigidbody.IsSleeping() || inflationLevel > 0f;
 		array = balloonColliders;
-		for (int i = 0; i < array.Length; i++)
+		foreach (GameObject gameObject2 in array)
 		{
-			array[i].SetActive(!myRigidbody.IsSleeping() || inflationLevel > 0f);
+			if (gameObject2.activeSelf != flag2)
+			{
+				gameObject2.SetActive(flag2);
+			}
 		}
 		if (IsOn())
 		{
-			if (inflationLevel >= 1f)
+			if (IsFullyInflated)
 			{
 				currentBuoyancy += UnityEngine.Time.fixedDeltaTime * 0.2f;
 				lastBlastTime = UnityEngine.Time.time;
@@ -396,11 +439,19 @@ public class HotAirBalloon : BaseCombatEntity
 
 	public override Vector3 GetLocalVelocityServer()
 	{
+		if (myRigidbody == null)
+		{
+			return Vector3.zero;
+		}
 		return myRigidbody.velocity;
 	}
 
 	public override Quaternion GetAngularVelocityServer()
 	{
+		if (myRigidbody == null)
+		{
+			return Quaternion.identity;
+		}
 		if (myRigidbody.angularVelocity.sqrMagnitude < 0.1f)
 		{
 			return Quaternion.identity;
@@ -412,10 +463,5 @@ public class HotAirBalloon : BaseCombatEntity
 	{
 		float num = pos.y * 6f;
 		return new Vector3(Mathf.Sin(num * ((float)Math.PI / 180f)), 0f, Mathf.Cos(num * ((float)Math.PI / 180f))).normalized * 1f;
-	}
-
-	public override bool SupportsChildDeployables()
-	{
-		return false;
 	}
 }

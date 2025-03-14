@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.UI;
 
 public class DeveloperTools : SingletonComponent<DeveloperTools>
 {
@@ -7,4 +8,6 @@ public class DeveloperTools : SingletonComponent<DeveloperTools>
 	public GameObject navButton;
 
 	public GameObject panelContainer;
+
+	public Text ConsoleInput;
 }

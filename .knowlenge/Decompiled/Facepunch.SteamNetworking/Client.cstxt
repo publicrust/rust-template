@@ -1,6 +1,4 @@
 using System;
-using System.Diagnostics;
-using System.IO;
 using Network;
 using Steamworks;
 using Steamworks.Data;
@@ -10,12 +8,7 @@ public class Client : global::Network.Client, IConnectionManager
 {
 	private ConnectionManager manager;
 
-	private bool relay;
-
-	public Client(bool enableSteamDatagramRelay)
-	{
-		relay = enableSteamDatagramRelay;
-	}
+	private const int bufferSize = 32;
 
 	public override bool IsConnected()
 	{
@@ -24,90 +17,101 @@ public class Client : global::Network.Client, IConnectionManager
 
 	public override bool Connect(string strURL, int port)
 	{
-		base.Connect(strURL, port);
-		SteamNetworkingUtils.AllowWithoutAuth = 2;
-		SteamNetworkingUtils.Unencrypted = 2;
-		if (relay)
+		lock (readLock)
 		{
-			ulong num = ulong.Parse(strURL);
-			manager = SteamNetworkingSockets.ConnectRelay(num, port, this);
+			lock (writeLock)
+			{
+				lock (decryptLock)
+				{
+					base.Connect(strURL, port);
+					SteamNetworkingUtils.AllowWithoutAuth = 2;
+					SteamNetworkingUtils.Unencrypted = 2;
+					SteamNetworkingUtils.SendRateMax = 1048576;
+					SteamNetworkingUtils.SendRateMin = 1048576;
+					NetAddress address = NetAddress.From(strURL, (ushort)port);
+					manager = SteamNetworkingSockets.ConnectNormal(address, this);
+					if (manager == null)
+					{
+						return false;
+					}
+					base.ConnectedAddress = strURL;
+					base.ConnectedPort = port;
+					base.ServerName = "";
+					base.Connection = new global::Network.Connection();
+					MultithreadingInit();
+					return true;
+				}
+			}
 		}
-		else
-		{
-			NetAddress address = NetAddress.From(strURL, (ushort)port);
-			manager = SteamNetworkingSockets.ConnectNormal(address, this);
-		}
-		if (manager == null)
-		{
-			return false;
-		}
-		base.ConnectedAddress = strURL;
-		base.ConnectedPort = port;
-		base.ServerName = "";
-		base.Connection = new global::Network.Connection();
-		return true;
 	}
 
-	public override void Cycle()
+	protected override bool Receive()
 	{
-		if (manager != null)
+		if (manager.Receive(32, receiveToEnd: false) == 32)
 		{
-			Stopwatch obj = Pool.Get<Stopwatch>();
-			obj.Reset();
-			obj.Start();
-			while (manager.Receive(32, receiveToEnd: false) == 32 && !(obj.Elapsed.TotalMilliseconds > (double)global::Network.Client.MaxReceiveTime))
-			{
-			}
-			Pool.Free(ref obj);
+			return true;
 		}
+		return false;
 	}
 
 	public override void Disconnect(string reason, bool sendReasonToServer)
 	{
-		if (sendReasonToServer)
+		lock (readLock)
 		{
-			if (base.write != null && base.write.Start())
+			lock (writeLock)
 			{
-				base.write.PacketID(Message.Type.DisconnectReason);
-				base.write.String(reason);
-				base.write.Send(new SendInfo(base.Connection)
+				lock (decryptLock)
 				{
-					method = SendMethod.ReliableUnordered,
-					priority = Priority.Immediate
-				});
-			}
-			if (manager != null)
-			{
-				manager.Close(linger: true, 0, reason);
-				manager = null;
+					if (sendReasonToServer)
+					{
+						NetWrite netWrite = StartWrite();
+						netWrite.PacketID(Message.Type.DisconnectReason);
+						netWrite.String(reason);
+						netWrite.SendImmediate(new SendInfo(base.Connection)
+						{
+							method = SendMethod.ReliableUnordered,
+							priority = Priority.Immediate
+						});
+						if (manager != null)
+						{
+							manager.Close(linger: true, 0, reason);
+							manager = null;
+						}
+					}
+					else if (manager != null)
+					{
+						manager.Close();
+						manager = null;
+					}
+					base.ConnectedAddress = "";
+					base.ConnectedPort = 0;
+					base.Connection = null;
+					OnDisconnected(reason);
+				}
 			}
 		}
-		else if (manager != null)
-		{
-			manager.Close();
-			manager = null;
-		}
-		base.ConnectedAddress = "";
-		base.ConnectedPort = 0;
-		base.Connection = null;
-		OnDisconnected(reason);
 	}
 
-	public unsafe override void Send(SendInfo sendinfo, MemoryStream data)
+	public override void Flush()
 	{
-		if (manager == null)
+		if (manager != null && base.Connection != null)
 		{
-			return;
+			((Steamworks.Data.Connection)(uint)base.Connection.guid).Flush();
 		}
-		Encrypt(base.Connection, ref data);
-		fixed (byte* buffer = data.GetBuffer())
+	}
+
+	public unsafe override void ProcessWrite(NetWrite write)
+	{
+		ArraySegment<byte> arraySegment = Encrypt(base.Connection, write);
+		fixed (byte* array = arraySegment.Array)
 		{
-			Result result = manager.Connection.SendMessage((IntPtr)buffer, (int)data.Length, ToSteamSendType(sendinfo.method, sendinfo.priority));
-			if (steamsendverify && result != Result.OK)
+			Result result = manager.Connection.SendMessage((IntPtr)array, arraySegment.Offset + arraySegment.Count, ToSteamSendType(write.method, write.priority), ToSteamLaneIndexClient(write.method, write.priority, write.channel));
+			if (result != Result.OK)
 			{
-				DebugEx.LogWarning("SendMessage failed: " + result);
+				Debug.LogWarning(string.Concat("SendMessage failed (", result, ")"));
 			}
 		}
+		Pool.Free(ref write);
 	}
 
 	void IConnectionManager.OnConnecting(ConnectionInfo info)
@@ -129,23 +133,37 @@ public class Client : global::Network.Client, IConnectionManager
 
 	void IConnectionManager.OnMessage(IntPtr data, int datasize, long messageNum, long recvTime, int channel)
 	{
-		base.read.Start(data, datasize);
-		Decrypt(base.Connection, base.read);
-		Record(base.Connection, base.read);
-		byte b = base.read.PacketID();
-		b -= 140;
-		if (base.Connection == null)
+		NetRead netRead = Pool.Get<NetRead>();
+		netRead.Start(base.Connection, data, datasize);
+		if (BaseNetwork.Multithreading)
 		{
-			UnityEngine.Debug.LogWarning(string.Concat("[CLIENT] Ignoring message ", (Message.Type)b, " ", b, " clientConnection is null"));
+			EnqueueDecrypt(netRead);
+		}
+		else
+		{
+			ProcessDecrypt(netRead);
+		}
+	}
+
+	public override void ProcessRead(NetRead read)
+	{
+		Record(read.connection, read);
+		byte b = read.PacketID();
+		b -= 140;
+		if (read.connection == null)
+		{
+			Debug.LogWarning(string.Concat("Ignoring message (", (Message.Type)b, " ", b, " connection is null)"));
+			Pool.Free(ref read);
 			return;
 		}
 		if (b > 25)
 		{
-			UnityEngine.Debug.LogWarning(string.Concat("Invalid Packet (higher than ", Message.Type.ConsoleReplicatedVars, ")"));
-			Disconnect("Invalid Packet (" + b + ") ", sendReasonToServer: true);
+			Debug.LogWarning(string.Concat("Invalid Packet (higher than ", Message.Type.ConsoleReplicatedVars, ")"));
+			Disconnect("Invalid Packet (" + b + ") " + read.Length + "b", sendReasonToServer: true);
+			Pool.Free(ref read);
 			return;
 		}
-		Message obj = StartMessage((Message.Type)b, base.Connection);
+		Message obj = StartMessage((Message.Type)b, read);
 		if (callbackHandler != null)
 		{
 			try
@@ -157,12 +175,13 @@ public class Client : global::Network.Client, IConnectionManager
 			}
 			catch (Exception ex)
 			{
-				UnityEngine.Debug.LogException(ex);
+				Debug.LogException(ex);
 				Disconnect(ex.Message + "\n" + ex.StackTrace, sendReasonToServer: true);
 			}
 		}
 		obj.Clear();
 		Pool.Free(ref obj);
+		Pool.Free(ref read);
 	}
 
 	public override string GetDebug(global::Network.Connection connection)

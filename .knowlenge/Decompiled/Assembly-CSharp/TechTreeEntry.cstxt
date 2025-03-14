@@ -14,4 +14,8 @@ public class TechTreeEntry : TechTreeWidget
 	public GameObject lockOverlay;
 
 	public GameObject selectedBackground;
+
+	public Image radialUnlock;
+
+	public float holdTime = 1f;
 }

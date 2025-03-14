@@ -96,9 +96,4 @@ public class AnimatedBuildingBlock : StabilityEntity
 	protected virtual void OnAnimatorDisabled()
 	{
 	}
-
-	public override bool SupportsChildDeployables()
-	{
-		return false;
-	}
 }

@@ -1,6 +1,8 @@
 #define UNITY_ASSERTIONS
 using System;
+using System.Collections.Generic;
 using ConVar;
+using Facepunch;
 using Network;
 using Oxide.Core;
 using UnityEngine;
@@ -31,6 +33,16 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 
 	public SoundDefinition vehicleCollisionSfx;
 
+	public GameObject[] ClosedColliderRoots;
+
+	[SerializeField]
+	[ReadOnly]
+	private float openAnimLength = 4f;
+
+	[SerializeField]
+	[ReadOnly]
+	private float closeAnimLength = 4f;
+
 	private float decayResetTimeLast = float.NegativeInfinity;
 
 	public NavMeshModifierVolume NavMeshVolumeAnimals;
@@ -46,6 +58,10 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 	private static int animalAgentTypeId = -1;
 
 	private static int humanoidAgentTypeId = -1;
+
+	private Dictionary<BasePlayer, TimeSince> woundedOpens = new Dictionary<BasePlayer, TimeSince>();
+
+	private Dictionary<BasePlayer, TimeSince> woundedCloses = new Dictionary<BasePlayer, TimeSince>();
 
 	private float nextKnockTime = float.NegativeInfinity;
 
@@ -213,6 +229,78 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 				}
 				return true;
 			}
+			if (rpc == 3672787865u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - Server_NotifyWoundedClose "));
+				}
+				using (TimeWarning.New("Server_NotifyWoundedClose"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(3672787865u, "Server_NotifyWoundedClose", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							Server_NotifyWoundedClose(msg2);
+						}
+					}
+					catch (Exception exception5)
+					{
+						Debug.LogException(exception5);
+						player.Kick("RPC Error in Server_NotifyWoundedClose");
+					}
+				}
+				return true;
+			}
+			if (rpc == 3730851545u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - Server_NotifyWoundedOpen "));
+				}
+				using (TimeWarning.New("Server_NotifyWoundedOpen"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(3730851545u, "Server_NotifyWoundedOpen", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg3 = rPCMessage;
+							Server_NotifyWoundedOpen(msg3);
+						}
+					}
+					catch (Exception exception6)
+					{
+						Debug.LogException(exception6);
+						player.Kick("RPC Error in Server_NotifyWoundedOpen");
+					}
+				}
+				return true;
+			}
 		}
 		return base.OnRpcMessage(player, rpc, msg);
 	}
@@ -227,6 +315,8 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 			{
 				SetNavMeshLinkEnabled(wantsOn: false);
 			}
+			woundedCloses.Clear();
+			woundedOpens.Clear();
 		}
 	}
 
@@ -343,16 +433,6 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 		SetOpen(open: false);
 	}
 
-	public override void OnFlagsChanged(Flags old, Flags next)
-	{
-		base.OnFlagsChanged(old, next);
-		BaseEntity slot = GetSlot(Slot.UpperModifier);
-		if ((bool)slot)
-		{
-			slot.SendMessage("Think");
-		}
-	}
-
 	public void SetOpen(bool open, bool suppressBlockageChecks = false)
 	{
 		SetFlag(Flags.Open, open);
@@ -363,7 +443,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 		}
 		if (!suppressBlockageChecks && (!open || checkPhysBoxesOnOpen))
 		{
-			StartCheckingForBlockages();
+			StartCheckingForBlockages(open);
 		}
 	}
 
@@ -404,9 +484,17 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 	[RPC_Server.MaxDistance(3f)]
 	private void RPC_OpenDoor(RPCMessage rpc)
 	{
-		if (!rpc.player.CanInteract() || !canHandOpen || IsOpen() || IsBusy() || IsLocked())
+		if (!rpc.player.CanInteract(usableWhileCrawling: true) || !canHandOpen || IsOpen() || IsBusy() || IsLocked())
 		{
 			return;
+		}
+		if (rpc.player.IsWounded())
+		{
+			if (!woundedOpens.ContainsKey(rpc.player) || !((float)woundedOpens[rpc.player] > 2.5f))
+			{
+				return;
+			}
+			woundedOpens.Remove(rpc.player);
 		}
 		BaseLock baseLock = GetSlot(Slot.Lock) as BaseLock;
 		if (baseLock != null)
@@ -437,17 +525,18 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 		}
 		if (checkPhysBoxesOnOpen)
 		{
-			StartCheckingForBlockages();
+			StartCheckingForBlockages(isOpening: true);
 		}
 		Interface.CallHook("OnDoorOpened", this, rpc.player);
 	}
 
-	private void StartCheckingForBlockages()
+	private void StartCheckingForBlockages(bool isOpening)
 	{
 		if (HasVehiclePushBoxes)
 		{
-			Invoke(EnableVehiclePhysBoxes, 0.25f);
-			Invoke(DisableVehiclePhysBox, 4f);
+			Invoke(EnableVehiclePhysBoxes, 0.2f);
+			float time = (isOpening ? openAnimLength : closeAnimLength);
+			Invoke(DisableVehiclePhysBox, time);
 		}
 	}
 
@@ -464,9 +553,17 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 	[RPC_Server.MaxDistance(3f)]
 	private void RPC_CloseDoor(RPCMessage rpc)
 	{
-		if (!rpc.player.CanInteract() || !canHandOpen || !IsOpen() || IsBusy() || IsLocked())
+		if (!rpc.player.CanInteract(usableWhileCrawling: true) || !canHandOpen || !IsOpen() || IsBusy() || IsLocked())
 		{
 			return;
+		}
+		if (rpc.player.IsWounded())
+		{
+			if (!woundedCloses.ContainsKey(rpc.player) || !((float)woundedCloses[rpc.player] > 2.5f))
+			{
+				return;
+			}
+			woundedCloses.Remove(rpc.player);
 		}
 		BaseLock baseLock = GetSlot(Slot.Lock) as BaseLock;
 		if (!(baseLock != null) || baseLock.OnTryToClose(rpc.player))
@@ -477,7 +574,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 			{
 				SetNavMeshLinkEnabled(wantsOn: false);
 			}
-			StartCheckingForBlockages();
+			StartCheckingForBlockages(isOpening: false);
 			Interface.CallHook("OnDoorClosed", this, rpc.player);
 		}
 	}
@@ -486,7 +583,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 	[RPC_Server.MaxDistance(3f)]
 	private void RPC_KnockDoor(RPCMessage rpc)
 	{
-		if (!rpc.player.CanInteract() || !knockEffect.isValid || UnityEngine.Time.realtimeSinceStartup < nextKnockTime)
+		if (!rpc.player.CanInteract(usableWhileCrawling: true) || !knockEffect.isValid || UnityEngine.Time.realtimeSinceStartup < nextKnockTime)
 		{
 			return;
 		}
@@ -509,7 +606,7 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 	[RPC_Server.MaxDistance(3f)]
 	private void RPC_ToggleHatch(RPCMessage rpc)
 	{
-		if (rpc.player.CanInteract() && hasHatch)
+		if (rpc.player.CanInteract(usableWhileCrawling: true) && hasHatch)
 		{
 			BaseLock baseLock = GetSlot(Slot.Lock) as BaseLock;
 			if (!baseLock || baseLock.OnTryToOpen(rpc.player))
@@ -545,6 +642,70 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 		}
 	}
 
+	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
+	private void Server_NotifyWoundedOpen(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (player.IsWounded())
+		{
+			if (!woundedOpens.ContainsKey(player))
+			{
+				woundedOpens.Add(player, default(TimeSince));
+			}
+			else
+			{
+				woundedOpens[player] = 0f;
+			}
+			Invoke(delegate
+			{
+				CheckTimedOutPlayers(woundedOpens);
+			}, 5f);
+		}
+	}
+
+	private void CheckTimedOutPlayers(Dictionary<BasePlayer, TimeSince> dictionary)
+	{
+		List<BasePlayer> obj = Facepunch.Pool.GetList<BasePlayer>();
+		foreach (KeyValuePair<BasePlayer, TimeSince> item in dictionary)
+		{
+			if ((float)item.Value > 5f)
+			{
+				obj.Add(item.Key);
+			}
+		}
+		foreach (BasePlayer item2 in obj)
+		{
+			if (dictionary.ContainsKey(item2))
+			{
+				dictionary.Remove(item2);
+			}
+		}
+		Facepunch.Pool.FreeList(ref obj);
+	}
+
+	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
+	private void Server_NotifyWoundedClose(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (player.IsWounded())
+		{
+			if (!woundedCloses.ContainsKey(player))
+			{
+				woundedCloses.Add(player, default(TimeSince));
+			}
+			else
+			{
+				woundedCloses[player] = 0f;
+			}
+			Invoke(delegate
+			{
+				CheckTimedOutPlayers(woundedCloses);
+			}, 5f);
+		}
+	}
+
 	private void ReverseDoorAnimation(bool wasOpening)
 	{
 		if (!(model == null) && !(model.animator == null))
@@ -561,17 +722,61 @@ public class Door : AnimatedBuildingBlock, INotifyTrigger
 
 	public void OnObjects(TriggerNotify trigger)
 	{
-		if (base.isServer)
+		if (!base.isServer)
 		{
-			bool flag = HasFlag(Flags.Open);
-			SetOpen(!flag, suppressBlockageChecks: true);
-			ReverseDoorAnimation(flag);
+			return;
+		}
+		bool flag = false;
+		foreach (BaseEntity entityContent in trigger.entityContents)
+		{
+			if (entityContent is BaseMountable { BlocksDoors: not false })
+			{
+				flag = true;
+				break;
+			}
+			if (entityContent is BaseVehicleModule baseVehicleModule && baseVehicleModule.Vehicle != null && baseVehicleModule.Vehicle.BlocksDoors)
+			{
+				flag = true;
+				break;
+			}
+		}
+		if (flag)
+		{
+			bool flag2 = HasFlag(Flags.Open);
+			SetOpen(!flag2, suppressBlockageChecks: true);
+			ReverseDoorAnimation(flag2);
 			StopCheckingForBlockages();
-			ClientRPC(null, "OnDoorInterrupted", flag ? 1 : 0);
+			ClientRPC(null, "OnDoorInterrupted", flag2 ? 1 : 0);
 		}
 	}
 
 	public void OnEmpty()
 	{
+	}
+
+	public override void OnFlagsChanged(Flags old, Flags next)
+	{
+		base.OnFlagsChanged(old, next);
+		if (base.isServer)
+		{
+			BaseEntity slot = GetSlot(Slot.UpperModifier);
+			if ((bool)slot)
+			{
+				slot.SendMessage("Think");
+			}
+		}
+		if (ClosedColliderRoots == null)
+		{
+			return;
+		}
+		bool active = !HasFlag(Flags.Open) || HasFlag(Flags.Busy);
+		GameObject[] closedColliderRoots = ClosedColliderRoots;
+		foreach (GameObject gameObject in closedColliderRoots)
+		{
+			if (gameObject != null)
+			{
+				gameObject.gameObject.SetActive(active);
+			}
+		}
 	}
 }

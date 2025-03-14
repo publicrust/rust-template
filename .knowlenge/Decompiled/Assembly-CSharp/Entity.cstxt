@@ -1,8 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using ConVar;
+using Facepunch;
 using UnityEngine;
 
 [Factory("entity")]
@@ -12,11 +15,11 @@ public class Entity : ConsoleSystem
 	{
 		public BaseNetworkable entity;
 
-		public uint entityID;
+		public NetworkableId entityID;
 
 		public uint groupID;
 
-		public uint parentID;
+		public NetworkableId parentID;
 
 		public string status;
 
@@ -25,10 +28,10 @@ public class Entity : ConsoleSystem
 			entity = src;
 			BaseEntity baseEntity = entity as BaseEntity;
 			BaseEntity baseEntity2 = ((baseEntity != null) ? baseEntity.GetParentEntity() : null);
-			entityID = ((entity != null && entity.net != null) ? entity.net.ID : 0u);
+			entityID = ((entity != null && entity.net != null) ? entity.net.ID : default(NetworkableId));
 			groupID = ((entity != null && entity.net != null && entity.net.group != null) ? entity.net.group.ID : 0u);
-			parentID = ((baseEntity != null) ? baseEntity.parentEntity.uid : 0u);
-			if (baseEntity != null && baseEntity.parentEntity.uid != 0)
+			parentID = ((baseEntity != null) ? baseEntity.parentEntity.uid : default(NetworkableId));
+			if (baseEntity != null && baseEntity.parentEntity.uid.IsValid)
 			{
 				if (baseEntity2 == null)
 				{
@@ -44,6 +47,15 @@ public class Entity : ConsoleSystem
 				status = string.Empty;
 			}
 		}
+	}
+
+	private struct EntitySpawnRequest
+	{
+		public string PrefabName;
+
+		public string Error;
+
+		public bool Valid => string.IsNullOrEmpty(Error);
 	}
 
 	private static TextTable GetEntityTable(Func<EntityInfo, bool> filter)
@@ -67,7 +79,7 @@ public class Entity : ConsoleSystem
 				EntityInfo arg = new EntityInfo(serverEntity);
 				if (filter(arg))
 				{
-					textTable.AddRow("sv", arg.entityID.ToString(), arg.groupID.ToString(), arg.parentID.ToString(), arg.entity.ShortPrefabName, arg.entity.transform.position.ToString(), arg.entity.transform.localPosition.ToString(), arg.entity.transform.rotation.eulerAngles.ToString(), arg.entity.transform.localRotation.eulerAngles.ToString(), arg.status, arg.entity.InvokeString());
+					textTable.AddRow("sv", arg.entityID.Value.ToString(), arg.groupID.ToString(), arg.parentID.Value.ToString(), arg.entity.ShortPrefabName, arg.entity.transform.position.ToString(), arg.entity.transform.localPosition.ToString(), arg.entity.transform.rotation.eulerAngles.ToString(), arg.entity.transform.localRotation.eulerAngles.ToString(), arg.status, arg.entity.InvokeString());
 				}
 			}
 		}
@@ -87,7 +99,7 @@ public class Entity : ConsoleSystem
 	[ClientVar]
 	public static void find_id(Arg args)
 	{
-		uint filter = args.GetUInt(0);
+		NetworkableId filter = ArgEx.GetEntityID(args, 0);
 		TextTable entityTable = GetEntityTable((EntityInfo info) => info.entityID == filter);
 		args.ReplyWith(entityTable.ToString());
 	}
@@ -105,7 +117,7 @@ public class Entity : ConsoleSystem
 	[ClientVar]
 	public static void find_parent(Arg args)
 	{
-		uint filter = args.GetUInt(0);
+		NetworkableId filter = ArgEx.GetEntityID(args, 0);
 		TextTable entityTable = GetEntityTable((EntityInfo info) => info.parentID == filter);
 		args.ReplyWith(entityTable.ToString());
 	}
@@ -139,7 +151,7 @@ public class Entity : ConsoleSystem
 		BasePlayer basePlayer = ArgEx.Player(args);
 		if (!(basePlayer == null) && basePlayer.net != null)
 		{
-			uint filter = basePlayer.net.ID;
+			NetworkableId filter = basePlayer.net.ID;
 			TextTable entityTable = GetEntityTable((EntityInfo info) => info.entityID == filter);
 			args.ReplyWith(entityTable.ToString());
 		}
@@ -148,12 +160,12 @@ public class Entity : ConsoleSystem
 	[ServerVar]
 	public static void debug_toggle(Arg args)
 	{
-		int @int = args.GetInt(0);
-		if (@int == 0)
+		NetworkableId entityID = ArgEx.GetEntityID(args, 0);
+		if (!entityID.IsValid)
 		{
 			return;
 		}
-		BaseEntity baseEntity = BaseNetworkable.serverEntities.Find((uint)@int) as BaseEntity;
+		BaseEntity baseEntity = BaseNetworkable.serverEntities.Find(entityID) as BaseEntity;
 		if (!(baseEntity == null))
 		{
 			baseEntity.SetFlag(BaseEntity.Flags.Debugging, !baseEntity.IsDebugging());
@@ -161,16 +173,17 @@ public class Entity : ConsoleSystem
 			{
 				baseEntity.OnDebugStart();
 			}
-			args.ReplyWith("Debugging for " + baseEntity.net.ID + " " + (baseEntity.IsDebugging() ? "enabled" : "disabled"));
+			args.ReplyWith(string.Concat("Debugging for ", baseEntity.net.ID, " ", baseEntity.IsDebugging() ? "enabled" : "disabled"));
 		}
 	}
 
 	[ServerVar]
-	public static void nudge(int entID)
+	public static void nudge(Arg args)
 	{
-		if (entID != 0)
+		NetworkableId entityID = ArgEx.GetEntityID(args, 0);
+		if (entityID.IsValid)
 		{
-			BaseEntity baseEntity = BaseNetworkable.serverEntities.Find((uint)entID) as BaseEntity;
+			BaseEntity baseEntity = BaseNetworkable.serverEntities.Find(entityID) as BaseEntity;
 			if (!(baseEntity == null))
 			{
 				baseEntity.BroadcastMessage("DebugNudge", SendMessageOptions.DontRequireReceiver);
@@ -178,35 +191,53 @@ public class Entity : ConsoleSystem
 		}
 	}
 
-	[ServerVar(Name = "spawn")]
-	public static string svspawn(string name, Vector3 pos, Vector3 dir)
+	private static EntitySpawnRequest GetSpawnEntityFromName(string name)
 	{
-		BasePlayer arg = ArgEx.Player(ConsoleSystem.CurrentArgs);
+		EntitySpawnRequest result;
 		if (string.IsNullOrEmpty(name))
 		{
-			return "No entity name provided";
+			result = default(EntitySpawnRequest);
+			result.Error = "No entity name provided";
+			return result;
 		}
 		string[] array = (from x in GameManifest.Current.entities
 			where Path.GetFileNameWithoutExtension(x).Contains(name, CompareOptions.IgnoreCase)
 			select x.ToLower()).ToArray();
 		if (array.Length == 0)
 		{
-			return "Entity type not found";
+			result = default(EntitySpawnRequest);
+			result.Error = "Entity type not found";
+			return result;
 		}
 		if (array.Length > 1)
 		{
 			string text = array.FirstOrDefault((string x) => string.Compare(Path.GetFileNameWithoutExtension(x), name, StringComparison.OrdinalIgnoreCase) == 0);
 			if (text == null)
 			{
-				Debug.Log($"{arg} failed to spawn \"{name}\"");
-				return "Unknown entity - could be:\n\n" + string.Join("\n", array.Select(Path.GetFileNameWithoutExtension).ToArray());
+				result = default(EntitySpawnRequest);
+				result.Error = "Unknown entity - could be:\n\n" + string.Join("\n", array.Select(Path.GetFileNameWithoutExtension).ToArray());
+				return result;
 			}
 			array[0] = text;
 		}
-		BaseEntity baseEntity = GameManager.server.CreateEntity(array[0], pos, Quaternion.LookRotation(dir, Vector3.up));
+		result = default(EntitySpawnRequest);
+		result.PrefabName = array[0];
+		return result;
+	}
+
+	[ServerVar(Name = "spawn")]
+	public static string svspawn(string name, Vector3 pos, Vector3 dir)
+	{
+		BasePlayer arg = ArgEx.Player(ConsoleSystem.CurrentArgs);
+		EntitySpawnRequest spawnEntityFromName = GetSpawnEntityFromName(name);
+		if (!spawnEntityFromName.Valid)
+		{
+			return spawnEntityFromName.Error;
+		}
+		BaseEntity baseEntity = GameManager.server.CreateEntity(spawnEntityFromName.PrefabName, pos, Quaternion.LookRotation(dir, Vector3.up));
 		if (baseEntity == null)
 		{
-			Debug.Log($"{arg} failed to spawn \"{array[0]}\" (tried to spawn \"{name}\")");
+			Debug.Log($"{arg} failed to spawn \"{spawnEntityFromName.PrefabName}\" (tried to spawn \"{name}\")");
 			return "Couldn't spawn " + name;
 		}
 		BasePlayer basePlayer = baseEntity as BasePlayer;
@@ -256,6 +287,36 @@ public class Entity : ConsoleSystem
 		return string.Concat("spawned ", item, " at ", pos);
 	}
 
+	[ServerVar(Name = "spawngrid")]
+	public static string svspawngrid(string name, int width = 5, int height = 5, int spacing = 5)
+	{
+		BasePlayer basePlayer = ArgEx.Player(ConsoleSystem.CurrentArgs);
+		EntitySpawnRequest spawnEntityFromName = GetSpawnEntityFromName(name);
+		if (!spawnEntityFromName.Valid)
+		{
+			return spawnEntityFromName.Error;
+		}
+		Quaternion rotation = basePlayer.transform.rotation;
+		rotation.eulerAngles = new Vector3(0f, rotation.eulerAngles.y, 0f);
+		Matrix4x4 matrix4x = Matrix4x4.TRS(basePlayer.transform.position, basePlayer.transform.rotation, Vector3.one);
+		for (int i = 0; i < width; i++)
+		{
+			for (int j = 0; j < height; j++)
+			{
+				Vector3 pos = matrix4x.MultiplyPoint(new Vector3(i * spacing, 0f, j * spacing));
+				BaseEntity baseEntity = GameManager.server.CreateEntity(spawnEntityFromName.PrefabName, pos, rotation);
+				if (baseEntity == null)
+				{
+					Debug.Log($"{basePlayer} failed to spawn \"{spawnEntityFromName.PrefabName}\" (tried to spawn \"{name}\")");
+					return "Couldn't spawn " + name;
+				}
+				baseEntity.Spawn();
+			}
+		}
+		Debug.Log($"{basePlayer} spawned ({width * height}) " + spawnEntityFromName.PrefabName);
+		return $"spawned ({width * height}) " + spawnEntityFromName.PrefabName;
+	}
+
 	[ServerVar]
 	public static void spawnlootfrom(Arg args)
 	{
@@ -285,22 +346,82 @@ public class Entity : ConsoleSystem
 		baseEntity.Kill();
 	}
 
-	[ServerVar(Help = "Destroy all entities created by this user")]
-	public static int DeleteBy(ulong SteamId)
+	public static int DeleteBy(ulong id)
 	{
-		if (SteamId == 0L)
+		List<ulong> obj = Facepunch.Pool.GetList<ulong>();
+		obj.Add(id);
+		int result = DeleteBy(obj);
+		Facepunch.Pool.FreeList(ref obj);
+		return result;
+	}
+
+	[ServerVar(Help = "Destroy all entities created by provided users (separate users by space)")]
+	public static int DeleteBy(Arg arg)
+	{
+		if (!arg.HasArgs())
 		{
 			return 0;
 		}
+		List<ulong> obj = Facepunch.Pool.GetList<ulong>();
+		string[] args = arg.Args;
+		for (int i = 0; i < args.Length; i++)
+		{
+			if (ulong.TryParse(args[i], out var result))
+			{
+				obj.Add(result);
+			}
+		}
+		int result2 = DeleteBy(obj);
+		Facepunch.Pool.FreeList(ref obj);
+		return result2;
+	}
+
+	private static int DeleteBy(List<ulong> ids)
+	{
 		int num = 0;
 		foreach (BaseEntity serverEntity in BaseNetworkable.serverEntities)
 		{
-			if (!(serverEntity == null) && serverEntity.OwnerID == SteamId)
+			if (serverEntity == null)
+			{
+				continue;
+			}
+			bool flag = false;
+			foreach (ulong id in ids)
+			{
+				if (serverEntity.OwnerID == id)
+				{
+					flag = true;
+					break;
+				}
+			}
+			if (flag)
 			{
 				serverEntity.Invoke(serverEntity.KillMessage, (float)num * 0.2f);
 				num++;
 			}
 		}
 		return num;
+	}
+
+	[ServerVar(Help = "Destroy all entities created by users in the provided text block (can use with copied results from ent auth)")]
+	public static void DeleteByTextBlock(Arg arg)
+	{
+		if (arg.Args.Length != 1)
+		{
+			arg.ReplyWith("Invalid arguments, provide a text block surrounded by \" and listing player id's at the start of each line");
+			return;
+		}
+		MatchCollection matchCollection = Regex.Matches(arg.GetString(0), "^\\b\\d{17}", RegexOptions.Multiline);
+		List<ulong> obj = Facepunch.Pool.GetList<ulong>();
+		foreach (Match item in matchCollection)
+		{
+			if (ulong.TryParse(item.Value, out var result))
+			{
+				obj.Add(result);
+			}
+		}
+		int num = DeleteBy(obj);
+		Facepunch.Pool.FreeList(ref obj);
+		arg.ReplyWith($"Destroyed {num} entities");
 	}
 }

@@ -3,6 +3,8 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using ConVar;
+using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
@@ -41,6 +43,8 @@ public class VendingMachine : StorageContainer
 
 	public ItemDefinition blueprintBaseDef;
 
+	private Action fullUpdateCached;
+
 	protected BasePlayer vend_Player;
 
 	private int vend_sellOrderID;
@@ -50,6 +54,8 @@ public class VendingMachine : StorageContainer
 	public bool transactionActive;
 
 	private VendingMachineMapMarker myMarker;
+
+	private bool industrialItemIncoming;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -66,6 +72,10 @@ public class VendingMachine : StorageContainer
 				{
 					using (TimeWarning.New("Conditions"))
 					{
+						if (!RPC_Server.CallsPerSecond.Test(3011053703u, "BuyItem", this, player, 5uL))
+						{
+							return true;
+						}
 						if (!RPC_Server.IsVisible.Test(3011053703u, "BuyItem", this, player, 3f))
 						{
 							return true;
@@ -437,6 +447,7 @@ public class VendingMachine : StorageContainer
 			ItemContainer itemContainer = base.inventory;
 			itemContainer.canAcceptItem = (Func<Item, int, bool>)Delegate.Combine(itemContainer.canAcceptItem, new Func<Item, int, bool>(CanAcceptItem));
 			UpdateMapMarker();
+			fullUpdateCached = FullUpdate;
 		}
 	}
 
@@ -465,50 +476,53 @@ public class VendingMachine : StorageContainer
 	protected override void OnInventoryDirty()
 	{
 		base.OnInventoryDirty();
-		CancelInvoke(FullUpdate);
-		Invoke(FullUpdate, 0.2f);
+		CancelInvoke(fullUpdateCached);
+		Invoke(fullUpdateCached, 0.2f);
 	}
 
 	public void RefreshSellOrderStockLevel(ItemDefinition itemDef = null)
 	{
-		foreach (ProtoBuf.VendingMachine.SellOrder so in sellOrders.sellOrders)
+		foreach (ProtoBuf.VendingMachine.SellOrder sellOrder in sellOrders.sellOrders)
 		{
-			if (!(itemDef == null) && itemDef.itemid != so.itemToSellID)
+			if (!(itemDef == null) && itemDef.itemid != sellOrder.itemToSellID)
 			{
 				continue;
 			}
-			if (so.itemToSellIsBP)
+			List<Item> obj = Facepunch.Pool.GetList<Item>();
+			GetItemsToSell(sellOrder, obj);
+			int inStock;
+			if (obj.Count < 0)
 			{
-				List<Item> list = (from x in base.inventory.FindItemsByItemID(blueprintBaseDef.itemid)
-					where x.blueprintTarget == so.itemToSellID
-					select x).ToList();
-				ProtoBuf.VendingMachine.SellOrder sellOrder = so;
-				int inStock;
-				if (list == null || list.Count() < 0)
-				{
-					inStock = 0;
-				}
-				else
-				{
-					Interface.CallHook("OnRefreshVendingStock", this, itemDef);
-					inStock = list.Sum((Item x) => x.amount) / so.itemToSellAmount;
-				}
-				sellOrder.inStock = inStock;
-				continue;
-			}
-			List<Item> list2 = base.inventory.FindItemsByItemID(so.itemToSellID);
-			ProtoBuf.VendingMachine.SellOrder sellOrder2 = so;
-			int inStock2;
-			if (list2 == null || list2.Count < 0)
-			{
-				inStock2 = 0;
+				inStock = 0;
 			}
 			else
 			{
+				List<Item> source = obj;
+				Func<Item, int> selector = (Item x) => x.amount;
 				Interface.CallHook("OnRefreshVendingStock", this, itemDef);
-				inStock2 = list2.Sum((Item x) => x.amount) / so.itemToSellAmount;
+				inStock = source.Sum(selector) / sellOrder.itemToSellAmount;
 			}
-			sellOrder2.inStock = inStock2;
+			sellOrder.inStock = inStock;
+			float itemCondition = 0f;
+			float itemConditionMax = 0f;
+			int instanceData = 0;
+			if (obj.Count > 0)
+			{
+				if (obj[0].hasCondition)
+				{
+					itemCondition = obj[0].condition;
+					itemConditionMax = obj[0].maxCondition;
+				}
+				if (obj[0].info != null && obj[0].info.amountType == ItemDefinition.AmountType.Genetics && obj[0].instanceData != null)
+				{
+					instanceData = obj[0].instanceData.dataInt;
+					sellOrder.inStock = obj[0].amount;
+				}
+			}
+			sellOrder.itemCondition = itemCondition;
+			sellOrder.itemConditionMax = itemConditionMax;
+			sellOrder.instanceData = instanceData;
+			Facepunch.Pool.FreeList(ref obj);
 		}
 	}
 
@@ -589,6 +603,7 @@ public class VendingMachine : StorageContainer
 
 	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
+	[RPC_Server.CallsPerSecond(5uL)]
 	public void BuyItem(RPCMessage rpc)
 	{
 		if (OccupiedCheck(rpc.player))
@@ -597,7 +612,7 @@ public class VendingMachine : StorageContainer
 			int num2 = rpc.read.Int32();
 			if (IsVending())
 			{
-				rpc.player.ShowToast(1, WaitForVendingMessage);
+				rpc.player.ShowToast(GameTip.Styles.Red_Normal, WaitForVendingMessage);
 			}
 			else if (Interface.CallHook("OnBuyVendingItem", this, rpc.player, num, num2) == null)
 			{
@@ -620,38 +635,57 @@ public class VendingMachine : StorageContainer
 	{
 	}
 
-	public bool DoTransaction(BasePlayer buyer, int sellOrderId, int numberOfTransactions = 1)
+	private void GetItemsToSell(ProtoBuf.VendingMachine.SellOrder sellOrder, List<Item> items)
 	{
-		if (sellOrderId < 0 || sellOrderId > sellOrders.sellOrders.Count)
+		if (sellOrder.itemToSellIsBP)
+		{
+			foreach (Item item in base.inventory.itemList)
+			{
+				if (item.info.itemid == blueprintBaseDef.itemid && item.blueprintTarget == sellOrder.itemToSellID)
+				{
+					items.Add(item);
+				}
+			}
+			return;
+		}
+		foreach (Item item2 in base.inventory.itemList)
+		{
+			if (item2.info.itemid == sellOrder.itemToSellID)
+			{
+				items.Add(item2);
+			}
+		}
+	}
+
+	public bool DoTransaction(BasePlayer buyer, int sellOrderId, int numberOfTransactions = 1, ItemContainer targetContainer = null, Action<BasePlayer, Item> onCurrencyRemoved = null, Action<BasePlayer, Item> onItemPurchased = null, MarketTerminal droneMarketTerminal = null)
+	{
+		if (sellOrderId < 0 || sellOrderId >= sellOrders.sellOrders.Count)
 		{
 			return false;
 		}
-		if (Vector3.Distance(buyer.transform.position, base.transform.position) > 4f)
+		if (targetContainer == null && Vector3.Distance(buyer.transform.position, base.transform.position) > 4f)
 		{
 			return false;
 		}
-		object obj = Interface.CallHook("OnVendingTransaction", this, buyer, sellOrderId, numberOfTransactions);
+		object obj = Interface.CallHook("OnVendingTransaction", this, buyer, sellOrderId, numberOfTransactions, targetContainer);
 		if (obj is bool)
 		{
 			return (bool)obj;
 		}
 		ProtoBuf.VendingMachine.SellOrder sellOrder = sellOrders.sellOrders[sellOrderId];
-		List<Item> list = base.inventory.FindItemsByItemID(sellOrder.itemToSellID);
-		if (sellOrder.itemToSellIsBP)
+		List<Item> obj2 = Facepunch.Pool.GetList<Item>();
+		GetItemsToSell(sellOrder, obj2);
+		if (obj2 == null || obj2.Count == 0)
 		{
-			list = (from x in base.inventory.FindItemsByItemID(blueprintBaseDef.itemid)
-				where x.blueprintTarget == sellOrder.itemToSellID
-				select x).ToList();
-		}
-		if (list == null || list.Count == 0)
-		{
+			Facepunch.Pool.FreeList(ref obj2);
 			return false;
 		}
-		numberOfTransactions = Mathf.Clamp(numberOfTransactions, 1, list[0].hasCondition ? 1 : 1000000);
+		numberOfTransactions = Mathf.Clamp(numberOfTransactions, 1, obj2[0].hasCondition ? 1 : 1000000);
 		int num = sellOrder.itemToSellAmount * numberOfTransactions;
-		int num2 = list.Sum((Item x) => x.amount);
+		int num2 = obj2.Sum((Item x) => x.amount);
 		if (num > num2)
 		{
+			Facepunch.Pool.FreeList(ref obj2);
 			return false;
 		}
 		List<Item> source = buyer.inventory.FindItemIDs(sellOrder.currencyID);
@@ -664,49 +698,73 @@ public class VendingMachine : StorageContainer
 		source = source.Where((Item x) => !x.hasCondition || (x.conditionNormalized >= 0.5f && x.maxConditionNormalized > 0.5f)).ToList();
 		if (source.Count == 0)
 		{
+			Facepunch.Pool.FreeList(ref obj2);
 			return false;
 		}
 		int num3 = source.Sum((Item x) => x.amount);
 		int num4 = sellOrder.currencyAmountPerItem * numberOfTransactions;
 		if (num3 < num4)
 		{
+			Facepunch.Pool.FreeList(ref obj2);
 			return false;
 		}
 		transactionActive = true;
 		int num5 = 0;
-		foreach (Item item2 in source)
+		foreach (Item item3 in source)
 		{
-			int num6 = Mathf.Min(num4 - num5, item2.amount);
-			Item takenCurrencyItem = ((item2.amount > num6) ? item2.SplitItem(num6) : item2);
-			TakeCurrencyItem(takenCurrencyItem);
+			int num6 = Mathf.Min(num4 - num5, item3.amount);
+			Item item = ((item3.amount > num6) ? item3.SplitItem(num6) : item3);
+			TakeCurrencyItem(item);
+			onCurrencyRemoved?.Invoke(buyer, item);
 			num5 += num6;
 			if (num5 >= num4)
 			{
 				break;
 			}
 		}
+		Facepunch.Rust.Analytics.Azure.OnBuyFromVendingMachine(buyer, this, sellOrder.itemToSellID, sellOrder.itemToSellAmount * numberOfTransactions, sellOrder.itemToSellIsBP, sellOrder.currencyID, sellOrder.currencyAmountPerItem * numberOfTransactions, sellOrder.currencyIsBP, numberOfTransactions, droneMarketTerminal);
 		int num7 = 0;
-		foreach (Item item3 in list)
+		foreach (Item item4 in obj2)
 		{
 			int num8 = num - num7;
-			Item item = ((item3.amount > num8) ? item3.SplitItem(num8) : item3);
-			if (item == null)
+			Item item2 = ((item4.amount > num8) ? item4.SplitItem(num8) : item4);
+			if (item2 == null)
 			{
 				Debug.LogError("Vending machine error, contact developers!");
 			}
 			else
 			{
-				num7 += item.amount;
-				GiveSoldItem(item, buyer);
+				num7 += item2.amount;
+				object obj3 = Interface.CallHook("CanPurchaseItem", buyer, item2, onItemPurchased, this, targetContainer);
+				if (obj3 is bool)
+				{
+					return (bool)obj3;
+				}
+				RecordSaleAnalytics(item2);
+				if (targetContainer == null)
+				{
+					GiveSoldItem(item2, buyer);
+				}
+				else if (!item2.MoveToContainer(targetContainer))
+				{
+					item2.Drop(targetContainer.dropPosition, targetContainer.dropVelocity);
+				}
+				onItemPurchased?.Invoke(buyer, item2);
 			}
 			if (num7 >= num)
 			{
 				break;
 			}
 		}
+		Facepunch.Pool.FreeList(ref obj2);
 		UpdateEmptyFlag();
 		transactionActive = false;
 		return true;
+	}
+
+	protected virtual void RecordSaleAnalytics(Item itemSold)
+	{
+		Facepunch.Rust.Analytics.Server.VendingMachineTransaction(null, itemSold.info, itemSold.amount);
 	}
 
 	public virtual void TakeCurrencyItem(Item takenCurrencyItem)
@@ -797,11 +855,11 @@ public class VendingMachine : StorageContainer
 	[RPC_Server.IsVisible(3f)]
 	public void RPC_OpenShop(RPCMessage msg)
 	{
-		if (OccupiedCheck(msg.player))
+		if (OccupiedCheck(msg.player) && Interface.CallHook("OnVendingShopOpen", this, msg.player) == null)
 		{
 			SendSellOrders(msg.player);
 			PlayerOpenLoot(msg.player, customerPanel);
-			Interface.CallHook("OnOpenVendingShop", this, msg.player);
+			Interface.CallHook("OnVendingShopOpened", this, msg.player);
 		}
 	}
 
@@ -819,6 +877,16 @@ public class VendingMachine : StorageContainer
 		}
 	}
 
+	public void OnIndustrialItemTransferBegins()
+	{
+		industrialItemIncoming = true;
+	}
+
+	public void OnIndustrialItemTransferEnds()
+	{
+		industrialItemIncoming = false;
+	}
+
 	public bool CanAcceptItem(Item item, int targetSlot)
 	{
 		object obj = Interface.CallHook("CanVendingAcceptItem", this, item, targetSlot);
@@ -827,7 +895,7 @@ public class VendingMachine : StorageContainer
 			return (bool)obj;
 		}
 		BasePlayer ownerPlayer = item.GetOwnerPlayer();
-		if (transactionActive)
+		if (transactionActive || industrialItemIncoming)
 		{
 			return true;
 		}
@@ -851,7 +919,7 @@ public class VendingMachine : StorageContainer
 		return CanPlayerAdmin(player);
 	}
 
-	public override bool CanOpenLootPanel(BasePlayer player, string panelName = "")
+	public override bool CanOpenLootPanel(BasePlayer player, string panelName)
 	{
 		object obj = Interface.CallHook("CanUseVending", player, this);
 		if (obj is bool)
@@ -880,6 +948,8 @@ public class VendingMachine : StorageContainer
 			Interface.CallHook("OnDeleteVendingOffer", this, num);
 			if (num >= 0 && num < sellOrders.sellOrders.Count)
 			{
+				ProtoBuf.VendingMachine.SellOrder sellOrder = sellOrders.sellOrders[num];
+				Facepunch.Rust.Analytics.Azure.OnVendingMachineOrderChanged(msg.player, this, sellOrder.itemToSellID, sellOrder.itemToSellAmount, sellOrder.itemToSellIsBP, sellOrder.currencyID, sellOrder.currencyAmountPerItem, sellOrder.currencyIsBP, added: false);
 				sellOrders.sellOrders.RemoveAt(num);
 			}
 			RefreshSellOrderStockLevel();
@@ -915,12 +985,13 @@ public class VendingMachine : StorageContainer
 				player.ChatMessage("Too many sell orders - remove some");
 				return;
 			}
-			int itemToSellID = msg.read.Int32();
-			int itemToSellAmount = msg.read.Int32();
-			int currencyToUseID = msg.read.Int32();
-			int currencyAmount = msg.read.Int32();
-			byte bpState = msg.read.UInt8();
-			AddSellOrder(itemToSellID, itemToSellAmount, currencyToUseID, currencyAmount, bpState);
+			int num = msg.read.Int32();
+			int num2 = msg.read.Int32();
+			int num3 = msg.read.Int32();
+			int num4 = msg.read.Int32();
+			byte b = msg.read.UInt8();
+			AddSellOrder(num, num2, num3, num4, b);
+			Facepunch.Rust.Analytics.Azure.OnVendingMachineOrderChanged(msg.player, this, num, num2, b == 2 || b == 3, num3, num4, b == 1 || b == 3, added: true);
 		}
 	}
 
@@ -996,7 +1067,7 @@ public class VendingMachine : StorageContainer
 
 	protected virtual bool CanRotate()
 	{
-		return true;
+		return !HasAttachedStorageAdaptor();
 	}
 
 	public bool IsBroadcasting()
@@ -1036,5 +1107,10 @@ public class VendingMachine : StorageContainer
 			return OccupiedCheck(player);
 		}
 		return false;
+	}
+
+	public override bool SupportsChildDeployables()
+	{
+		return true;
 	}
 }

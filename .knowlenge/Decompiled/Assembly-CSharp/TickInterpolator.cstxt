@@ -28,6 +28,8 @@ public class TickInterpolator
 
 	public Vector3 EndPoint;
 
+	public int Count => points.Count;
+
 	public void Reset()
 	{
 		index = 0;

@@ -29,7 +29,7 @@ public class ItemTextValue : MonoBehaviour
 		{
 			text.text += " %";
 		}
-		if (suffix != "")
+		if (suffix != "" && !float.IsPositiveInfinity(val))
 		{
 			text.text += suffix;
 		}

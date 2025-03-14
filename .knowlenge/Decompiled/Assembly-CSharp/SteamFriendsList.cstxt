@@ -5,7 +5,7 @@ using UnityEngine.Events;
 public class SteamFriendsList : MonoBehaviour
 {
 	[Serializable]
-	public class onFriendSelectedEvent : UnityEvent<ulong>
+	public class onFriendSelectedEvent : UnityEvent<ulong, string>
 	{
 	}
 
@@ -21,5 +21,13 @@ public class SteamFriendsList : MonoBehaviour
 
 	public bool IncludeRecentlyPlayedWith;
 
+	public bool ShowTeamFirst;
+
+	public bool HideSteamIdsInStreamerMode;
+
+	public bool RefreshOnEnable = true;
+
 	public onFriendSelectedEvent onFriendSelected;
+
+	public Func<ulong, bool> shouldShowPlayer;
 }

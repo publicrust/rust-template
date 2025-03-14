@@ -11,7 +11,7 @@ public class VitalNote : MonoBehaviour, IClientComponent, IVitalNotice
 		Cold,
 		Bleeding,
 		Hot,
-		Drowning,
+		Oxygen,
 		Wet,
 		Hygiene,
 		Starving,

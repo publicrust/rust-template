@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
@@ -18,6 +19,26 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		public const Flags Peacekeeper = Flags.Reserved1;
 	}
 
+	public class UpdateAutoTurretScanQueue : ObjectWorkQueue<AutoTurret>
+	{
+		protected override void RunJob(AutoTurret entity)
+		{
+			if (ShouldAdd(entity))
+			{
+				entity.TargetScan();
+			}
+		}
+
+		protected override bool ShouldAdd(AutoTurret entity)
+		{
+			if (base.ShouldAdd(entity))
+			{
+				return entity.IsValid();
+			}
+			return false;
+		}
+	}
+
 	public GameObjectRef gun_fire_effect;
 
 	public GameObjectRef bulletEffect;
@@ -26,15 +47,22 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 
 	public AmbienceEmitter ambienceEmitter;
 
-	private BasePlayer playerController;
+	public GameObject assignDialog;
 
-	private string rcIdentifier = "TURRET";
+	public LaserBeam laserBeam;
 
-	private Vector3 initialAimDir;
+	public static UpdateAutoTurretScanQueue updateAutoTurretScanQueue = new UpdateAutoTurretScanQueue();
 
+	[Header("RC")]
 	public float rcTurnSensitivity = 4f;
 
 	public Transform RCEyes;
+
+	public GameObjectRef IDPanelPrefab;
+
+	public RemoteControllableControls rcControls;
+
+	public string rcIdentifier = "";
 
 	public TargetTrigger targetTrigger;
 
@@ -58,13 +86,15 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 
 	public const float bulletDamage = 15f;
 
+	public RealTimeSinceEx timeSinceLastServerTick;
+
 	public float nextForcedAimTime;
 
 	public Vector3 lastSentAimDir = Vector3.zero;
 
-	private static float[] visibilityOffsets = new float[3] { 0f, 0.15f, -0.15f };
+	public static float[] visibilityOffsets = new float[3] { 0f, 0.15f, -0.15f };
 
-	private int peekIndex;
+	public int peekIndex;
 
 	[NonSerialized]
 	public int numConsecutiveMisses;
@@ -126,8 +156,37 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 
 	public const Flags Flag_Equipped = Flags.Reserved3;
 
+	public const Flags Flag_MaxAuths = Flags.Reserved4;
+
 	[NonSerialized]
 	public List<PlayerNameID> authorizedPlayers = new List<PlayerNameID>();
+
+	[NonSerialized]
+	public int consumptionAmount = 10;
+
+	public bool CanPing => false;
+
+	public virtual bool RequiresMouse => true;
+
+	public float MaxRange => 10000f;
+
+	public RemoteControllableControls RequiredControls => rcControls;
+
+	public int ViewerCount { get; set; }
+
+	public CameraViewerId? ControllingViewerId { get; set; }
+
+	public bool IsBeingControlled
+	{
+		get
+		{
+			if (ViewerCount > 0)
+			{
+				return ControllingViewerId.HasValue;
+			}
+			return false;
+		}
+	}
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -169,6 +228,42 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 				}
 				return true;
 			}
+			if (rpc == 3057055788u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - AssignToFriend "));
+				}
+				using (TimeWarning.New("AssignToFriend"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(3057055788u, "AssignToFriend", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							AssignToFriend(msg2);
+						}
+					}
+					catch (Exception exception2)
+					{
+						Debug.LogException(exception2);
+						player.Kick("RPC Error in AssignToFriend");
+					}
+				}
+				return true;
+			}
 			if (rpc == 253307592 && player != null)
 			{
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
@@ -197,9 +292,9 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 							ClearList(rpc3);
 						}
 					}
-					catch (Exception exception2)
+					catch (Exception exception3)
 					{
-						Debug.LogException(exception2);
+						Debug.LogException(exception3);
 						player.Kick("RPC Error in ClearList");
 					}
 				}
@@ -233,9 +328,9 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 							FlipAim(rpc4);
 						}
 					}
-					catch (Exception exception3)
+					catch (Exception exception4)
 					{
-						Debug.LogException(exception3);
+						Debug.LogException(exception4);
 						player.Kick("RPC Error in FlipAim");
 					}
 				}
@@ -269,9 +364,9 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 							RemoveSelfAuthorize(rpc5);
 						}
 					}
-					catch (Exception exception4)
+					catch (Exception exception5)
 					{
-						Debug.LogException(exception4);
+						Debug.LogException(exception5);
 						player.Kick("RPC Error in RemoveSelfAuthorize");
 					}
 				}
@@ -305,9 +400,9 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 							SERVER_AttackAll(rpc6);
 						}
 					}
-					catch (Exception exception5)
+					catch (Exception exception6)
 					{
-						Debug.LogException(exception5);
+						Debug.LogException(exception6);
 						player.Kick("RPC Error in SERVER_AttackAll");
 					}
 				}
@@ -341,10 +436,46 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 							SERVER_Peacekeeper(rpc7);
 						}
 					}
-					catch (Exception exception6)
+					catch (Exception exception7)
 					{
-						Debug.LogException(exception6);
+						Debug.LogException(exception7);
 						player.Kick("RPC Error in SERVER_Peacekeeper");
+					}
+				}
+				return true;
+			}
+			if (rpc == 1053317251 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - Server_SetID "));
+				}
+				using (TimeWarning.New("Server_SetID"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.MaxDistance.Test(1053317251u, "Server_SetID", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg3 = rPCMessage;
+							Server_SetID(msg3);
+						}
+					}
+					catch (Exception exception8)
+					{
+						Debug.LogException(exception8);
+						player.Kick("RPC Error in Server_SetID");
 					}
 				}
 				return true;
@@ -358,19 +489,14 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		return HasFlag(Flags.Reserved1);
 	}
 
-	public bool IsBeingRemoteControlled()
-	{
-		return playerController != null;
-	}
-
 	public Transform GetEyes()
 	{
 		return RCEyes;
 	}
 
-	public bool Occupied()
+	public float GetFovScale()
 	{
-		return false;
+		return 1f;
 	}
 
 	public BaseEntity GetEnt()
@@ -378,74 +504,132 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		return this;
 	}
 
-	public virtual bool CanControl()
+	public virtual bool CanControl(ulong playerID)
 	{
-		object obj = Interface.CallHook("OnEntityControl", this);
+		object obj = Interface.CallHook("OnEntityControl", this, playerID);
 		if (obj is bool)
 		{
 			return (bool)obj;
 		}
+		if (booting)
+		{
+			return false;
+		}
+		if (IsPowered())
+		{
+			return !PeacekeeperMode();
+		}
 		return false;
 	}
 
-	public void UserInput(InputState inputState, BasePlayer player)
+	public bool InitializeControl(CameraViewerId viewerID)
 	{
-		float x = Mathf.Clamp(0f - inputState.current.mouseDelta.y, -1f, 1f) * rcTurnSensitivity;
-		float y = Mathf.Clamp(inputState.current.mouseDelta.x, -1f, 1f) * rcTurnSensitivity;
-		Quaternion quaternion = Quaternion.LookRotation(aimDir, base.transform.up);
-		Quaternion quaternion2 = Quaternion.Euler(x, y, 0f);
-		Quaternion quaternion3 = quaternion * quaternion2;
-		aimDir = quaternion3 * Vector3.forward;
-		if (inputState.IsDown(BUTTON.RELOAD))
+		ViewerCount++;
+		if (!ControllingViewerId.HasValue)
 		{
-			Reload();
+			ControllingViewerId = viewerID;
+			SetTarget(null);
+			SendAimDirImmediate();
+			return true;
 		}
-		bool flag = inputState.IsDown(BUTTON.FIRE_PRIMARY);
-		EnsureReloaded();
-		if (!(UnityEngine.Time.time >= nextShotTime && flag))
+		return false;
+	}
+
+	public void StopControl(CameraViewerId viewerID)
+	{
+		ViewerCount--;
+		if (ControllingViewerId == viewerID)
+		{
+			ControllingViewerId = null;
+		}
+	}
+
+	public void UserInput(InputState inputState, CameraViewerId viewerID)
+	{
+		CameraViewerId? controllingViewerId = ControllingViewerId;
+		if (viewerID != controllingViewerId)
 		{
 			return;
 		}
-		BaseProjectile attachedWeapon = GetAttachedWeapon();
-		if ((bool)attachedWeapon)
+		UpdateManualAim(inputState);
+		if (UnityEngine.Time.time < nextShotTime)
 		{
-			if (attachedWeapon.primaryMagazine.contents > 0)
-			{
-				FireAttachedGun(Vector3.zero, aimCone);
-				float delay = (attachedWeapon.isSemiAuto ? (attachedWeapon.repeatDelay * 1.5f) : attachedWeapon.repeatDelay);
-				delay = attachedWeapon.ScaleRepeatDelay(delay);
-				nextShotTime = UnityEngine.Time.time + delay;
-			}
-			else
-			{
-				nextShotTime = UnityEngine.Time.time + 5f;
-			}
+			return;
 		}
-		else if (HasGenericFireable())
+		if (inputState.WasJustPressed(BUTTON.RELOAD))
 		{
-			AttachedWeapon.ServerUse();
-			nextShotTime = UnityEngine.Time.time + 0.115f;
+			Reload();
 		}
 		else
 		{
-			nextShotTime = UnityEngine.Time.time + 1f;
+			if (EnsureReloaded() || !inputState.IsDown(BUTTON.FIRE_PRIMARY))
+			{
+				return;
+			}
+			BaseProjectile attachedWeapon = GetAttachedWeapon();
+			if ((bool)attachedWeapon)
+			{
+				if (attachedWeapon.primaryMagazine.contents > 0)
+				{
+					FireAttachedGun(Vector3.zero, aimCone);
+					float delay = (attachedWeapon.isSemiAuto ? (attachedWeapon.repeatDelay * 1.5f) : attachedWeapon.repeatDelay);
+					delay = attachedWeapon.ScaleRepeatDelay(delay);
+					nextShotTime = UnityEngine.Time.time + delay;
+				}
+				else
+				{
+					nextShotTime = UnityEngine.Time.time + 5f;
+				}
+			}
+			else if (HasGenericFireable())
+			{
+				AttachedWeapon.ServerUse();
+				nextShotTime = UnityEngine.Time.time + 0.115f;
+			}
+			else
+			{
+				nextShotTime = UnityEngine.Time.time + 1f;
+			}
 		}
 	}
 
-	public void InitializeControl(BasePlayer controller)
+	public bool UpdateManualAim(InputState inputState)
 	{
-		playerController = controller;
-		SetTarget(null);
-		initialAimDir = aimDir;
+		float x = (0f - inputState.current.mouseDelta.y) * rcTurnSensitivity;
+		float y = inputState.current.mouseDelta.x * rcTurnSensitivity;
+		Vector3 euler = Quaternion.LookRotation(aimDir, base.transform.up).eulerAngles + new Vector3(x, y, 0f);
+		if (euler.x >= 0f && euler.x <= 135f)
+		{
+			euler.x = Mathf.Clamp(euler.x, 0f, 45f);
+		}
+		if (euler.x >= 225f && euler.x <= 360f)
+		{
+			euler.x = Mathf.Clamp(euler.x, 285f, 360f);
+		}
+		Vector3 vector = Quaternion.Euler(euler) * Vector3.forward;
+		bool result = !Mathf.Approximately(aimDir.x, vector.x) || !Mathf.Approximately(aimDir.y, vector.y) || !Mathf.Approximately(aimDir.z, vector.z);
+		aimDir = vector;
+		return result;
 	}
 
-	public void StopControl()
+	public override void InitShared()
 	{
-		playerController = null;
+		base.InitShared();
+		RCSetup();
+	}
+
+	public override void DestroyShared()
+	{
+		RCShutdown();
+		base.DestroyShared();
 	}
 
 	public void RCSetup()
 	{
+		if (base.isServer)
+		{
+			RemoteControlEntity.InstallControllable(this);
+		}
 	}
 
 	public void RCShutdown()
@@ -456,9 +640,37 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 	}
 
+	[RPC_Server]
+	[RPC_Server.MaxDistance(3f)]
+	public void Server_SetID(RPCMessage msg)
+	{
+		if (msg.player == null || !CanChangeID(msg.player))
+		{
+			return;
+		}
+		string text = msg.read.String();
+		if (string.IsNullOrEmpty(text) || ComputerStation.IsValidIdentifier(text))
+		{
+			string text2 = msg.read.String();
+			if (ComputerStation.IsValidIdentifier(text2) && text == GetIdentifier())
+			{
+				Debug.Log("SetID success!");
+				UpdateIdentifier(text2);
+			}
+		}
+	}
+
 	public void UpdateIdentifier(string newID, bool clientSend = false)
 	{
-		rcIdentifier = newID;
+		_ = rcIdentifier;
+		if (base.isServer)
+		{
+			if (!RemoteControlEntity.IDInUse(newID))
+			{
+				rcIdentifier = newID;
+			}
+			SendNetworkUpdate();
+		}
 	}
 
 	public string GetIdentifier()
@@ -466,9 +678,14 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		return rcIdentifier;
 	}
 
+	public virtual bool CanChangeID(BasePlayer player)
+	{
+		return CanChangeSettings(player);
+	}
+
 	public override int ConsumptionAmount()
 	{
-		return 10;
+		return consumptionAmount;
 	}
 
 	public void SetOnline()
@@ -482,6 +699,7 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		{
 			SetFlag(Flags.On, online);
 			booting = false;
+			GetAttachedWeapon()?.SetLightsOn(online);
 			SendNetworkUpdate();
 			if (IsOffline())
 			{
@@ -613,6 +831,23 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		return false;
 	}
 
+	public bool AtMaxAuthCapacity()
+	{
+		return HasFlag(Flags.Reserved4);
+	}
+
+	public void UpdateMaxAuthCapacity()
+	{
+		if (authorizedPlayers.Count >= 200)
+		{
+			SetFlag(Flags.Reserved4, b: true);
+			return;
+		}
+		BaseGameMode activeGameMode = BaseGameMode.GetActiveGameMode(serverside: true);
+		bool b = activeGameMode != null && activeGameMode.limitTeamAuths && authorizedPlayers.Count >= activeGameMode.GetMaxRelationshipTeamSize();
+		SetFlag(Flags.Reserved4, b);
+	}
+
 	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
 	private void FlipAim(RPCMessage rpc)
@@ -628,14 +863,21 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 	[RPC_Server.IsVisible(3f)]
 	private void AddSelfAuthorize(RPCMessage rpc)
 	{
-		RPCMessage rpc2 = rpc;
-		if (!IsOnline() && rpc2.player.CanBuild() && Interface.CallHook("OnTurretAuthorize", this, rpc.player) == null)
+		AddSelfAuthorize(rpc.player);
+	}
+
+	public void AddSelfAuthorize(BasePlayer player)
+	{
+		BasePlayer player2 = player;
+		if (!IsOnline() && player2.CanBuild() && !AtMaxAuthCapacity() && Interface.CallHook("OnTurretAuthorize", this, player) == null)
 		{
-			authorizedPlayers.RemoveAll((PlayerNameID x) => x.userid == rpc2.player.userID);
+			authorizedPlayers.RemoveAll((PlayerNameID x) => x.userid == player2.userID);
 			PlayerNameID playerNameID = new PlayerNameID();
-			playerNameID.userid = rpc2.player.userID;
-			playerNameID.username = rpc2.player.displayName;
+			playerNameID.userid = player2.userID;
+			playerNameID.username = player2.displayName;
 			authorizedPlayers.Add(playerNameID);
+			Facepunch.Rust.Analytics.Azure.OnEntityAuthChanged(this, player2, authorizedPlayers.Select((PlayerNameID x) => x.userid), "added", player2.userID);
+			UpdateMaxAuthCapacity();
 			SendNetworkUpdate();
 		}
 	}
@@ -648,6 +890,8 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		if (!booting && !IsOnline() && IsAuthed(rpc2.player) && Interface.CallHook("OnTurretDeauthorize", this, rpc.player) == null)
 		{
 			authorizedPlayers.RemoveAll((PlayerNameID x) => x.userid == rpc2.player.userID);
+			Facepunch.Rust.Analytics.Azure.OnEntityAuthChanged(this, rpc2.player, authorizedPlayers.Select((PlayerNameID x) => x.userid), "removed", rpc2.player.userID);
+			UpdateMaxAuthCapacity();
 			SendNetworkUpdate();
 		}
 	}
@@ -659,7 +903,32 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		if (!booting && !IsOnline() && IsAuthed(rpc.player) && Interface.CallHook("OnTurretClearList", this, rpc.player) == null)
 		{
 			authorizedPlayers.Clear();
+			Facepunch.Rust.Analytics.Azure.OnEntityAuthChanged(this, rpc.player, authorizedPlayers.Select((PlayerNameID x) => x.userid), "clear", rpc.player.userID);
+			UpdateMaxAuthCapacity();
 			SendNetworkUpdate();
+		}
+	}
+
+	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
+	public void AssignToFriend(RPCMessage msg)
+	{
+		if (AtMaxAuthCapacity() || msg.player == null || !msg.player.CanInteract() || !CanChangeSettings(msg.player))
+		{
+			return;
+		}
+		ulong num = msg.read.UInt64();
+		if (num != 0L && !IsAuthed(num) && Interface.CallHook("OnTurretAssign", this, num, msg.player) == null)
+		{
+			string username = BasePlayer.SanitizePlayerNameString(msg.read.String(), num);
+			PlayerNameID playerNameID = new PlayerNameID();
+			playerNameID.userid = num;
+			playerNameID.username = username;
+			Facepunch.Rust.Analytics.Azure.OnEntityAuthChanged(this, msg.player, authorizedPlayers.Select((PlayerNameID x) => x.userid), "added", num);
+			authorizedPlayers.Add(playerNameID);
+			UpdateMaxAuthCapacity();
+			SendNetworkUpdate();
+			Interface.CallHook("OnTurretAssigned", this, num, msg.player);
 		}
 	}
 
@@ -693,9 +962,10 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		base.ServerInit();
 		ItemContainer itemContainer = base.inventory;
 		itemContainer.canAcceptItem = (Func<Item, int, bool>)Delegate.Combine(itemContainer.canAcceptItem, new Func<Item, int, bool>(CanAcceptItem));
+		timeSinceLastServerTick = 0.0;
 		InvokeRepeating(ServerTick, UnityEngine.Random.Range(0f, 1f), 0.015f);
 		InvokeRandomized(SendAimDir, UnityEngine.Random.Range(0f, 1f), 0.2f, 0.05f);
-		InvokeRandomized(TargetScan, UnityEngine.Random.Range(0f, 1f), TargetScanRate(), 0.2f);
+		InvokeRandomized(ScheduleForTargetScan, UnityEngine.Random.Range(0f, 1f), TargetScanRate(), 0.2f);
 		targetTrigger.GetComponent<SphereCollider>().radius = sightRange;
 	}
 
@@ -703,10 +973,15 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 	{
 		if (UnityEngine.Time.realtimeSinceStartup > nextForcedAimTime || HasTarget() || Vector3.Angle(lastSentAimDir, aimDir) > 0.03f)
 		{
-			lastSentAimDir = aimDir;
-			ClientRPC(null, "CLIENT_ReceiveAimDir", aimDir);
-			nextForcedAimTime = UnityEngine.Time.realtimeSinceStartup + 2f;
+			SendAimDirImmediate();
 		}
+	}
+
+	public void SendAimDirImmediate()
+	{
+		lastSentAimDir = aimDir;
+		ClientRPC(null, "CLIENT_ReceiveAimDir", aimDir);
+		nextForcedAimTime = UnityEngine.Time.realtimeSinceStartup + 2f;
 	}
 
 	public void SetTarget(BaseCombatEntity targ)
@@ -737,6 +1012,10 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 		List<RaycastHit> obj3 = Facepunch.Pool.GetList<RaycastHit>();
 		Vector3 position = eyePos.transform.position;
+		if (GamePhysics.CheckSphere(position, 0.1f, 2097152))
+		{
+			return false;
+		}
 		Vector3 vector = AimOffset(obj);
 		float num = Vector3.Distance(vector, position);
 		Vector3 vector2 = Vector3.Cross((vector - position).normalized, Vector3.up);
@@ -772,7 +1051,7 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		BaseProjectile attachedWeapon = GetAttachedWeapon();
 		if (!(attachedWeapon == null) && !IsOffline())
 		{
-			attachedWeapon.ServerUse(1f, gun_pitch);
+			attachedWeapon.ServerUse(1f, IsBeingControlled ? RCEyes : gun_pitch);
 		}
 	}
 
@@ -835,7 +1114,7 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		Facepunch.Pool.FreeList(ref obj);
 	}
 
-	private void ApplyDamage(BaseCombatEntity entity, Vector3 point, Vector3 normal)
+	public void ApplyDamage(BaseCombatEntity entity, Vector3 point, Vector3 normal)
 	{
 		float num = 15f * UnityEngine.Random.Range(0.9f, 1.1f);
 		if (entity is BasePlayer && entity != target)
@@ -844,7 +1123,7 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 		if (PeacekeeperMode() && entity == target)
 		{
-			target.MarkHostileFor(1800f);
+			target.MarkHostileFor(300f);
 		}
 		HitInfo info = new HitInfo(this, entity, DamageType.Bullet, num, point);
 		entity.OnAttacked(info);
@@ -859,7 +1138,7 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 	}
 
-	public void IdleTick()
+	public void IdleTick(float dt)
 	{
 		if (UnityEngine.Time.realtimeSinceStartup > nextIdleAimTime)
 		{
@@ -870,7 +1149,7 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 		if (!HasTarget())
 		{
-			aimDir = Vector3.Lerp(aimDir, targetAimDir, UnityEngine.Time.deltaTime * 2f);
+			aimDir = Mathx.Lerp(aimDir, targetAimDir, 2f, dt);
 		}
 	}
 
@@ -938,6 +1217,27 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		AmmoTypes ammoTypes = attachedWeapon.primaryMagazine.definition.ammoTypes;
 		if (attachedWeapon.primaryMagazine.contents > 0)
 		{
+			bool flag = false;
+			if (base.inventory.capacity > base.inventory.itemList.Count)
+			{
+				flag = true;
+			}
+			else
+			{
+				int num = 0;
+				foreach (Item item in base.inventory.itemList)
+				{
+					if (item.info == attachedWeapon.primaryMagazine.ammoType)
+					{
+						num += item.MaxStackable() - item.amount;
+					}
+				}
+				flag = num >= attachedWeapon.primaryMagazine.contents;
+			}
+			if (!flag)
+			{
+				return;
+			}
 			base.inventory.AddItem(attachedWeapon.primaryMagazine.ammoType, attachedWeapon.primaryMagazine.contents, 0uL);
 			attachedWeapon.primaryMagazine.contents = 0;
 		}
@@ -948,17 +1248,17 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 			Effect.server.Run(reloadEffect.resourcePath, this, StringPool.Get("WeaponAttachmentPoint"), Vector3.zero, Vector3.zero);
 			totalAmmoDirty = true;
 			attachedWeapon.primaryMagazine.ammoType = obj[0].info;
-			int num = 0;
-			while (attachedWeapon.primaryMagazine.contents < attachedWeapon.primaryMagazine.capacity && num < obj.Count)
+			int num2 = 0;
+			while (attachedWeapon.primaryMagazine.contents < attachedWeapon.primaryMagazine.capacity && num2 < obj.Count)
 			{
-				if (obj[num].info == attachedWeapon.primaryMagazine.ammoType)
+				if (obj[num2].info == attachedWeapon.primaryMagazine.ammoType)
 				{
 					int b = attachedWeapon.primaryMagazine.capacity - attachedWeapon.primaryMagazine.contents;
-					b = Mathf.Min(obj[num].amount, b);
-					obj[num].UseItem(b);
+					b = Mathf.Min(obj[num2].amount, b);
+					obj[num2].UseItem(b);
 					attachedWeapon.primaryMagazine.contents += b;
 				}
-				num++;
+				num2++;
 			}
 		}
 		ItemDefinition ammoType = attachedWeapon.primaryMagazine.ammoType;
@@ -1018,12 +1318,23 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 	}
 
-	public void EnsureReloaded()
+	public bool EnsureReloaded(bool onlyReloadIfEmpty = true)
 	{
-		if (!HasClipAmmo() && HasReserveAmmo())
+		bool flag = HasReserveAmmo();
+		if (onlyReloadIfEmpty)
+		{
+			if (flag && !HasClipAmmo())
+			{
+				Reload();
+				return true;
+			}
+		}
+		else if (flag)
 		{
 			Reload();
+			return true;
 		}
+		return false;
 	}
 
 	public BaseProjectile GetAttachedWeapon()
@@ -1036,7 +1347,7 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		return false;
 	}
 
-	private bool HasGenericFireable()
+	public bool HasGenericFireable()
 	{
 		if (AttachedWeapon != null)
 		{
@@ -1108,10 +1419,20 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		base.OnKilled(info);
 	}
 
+	public override bool OnStartBeingLooted(BasePlayer baseEntity)
+	{
+		if (!IsAuthed(baseEntity))
+		{
+			return false;
+		}
+		return base.OnStartBeingLooted(baseEntity);
+	}
+
 	public override void PlayerStoppedLooting(BasePlayer player)
 	{
 		base.PlayerStoppedLooting(player);
-		EnsureReloaded();
+		UpdateTotalAmmo();
+		EnsureReloaded(onlyReloadIfEmpty: false);
 		UpdateTotalAmmo();
 		nextShotTime = UnityEngine.Time.time;
 	}
@@ -1193,6 +1514,18 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 
 	public virtual bool IsEntityHostile(BaseCombatEntity ent)
 	{
+		if (ent is ScarecrowNPC)
+		{
+			return true;
+		}
+		if (ent is BasePet basePet && basePet.Brain.OwningPlayer != null)
+		{
+			if (!basePet.Brain.OwningPlayer.IsHostile())
+			{
+				return ent.IsHostile();
+			}
+			return true;
+		}
 		return ent.IsHostile();
 	}
 
@@ -1206,55 +1539,58 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		{
 			return false;
 		}
+		if (targ is BasePet basePet && basePet.Brain.OwningPlayer != null && IsAuthed(basePet.Brain.OwningPlayer))
+		{
+			return false;
+		}
 		return true;
+	}
+
+	public void ScheduleForTargetScan()
+	{
+		updateAutoTurretScanQueue.Add(this);
 	}
 
 	public void TargetScan()
 	{
-		if (HasTarget() || IsOffline() || IsBeingRemoteControlled() || targetTrigger.entityContents == null)
+		if (HasTarget() || IsOffline() || IsBeingControlled)
 		{
 			return;
 		}
-		foreach (BaseEntity entityContent in targetTrigger.entityContents)
+		if (targetTrigger.entityContents != null)
 		{
-			if (entityContent == null)
+			foreach (BaseEntity entityContent in targetTrigger.entityContents)
 			{
-				continue;
-			}
-			BaseCombatEntity component = entityContent.GetComponent<BaseCombatEntity>();
-			if (component == null || !component.IsAlive() || !InFiringArc(component) || !ObjectVisible(component))
-			{
-				continue;
-			}
-			if (!Sentry.targetall)
-			{
-				BasePlayer basePlayer = component as BasePlayer;
-				if ((bool)basePlayer && (IsAuthed(basePlayer) || Ignore(basePlayer)))
+				BaseCombatEntity baseCombatEntity = entityContent as BaseCombatEntity;
+				if (baseCombatEntity == null)
 				{
 					continue;
 				}
-			}
-			if (!ShouldTarget(component))
-			{
-				continue;
-			}
-			if (PeacekeeperMode())
-			{
-				if (!IsEntityHostile(component))
+				if (!Sentry.targetall)
 				{
-					continue;
+					BasePlayer basePlayer = baseCombatEntity as BasePlayer;
+					if (basePlayer != null && (IsAuthed(basePlayer) || Ignore(basePlayer)))
+					{
+						continue;
+					}
 				}
-				if (target == null)
+				if ((!PeacekeeperMode() || IsEntityHostile(baseCombatEntity)) && baseCombatEntity.IsAlive() && ShouldTarget(baseCombatEntity) && InFiringArc(baseCombatEntity) && ObjectVisible(baseCombatEntity))
 				{
-					nextShotTime = UnityEngine.Time.time + 1f;
+					SetTarget(baseCombatEntity);
+					if ((object)target != null)
+					{
+						break;
+					}
 				}
 			}
-			SetTarget(component);
-			break;
+		}
+		if (PeacekeeperMode() && target == null)
+		{
+			nextShotTime = UnityEngine.Time.time + 1f;
 		}
 	}
 
-	protected virtual bool Ignore(BasePlayer player)
+	public virtual bool Ignore(BasePlayer player)
 	{
 		return false;
 	}
@@ -1265,11 +1601,13 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		{
 			return;
 		}
+		float dt = (float)(double)timeSinceLastServerTick;
+		timeSinceLastServerTick = 0.0;
 		if (!IsOnline())
 		{
 			OfflineTick();
 		}
-		else if (!IsBeingRemoteControlled())
+		else if (!IsBeingControlled)
 		{
 			if (HasTarget())
 			{
@@ -1277,10 +1615,10 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 			}
 			else
 			{
-				IdleTick();
+				IdleTick(dt);
 			}
 		}
-		UpdateFacingToTarget();
+		UpdateFacingToTarget(dt);
 		if (totalAmmoDirty && UnityEngine.Time.time > nextAmmoCheckTime)
 		{
 			UpdateTotalAmmo();
@@ -1302,9 +1640,9 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		}
 	}
 
-	public void UpdateFacingToTarget()
+	public void UpdateFacingToTarget(float dt)
 	{
-		if (target != null && targetVisible)
+		if (target != null && targetVisible && !IsBeingControlled)
 		{
 			Vector3 vector = AimOffset(target);
 			if (peekIndex != 0)
@@ -1333,10 +1671,10 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 			}
 			aimDir = vector3;
 		}
-		UpdateAiming();
+		UpdateAiming(dt);
 	}
 
-	private float GetAngle(Vector3 launchPosition, Vector3 targetPosition, float launchVelocity, float gravityScale)
+	public float GetAngle(Vector3 launchPosition, Vector3 targetPosition, float launchVelocity, float gravityScale)
 	{
 		float num = UnityEngine.Physics.gravity.y * gravityScale;
 		float num2 = Vector3.Distance(launchPosition.XZ3D(), targetPosition.XZ3D());
@@ -1358,6 +1696,38 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 			return num7;
 		}
 		return num6;
+	}
+
+	public override void OnDeployed(BaseEntity parent, BasePlayer deployedBy, Item fromItem)
+	{
+		base.OnDeployed(parent, deployedBy, fromItem);
+		AddSelfAuthorize(deployedBy);
+	}
+
+	public override ItemContainerId GetIdealContainer(BasePlayer player, Item item, bool altMove)
+	{
+		return default(ItemContainerId);
+	}
+
+	public override int GetIdealSlot(BasePlayer player, Item item)
+	{
+		bool num = item.info.category == ItemCategory.Weapon;
+		bool flag = item.info.category == ItemCategory.Ammunition;
+		if (num)
+		{
+			return 0;
+		}
+		if (flag)
+		{
+			for (int i = 1; i < base.inventory.capacity; i++)
+			{
+				if (!base.inventory.SlotTaken(item, i))
+				{
+					return i;
+				}
+			}
+		}
+		return -1;
 	}
 
 	public bool IsOnline()
@@ -1404,13 +1774,21 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		return false;
 	}
 
+	public override bool CanUseNetworkCache(Connection connection)
+	{
+		return false;
+	}
+
 	public override void Save(SaveInfo info)
 	{
 		base.Save(info);
 		info.msg.autoturret = Facepunch.Pool.Get<ProtoBuf.AutoTurret>();
 		info.msg.autoturret.users = authorizedPlayers;
-		info.msg.rcEntity = Facepunch.Pool.Get<RCEntity>();
-		info.msg.rcEntity.identifier = GetIdentifier();
+		if (info.forDisk || (info.forConnection?.player != null && CanChangeID(info.forConnection.player as BasePlayer)))
+		{
+			info.msg.rcEntity = Facepunch.Pool.Get<RCEntity>();
+			info.msg.rcEntity.identifier = GetIdentifier();
+		}
 	}
 
 	public override void PostSave(SaveInfo info)
@@ -1460,12 +1838,12 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 		return 1f;
 	}
 
-	public void UpdateAiming()
+	public void UpdateAiming(float dt)
 	{
 		if (!(aimDir == Vector3.zero))
 		{
 			float speed = 5f;
-			if (base.isServer)
+			if (base.isServer && !IsBeingControlled)
 			{
 				speed = ((!HasTarget()) ? 15f : 35f);
 			}
@@ -1474,23 +1852,30 @@ public class AutoTurret : ContainerIOEntity, IRemoteControllable
 			Quaternion quaternion3 = Quaternion.Euler(quaternion.eulerAngles.x, 0f, 0f);
 			if (gun_yaw.transform.rotation != quaternion2)
 			{
-				gun_yaw.transform.rotation = Lerp(gun_yaw.transform.rotation, quaternion2, speed);
+				gun_yaw.transform.rotation = Mathx.Lerp(gun_yaw.transform.rotation, quaternion2, speed, dt);
 			}
 			if (gun_pitch.transform.localRotation != quaternion3)
 			{
-				gun_pitch.transform.localRotation = Lerp(gun_pitch.transform.localRotation, quaternion3, speed);
+				gun_pitch.transform.localRotation = Mathx.Lerp(gun_pitch.transform.localRotation, quaternion3, speed, dt);
 			}
 		}
 	}
 
-	private static Quaternion Lerp(Quaternion from, Quaternion to, float speed)
+	public bool IsAuthed(ulong id)
 	{
-		return Quaternion.Lerp(to, from, Mathf.Pow(2f, (0f - speed) * UnityEngine.Time.deltaTime));
+		foreach (PlayerNameID authorizedPlayer in authorizedPlayers)
+		{
+			if (authorizedPlayer.userid == id)
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	public bool IsAuthed(BasePlayer player)
 	{
-		return authorizedPlayers.Any((PlayerNameID x) => x.userid == player.userID);
+		return IsAuthed(player.userID);
 	}
 
 	public bool AnyAuthed()

@@ -80,15 +80,18 @@ public class SlidingProgressDoor : ProgressDoor
 
 	public override void UpdateProgress()
 	{
-		base.UpdateProgress();
 		Vector3 localPosition = doorObject.transform.localPosition;
 		float t = storedEnergy / energyForOpen;
 		Vector3 vector = Vector3.Lerp(closedPosition, openPosition, t);
 		doorObject.transform.localPosition = vector;
 		if (base.isServer)
 		{
-			bool b = Vector3.Distance(localPosition, vector) > 0.01f;
-			SetFlag(Flags.Reserved1, b);
+			bool flag = Vector3.Distance(localPosition, vector) > 0.01f;
+			SetFlag(Flags.Reserved1, flag);
+			if (flag)
+			{
+				SendNetworkUpdate();
+			}
 		}
 	}
 

@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
@@ -54,6 +55,13 @@ public class BaseCombatEntity : BaseEntity
 		public GameObjectRef repairFailedEffect;
 	}
 
+	public enum ActionVolume
+	{
+		Quiet,
+		Normal,
+		Loud
+	}
+
 	public enum LifeState
 	{
 		Alive,
@@ -78,12 +86,16 @@ public class BaseCombatEntity : BaseEntity
 	[NonSerialized]
 	public BaseEntity lastAttacker;
 
+	public BaseEntity lastDealtDamageTo;
+
 	[NonSerialized]
 	public bool ResetLifeStateOnSpawn = true;
 
 	public DirectionProperties[] propDirection;
 
 	public float unHostileTime;
+
+	public float lastNoiseTime;
 
 	[Header("BaseCombatEntity")]
 	public SkeletonProperties skeletonProperties;
@@ -106,9 +118,6 @@ public class BaseCombatEntity : BaseEntity
 
 	public bool markAttackerHostile = true;
 
-	[Tooltip("If diesAtZeroHealth is false, this can still take damagebut won't become 'dead' when it reaches zero health.")]
-	public bool diesAtZeroHealth = true;
-
 	public float _health;
 
 	public float _maxHealth = 100f;
@@ -118,9 +127,16 @@ public class BaseCombatEntity : BaseEntity
 	[NonSerialized]
 	public float lastAttackedTime = float.NegativeInfinity;
 
+	[NonSerialized]
 	public float lastDealtDamageTime = float.NegativeInfinity;
 
 	public int lastNotifyFrame;
+
+	public float TimeSinceLastNoise => UnityEngine.Time.time - lastNoiseTime;
+
+	public ActionVolume LastNoiseVolume { get; private set; }
+
+	public Vector3 LastNoisePosition { get; private set; }
 
 	public Vector3 LastAttackedDir { get; set; }
 
@@ -220,6 +236,11 @@ public class BaseCombatEntity : BaseEntity
 
 	public virtual void OnPickedUp(Item createdItem, BasePlayer player)
 	{
+		Interface.CallHook("OnEntityPickedUp", this, createdItem, player);
+	}
+
+	public virtual void OnPickedUpPreItemMove(Item createdItem, BasePlayer player)
+	{
 	}
 
 	[RPC_Server]
@@ -233,8 +254,10 @@ public class BaseCombatEntity : BaseEntity
 			{
 				item.conditionNormalized = Mathf.Clamp01(healthFraction - pickup.subtractCondition);
 			}
+			OnPickedUpPreItemMove(item, rpc.player);
 			rpc.player.GiveItem(item, GiveItemReason.PickedUp);
 			OnPickedUp(item, rpc.player);
+			Facepunch.Rust.Analytics.Azure.OnEntityPickedUp(rpc.player, this);
 			Kill();
 		}
 	}
@@ -268,12 +291,9 @@ public class BaseCombatEntity : BaseEntity
 		List<ItemAmount> list2 = new List<ItemAmount>();
 		foreach (ItemAmount item in list)
 		{
-			int num = Mathf.RoundToInt(item.amount * RepairCostFraction() * healthMissingFraction);
-			if (num > 0)
-			{
-				list2.Add(new ItemAmount(item.itemDef, num));
-			}
+			list2.Add(new ItemAmount(item.itemDef, Mathf.RoundToInt(item.amount * RepairCostFraction() * healthMissingFraction)));
 		}
+		RepairBench.StripComponentRepairCost(list2);
 		return list2;
 	}
 
@@ -293,6 +313,18 @@ public class BaseCombatEntity : BaseEntity
 		if (player != null && !string.IsNullOrEmpty(reason))
 		{
 			player.ChatMessage(reason);
+		}
+	}
+
+	public virtual void OnRepairFailedResources(BasePlayer player, List<ItemAmount> requirements)
+	{
+		Effect.server.Run(repair.repairFailedEffect.isValid ? repair.repairFailedEffect.resourcePath : "assets/bundled/prefabs/fx/build/repair_failed.prefab", this, 0u, Vector3.zero, Vector3.zero);
+		if (player != null)
+		{
+			using (ItemAmountList arg = ItemAmount.SerialiseList(requirements))
+			{
+				player.ClientRPCPlayer(null, player, "Client_OnRepairFailedResources", arg);
+			}
 		}
 	}
 
@@ -322,28 +354,34 @@ public class BaseCombatEntity : BaseEntity
 			return;
 		}
 		float num4 = list.Sum((ItemAmount x) => x.amount);
+		float healthBefore = health;
 		if (num4 > 0f)
 		{
-			float a = list.Min((ItemAmount x) => Mathf.Clamp01((float)player2.inventory.GetAmount(x.itemid) / x.amount));
-			a = Mathf.Min(a, 50f / num2);
-			if (a <= 0f)
+			float num5 = list.Min((ItemAmount x) => Mathf.Clamp01((float)player2.inventory.GetAmount(x.itemid) / x.amount));
+			if (float.IsNaN(num5))
 			{
-				OnRepairFailed(player2, "Unable to repair: Insufficient resources.");
+				num5 = 0f;
+			}
+			num5 = Mathf.Min(num5, 50f / num2);
+			if (num5 <= 0f)
+			{
+				OnRepairFailedResources(player2, list);
 				return;
 			}
-			int num5 = 0;
+			int num6 = 0;
 			foreach (ItemAmount item in list)
 			{
-				int amount = Mathf.CeilToInt(a * item.amount);
-				int num6 = player2.inventory.Take(null, item.itemid, amount);
-				if (num6 > 0)
+				int amount = Mathf.CeilToInt(num5 * item.amount);
+				int num7 = player2.inventory.Take(null, item.itemid, amount);
+				Facepunch.Rust.Analytics.Azure.LogResource(Facepunch.Rust.Analytics.Azure.ResourceMode.Consumed, "repair_entity", item.itemDef.shortname, num7, this, null, safezone: false, null, player2.userID);
+				if (num7 > 0)
 				{
-					num5 += num6;
-					player2.Command("note.inv", item.itemid, num6 * -1);
+					num6 += num7;
+					player2.Command("note.inv", item.itemid, num7 * -1);
 				}
 			}
-			float num7 = (float)num5 / num4;
-			health += num2 * num7;
+			float num8 = (float)num6 / num4;
+			health += num2 * num8;
 			SendNetworkUpdate();
 		}
 		else
@@ -351,6 +389,7 @@ public class BaseCombatEntity : BaseEntity
 			health += num2;
 			SendNetworkUpdate();
 		}
+		Facepunch.Rust.Analytics.Azure.OnEntityRepaired(player2, this, healthBefore, health);
 		if (Health() >= MaxHealth())
 		{
 			OnRepairFinished();
@@ -425,13 +464,13 @@ public class BaseCombatEntity : BaseEntity
 			info.damageTypes.Scale(DamageType.Blunt, ConVar.Server.meleedamage);
 			info.damageTypes.Scale(DamageType.Stab, ConVar.Server.meleedamage);
 			info.damageTypes.Scale(DamageType.Bleeding, ConVar.Server.bleedingdamage);
-			if (Interface.CallHook("IOnBaseCombatEntityHurt", this, info) != null)
-			{
-				return;
-			}
 			if (!(this is BasePlayer))
 			{
 				info.damageTypes.Scale(DamageType.Fun_Water, 0f);
+			}
+			if (Interface.CallHook("IOnBaseCombatEntityHurt", this, info) != null)
+			{
+				return;
 			}
 			DebugHurt(info);
 			health = num - info.damageTypes.Total();
@@ -448,6 +487,7 @@ public class BaseCombatEntity : BaseEntity
 				if (baseCombatEntity != null)
 				{
 					baseCombatEntity.lastDealtDamageTime = UnityEngine.Time.time;
+					baseCombatEntity.lastDealtDamageTo = this;
 				}
 			}
 			BaseCombatEntity baseCombatEntity2 = lastAttacker as BaseCombatEntity;
@@ -463,7 +503,9 @@ public class BaseCombatEntity : BaseEntity
 					LastAttackedDir = (lastAttacker.transform.position - base.transform.position).normalized;
 				}
 			}
-			if (diesAtZeroHealth && Health() <= 0f)
+			bool flag = Health() <= 0f;
+			Facepunch.Rust.Analytics.Azure.OnEntityTakeDamage(info, flag);
+			if (flag)
 			{
 				Die(info);
 			}
@@ -472,11 +514,11 @@ public class BaseCombatEntity : BaseEntity
 			{
 				if (IsDead())
 				{
-					initiatorPlayer.stats.combat.Log(info, num, health, "killed");
+					initiatorPlayer.stats.combat.LogAttack(info, "killed", num);
 				}
 				else
 				{
-					initiatorPlayer.stats.combat.Log(info, num, health);
+					initiatorPlayer.stats.combat.LogAttack(info, "", num);
 				}
 			}
 		}
@@ -567,6 +609,14 @@ public class BaseCombatEntity : BaseEntity
 		health = 0f;
 		lifestate = LifeState.Dead;
 		Interface.CallHook("OnEntityDeath", this, info);
+		if (info != null && (bool)info.InitiatorPlayer)
+		{
+			BasePlayer initiatorPlayer = info.InitiatorPlayer;
+			if (initiatorPlayer != null && initiatorPlayer.GetActiveMission() != -1 && !initiatorPlayer.IsNpc)
+			{
+				initiatorPlayer.ProcessMissionEvent(BaseMission.MissionEventType.KILL_ENTITY, prefabID.ToString(), 1f);
+			}
+		}
 		using (TimeWarning.New("OnKilled"))
 		{
 			OnKilled(info);
@@ -590,6 +640,22 @@ public class BaseCombatEntity : BaseEntity
 	public void UpdateSurroundings()
 	{
 		StabilityEntity.updateSurroundingsQueue.Add(WorldSpaceBounds().ToBounds());
+	}
+
+	public void MakeNoise(Vector3 position, ActionVolume loudness)
+	{
+		LastNoisePosition = position;
+		LastNoiseVolume = loudness;
+		lastNoiseTime = UnityEngine.Time.time;
+	}
+
+	public bool CanLastNoiseBeHeard(Vector3 listenPosition, float listenRange)
+	{
+		if (listenRange <= 0f)
+		{
+			return false;
+		}
+		return Vector3.Distance(listenPosition, LastNoisePosition) <= listenRange;
 	}
 
 	public virtual bool IsDead()
@@ -641,7 +707,7 @@ public class BaseCombatEntity : BaseEntity
 	{
 		if (!baseProtection)
 		{
-			return 1f;
+			return 100f;
 		}
 		return baseProtection.density;
 	}
@@ -728,14 +794,14 @@ public class BaseCombatEntity : BaseEntity
 	{
 		using (TimeWarning.New("DoHitNotify"))
 		{
-			if (sendsHitNotification && !(info.Initiator == null) && info.Initiator is BasePlayer && !info.isHeadshot && !(this == info.Initiator) && UnityEngine.Time.frameCount != lastNotifyFrame)
+			if (sendsHitNotification && !(info.Initiator == null) && info.Initiator is BasePlayer && !(this == info.Initiator) && (!info.isHeadshot || !(info.HitEntity is BasePlayer)) && UnityEngine.Time.frameCount != lastNotifyFrame)
 			{
 				lastNotifyFrame = UnityEngine.Time.frameCount;
 				bool flag = info.Weapon is BaseMelee;
 				if (base.isServer && (!flag || sendsMeleeHitNotification))
 				{
 					bool arg = info.Initiator.net.connection == info.Predicted;
-					ClientRPCPlayer(null, info.Initiator as BasePlayer, "HitNotify", arg);
+					ClientRPCPlayerAndSpectators(null, info.Initiator as BasePlayer, "HitNotify", arg);
 				}
 			}
 		}

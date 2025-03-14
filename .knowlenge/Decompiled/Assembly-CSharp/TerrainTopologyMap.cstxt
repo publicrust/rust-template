@@ -7,35 +7,31 @@ public class TerrainTopologyMap : TerrainMap<int>
 
 	public override void Setup()
 	{
-		if (TopologyTexture != null)
+		res = terrain.terrainData.alphamapResolution;
+		src = (dst = new int[res * res]);
+		if (!(TopologyTexture != null))
 		{
-			if (TopologyTexture.width == TopologyTexture.height)
+			return;
+		}
+		if (TopologyTexture.width == TopologyTexture.height && TopologyTexture.width == res)
+		{
+			Color32[] pixels = TopologyTexture.GetPixels32();
+			int i = 0;
+			int num = 0;
+			for (; i < res; i++)
 			{
-				res = TopologyTexture.width;
-				src = (dst = new int[res * res]);
-				Color32[] pixels = TopologyTexture.GetPixels32();
-				int i = 0;
-				int num = 0;
-				for (; i < res; i++)
+				int num2 = 0;
+				while (num2 < res)
 				{
-					int num2 = 0;
-					while (num2 < res)
-					{
-						dst[i * res + num2] = BitUtility.DecodeInt(pixels[num]);
-						num2++;
-						num++;
-					}
+					dst[i * res + num2] = BitUtility.DecodeInt(pixels[num]);
+					num2++;
+					num++;
 				}
-			}
-			else
-			{
-				Debug.LogError("Invalid topology texture: " + TopologyTexture.name);
 			}
 		}
 		else
 		{
-			res = terrain.terrainData.alphamapResolution;
-			src = (dst = new int[res * res]);
+			Debug.LogError("Invalid topology texture: " + TopologyTexture.name);
 		}
 	}
 

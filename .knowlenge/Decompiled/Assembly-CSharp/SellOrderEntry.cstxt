@@ -16,7 +16,7 @@ public class SellOrderEntry : MonoBehaviour, IInventoryChanged
 
 	public GameObject outOfStockNotification;
 
-	private LootPanelVendingMachine vendingPanel;
+	private IVendingMachineInterface vendingPanel;
 
 	public UIIntegerEntry intEntry;
 }

@@ -60,7 +60,7 @@ public class Model : MonoBehaviour, IPrefabPreProcess
 		return boneDict.FindBone(name);
 	}
 
-	public Transform FindBone(int hash)
+	public Transform FindBone(uint hash)
 	{
 		BuildBoneDictionary();
 		Transform result = rootBone;
@@ -69,6 +69,12 @@ public class Model : MonoBehaviour, IPrefabPreProcess
 			return result;
 		}
 		return boneDict.FindBone(hash);
+	}
+
+	public uint FindBoneID(Transform transform)
+	{
+		BuildBoneDictionary();
+		return boneDict.FindBoneID(transform);
 	}
 
 	public Transform[] GetBones()

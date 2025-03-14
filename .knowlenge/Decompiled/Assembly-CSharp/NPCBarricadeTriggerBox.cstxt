@@ -31,7 +31,7 @@ public class NPCBarricadeTriggerBox : MonoBehaviour
 		if ((other.gameObject.layer & playerServerLayer) > 0)
 		{
 			BasePlayer component = other.gameObject.GetComponent<BasePlayer>();
-			if (component != null && component.IsNpc)
+			if (component != null && component.IsNpc && !(component is BasePet))
 			{
 				target.Kill(BaseNetworkable.DestroyMode.Gib);
 			}

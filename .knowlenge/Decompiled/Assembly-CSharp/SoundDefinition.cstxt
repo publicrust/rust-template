@@ -123,7 +123,8 @@ public class SoundDefinition : ScriptableObject
 				}
 			}
 		}
-		return num;
+		float num2 = 1f / (pitch - pitchVariation);
+		return num * num2;
 	}
 
 	public Sound Play()

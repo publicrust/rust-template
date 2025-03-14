@@ -8,6 +8,12 @@ public class Spawnable : MonoBehaviour, IServerComponent
 	[ReadOnly]
 	public SpawnPopulation Population;
 
+	[SerializeField]
+	private bool ForceSpawnOnly;
+
+	[SerializeField]
+	private string ForceSpawnInfoMessage = string.Empty;
+
 	internal uint PrefabID;
 
 	internal bool SpawnIndividual;

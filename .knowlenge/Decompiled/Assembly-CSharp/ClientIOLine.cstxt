@@ -15,5 +15,7 @@ public class ClientIOLine : BaseMonoBehaviour
 
 	public static List<ClientIOLine> _allLines = new List<ClientIOLine>();
 
+	public WireTool.WireColour colour;
+
 	public IOEntity ownerIOEnt;
 }

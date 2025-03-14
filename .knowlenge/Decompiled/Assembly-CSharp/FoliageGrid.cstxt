@@ -8,8 +8,6 @@ public class FoliageGrid : SingletonComponent<FoliageGrid>, IClientComponent
 
 	public float CellSize = 50f;
 
-	public float MaxMilliseconds = 0.1f;
-
 	public LayerSelect FoliageLayer = 0;
 
 	public ShadowCastingMode FoliageShadows;

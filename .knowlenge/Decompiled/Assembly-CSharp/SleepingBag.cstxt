@@ -2,8 +2,10 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using ConVar;
 using Facepunch;
+using Facepunch.Rust;
 using Network;
 using Oxide.Core;
 using ProtoBuf;
@@ -12,6 +14,13 @@ using UnityEngine.Assertions;
 
 public class SleepingBag : DecayEntity
 {
+	public enum SleepingBagResetReason
+	{
+		Respawned,
+		Placed,
+		Death
+	}
+
 	[NonSerialized]
 	public ulong deployerUserID;
 
@@ -27,13 +36,29 @@ public class SleepingBag : DecayEntity
 
 	public RespawnInformation.SpawnOptions.RespawnType RespawnType = RespawnInformation.SpawnOptions.RespawnType.SleepingBag;
 
+	public bool isStatic;
+
 	public bool canBePublic;
+
+	public const Flags IsPublicFlag = Flags.Reserved3;
+
+	public static Translate.Phrase bagLimitPhrase = new Translate.Phrase("bag_limit_update", "You are now at {0}/{1} bags");
+
+	public static Translate.Phrase bagLimitReachedPhrase = new Translate.Phrase("bag_limit_reached", "You have reached your bag limit!");
+
+	public Translate.Phrase assignOtherBagPhrase = new Translate.Phrase("assigned_other_bag_limit", "You have assigned {0} a bag, they are now at {0}/{1} bags");
+
+	public Translate.Phrase assignedBagPhrase = new Translate.Phrase("assigned_bag_limit", "You have been assigned a bag, you are now at {0}/{1} bags");
+
+	public Translate.Phrase cannotAssignBedPhrase = new Translate.Phrase("cannot_assign_bag_limit", "You cannot assign {0} a bag, they have reached their bag limit!");
+
+	public Translate.Phrase cannotMakeBedPhrase = new Translate.Phrase("cannot_make_bed_limit", "You cannot take ownership of the bed, you are at your bag limit");
 
 	public float unlockTime;
 
 	public static List<SleepingBag> sleepingBags = new List<SleepingBag>();
 
-	public float unlockSeconds
+	public virtual float unlockSeconds
 	{
 		get
 		{
@@ -202,21 +227,44 @@ public class SleepingBag : DecayEntity
 		return HasFlag(Flags.Reserved3);
 	}
 
-	public static SleepingBag[] FindForPlayer(ulong playerID, bool ignoreTimers)
+	public virtual float GetUnlockSeconds(ulong playerID)
 	{
-		return sleepingBags.Where((SleepingBag x) => x.deployerUserID == playerID && (ignoreTimers || x.unlockTime < UnityEngine.Time.realtimeSinceStartup)).ToArray();
+		return unlockSeconds;
 	}
 
-	public static SleepingBag FindForPlayer(ulong playerID, uint sleepingBagID, bool ignoreTimers)
+	public virtual bool ValidForPlayer(ulong playerID, bool ignoreTimers)
+	{
+		object obj = Interface.CallHook("OnSleepingBagValidCheck", this, playerID, ignoreTimers);
+		if (obj is bool)
+		{
+			return (bool)obj;
+		}
+		if (deployerUserID == playerID)
+		{
+			if (!ignoreTimers)
+			{
+				return unlockTime < UnityEngine.Time.realtimeSinceStartup;
+			}
+			return true;
+		}
+		return false;
+	}
+
+	public static SleepingBag[] FindForPlayer(ulong playerID, bool ignoreTimers)
+	{
+		return sleepingBags.Where((SleepingBag x) => x.ValidForPlayer(playerID, ignoreTimers)).ToArray();
+	}
+
+	public static SleepingBag FindForPlayer(ulong playerID, NetworkableId sleepingBagID, bool ignoreTimers)
 	{
 		return sleepingBags.FirstOrDefault((SleepingBag x) => x.deployerUserID == playerID && x.net.ID == sleepingBagID && (ignoreTimers || x.unlockTime < UnityEngine.Time.realtimeSinceStartup));
 	}
 
-	public static bool SpawnPlayer(BasePlayer player, uint sleepingBag)
+	public static bool SpawnPlayer(BasePlayer player, NetworkableId sleepingBag)
 	{
 		BasePlayer player2 = player;
 		SleepingBag[] array = FindForPlayer(player2.userID, ignoreTimers: true);
-		SleepingBag sleepingBag2 = array.FirstOrDefault((SleepingBag x) => x.deployerUserID == player2.userID && x.net.ID == sleepingBag && x.unlockTime < UnityEngine.Time.realtimeSinceStartup);
+		SleepingBag sleepingBag2 = array.FirstOrDefault((SleepingBag x) => x.ValidForPlayer(player2.userID, ignoreTimers: false) && x.net.ID == sleepingBag && x.unlockTime < UnityEngine.Time.realtimeSinceStartup);
 		if (sleepingBag2 == null)
 		{
 			return false;
@@ -226,21 +274,27 @@ public class SleepingBag : DecayEntity
 		{
 			sleepingBag2 = (SleepingBag)obj;
 		}
-		Vector3 vector = sleepingBag2.transform.position + sleepingBag2.spawnOffset;
-		Quaternion rotation = Quaternion.Euler(0f, sleepingBag2.transform.rotation.eulerAngles.y, 0f);
-		player2.RespawnAt(vector, rotation);
-		SleepingBag[] array2 = array;
-		foreach (SleepingBag sleepingBag3 in array2)
+		if (sleepingBag2.IsOccupied())
 		{
-			if (Vector3.Distance(vector, sleepingBag3.transform.position) <= ConVar.Server.respawnresetrange)
-			{
-				sleepingBag3.unlockTime = UnityEngine.Time.realtimeSinceStartup + sleepingBag3.secondsBetweenReuses;
-			}
+			return false;
+		}
+		sleepingBag2.GetSpawnPos(out var pos, out var rot);
+		player2.RespawnAt(pos, rot, sleepingBag2);
+		sleepingBag2.PostPlayerSpawn(player2);
+		SleepingBag[] array2 = array;
+		for (int i = 0; i < array2.Length; i++)
+		{
+			SetBagTimer(array2[i], pos, SleepingBagResetReason.Respawned);
 		}
 		return true;
 	}
 
-	public static bool DestroyBag(BasePlayer player, uint sleepingBag)
+	public virtual void SetUnlockTime(float newTime)
+	{
+		unlockTime = newTime;
+	}
+
+	public static bool DestroyBag(BasePlayer player, NetworkableId sleepingBag)
 	{
 		SleepingBag sleepingBag2 = FindForPlayer(player.userID, sleepingBag, ignoreTimers: false);
 		if (sleepingBag2 == null)
@@ -265,29 +319,78 @@ public class SleepingBag : DecayEntity
 		return true;
 	}
 
+	public static void ResetTimersForPlayer(BasePlayer player)
+	{
+		SleepingBag[] array = FindForPlayer(player.userID, ignoreTimers: true);
+		for (int i = 0; i < array.Length; i++)
+		{
+			array[i].unlockTime = 0f;
+		}
+	}
+
+	public virtual void GetSpawnPos(out Vector3 pos, out Quaternion rot)
+	{
+		pos = base.transform.position + spawnOffset;
+		rot = Quaternion.Euler(0f, base.transform.rotation.eulerAngles.y, 0f);
+	}
+
 	public void SetPublic(bool isPublic)
 	{
 		SetFlag(Flags.Reserved3, isPublic);
 	}
 
-	private void SetDeployedBy(BasePlayer player)
+	public void SetDeployedBy(BasePlayer player)
 	{
-		if (player == null)
+		if (!(player == null))
+		{
+			deployerUserID = player.userID;
+			SetBagTimer(this, base.transform.position, SleepingBagResetReason.Placed);
+			SendNetworkUpdate();
+		}
+	}
+
+	public static void OnPlayerDeath(BasePlayer player)
+	{
+		SleepingBag[] array = FindForPlayer(player.userID, ignoreTimers: true);
+		for (int i = 0; i < array.Length; i++)
+		{
+			SetBagTimer(array[i], player.transform.position, SleepingBagResetReason.Death);
+		}
+	}
+
+	public static void SetBagTimer(SleepingBag bag, Vector3 position, SleepingBagResetReason reason)
+	{
+		BaseGameMode activeGameMode = BaseGameMode.GetActiveGameMode(serverside: true);
+		float? num = null;
+		if (activeGameMode != null)
+		{
+			num = activeGameMode.EvaluateSleepingBagReset(bag, position, reason);
+		}
+		if (num.HasValue)
+		{
+			bag.SetUnlockTime(UnityEngine.Time.realtimeSinceStartup + num.Value);
+			return;
+		}
+		if (reason == SleepingBagResetReason.Respawned && Vector3.Distance(position, bag.transform.position) <= ConVar.Server.respawnresetrange)
+		{
+			bag.SetUnlockTime(UnityEngine.Time.realtimeSinceStartup + bag.secondsBetweenReuses);
+			bag.SendNetworkUpdate();
+		}
+		if (reason != SleepingBagResetReason.Placed)
 		{
 			return;
 		}
-		deployerUserID = player.userID;
 		float realtimeSinceStartup = UnityEngine.Time.realtimeSinceStartup;
-		SleepingBag[] array = sleepingBags.Where((SleepingBag x) => x.deployerUserID == player.userID && x.unlockTime > UnityEngine.Time.realtimeSinceStartup).ToArray();
+		SleepingBag[] array = sleepingBags.Where((SleepingBag x) => x.deployerUserID != 0L && x.deployerUserID == bag.deployerUserID && x.unlockTime > UnityEngine.Time.realtimeSinceStartup).ToArray();
 		foreach (SleepingBag sleepingBag in array)
 		{
-			if (sleepingBag.unlockTime > realtimeSinceStartup && Vector3.Distance(sleepingBag.transform.position, base.transform.position) <= ConVar.Server.respawnresetrange)
+			if (bag.unlockTime > realtimeSinceStartup && Vector3.Distance(sleepingBag.transform.position, position) <= ConVar.Server.respawnresetrange)
 			{
-				realtimeSinceStartup = sleepingBag.unlockTime;
+				realtimeSinceStartup = bag.unlockTime;
 			}
 		}
-		unlockTime = Mathf.Max(realtimeSinceStartup, UnityEngine.Time.realtimeSinceStartup + secondsBetweenReuses);
-		SendNetworkUpdate();
+		bag.SetUnlockTime(Mathf.Max(realtimeSinceStartup, UnityEngine.Time.realtimeSinceStartup + bag.secondsBetweenReuses));
+		bag.SendNetworkUpdate();
 	}
 
 	public override void ServerInit()
@@ -299,7 +402,7 @@ public class SleepingBag : DecayEntity
 		}
 	}
 
-	internal override void DoServerDestroy()
+	public override void DoServerDestroy()
 	{
 		base.DoServerDestroy();
 		sleepingBags.RemoveAll((SleepingBag x) => x == this);
@@ -342,46 +445,141 @@ public class SleepingBag : DecayEntity
 	[RPC_Server.IsVisible(3f)]
 	public void AssignToFriend(RPCMessage msg)
 	{
-		if (msg.player.CanInteract() && deployerUserID == msg.player.userID)
+		if (!msg.player.CanInteract() || deployerUserID != msg.player.userID)
 		{
-			ulong num = msg.read.UInt64();
-			if (num != 0L && Interface.CallHook("CanAssignBed", msg.player, this, num) == null)
+			return;
+		}
+		ulong num = msg.read.UInt64();
+		if (num == 0L || Interface.CallHook("CanAssignBed", msg.player, this, num) != null)
+		{
+			return;
+		}
+		BaseGameMode activeGameMode = BaseGameMode.GetActiveGameMode(serverside: true);
+		if (activeGameMode != null)
+		{
+			BaseGameMode.CanAssignBedResult? canAssignBedResult = activeGameMode.CanAssignBed(msg.player, this, num, 1, -1);
+			if (canAssignBedResult.HasValue)
 			{
-				deployerUserID = num;
-				SendNetworkUpdate();
+				BasePlayer basePlayer = RelationshipManager.FindByID(num);
+				if (!canAssignBedResult.Value.Result)
+				{
+					msg.player.ShowToast(GameTip.Styles.Red_Normal, cannotAssignBedPhrase, basePlayer?.displayName ?? "other player");
+				}
+				else
+				{
+					basePlayer?.ShowToast(GameTip.Styles.Blue_Long, assignedBagPhrase, canAssignBedResult.Value.Count.ToString(), canAssignBedResult.Value.Max.ToString());
+				}
+				if (!canAssignBedResult.Value.Result)
+				{
+					return;
+				}
+			}
+		}
+		deployerUserID = num;
+		Facepunch.Rust.Analytics.Azure.OnSleepingBagAssigned(msg.player, this, num);
+		SendNetworkUpdate();
+		CheckForOnlineAndDead();
+	}
+
+	private void CheckForOnlineAndDead()
+	{
+		if (deployerUserID != 0L)
+		{
+			BasePlayer basePlayer = BasePlayer.FindByID(deployerUserID);
+			if (basePlayer != null && basePlayer.IsConnected && basePlayer.IsDead())
+			{
+				basePlayer.SendRespawnOptions();
 			}
 		}
 	}
 
 	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
-	public void RPC_MakePublic(RPCMessage msg)
+	public virtual void RPC_MakePublic(RPCMessage msg)
 	{
 		if (!canBePublic || !msg.player.CanInteract() || (deployerUserID != msg.player.userID && !msg.player.CanBuild()))
 		{
 			return;
 		}
 		bool flag = msg.read.Bit();
-		if (flag != IsPublic() && Interface.CallHook("CanSetBedPublic", msg.player, this) == null)
+		if (flag == IsPublic() || Interface.CallHook("CanSetBedPublic", msg.player, this) != null)
 		{
-			SetPublic(flag);
-			if (!IsPublic())
-			{
-				deployerUserID = msg.player.userID;
-			}
-			SendNetworkUpdate();
+			return;
 		}
+		SetPublic(flag);
+		if (!IsPublic())
+		{
+			BaseGameMode.CanAssignBedResult? canAssignBedResult = BaseGameMode.GetActiveGameMode(serverside: true)?.CanAssignBed(msg.player, this, msg.player.userID, 1, 0, this);
+			if (canAssignBedResult.HasValue)
+			{
+				if (canAssignBedResult.Value.Result)
+				{
+					msg.player.ShowToast(GameTip.Styles.Blue_Long, bagLimitPhrase, canAssignBedResult.Value.Count.ToString(), canAssignBedResult.Value.Max.ToString());
+				}
+				else
+				{
+					msg.player.ShowToast(GameTip.Styles.Blue_Long, cannotMakeBedPhrase, canAssignBedResult.Value.Count.ToString(), canAssignBedResult.Value.Max.ToString());
+				}
+				if (!canAssignBedResult.Value.Result)
+				{
+					return;
+				}
+			}
+			deployerUserID = msg.player.userID;
+			Facepunch.Rust.Analytics.Azure.OnSleepingBagAssigned(msg.player, this, deployerUserID = msg.player.userID);
+		}
+		else
+		{
+			Facepunch.Rust.Analytics.Azure.OnSleepingBagAssigned(msg.player, this, 0uL);
+		}
+		SendNetworkUpdate();
 	}
 
 	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
 	public void RPC_MakeBed(RPCMessage msg)
 	{
-		if (canBePublic && IsPublic() && msg.player.CanInteract())
+		if (!canBePublic || !IsPublic() || !msg.player.CanInteract())
 		{
-			deployerUserID = msg.player.userID;
-			SendNetworkUpdate();
+			return;
 		}
+		BaseGameMode.CanAssignBedResult? canAssignBedResult = BaseGameMode.GetActiveGameMode(serverside: true)?.CanAssignBed(msg.player, this, msg.player.userID, 1, 0, this);
+		if (canAssignBedResult.HasValue)
+		{
+			if (!canAssignBedResult.Value.Result)
+			{
+				msg.player.ShowToast(GameTip.Styles.Red_Normal, cannotMakeBedPhrase);
+			}
+			else
+			{
+				msg.player.ShowToast(GameTip.Styles.Blue_Long, bagLimitPhrase, canAssignBedResult.Value.Count.ToString(), canAssignBedResult.Value.Max.ToString());
+			}
+			if (!canAssignBedResult.Value.Result)
+			{
+				return;
+			}
+		}
+		deployerUserID = msg.player.userID;
+		SendNetworkUpdate();
+	}
+
+	protected virtual void PostPlayerSpawn(BasePlayer p)
+	{
+	}
+
+	public virtual bool IsOccupied()
+	{
+		return false;
+	}
+
+	public override string Admin_Who()
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+		stringBuilder.AppendLine(base.Admin_Who());
+		stringBuilder.AppendLine($"Assigned bag ID: {deployerUserID}");
+		stringBuilder.AppendLine("Assigned player name: " + Admin.GetPlayerName(deployerUserID));
+		stringBuilder.AppendLine("Bag Name:" + niceName);
+		return stringBuilder.ToString();
 	}
 
 	public override void Load(LoadInfo info)

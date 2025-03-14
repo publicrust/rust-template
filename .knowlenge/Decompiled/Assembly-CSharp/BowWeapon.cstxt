@@ -58,7 +58,7 @@ public class BowWeapon : BaseProjectile
 		ReloadMagazine();
 	}
 
-	public override bool ForceSendMagazine()
+	public override bool ForceSendMagazine(SaveInfo saveInfo)
 	{
 		return true;
 	}

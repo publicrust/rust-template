@@ -49,7 +49,7 @@ public class GameManifest : ScriptableObject
 
 	public static Dictionary<string, string> guidToPath = new Dictionary<string, string>();
 
-	internal static Dictionary<string, string> pathToGuid = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+	public static Dictionary<string, string> pathToGuid = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
 	public static Dictionary<string, UnityEngine.Object> guidToObject = new Dictionary<string, UnityEngine.Object>();
 

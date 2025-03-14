@@ -1,7 +1,9 @@
 using UnityEngine;
 
-public class PathInterestNode : MonoBehaviour
+public class PathInterestNode : MonoBehaviour, IAIPathInterestNode
 {
+	public Vector3 Position => base.transform.position;
+
 	public float NextVisitTime { get; set; }
 
 	public void OnDrawGizmos()

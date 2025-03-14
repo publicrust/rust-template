@@ -107,6 +107,7 @@ public class ServerBuildingManager : BuildingManager
 
 	private void Merge(Building building1, Building building2)
 	{
+		Interface.CallHook("OnBuildingMerge", this, building1, building2);
 		while (building2.HasDecayEntities())
 		{
 			building2.decayEntities[0].AttachToBuilding(building1.ID);

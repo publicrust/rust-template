@@ -78,13 +78,9 @@ public class TimerSwitch : IOEntity
 
 	public override int GetPassthroughAmount(int outputSlot = 0)
 	{
-		if (outputSlot == 0)
+		if (!IsPowered() || !IsOn())
 		{
-			if (!IsPowered() || !IsOn())
-			{
-				return 0;
-			}
-			return base.GetPassthroughAmount();
+			return 0;
 		}
 		return base.GetPassthroughAmount();
 	}

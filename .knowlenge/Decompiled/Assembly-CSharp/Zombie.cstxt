@@ -1,6 +1,6 @@
 public class Zombie : BaseAnimalNPC
 {
-	[ServerVar(Help = "Population active on the server, per square km")]
+	[ServerVar(Help = "Population active on the server, per square km", ShowInAdminUI = true)]
 	public static float Population;
 
 	public override TraitFlag Traits => TraitFlag.Alive | TraitFlag.Animal | TraitFlag.Food | TraitFlag.Meat;

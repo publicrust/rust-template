@@ -2,12 +2,12 @@ using System.Collections;
 using System.Globalization;
 using System.Linq;
 using System.Threading;
-using CCTVRender;
 using CompanionServer;
 using ConVar;
 using Facepunch;
 using Facepunch.Network;
 using Facepunch.Network.Raknet;
+using Facepunch.Rust;
 using Facepunch.Utility;
 using Network;
 using Oxide.Core;
@@ -15,6 +15,7 @@ using Rust;
 using Rust.Ai;
 using TMPro;
 using UnityEngine;
+using UnityEngine.AI;
 
 public class Bootstrap : SingletonComponent<Bootstrap>
 {
@@ -69,10 +70,16 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		ConsoleSystem.Index.Initialize(ConsoleGen.All);
 		UnityButtons.Register();
 		Output.Install();
+		Facepunch.Pool.ResizeBuffer<NetRead>(16384);
+		Facepunch.Pool.ResizeBuffer<NetWrite>(16384);
 		Facepunch.Pool.ResizeBuffer<Networkable>(65536);
 		Facepunch.Pool.ResizeBuffer<EntityLink>(65536);
 		Facepunch.Pool.FillBuffer<Networkable>();
 		Facepunch.Pool.FillBuffer<EntityLink>();
+		if (Facepunch.CommandLine.HasSwitch("-nonetworkthread"))
+		{
+			BaseNetwork.Multithreading = false;
+		}
 		SteamNetworking.SetDebugFunction();
 		if (Facepunch.CommandLine.HasSwitch("-swnet"))
 		{
@@ -81,6 +88,10 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		else if (Facepunch.CommandLine.HasSwitch("-sdrnet"))
 		{
 			NetworkInitSteamworks(enableSteamDatagramRelay: true);
+		}
+		else if (Facepunch.CommandLine.HasSwitch("-raknet"))
+		{
+			NetworkInitRaknet();
 		}
 		else
 		{
@@ -97,6 +108,13 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 	public static void Init_Systems()
 	{
 		Rust.Global.Init();
+		if (Rust.GameInfo.IsOfficialServer && ConVar.Server.stats)
+		{
+			GA.Logging = false;
+			GA.Build = BuildInfo.Current.Scm.ChangeId;
+			GA.Initialize("218faecaf1ad400a4e15c53392ebeebc", "0c9803ce52c38671278899538b9c54c8d4e19849");
+			Facepunch.Rust.Analytics.Server.Enabled = true;
+		}
 		Facepunch.Application.Initialize(new Integration());
 		Facepunch.Performance.GetMemoryUsage = () => SystemInfoEx.systemMemoryUsed;
 	}
@@ -126,14 +144,18 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		BenchmarkTimer timer = BenchmarkTimer.New("bootstrap");
 		if (!UnityEngine.Application.isEditor)
 		{
-			ExceptionReporter.InitializeFromUrl("https://83df169465e84da091c1a3cd2fbffeee:3671b903f9a840ecb68411cf946ab9b6@sentry.io/51080");
-			ExceptionReporter.Disabled = !Facepunch.Utility.CommandLine.Full.Contains("-official") && !Facepunch.Utility.CommandLine.Full.Contains("+official");
 			BuildInfo current = BuildInfo.Current;
-			if (current.Scm.Branch != null && current.Scm.Branch.StartsWith("main"))
+			if ((current.Scm.Branch == null || !(current.Scm.Branch == "experimental/release")) && !(current.Scm.Branch == "release"))
 			{
 				ExceptionReporter.InitializeFromUrl("https://0654eb77d1e04d6babad83201b6b6b95:d2098f1d15834cae90501548bd5dbd0d@sentry.io/1836389");
-				ExceptionReporter.Disabled = false;
 			}
+			else
+			{
+				ExceptionReporter.InitializeFromUrl("https://83df169465e84da091c1a3cd2fbffeee:3671b903f9a840ecb68411cf946ab9b6@sentry.io/51080");
+			}
+			bool num = Facepunch.Utility.CommandLine.Full.Contains("-official") || Facepunch.Utility.CommandLine.Full.Contains("-server.official") || Facepunch.Utility.CommandLine.Full.Contains("+official") || Facepunch.Utility.CommandLine.Full.Contains("+server.official");
+			bool flag = Facepunch.Utility.CommandLine.Full.Contains("-stats") || Facepunch.Utility.CommandLine.Full.Contains("-server.stats") || Facepunch.Utility.CommandLine.Full.Contains("+stats") || Facepunch.Utility.CommandLine.Full.Contains("+server.stats");
+			ExceptionReporter.Disabled = !(num && flag);
 		}
 		if (AssetBundleBackend.Enabled)
 		{
@@ -221,6 +243,7 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 	private IEnumerator DedicatedServerStartup()
 	{
 		Rust.Application.isLoading = true;
+		UnityEngine.Application.backgroundLoadingPriority = UnityEngine.ThreadPriority.High;
 		WriteToLog("Skinnable Warmup");
 		yield return CoroutineEx.waitForEndOfFrame;
 		yield return CoroutineEx.waitForEndOfFrame;
@@ -229,7 +252,9 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		yield return CoroutineEx.waitForEndOfFrame;
 		yield return CoroutineEx.waitForEndOfFrame;
 		UnityEngine.Physics.solverIterationCount = 3;
+		int @int = PlayerPrefs.GetInt("UnityGraphicsQuality");
 		QualitySettings.SetQualityLevel(0);
+		PlayerPrefs.SetInt("UnityGraphicsQuality", @int);
 		Object.DontDestroyOnLoad(base.gameObject);
 		Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/server_console.prefab"));
 		StartupShared();
@@ -241,13 +266,13 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		LevelManager.LoadLevel(ConVar.Server.level);
 		yield return CoroutineEx.waitForEndOfFrame;
 		yield return CoroutineEx.waitForEndOfFrame;
-		yield return StartCoroutine(FileSystem_Warmup.Run(2f, WriteToLog, "Asset Warmup ({0}/{1})"));
+		string[] assetList = FileSystem_Warmup.GetAssetList(null);
+		yield return StartCoroutine(FileSystem_Warmup.Run(assetList, WriteToLog, "Asset Warmup ({0}/{1})"));
 		yield return StartCoroutine(StartServer(!Facepunch.CommandLine.HasSwitch("-skipload"), "", allowOutOfDateSaves: false));
 		if (!Object.FindObjectOfType<Performance>())
 		{
 			Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/performance.prefab"));
 		}
-		Facepunch.Pool.Clear();
 		Rust.GC.Collect();
 		Rust.Application.isLoading = false;
 	}
@@ -281,6 +306,30 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 						yield return monument.StartCoroutine(monument.GetMonumentNavMesh().UpdateNavMeshAndWait());
 					}
 				}
+				if ((bool)TerrainMeta.Path && (bool)TerrainMeta.Path.DungeonGridRoot)
+				{
+					DungeonNavmesh dungeonNavmesh = TerrainMeta.Path.DungeonGridRoot.AddComponent<DungeonNavmesh>();
+					dungeonNavmesh.NavMeshCollectGeometry = NavMeshCollectGeometry.PhysicsColliders;
+					dungeonNavmesh.LayerMask = 65537;
+					yield return dungeonNavmesh.StartCoroutine(dungeonNavmesh.UpdateNavMeshAndWait());
+				}
+				else
+				{
+					Debug.LogError("Failed to find DungeonGridRoot, NOT generating Dungeon navmesh");
+				}
+				if ((bool)TerrainMeta.Path && (bool)TerrainMeta.Path.DungeonBaseRoot)
+				{
+					DungeonNavmesh dungeonNavmesh2 = TerrainMeta.Path.DungeonBaseRoot.AddComponent<DungeonNavmesh>();
+					dungeonNavmesh2.NavmeshResolutionModifier = 0.3f;
+					dungeonNavmesh2.NavMeshCollectGeometry = NavMeshCollectGeometry.PhysicsColliders;
+					dungeonNavmesh2.LayerMask = 65537;
+					yield return dungeonNavmesh2.StartCoroutine(dungeonNavmesh2.UpdateNavMeshAndWait());
+				}
+				else
+				{
+					Debug.LogError("Failed to find DungeonBaseRoot , NOT generating Dungeon navmesh");
+				}
+				GenerateDungeonBase.SetupAI();
 			}
 		}
 		GameObject gameObject = GameManager.server.CreatePrefab("assets/bundled/prefabs/system/server.prefab");
@@ -296,9 +345,16 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
 		SaveRestore.GetSaveCache();
 		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		BaseGameMode.CreateGameMode();
+		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		MissionManifest.Get();
+		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
 		serverMgr.OpenConnection();
 		CompanionServer.Server.Initialize();
-		Manager.Initialize();
+		using (BenchmarkTimer.New("Boombox.LoadStations"))
+		{
+			BoomBox.LoadStations();
+		}
 		if (ConVar.Time.pausewhileloading)
 		{
 			UnityEngine.Time.timeScale = timeScale;
@@ -341,6 +397,7 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		if (!(lastWrittenValue == str))
 		{
 			DebugEx.Log(str);
+			lastWrittenValue = str;
 		}
 	}
 }

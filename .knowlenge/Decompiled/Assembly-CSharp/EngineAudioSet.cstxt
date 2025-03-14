@@ -35,7 +35,7 @@ public class EngineAudioSet : ScriptableObject
 
 	public SoundDefinition badPerformanceLoop;
 
-	public BlendedEngineLoopDefinition GetEngineLoopDef(byte numEngines)
+	public BlendedEngineLoopDefinition GetEngineLoopDef(int numEngines)
 	{
 		int num = (numEngines - 1) % engineAudioLoops.Length;
 		return engineAudioLoops[num];

@@ -1,6 +1,6 @@
 using UnityEngine;
 
-public class MeshPaintable : MonoBehaviour, IClientComponent
+public class MeshPaintable : BaseMeshPaintable
 {
 	public string replacementTextureName = "_MainTex";
 

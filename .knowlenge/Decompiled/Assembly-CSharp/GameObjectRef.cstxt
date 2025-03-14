@@ -9,4 +9,9 @@ public class GameObjectRef : ResourceRef<GameObject>
 	{
 		return Facepunch.Instantiate.GameObject(Get(), parent);
 	}
+
+	public BaseEntity GetEntity()
+	{
+		return Get().GetComponent<BaseEntity>();
+	}
 }

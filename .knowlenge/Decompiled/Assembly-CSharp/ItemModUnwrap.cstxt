@@ -1,3 +1,4 @@
+using Oxide.Core;
 using UnityEngine;
 
 public class ItemModUnwrap : ItemMod
@@ -12,10 +13,10 @@ public class ItemModUnwrap : ItemMod
 
 	public override void ServerCommand(Item item, string command, BasePlayer player)
 	{
-		if (command == "unwrap" && item.amount > 0)
+		if (command == "unwrap" && item.amount > 0 && Interface.CallHook("OnItemUnwrap", item, player, this) == null)
 		{
 			item.UseItem();
-			int num = Random.Range(minTries, maxTries + 1);
+			int num = UnityEngine.Random.Range(minTries, maxTries + 1);
 			for (int i = 0; i < num; i++)
 			{
 				revealList.SpawnIntoContainer(player.inventory.containerMain);

@@ -17,6 +17,10 @@ public class CompoundBowWeapon : BowWeapon
 
 	public float movementPenaltyRampUpTime = 0.5f;
 
+	public float conditionLossPerSecondHeld = 1f;
+
+	public float conditionLossHeldDelay = 3f;
+
 	public SoundDefinition chargeUpSoundDef;
 
 	public SoundDefinition stringHeldSoundDef;
@@ -30,6 +34,8 @@ public class CompoundBowWeapon : BowWeapon
 	protected float movementPenalty;
 
 	internal float stringHoldTimeStart;
+
+	protected float conditionLossCheckTickRate = 0.5f;
 
 	protected float serverMovementCheckTickRate = 0.1f;
 
@@ -93,6 +99,14 @@ public class CompoundBowWeapon : BowWeapon
 		movementPenalty = Mathf.Clamp01(movementPenalty);
 	}
 
+	public void UpdateConditionLoss()
+	{
+		if (stringHoldTimeStart != 0f && UnityEngine.Time.time - stringHoldTimeStart > conditionLossHeldDelay && GetStringBonusScale() > 0f)
+		{
+			GetOwnerItem()?.LoseCondition(conditionLossCheckTickRate * conditionLossPerSecondHeld);
+		}
+	}
+
 	public void ServerMovementCheck()
 	{
 		UpdateMovementPenalty(serverMovementCheckTickRate);
@@ -104,10 +118,12 @@ public class CompoundBowWeapon : BowWeapon
 		if (IsDisabled())
 		{
 			CancelInvoke(ServerMovementCheck);
+			CancelInvoke(UpdateConditionLoss);
 		}
 		else
 		{
 			InvokeRepeating(ServerMovementCheck, 0f, serverMovementCheckTickRate);
+			InvokeRepeating(UpdateConditionLoss, 0f, conditionLossCheckTickRate);
 		}
 	}
 

@@ -42,6 +42,23 @@ public class FireBall : BaseEntity, ISplashable
 
 	private float spawnTime;
 
+	private Vector3 delayedVelocity;
+
+	public void SetDelayedVelocity(Vector3 delayed)
+	{
+		if (!(delayedVelocity != Vector3.zero))
+		{
+			delayedVelocity = delayed;
+			Invoke(ApplyDelayedVelocity, 0.1f);
+		}
+	}
+
+	private void ApplyDelayedVelocity()
+	{
+		SetVelocity(delayedVelocity);
+		delayedVelocity = Vector3.zero;
+	}
+
 	public override void ServerInit()
 	{
 		base.ServerInit();

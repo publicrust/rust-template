@@ -7,6 +7,7 @@ using Facepunch;
 using Facepunch.Extend;
 using Network;
 using Network.Visibility;
+using ProtoBuf;
 using Rust;
 using UnityEngine;
 using UnityEngine.Profiling;
@@ -17,8 +18,37 @@ public class Global : ConsoleSystem
 	private static int _developer;
 
 	[ServerVar]
+	[ClientVar(Help = "WARNING: This causes random crashes!")]
+	public static bool skipAssetWarmup_crashes = false;
+
+	[ServerVar]
 	[ClientVar]
 	public static int maxthreads = 8;
+
+	private const int DefaultWarmupConcurrency = 1;
+
+	private const int DefaultPreloadConcurrency = 1;
+
+	[ServerVar]
+	[ClientVar]
+	public static int warmupConcurrency = 1;
+
+	[ServerVar]
+	[ClientVar]
+	public static int preloadConcurrency = 1;
+
+	[ServerVar]
+	[ClientVar]
+	public static bool forceUnloadBundles = true;
+
+	private const bool DefaultAsyncWarmupEnabled = false;
+
+	[ServerVar]
+	[ClientVar]
+	public static bool asyncWarmup = false;
+
+	[ClientVar(Saved = true, Help = "Experimental faster loading, requires game restart (0 = off, 1 = partial, 2 = full)")]
+	public static int asyncLoadingPreset = 0;
 
 	[ServerVar(Saved = true)]
 	[ClientVar(Saved = true)]
@@ -29,6 +59,24 @@ public class Global : ConsoleSystem
 
 	[ClientVar(ClientInfo = true, Saved = true, Help = "If enabled you will be networked when you're spectating. This means that you will hear audio chat, but also means that cheaters will potentially be able to detect you watching them.")]
 	public static bool specnet = false;
+
+	[ClientVar]
+	[ServerVar(ClientAdmin = true, ServerAdmin = true, Help = "When enabled a player wearing a gingerbread suit will gib like the gingerbread NPC's")]
+	public static bool cinematicGingerbreadCorpses = false;
+
+	private static uint _gingerbreadMaterialID = 0u;
+
+	[ServerVar(Saved = true, ShowInAdminUI = true, Help = "Multiplier applied to SprayDuration if a spray isn't in the sprayers auth (cannot go above 1f)")]
+	public static float SprayOutOfAuthMultiplier = 0.5f;
+
+	[ServerVar(Saved = true, ShowInAdminUI = true, Help = "Base time (in seconds) that sprays last")]
+	public static float SprayDuration = 10800f;
+
+	[ServerVar(Saved = true, ShowInAdminUI = true, Help = "If a player sprays more than this, the oldest spray will be destroyed. 0 will disable")]
+	public static int MaxSpraysPerPlayer = 40;
+
+	[ServerVar(Help = "Disables the backpacks that appear after a corpse times out")]
+	public static bool disableBagDropping = false;
 
 	[ServerVar]
 	[ClientVar]
@@ -41,6 +89,44 @@ public class Global : ConsoleSystem
 		set
 		{
 			_developer = value;
+		}
+	}
+
+	public static void ApplyAsyncLoadingPreset()
+	{
+		if (asyncLoadingPreset != 0)
+		{
+			UnityEngine.Debug.Log($"Applying async loading preset number {asyncLoadingPreset}");
+		}
+		switch (asyncLoadingPreset)
+		{
+		case 1:
+			if (warmupConcurrency <= 1)
+			{
+				warmupConcurrency = 256;
+			}
+			if (preloadConcurrency <= 1)
+			{
+				preloadConcurrency = 256;
+			}
+			asyncWarmup = false;
+			break;
+		case 2:
+			if (warmupConcurrency <= 1)
+			{
+				warmupConcurrency = 256;
+			}
+			if (preloadConcurrency <= 1)
+			{
+				preloadConcurrency = 256;
+			}
+			asyncWarmup = false;
+			break;
+		default:
+			UnityEngine.Debug.LogWarning($"There is no asyncLoading preset number {asyncLoadingPreset}");
+			break;
+		case 0:
+			break;
 		}
 	}
 
@@ -213,19 +299,57 @@ public class Global : ConsoleSystem
 			}
 			basePlayer.SendNetworkUpdate();
 		}
+		else if (basePlayer.CanRespawn())
+		{
+			basePlayer.MarkRespawn();
+			basePlayer.Respawn();
+		}
 		else
 		{
-			basePlayer.Respawn();
+			basePlayer.ConsoleMessage("You can't respawn again so quickly, wait a while");
 		}
 	}
 
 	[ServerVar]
 	public static void injure(Arg args)
 	{
-		BasePlayer basePlayer = ArgEx.Player(args);
-		if ((bool)basePlayer && !basePlayer.IsDead())
+		InjurePlayer(ArgEx.Player(args));
+	}
+
+	public static void InjurePlayer(BasePlayer ply)
+	{
+		if (ply == null || ply.IsDead())
 		{
-			basePlayer.StartWounded();
+			return;
+		}
+		if (ConVar.Server.woundingenabled && !ply.IsIncapacitated() && !ply.IsSleeping() && !ply.isMounted)
+		{
+			if (ply.IsCrawling())
+			{
+				ply.GoToIncapacitated(null);
+			}
+			else
+			{
+				ply.BecomeWounded();
+			}
+		}
+		else
+		{
+			ply.ConsoleMessage("Can't go to wounded state right now.");
+		}
+	}
+
+	[ServerVar]
+	public static void recover(Arg args)
+	{
+		RecoverPlayer(ArgEx.Player(args));
+	}
+
+	public static void RecoverPlayer(BasePlayer ply)
+	{
+		if (!(ply == null) && !ply.IsDead())
+		{
+			ply.StopWounded();
 		}
 	}
 
@@ -248,21 +372,52 @@ public class Global : ConsoleSystem
 		}
 	}
 
+	[ServerVar]
+	public static void spectateid(Arg args)
+	{
+		BasePlayer basePlayer = ArgEx.Player(args);
+		if ((bool)basePlayer)
+		{
+			if (!basePlayer.IsDead())
+			{
+				basePlayer.DieInstantly();
+			}
+			ulong uLong = args.GetULong(0, 0uL);
+			if (basePlayer.IsDead())
+			{
+				basePlayer.StartSpectating();
+				basePlayer.UpdateSpectateTarget(uLong);
+			}
+		}
+	}
+
 	[ServerUserVar]
 	public static void respawn_sleepingbag(Arg args)
 	{
 		BasePlayer basePlayer = ArgEx.Player(args);
-		if ((bool)basePlayer && basePlayer.IsDead())
+		if (!basePlayer || !basePlayer.IsDead())
 		{
-			uint uInt = args.GetUInt(0);
-			if (uInt == 0)
+			return;
+		}
+		NetworkableId entityID = ArgEx.GetEntityID(args, 0);
+		if (!entityID.IsValid)
+		{
+			args.ReplyWith("Missing sleeping bag ID");
+		}
+		else if (basePlayer.CanRespawn())
+		{
+			if (SleepingBag.SpawnPlayer(basePlayer, entityID))
 			{
-				args.ReplyWith("Missing sleeping bag ID");
+				basePlayer.MarkRespawn();
 			}
-			else if (!SleepingBag.SpawnPlayer(basePlayer, uInt))
+			else
 			{
 				args.ReplyWith("Couldn't spawn in sleeping bag!");
 			}
+		}
+		else
+		{
+			basePlayer.ConsoleMessage("You can't respawn again so quickly, wait a while");
 		}
 	}
 
@@ -272,14 +427,14 @@ public class Global : ConsoleSystem
 		BasePlayer basePlayer = ArgEx.Player(args);
 		if ((bool)basePlayer)
 		{
-			uint uInt = args.GetUInt(0);
-			if (uInt == 0)
+			NetworkableId entityID = ArgEx.GetEntityID(args, 0);
+			if (!entityID.IsValid)
 			{
 				args.ReplyWith("Missing sleeping bag ID");
 			}
 			else
 			{
-				SleepingBag.DestroyBag(basePlayer, uInt);
+				SleepingBag.DestroyBag(basePlayer, entityID);
 			}
 		}
 	}
@@ -414,18 +569,90 @@ public class Global : ConsoleSystem
 	}
 
 	[ServerVar]
+	public static void teleport2autheditem(Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		BasePlayer playerOrSleeper = ArgEx.GetPlayerOrSleeper(arg, 0);
+		ulong result;
+		if (playerOrSleeper != null)
+		{
+			result = playerOrSleeper.userID;
+		}
+		else if (!ulong.TryParse(arg.GetString(0), out result))
+		{
+			arg.ReplyWith("No player with that id found");
+			return;
+		}
+		string @string = arg.GetString(1);
+		BaseEntity[] array = BaseEntity.Util.FindTargetsAuthedTo(result, @string);
+		if (array.Length == 0)
+		{
+			arg.ReplyWith("No targets found");
+			return;
+		}
+		int num = UnityEngine.Random.Range(0, array.Length);
+		arg.ReplyWith($"Teleporting to {array[num].ShortPrefabName} at {array[num].transform.position}");
+		basePlayer.Teleport(array[num].transform.position);
+	}
+
+	[ServerVar]
 	public static void teleport2marker(Arg arg)
 	{
 		BasePlayer basePlayer = ArgEx.Player(arg);
-		if (basePlayer.ServerCurrentMapNote == null)
+		if (basePlayer.State.pointsOfInterest == null || basePlayer.State.pointsOfInterest.Count == 0)
 		{
 			arg.ReplyWith("You don't have a marker set");
 			return;
 		}
-		Vector3 worldPosition = basePlayer.ServerCurrentMapNote.worldPosition;
+		string @string = arg.GetString(0);
+		if (!string.IsNullOrEmpty(@string))
+		{
+			foreach (MapNote item in basePlayer.State.pointsOfInterest)
+			{
+				if (!string.IsNullOrEmpty(item.label) && string.Equals(item.label, @string, StringComparison.InvariantCultureIgnoreCase))
+				{
+					TeleportToMarker(item, basePlayer);
+					return;
+				}
+			}
+		}
+		if (arg.HasArgs())
+		{
+			int @int = arg.GetInt(0);
+			if (@int >= 0 && @int < basePlayer.State.pointsOfInterest.Count)
+			{
+				TeleportToMarker(basePlayer.State.pointsOfInterest[@int], basePlayer);
+				return;
+			}
+		}
+		int debugMapMarkerIndex = basePlayer.DebugMapMarkerIndex;
+		debugMapMarkerIndex++;
+		if (debugMapMarkerIndex >= basePlayer.State.pointsOfInterest.Count)
+		{
+			debugMapMarkerIndex = 0;
+		}
+		TeleportToMarker(basePlayer.State.pointsOfInterest[debugMapMarkerIndex], basePlayer);
+		basePlayer.DebugMapMarkerIndex = debugMapMarkerIndex;
+	}
+
+	private static void TeleportToMarker(MapNote marker, BasePlayer player)
+	{
+		Vector3 worldPosition = marker.worldPosition;
 		float height = TerrainMeta.HeightMap.GetHeight(worldPosition);
 		float height2 = TerrainMeta.WaterMap.GetHeight(worldPosition);
 		worldPosition.y = Mathf.Max(height, height2);
+		player.Teleport(worldPosition);
+	}
+
+	[ServerVar]
+	public static void teleport2death(Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer.ServerCurrentDeathNote == null)
+		{
+			arg.ReplyWith("You don't have a current death note!");
+		}
+		Vector3 worldPosition = basePlayer.ServerCurrentDeathNote.worldPosition;
 		basePlayer.Teleport(worldPosition);
 	}
 
@@ -473,6 +700,20 @@ public class Global : ConsoleSystem
 	}
 
 	[ServerVar]
+	public static void breakclothing(Arg args)
+	{
+		BasePlayer basePlayer = ArgEx.Player(args);
+		if (!basePlayer)
+		{
+			return;
+		}
+		foreach (Item item in basePlayer.inventory.containerWear.itemList)
+		{
+			item?.LoseCondition(item.condition);
+		}
+	}
+
+	[ServerVar]
 	[ClientVar]
 	public static void subscriptions(Arg arg)
 	{
@@ -487,6 +728,116 @@ public class Global : ConsoleSystem
 				textTable.AddRow("sv", item.ID.ToString());
 			}
 		}
-		arg.ReplyWith(textTable.ToString());
+		arg.ReplyWith(arg.HasArg("--json") ? textTable.ToJson() : textTable.ToString());
+	}
+
+	public static uint GingerbreadMaterialID()
+	{
+		if (_gingerbreadMaterialID == 0)
+		{
+			_gingerbreadMaterialID = StringPool.Get("Gingerbread");
+		}
+		return _gingerbreadMaterialID;
+	}
+
+	[ServerVar]
+	public static void ClearAllSprays()
+	{
+		List<SprayCanSpray> obj = Facepunch.Pool.GetList<SprayCanSpray>();
+		foreach (SprayCanSpray allSpray in SprayCanSpray.AllSprays)
+		{
+			obj.Add(allSpray);
+		}
+		foreach (SprayCanSpray item in obj)
+		{
+			item.Kill();
+		}
+		Facepunch.Pool.FreeList(ref obj);
+	}
+
+	[ServerVar]
+	public static void ClearAllSpraysByPlayer(Arg arg)
+	{
+		if (!arg.HasArgs())
+		{
+			return;
+		}
+		ulong uLong = arg.GetULong(0, 0uL);
+		List<SprayCanSpray> obj = Facepunch.Pool.GetList<SprayCanSpray>();
+		foreach (SprayCanSpray allSpray in SprayCanSpray.AllSprays)
+		{
+			if (allSpray.sprayedByPlayer == uLong)
+			{
+				obj.Add(allSpray);
+			}
+		}
+		foreach (SprayCanSpray item in obj)
+		{
+			item.Kill();
+		}
+		int count = obj.Count;
+		Facepunch.Pool.FreeList(ref obj);
+		arg.ReplyWith($"Deleted {count} sprays by {uLong}");
+	}
+
+	[ServerVar]
+	public static void ClearSpraysInRadius(Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (!(basePlayer == null))
+		{
+			float @float = arg.GetFloat(0, 16f);
+			int num = ClearSpraysInRadius(basePlayer.transform.position, @float);
+			arg.ReplyWith($"Deleted {num} sprays within {@float} of {basePlayer.displayName}");
+		}
+	}
+
+	private static int ClearSpraysInRadius(Vector3 position, float radius)
+	{
+		List<SprayCanSpray> obj = Facepunch.Pool.GetList<SprayCanSpray>();
+		foreach (SprayCanSpray allSpray in SprayCanSpray.AllSprays)
+		{
+			if (allSpray.Distance(position) <= radius)
+			{
+				obj.Add(allSpray);
+			}
+		}
+		foreach (SprayCanSpray item in obj)
+		{
+			item.Kill();
+		}
+		int count = obj.Count;
+		Facepunch.Pool.FreeList(ref obj);
+		return count;
+	}
+
+	[ServerVar]
+	public static void ClearSpraysAtPositionInRadius(Arg arg)
+	{
+		Vector3 vector = arg.GetVector3(0);
+		float @float = arg.GetFloat(1);
+		if (@float != 0f)
+		{
+			int num = ClearSpraysInRadius(vector, @float);
+			arg.ReplyWith($"Deleted {num} sprays within {@float} of {vector}");
+		}
+	}
+
+	[ServerVar]
+	public static void ClearDroppedItems()
+	{
+		List<DroppedItem> obj = Facepunch.Pool.GetList<DroppedItem>();
+		foreach (BaseNetworkable serverEntity in BaseNetworkable.serverEntities)
+		{
+			if (serverEntity is DroppedItem item)
+			{
+				obj.Add(item);
+			}
+		}
+		foreach (DroppedItem item2 in obj)
+		{
+			item2.Kill();
+		}
+		Facepunch.Pool.FreeList(ref obj);
 	}
 }

@@ -29,4 +29,6 @@ public class MixerSnapshotManager : SingletonComponent<MixerSnapshotManager>, IC
 	public SoundDefinition cctvModeStartDef;
 
 	public SoundDefinition cctvModeStopDef;
+
+	public float deafness;
 }

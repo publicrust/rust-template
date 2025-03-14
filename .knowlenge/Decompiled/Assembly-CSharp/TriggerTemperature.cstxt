@@ -21,7 +21,13 @@ public class TriggerTemperature : TriggerBase
 
 	private void OnValidate()
 	{
-		triggerSize = GetComponent<SphereCollider>().radius * base.transform.localScale.y;
+		if (GetComponent<SphereCollider>() != null)
+		{
+			triggerSize = GetComponent<SphereCollider>().radius * base.transform.localScale.y;
+			return;
+		}
+		Vector3 v = Vector3.Scale(GetComponent<BoxCollider>().size, base.transform.localScale);
+		triggerSize = v.Max() * 0.5f;
 	}
 
 	public float WorkoutTemperature(Vector3 position, float oldTemperature)

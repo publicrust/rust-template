@@ -1,8 +1,8 @@
 using UnityEngine;
 
-public class LootPanelVendingMachine : LootPanel
+public class LootPanelVendingMachine : LootPanel, IVendingMachineInterface
 {
-	public GameObject sellOrderPrefab;
+	public GameObjectRef sellOrderPrefab;
 
 	public GameObject sellOrderContainer;
 

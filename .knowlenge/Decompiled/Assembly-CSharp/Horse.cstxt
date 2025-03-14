@@ -1,6 +1,6 @@
 public class Horse : BaseAnimalNPC
 {
-	[ServerVar(Help = "Population active on the server, per square km")]
+	[ServerVar(Help = "Population active on the server, per square km", ShowInAdminUI = true)]
 	public static float Population;
 
 	public override float RealisticMass => 500f;

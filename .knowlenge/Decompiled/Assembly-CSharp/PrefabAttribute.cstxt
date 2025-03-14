@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using UnityEngine;
 using UnityEngine.Assertions;
 
@@ -222,6 +223,7 @@ public abstract class PrefabAttribute : MonoBehaviour, IPrefabPreProcess
 		return (object)exists != null;
 	}
 
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	internal static bool ComparePrefabAttribute(PrefabAttribute x, PrefabAttribute y)
 	{
 		bool flag = (object)x == null;
@@ -234,7 +236,11 @@ public abstract class PrefabAttribute : MonoBehaviour, IPrefabPreProcess
 		{
 			return false;
 		}
-		return x.instanceID == y.instanceID;
+		if (x.instanceID == y.instanceID)
+		{
+			return true;
+		}
+		return false;
 	}
 
 	public override string ToString()
