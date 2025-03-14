@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Security.Permissions;
 using System.Text.RegularExpressions;
+using Mono.Posix;
 using Oxide.Core;
 using Oxide.Core.Libraries;
 using Oxide.Core.Plugins.Watchers;
@@ -24,6 +25,8 @@ public sealed class FSWatcher : PluginChangeWatcher
 
 	private Timer timers;
 
+	private Dictionary<string, FileSystemWatcher> m_symlinkWatchers = new Dictionary<string, FileSystemWatcher>();
+
 	public FSWatcher(string directory, string filter)
 	{
 		watchedPlugins = new HashSet<string>();
@@ -32,10 +35,48 @@ public sealed class FSWatcher : PluginChangeWatcher
 		if (Interface.Oxide.Config.Options.PluginWatchers)
 		{
 			LoadWatcher(directory, filter);
+			if (Environment.OSVersion.Platform != PlatformID.Unix)
+			{
+				return;
+			}
+			FileInfo[] files = new DirectoryInfo(directory).GetFiles(filter);
+			foreach (FileInfo fileInfo in files)
+			{
+				if (IsFileSymlink(fileInfo.FullName))
+				{
+					LoadWatcherSymlink(fileInfo.FullName);
+				}
+			}
 		}
 		else
 		{
 			Interface.Oxide.LogWarning("Automatic plugin reloading and unloading has been disabled");
+		}
+	}
+
+	private bool IsFileSymlink(string path)
+	{
+		return (File.GetAttributes(path) & FileAttributes.ReparsePoint) > (FileAttributes)0;
+	}
+
+	[PermissionSet(SecurityAction.Demand, Name = "FullTrust")]
+	private void LoadWatcherSymlink(string path)
+	{
+		string path2 = Syscall.readlink(path);
+		string directoryName = Path.GetDirectoryName(path2);
+		string fileName = Path.GetFileName(path2);
+		FileSystemWatcher fileSystemWatcher = new FileSystemWatcher(directoryName, fileName);
+		m_symlinkWatchers[path] = fileSystemWatcher;
+		fileSystemWatcher.Changed += symlinkTarget_Changed;
+		fileSystemWatcher.Created += symlinkTarget_Changed;
+		fileSystemWatcher.Deleted += symlinkTarget_Changed;
+		fileSystemWatcher.Error += watcher_Error;
+		fileSystemWatcher.NotifyFilter = NotifyFilters.LastWrite;
+		fileSystemWatcher.IncludeSubdirectories = false;
+		fileSystemWatcher.EnableRaisingEvents = true;
+		void symlinkTarget_Changed(object sender, FileSystemEventArgs e)
+		{
+			watcher_Changed(sender, e);
 		}
 	}
 
@@ -47,7 +88,7 @@ public sealed class FSWatcher : PluginChangeWatcher
 		watcher.Created += watcher_Changed;
 		watcher.Deleted += watcher_Changed;
 		watcher.Error += watcher_Error;
-		watcher.NotifyFilter = NotifyFilters.LastWrite;
+		watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite;
 		watcher.IncludeSubdirectories = true;
 		watcher.EnableRaisingEvents = true;
 		GC.KeepAlive(watcher);
@@ -67,11 +108,11 @@ public sealed class FSWatcher : PluginChangeWatcher
 	{
 		FileSystemWatcher fileSystemWatcher = (FileSystemWatcher)sender;
 		int length = e.FullPath.Length - fileSystemWatcher.Path.Length - Path.GetExtension(e.Name).Length - 1;
-		string sub_path = e.FullPath.Substring(fileSystemWatcher.Path.Length + 1, length);
-		if (!changeQueue.TryGetValue(sub_path, out var change))
+		string subPath = e.FullPath.Substring(fileSystemWatcher.Path.Length + 1, length);
+		if (!changeQueue.TryGetValue(subPath, out var change))
 		{
 			change = new QueuedChange();
-			changeQueue[sub_path] = change;
+			changeQueue[subPath] = change;
 		}
 		change.timer?.Destroy();
 		change.timer = null;
@@ -96,7 +137,7 @@ public sealed class FSWatcher : PluginChangeWatcher
 		case WatcherChangeTypes.Deleted:
 			if (change.type == WatcherChangeTypes.Created)
 			{
-				changeQueue.Remove(sub_path);
+				changeQueue.Remove(subPath);
 				return;
 			}
 			change.type = WatcherChangeTypes.Deleted;
@@ -104,16 +145,36 @@ public sealed class FSWatcher : PluginChangeWatcher
 		}
 		Interface.Oxide.NextTick(delegate
 		{
+			if (Environment.OSVersion.Platform == PlatformID.Unix)
+			{
+				switch (e.ChangeType)
+				{
+				case WatcherChangeTypes.Created:
+					if (IsFileSymlink(e.FullPath))
+					{
+						LoadWatcherSymlink(e.FullPath);
+					}
+					break;
+				case WatcherChangeTypes.Deleted:
+					if (m_symlinkWatchers.ContainsKey(e.FullPath))
+					{
+						m_symlinkWatchers.TryGetValue(e.FullPath, out var value);
+						value?.Dispose();
+						m_symlinkWatchers.Remove(e.FullPath);
+					}
+					break;
+				}
+			}
 			change.timer?.Destroy();
 			change.timer = timers.Once(0.2f, delegate
 			{
 				change.timer = null;
-				changeQueue.Remove(sub_path);
-				if (Regex.Match(sub_path, "include\\\\", RegexOptions.IgnoreCase).Success)
+				changeQueue.Remove(subPath);
+				if (Regex.Match(subPath, "include\\\\", RegexOptions.IgnoreCase).Success)
 				{
 					if (change.type == WatcherChangeTypes.Created || change.type == WatcherChangeTypes.Changed)
 					{
-						FirePluginSourceChanged(sub_path);
+						FirePluginSourceChanged(subPath);
 					}
 				}
 				else
@@ -121,22 +182,22 @@ public sealed class FSWatcher : PluginChangeWatcher
 					switch (change.type)
 					{
 					case WatcherChangeTypes.Changed:
-						if (watchedPlugins.Contains(sub_path))
+						if (watchedPlugins.Contains(subPath))
 						{
-							FirePluginSourceChanged(sub_path);
+							FirePluginSourceChanged(subPath);
 						}
 						else
 						{
-							FirePluginAdded(sub_path);
+							FirePluginAdded(subPath);
 						}
 						break;
 					case WatcherChangeTypes.Created:
-						FirePluginAdded(sub_path);
+						FirePluginAdded(subPath);
 						break;
 					case WatcherChangeTypes.Deleted:
-						if (watchedPlugins.Contains(sub_path))
+						if (watchedPlugins.Contains(subPath))
 						{
-							FirePluginRemoved(sub_path);
+							FirePluginRemoved(subPath);
 						}
 						break;
 					case WatcherChangeTypes.Created | WatcherChangeTypes.Deleted:

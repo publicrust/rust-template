@@ -4,7 +4,11 @@ public class SpiderWeb : BaseCombatEntity
 {
 	public bool Fresh()
 	{
-		return !HasFlag(Flags.Reserved1) && !HasFlag(Flags.Reserved2) && !HasFlag(Flags.Reserved3) && !HasFlag(Flags.Reserved4);
+		if (!HasFlag(Flags.Reserved1) && !HasFlag(Flags.Reserved2) && !HasFlag(Flags.Reserved3))
+		{
+			return !HasFlag(Flags.Reserved4);
+		}
+		return false;
 	}
 
 	public override void ServerInit()

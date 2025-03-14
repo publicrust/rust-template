@@ -1,5 +1,7 @@
 using System.Collections.Generic;
 using Facepunch;
+using Network;
+using Oxide.Core;
 using ProtoBuf;
 using UnityEngine;
 
@@ -16,6 +18,8 @@ public class RelationshipManager : BaseEntity
 		public List<ulong> members = new List<ulong>();
 
 		public List<ulong> invites = new List<ulong>();
+
+		private List<Connection> onlineMemberConnections = new List<Connection>();
 
 		public BasePlayer GetLeader()
 		{
@@ -52,33 +56,6 @@ public class RelationshipManager : BaseEntity
 			invites.Remove(player.userID);
 		}
 
-		public BasePlayer GetMember(ulong userID)
-		{
-			return FindByID(userID);
-		}
-
-		public BasePlayer GetMember(int index)
-		{
-			if (index >= members.Count)
-			{
-				return null;
-			}
-			return GetMember(members[index]);
-		}
-
-		public void Cleanup()
-		{
-			for (int num = members.Count - 1; num >= 0; num--)
-			{
-				ulong num2 = members[num];
-				BasePlayer basePlayer = FindByID(num2);
-				if (basePlayer == null)
-				{
-					members.Remove(num2);
-				}
-			}
-		}
-
 		public bool AddPlayer(BasePlayer player)
 		{
 			ulong userID = player.userID;
@@ -86,7 +63,7 @@ public class RelationshipManager : BaseEntity
 			{
 				return false;
 			}
-			if (player.currentTeam != 0)
+			if (player.currentTeam != 0L)
 			{
 				return false;
 			}
@@ -96,6 +73,7 @@ public class RelationshipManager : BaseEntity
 			}
 			player.currentTeam = teamID;
 			members.Add(userID);
+			Instance.playerToTeam.Add(userID, this);
 			MarkDirty();
 			player.SendNetworkUpdate();
 			return true;
@@ -106,6 +84,7 @@ public class RelationshipManager : BaseEntity
 			if (members.Contains(playerID))
 			{
 				members.Remove(playerID);
+				Instance.playerToTeam.Remove(playerID);
 				BasePlayer basePlayer = FindByID(playerID);
 				if (basePlayer != null)
 				{
@@ -150,6 +129,24 @@ public class RelationshipManager : BaseEntity
 				}
 			}
 		}
+
+		public List<Connection> GetOnlineMemberConnections()
+		{
+			if (members.Count == 0)
+			{
+				return null;
+			}
+			onlineMemberConnections.Clear();
+			foreach (ulong member in members)
+			{
+				BasePlayer basePlayer = FindByID(member);
+				if (!(basePlayer == null) && basePlayer.Connection != null)
+				{
+					onlineMemberConnections.Add(basePlayer.Connection);
+				}
+			}
+			return onlineMemberConnections;
+		}
 	}
 
 	[ServerVar]
@@ -159,9 +156,11 @@ public class RelationshipManager : BaseEntity
 
 	public Dictionary<ulong, BasePlayer> cachedPlayers = new Dictionary<ulong, BasePlayer>();
 
-	public Dictionary<ulong, PlayerTeam> playerTeams = new Dictionary<ulong, PlayerTeam>();
+	public Dictionary<ulong, PlayerTeam> playerToTeam = new Dictionary<ulong, PlayerTeam>();
 
-	private ulong lastTeamIndex = 1uL;
+	public Dictionary<ulong, PlayerTeam> teams = new Dictionary<ulong, PlayerTeam>();
+
+	public ulong lastTeamIndex = 1uL;
 
 	public static RelationshipManager Instance => _instance;
 
@@ -197,9 +196,9 @@ public class RelationshipManager : BaseEntity
 		}
 		info.msg.relationshipManager.lastTeamIndex = lastTeamIndex;
 		info.msg.relationshipManager.teamList = Pool.GetList<ProtoBuf.PlayerTeam>();
-		foreach (KeyValuePair<ulong, PlayerTeam> playerTeam2 in playerTeams)
+		foreach (KeyValuePair<ulong, PlayerTeam> team in teams)
 		{
-			PlayerTeam value = playerTeam2.Value;
+			PlayerTeam value = team.Value;
 			if (value == null)
 			{
 				continue;
@@ -213,7 +212,7 @@ public class RelationshipManager : BaseEntity
 			{
 				ProtoBuf.PlayerTeam.TeamMember teamMember = Pool.Get<ProtoBuf.PlayerTeam.TeamMember>();
 				BasePlayer basePlayer = FindByID(member);
-				teamMember.displayName = ((!(basePlayer != null)) ? "DEAD" : basePlayer.displayName);
+				teamMember.displayName = ((basePlayer != null) ? basePlayer.displayName : (SingletonComponent<ServerMgr>.Instance.persistance.GetPlayerName(member) ?? "DEAD"));
 				teamMember.userID = member;
 				playerTeam.members.Add(teamMember);
 			}
@@ -223,7 +222,7 @@ public class RelationshipManager : BaseEntity
 
 	public void DisbandTeam(PlayerTeam teamToDisband)
 	{
-		playerTeams.Remove(teamToDisband.teamID);
+		teams.Remove(teamToDisband.teamID);
 		Pool.Free(ref teamToDisband);
 	}
 
@@ -252,9 +251,18 @@ public class RelationshipManager : BaseEntity
 
 	public PlayerTeam FindTeam(ulong TeamID)
 	{
-		if (playerTeams.ContainsKey(TeamID))
+		if (teams.ContainsKey(TeamID))
 		{
-			return playerTeams[TeamID];
+			return teams[TeamID];
+		}
+		return null;
+	}
+
+	public PlayerTeam FindPlayersTeam(ulong userID)
+	{
+		if (playerToTeam.TryGetValue(userID, out var value))
+		{
+			return value;
 		}
 		return null;
 	}
@@ -263,7 +271,7 @@ public class RelationshipManager : BaseEntity
 	{
 		PlayerTeam playerTeam = Pool.Get<PlayerTeam>();
 		playerTeam.teamID = lastTeamIndex;
-		playerTeams.Add(lastTeamIndex, playerTeam);
+		teams.Add(lastTeamIndex, playerTeam);
 		lastTeamIndex++;
 		return playerTeam;
 	}
@@ -277,7 +285,7 @@ public class RelationshipManager : BaseEntity
 			return;
 		}
 		BasePlayer basePlayer = ArgEx.Player(arg);
-		if (basePlayer.currentTeam == 0)
+		if (basePlayer.currentTeam == 0L)
 		{
 			PlayerTeam playerTeam = Instance.CreateTeam();
 			playerTeam.teamLeader = basePlayer.userID;
@@ -289,14 +297,14 @@ public class RelationshipManager : BaseEntity
 	public static void promote(ConsoleSystem.Arg arg)
 	{
 		BasePlayer basePlayer = ArgEx.Player(arg);
-		if (basePlayer.currentTeam == 0)
+		if (basePlayer.currentTeam == 0L)
 		{
 			return;
 		}
 		BasePlayer lookingAtPlayer = GetLookingAtPlayer(basePlayer);
 		if (!(lookingAtPlayer == null) && !lookingAtPlayer.IsDead() && !(lookingAtPlayer == basePlayer) && lookingAtPlayer.currentTeam == basePlayer.currentTeam)
 		{
-			PlayerTeam playerTeam = Instance.playerTeams[basePlayer.currentTeam];
+			PlayerTeam playerTeam = Instance.teams[basePlayer.currentTeam];
 			if (playerTeam != null && playerTeam.teamLeader == basePlayer.userID)
 			{
 				playerTeam.SetTeamLeader(lookingAtPlayer.userID);
@@ -308,10 +316,10 @@ public class RelationshipManager : BaseEntity
 	public static void leaveteam(ConsoleSystem.Arg arg)
 	{
 		BasePlayer basePlayer = ArgEx.Player(arg);
-		if (!(basePlayer == null) && basePlayer.currentTeam != 0)
+		if (!(basePlayer == null) && basePlayer.currentTeam != 0L)
 		{
 			PlayerTeam playerTeam = Instance.FindTeam(basePlayer.currentTeam);
-			if (playerTeam != null)
+			if (playerTeam != null && Interface.CallHook("OnTeamLeave", playerTeam, basePlayer) == null)
 			{
 				playerTeam.RemovePlayer(basePlayer.userID);
 				basePlayer.ClearTeam();
@@ -323,7 +331,7 @@ public class RelationshipManager : BaseEntity
 	public static void acceptinvite(ConsoleSystem.Arg arg)
 	{
 		BasePlayer basePlayer = ArgEx.Player(arg);
-		if (!(basePlayer == null) && basePlayer.currentTeam == 0)
+		if (!(basePlayer == null) && basePlayer.currentTeam == 0L)
 		{
 			ulong uLong = arg.GetULong(0, 0uL);
 			PlayerTeam playerTeam = Instance.FindTeam(uLong);
@@ -331,7 +339,7 @@ public class RelationshipManager : BaseEntity
 			{
 				basePlayer.ClearPendingInvite();
 			}
-			else
+			else if (Interface.CallHook("OnTeamAcceptInvite", playerTeam, basePlayer) == null)
 			{
 				playerTeam.AcceptInvite(basePlayer);
 			}
@@ -342,7 +350,7 @@ public class RelationshipManager : BaseEntity
 	public static void rejectinvite(ConsoleSystem.Arg arg)
 	{
 		BasePlayer basePlayer = ArgEx.Player(arg);
-		if (!(basePlayer == null) && basePlayer.currentTeam == 0)
+		if (!(basePlayer == null) && basePlayer.currentTeam == 0L)
 		{
 			ulong uLong = arg.GetULong(0, 0uL);
 			PlayerTeam playerTeam = Instance.FindTeam(uLong);
@@ -350,7 +358,7 @@ public class RelationshipManager : BaseEntity
 			{
 				basePlayer.ClearPendingInvite();
 			}
-			else
+			else if (Interface.CallHook("OnTeamRejectInvite", basePlayer, playerTeam) == null)
 			{
 				playerTeam.RejectInvite(basePlayer);
 			}
@@ -409,7 +417,7 @@ public class RelationshipManager : BaseEntity
 		if (playerTeam != null && !(playerTeam.GetLeader() != basePlayer))
 		{
 			ulong uLong = arg.GetULong(0, 0uL);
-			if (basePlayer.userID != uLong)
+			if (basePlayer.userID != uLong && Interface.CallHook("OnTeamKick", playerTeam, basePlayer, uLong) == null)
 			{
 				playerTeam.RemovePlayer(uLong);
 			}
@@ -421,12 +429,7 @@ public class RelationshipManager : BaseEntity
 	{
 		BasePlayer basePlayer = ArgEx.Player(arg);
 		PlayerTeam playerTeam = Instance.FindTeam(basePlayer.currentTeam);
-		if (playerTeam == null)
-		{
-			return;
-		}
-		BasePlayer leader = playerTeam.GetLeader();
-		if (leader == null || playerTeam.GetLeader() != basePlayer || !Physics.Raycast(basePlayer.eyes.position, basePlayer.eyes.HeadForward(), out var hitInfo, 5f, 1218652417, QueryTriggerInteraction.Ignore))
+		if (playerTeam == null || playerTeam.GetLeader() == null || playerTeam.GetLeader() != basePlayer || !Physics.Raycast(basePlayer.eyes.position, basePlayer.eyes.HeadForward(), out var hitInfo, 5f, 1218652417, QueryTriggerInteraction.Ignore))
 		{
 			return;
 		}
@@ -434,7 +437,7 @@ public class RelationshipManager : BaseEntity
 		if ((bool)entity)
 		{
 			BasePlayer component = entity.GetComponent<BasePlayer>();
-			if ((bool)component && component != basePlayer && !component.IsNpc && component.currentTeam == 0)
+			if ((bool)component && component != basePlayer && !component.IsNpc && component.currentTeam == 0L && Interface.CallHook("OnTeamInvite", basePlayer, component) == null)
 			{
 				playerTeam.SendInvite(component);
 			}
@@ -449,7 +452,7 @@ public class RelationshipManager : BaseEntity
 		PlayerTeam playerTeam = Instance.FindTeam(uLong);
 		if (playerTeam != null)
 		{
-			if (basePlayer.currentTeam != 0)
+			if (basePlayer.currentTeam != 0L)
 			{
 				Debug.Log("already in team");
 			}
@@ -463,12 +466,7 @@ public class RelationshipManager : BaseEntity
 	{
 		BasePlayer basePlayer = ArgEx.Player(arg);
 		PlayerTeam playerTeam = Instance.FindTeam(basePlayer.currentTeam);
-		if (playerTeam == null)
-		{
-			return;
-		}
-		BasePlayer leader = playerTeam.GetLeader();
-		if (leader == null || playerTeam.GetLeader() != basePlayer || !Physics.Raycast(basePlayer.eyes.position, basePlayer.eyes.HeadForward(), out var hitInfo, 5f, 1218652417, QueryTriggerInteraction.Ignore))
+		if (playerTeam == null || playerTeam.GetLeader() == null || playerTeam.GetLeader() != basePlayer || !Physics.Raycast(basePlayer.eyes.position, basePlayer.eyes.HeadForward(), out var hitInfo, 5f, 1218652417, QueryTriggerInteraction.Ignore))
 		{
 			return;
 		}
@@ -507,7 +505,20 @@ public class RelationshipManager : BaseEntity
 			{
 				playerTeam.members.Add(member.userID);
 			}
-			playerTeams[playerTeam.teamID] = playerTeam;
+			teams[playerTeam.teamID] = playerTeam;
+		}
+		foreach (PlayerTeam value in teams.Values)
+		{
+			foreach (ulong member2 in value.members)
+			{
+				playerToTeam[member2] = value;
+				BasePlayer basePlayer = FindByID(member2);
+				if (basePlayer != null && basePlayer.currentTeam != value.teamID)
+				{
+					Debug.LogWarning($"Player {member2} has the wrong teamID: got {basePlayer.currentTeam}, expected {value.teamID}. Fixing automatically.");
+					basePlayer.currentTeam = value.teamID;
+				}
+			}
 		}
 	}
 }

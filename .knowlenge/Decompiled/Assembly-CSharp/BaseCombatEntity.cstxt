@@ -83,7 +83,7 @@ public class BaseCombatEntity : BaseEntity
 
 	public float lastDealtDamageTime = float.NegativeInfinity;
 
-	private int lastNotifyFrame;
+	public int lastNotifyFrame;
 
 	private const float MAX_HEALTH_REPAIR = 50f;
 
@@ -216,7 +216,11 @@ public class BaseCombatEntity : BaseEntity
 
 	public override float PenetrationResistance(HitInfo info)
 	{
-		return (!baseProtection) ? 1f : baseProtection.density;
+		if (!baseProtection)
+		{
+			return 1f;
+		}
+		return baseProtection.density;
 	}
 
 	public virtual void ScaleDamage(HitInfo info)
@@ -291,6 +295,12 @@ public class BaseCombatEntity : BaseEntity
 		return StartHealth();
 	}
 
+	public void SetMaxHealth(float newMax)
+	{
+		_maxHealth = newMax;
+		_health = Mathf.Min(_health, newMax);
+	}
+
 	public void DoHitNotify(HitInfo info)
 	{
 		using (TimeWarning.New("DoHitNotify"))
@@ -326,12 +336,23 @@ public class BaseCombatEntity : BaseEntity
 
 	public virtual bool CanPickup(BasePlayer player)
 	{
-		object obj = Interface.CallHook("CanPickupEntity", player, this);
-		if (obj is bool)
+		if (pickup.enabled)
 		{
-			return (bool)obj;
+			if (pickup.requireBuildingPrivilege)
+			{
+				if (player.CanBuild())
+				{
+					if (pickup.requireHammer)
+					{
+						return player.IsHoldingEntity<Hammer>();
+					}
+					return true;
+				}
+				return false;
+			}
+			return true;
 		}
-		return pickup.enabled && (!pickup.requireBuildingPrivilege || (player.CanBuild() && (!pickup.requireHammer || player.IsHoldingEntity<Hammer>())));
+		return false;
 	}
 
 	public virtual void OnPickedUp(Item createdItem, BasePlayer player)
@@ -403,63 +424,67 @@ public class BaseCombatEntity : BaseEntity
 		Effect.server.Run("assets/bundled/prefabs/fx/build/repair_full.prefab", this, 0u, Vector3.zero, Vector3.zero);
 	}
 
-	public virtual void OnRepairFailed()
+	public virtual void OnRepairFailed(BasePlayer player, string reason)
 	{
 		Effect.server.Run("assets/bundled/prefabs/fx/build/repair_failed.prefab", this, 0u, Vector3.zero, Vector3.zero);
+		if (player != null && !string.IsNullOrEmpty(reason))
+		{
+			player.ChatMessage(reason);
+		}
 	}
 
 	public virtual void DoRepair(BasePlayer player)
 	{
-		BasePlayer player2 = player;
-		if (!repair.enabled || Interface.CallHook("OnStructureRepair", this, player) != null)
+		if (!repair.enabled)
 		{
 			return;
 		}
-		if (SecondsSinceAttacked <= 30f)
+		float num = 30f;
+		if (SecondsSinceAttacked <= num)
 		{
-			OnRepairFailed();
+			OnRepairFailed(player, $"Unable to repair: Recently damaged. Repairable in: {num - SecondsSinceAttacked:N0}s.");
 			return;
 		}
-		float num = MaxHealth() - health;
-		float num2 = num / MaxHealth();
-		if (num <= 0f || num2 <= 0f)
+		float num2 = MaxHealth() - health;
+		float num3 = num2 / MaxHealth();
+		if (num2 <= 0f || num3 <= 0f)
 		{
-			OnRepairFailed();
+			OnRepairFailed(player, "Unable to repair: Not damaged.");
 			return;
 		}
-		List<ItemAmount> list = RepairCost(num2);
+		List<ItemAmount> list = RepairCost(num3);
 		if (list == null)
 		{
 			return;
 		}
-		float num3 = list.Sum((ItemAmount x) => x.amount);
-		if (num3 > 0f)
+		float num4 = list.Sum((ItemAmount x) => x.amount);
+		if (num4 > 0f)
 		{
-			float a = list.Min((ItemAmount x) => Mathf.Clamp01((float)player2.inventory.GetAmount(x.itemid) / x.amount));
-			a = Mathf.Min(a, 50f / num);
+			float a = list.Min((ItemAmount x) => Mathf.Clamp01((float)player.inventory.GetAmount(x.itemid) / x.amount));
+			a = Mathf.Min(a, 50f / num2);
 			if (a <= 0f)
 			{
-				OnRepairFailed();
+				OnRepairFailed(player, "Unable to repair: Insufficient resources.");
 				return;
 			}
-			int num4 = 0;
+			int num5 = 0;
 			foreach (ItemAmount item in list)
 			{
 				int amount = Mathf.CeilToInt(a * item.amount);
-				int num5 = player2.inventory.Take(null, item.itemid, amount);
-				if (num5 > 0)
+				int num6 = player.inventory.Take(null, item.itemid, amount);
+				if (num6 > 0)
 				{
-					num4 += num5;
-					player2.Command("note.inv", item.itemid, num5 * -1);
+					num5 += num6;
+					player.Command("note.inv", item.itemid, num6 * -1);
 				}
 			}
-			float num6 = (float)num4 / num3;
-			health += num * num6;
+			float num7 = (float)num5 / num4;
+			health += num2 * num7;
 			SendNetworkUpdate();
 		}
 		else
 		{
-			health += num;
+			health += num2;
 			SendNetworkUpdate();
 		}
 		if (health >= MaxHealth())
@@ -533,10 +558,6 @@ public class BaseCombatEntity : BaseEntity
 			info.damageTypes.Scale(DamageType.Blunt, ConVar.Server.meleedamage);
 			info.damageTypes.Scale(DamageType.Stab, ConVar.Server.meleedamage);
 			info.damageTypes.Scale(DamageType.Bleeding, ConVar.Server.bleedingdamage);
-			if (Interface.CallHook("IOnBaseCombatEntityHurt", this, info) != null)
-			{
-				return;
-			}
 			DebugHurt(info);
 			health = num - info.damageTypes.Total();
 			SendNetworkUpdate();
@@ -616,14 +637,13 @@ public class BaseCombatEntity : BaseEntity
 			ConsoleNetwork.BroadcastToAllClients("ddraw.arrow", 60, Color.cyan, info.PointStart, info.PointEnd, 0.1f);
 			ConsoleNetwork.BroadcastToAllClients("ddraw.sphere", 60, Color.cyan, info.HitPositionWorld, 0.01f);
 		}
-		string text = string.Empty;
+		string text = "";
 		for (int i = 0; i < info.damageTypes.types.Length; i++)
 		{
 			float num = info.damageTypes.types[i];
 			if (num != 0f)
 			{
-				string text2 = text;
-				string[] obj = new string[5] { text2, " ", null, null, null };
+				string[] obj = new string[5] { text, " ", null, null, null };
 				DamageType damageType = (DamageType)i;
 				obj[2] = damageType.ToString().PadRight(10);
 				obj[3] = num.ToString("0.00");
@@ -631,8 +651,8 @@ public class BaseCombatEntity : BaseEntity
 				text = string.Concat(obj);
 			}
 		}
-		string text3 = string.Concat("<color=lightblue>Damage:</color>".PadRight(10), info.damageTypes.Total().ToString("0.00"), "\n<color=lightblue>Health:</color>".PadRight(10), health.ToString("0.00"), " / ", (!(health - info.damageTypes.Total() <= 0f)) ? "<color=green>" : "<color=red>", (health - info.damageTypes.Total()).ToString("0.00"), "</color>", "\n<color=lightblue>HitEnt:</color>".PadRight(10), this, "\n<color=lightblue>HitBone:</color>".PadRight(10), info.boneName, "\n<color=lightblue>Attacker:</color>".PadRight(10), info.Initiator, "\n<color=lightblue>WeaponPrefab:</color>".PadRight(10), info.WeaponPrefab, "\n<color=lightblue>Damages:</color>\n", text);
-		ConsoleNetwork.BroadcastToAllClients("ddraw.text", 60, Color.white, info.HitPositionWorld, text3);
+		string text2 = string.Concat("<color=lightblue>Damage:</color>".PadRight(10), info.damageTypes.Total().ToString("0.00"), "\n<color=lightblue>Health:</color>".PadRight(10), health.ToString("0.00"), " / ", (health - info.damageTypes.Total() <= 0f) ? "<color=red>" : "<color=green>", (health - info.damageTypes.Total()).ToString("0.00"), "</color>", "\n<color=lightblue>HitEnt:</color>".PadRight(10), this, "\n<color=lightblue>HitBone:</color>".PadRight(10), info.boneName, "\n<color=lightblue>Attacker:</color>".PadRight(10), info.Initiator, "\n<color=lightblue>WeaponPrefab:</color>".PadRight(10), info.WeaponPrefab, "\n<color=lightblue>Damages:</color>\n", text);
+		ConsoleNetwork.BroadcastToAllClients("ddraw.text", 60, Color.white, info.HitPositionWorld, text2);
 	}
 
 	public virtual void ChangeHealth(float amount)
@@ -675,7 +695,6 @@ public class BaseCombatEntity : BaseEntity
 		{
 			return;
 		}
-		Interface.CallHook("OnEntityDeath", this, info);
 		if (ConVar.Global.developer > 1)
 		{
 			Debug.Log("[Combat]".PadRight(10) + base.gameObject.name + " died");

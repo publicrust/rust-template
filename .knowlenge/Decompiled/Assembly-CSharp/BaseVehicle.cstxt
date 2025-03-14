@@ -12,6 +12,8 @@ public class BaseVehicle : BaseMountable
 
 		public Vector3 rot;
 
+		public string bone = "";
+
 		public GameObjectRef prefab;
 
 		public BaseMountable mountable;
@@ -19,16 +21,31 @@ public class BaseVehicle : BaseMountable
 
 	public GameObjectRef serverGibs;
 
+	[Tooltip("Allow players to mount other mountables/ladders from this vehicle")]
+	public bool mountChaining = true;
+
+	public bool shouldShowHudHealth;
+
+	[Header("Rigidbody (Optional)")]
+	public Rigidbody rigidBody;
+
 	[Header("Mount Points")]
 	public MountPointInfo[] mountPoints;
 
 	public const Flags Flag_Headlights = Flags.Reserved5;
+
+	public const Flags Flag_Stationary = Flags.Reserved7;
 
 	public bool seatClipCheck;
 
 	public override bool DirectlyMountable()
 	{
 		return true;
+	}
+
+	public override float GetNetworkTime()
+	{
+		return Time.fixedTime;
 	}
 
 	public bool HasAnyPassengers()
@@ -51,49 +68,46 @@ public class BaseVehicle : BaseMountable
 		{
 			Vector3 center = base.transform.TransformPoint(bounds.center);
 			int layerMask = 1210122497;
-			Collider[] array = Physics.OverlapBox(center, bounds.extents, base.transform.rotation, layerMask);
-			if (array.Length > 0)
+			if (Physics.OverlapBox(center, bounds.extents, base.transform.rotation, layerMask).Length != 0)
 			{
 				CheckSeatsForClipping();
 			}
 		}
+		if ((bool)rigidBody)
+		{
+			SetFlag(Flags.Reserved7, rigidBody.IsSleeping() && !HasAnyPassengers());
+		}
 	}
 
-	public virtual bool IsSeatClipping(BaseMountable mountable, bool checkWhenEmpty = false)
+	public virtual bool IsSeatVisible(BaseMountable mountable, Vector3 eyePos, int mask = 1218511105)
 	{
-		if (!seatClipCheck)
-		{
-			return false;
-		}
 		if (mountable == null)
 		{
 			return false;
 		}
-		if (!mountable.IsMounted() && !checkWhenEmpty)
+		Vector3 p = mountable.transform.position + base.transform.up * 0.15f;
+		return GamePhysics.LineOfSight(eyePos, p, mask);
+	}
+
+	public virtual bool IsSeatClipping(BaseMountable mountable, int mask = 1218511105)
+	{
+		if (mountable == null)
 		{
 			return false;
 		}
 		Vector3 position = mountable.transform.position;
-		Vector3 localPosition = mountable.eyeOverride.transform.localPosition;
 		Vector3 position2 = mountable.eyeOverride.transform.position;
-		Vector3 vector = position + base.transform.up * 0.15f;
-		int layerMask = 1210122497;
-		float maxDistance = Vector3.Distance(vector, position2);
-		Ray ray = new Ray(vector, base.transform.up);
-		if (Physics.SphereCast(ray, 0.1f, maxDistance, layerMask))
-		{
-			return true;
-		}
-		return false;
+		Vector3 end = position + base.transform.up * 0.15f;
+		return GamePhysics.CheckCapsule(position2, end, 0.1f, mask);
 	}
 
 	public virtual void CheckSeatsForClipping()
 	{
 		MountPointInfo[] array = mountPoints;
-		foreach (MountPointInfo mountPointInfo in array)
+		for (int i = 0; i < array.Length; i++)
 		{
-			BaseMountable mountable = mountPointInfo.mountable;
-			if (IsSeatClipping(mountable))
+			BaseMountable mountable = array[i].mountable;
+			if (!(mountable == null) && mountable.IsMounted() && IsSeatClipping(mountable, 1210122497))
 			{
 				SeatClippedWorld(mountable);
 			}
@@ -131,10 +145,25 @@ public class BaseVehicle : BaseMountable
 		for (int i = 0; i < mountPoints.Length; i++)
 		{
 			MountPointInfo mountPointInfo = mountPoints[i];
-			Vector3 forward = Quaternion.Euler(mountPointInfo.rot) * Vector3.forward;
-			BaseEntity baseEntity = GameManager.server.CreateEntity(mountPointInfo.prefab.resourcePath, mountPointInfo.pos, Quaternion.LookRotation(forward, Vector3.up));
+			Vector3 vector = Quaternion.Euler(mountPointInfo.rot) * Vector3.forward;
+			Vector3 pos = mountPointInfo.pos;
+			Vector3 up = Vector3.up;
+			if (mountPointInfo.bone != "")
+			{
+				pos = model.FindBone(mountPointInfo.bone).transform.position + base.transform.TransformDirection(mountPointInfo.pos);
+				vector = base.transform.TransformDirection(vector);
+				up = base.transform.up;
+			}
+			BaseEntity baseEntity = GameManager.server.CreateEntity(mountPointInfo.prefab.resourcePath, pos, Quaternion.LookRotation(vector, up));
 			baseEntity.Spawn();
-			baseEntity.SetParent(this);
+			if (mountPointInfo.bone != "")
+			{
+				baseEntity.SetParent(this, mountPointInfo.bone, worldPositionStays: true, sendImmediate: true);
+			}
+			else
+			{
+				baseEntity.SetParent(this);
+			}
 			mountPointInfo.mountable = baseEntity.GetComponent<BaseMountable>();
 		}
 	}
@@ -143,6 +172,33 @@ public class BaseVehicle : BaseMountable
 	{
 		base.Spawn();
 		SpawnSubEntities();
+	}
+
+	public bool AnyMounted()
+	{
+		return NumMounted() > 0;
+	}
+
+	public int NumMounted()
+	{
+		if (!HasMountPoints())
+		{
+			if (!IsMounted())
+			{
+				return 0;
+			}
+			return 1;
+		}
+		int num = 0;
+		for (int i = 0; i < mountPoints.Length; i++)
+		{
+			MountPointInfo mountPointInfo = mountPoints[i];
+			if (mountPointInfo.mountable != null && mountPointInfo.mountable.GetMounted() != null)
+			{
+				num++;
+			}
+		}
+		return num;
 	}
 
 	public bool HasDriver()
@@ -157,6 +213,20 @@ public class BaseVehicle : BaseMountable
 			return false;
 		}
 		return mountPointInfo.mountable.IsMounted();
+	}
+
+	public BasePlayer GetDriver()
+	{
+		if (!HasMountPoints())
+		{
+			return _mounted;
+		}
+		MountPointInfo mountPointInfo = mountPoints[0];
+		if (mountPointInfo == null || mountPointInfo.mountable == null)
+		{
+			return null;
+		}
+		return mountPointInfo.mountable.GetMounted();
 	}
 
 	public int GetPlayerSeat(BasePlayer player)
@@ -200,7 +270,7 @@ public class BaseVehicle : BaseMountable
 					num = 0;
 				}
 				MountPointInfo mountPointInfo = mountPoints[num];
-				if (mountPointInfo.mountable != null && !mountPointInfo.mountable.IsMounted() && !IsSeatClipping(mountPointInfo.mountable, checkWhenEmpty: true))
+				if (mountPointInfo.mountable != null && !mountPointInfo.mountable.IsMounted() && !IsSeatClipping(mountPointInfo.mountable) && IsSeatVisible(mountPointInfo.mountable, player.eyes.position))
 				{
 					baseMountable = mountPointInfo.mountable;
 					break;
@@ -217,14 +287,14 @@ public class BaseVehicle : BaseMountable
 
 	public bool HasMountPoints()
 	{
-		return mountPoints.Length > 0;
+		return mountPoints.Length != 0;
 	}
 
 	public BaseMountable GetIdealMountPoint(Vector3 pos)
 	{
 		if (!HasMountPoints())
 		{
-			return null;
+			return this;
 		}
 		BaseMountable result = null;
 		float num = float.PositiveInfinity;
@@ -232,7 +302,7 @@ public class BaseVehicle : BaseMountable
 		foreach (MountPointInfo mountPointInfo in array)
 		{
 			float num2 = Vector3.Distance(mountPointInfo.mountable.mountAnchor.position, pos);
-			if (num2 < num && !mountPointInfo.mountable.IsMounted() && !IsSeatClipping(mountPointInfo.mountable, checkWhenEmpty: true))
+			if (num2 < num && !mountPointInfo.mountable.IsMounted() && !IsSeatClipping(mountPointInfo.mountable) && IsSeatVisible(mountPointInfo.mountable, pos))
 			{
 				result = mountPointInfo.mountable;
 				num = num2;
@@ -251,13 +321,33 @@ public class BaseVehicle : BaseMountable
 		return true;
 	}
 
+	public int GetIndexFromSeat(BaseMountable seat)
+	{
+		for (int i = 0; i < mountPoints.Length; i++)
+		{
+			if (mountPoints[i].mountable == seat)
+			{
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	public virtual void PlayerMounted(BasePlayer player, BaseMountable seat)
+	{
+	}
+
+	public virtual void PlayerDismounted(BasePlayer player, BaseMountable seat)
+	{
+	}
+
 	public override void AttemptMount(BasePlayer player)
 	{
 		if (_mounted != null || !MountEligable())
 		{
 			return;
 		}
-		BaseMountable idealMountPoint = GetIdealMountPoint(player.transform.position);
+		BaseMountable idealMountPoint = GetIdealMountPoint(player.eyes.position);
 		if (!(idealMountPoint == null))
 		{
 			if (idealMountPoint == this)
@@ -268,25 +358,19 @@ public class BaseVehicle : BaseMountable
 			{
 				idealMountPoint.AttemptMount(player);
 			}
+			if (player.GetMountedVehicle() == this)
+			{
+				PlayerMounted(player, idealMountPoint);
+			}
 		}
 	}
 
-	public override bool AttemptDismount(BasePlayer player)
-	{
-		if (player != _mounted)
-		{
-			return false;
-		}
-		DismountPlayer(player);
-		return true;
-	}
-
-	public override Vector3 GetDismountPosition(BasePlayer player)
+	public override bool GetDismountPosition(BasePlayer player, out Vector3 res)
 	{
 		BaseVehicle baseVehicle = VehicleParent();
 		if (baseVehicle != null)
 		{
-			return baseVehicle.GetDismountPosition(player);
+			return baseVehicle.GetDismountPosition(player, out res);
 		}
 		List<Vector3> obj = Pool.GetList<Vector3>();
 		Transform[] array = dismountPositions;
@@ -301,13 +385,14 @@ public class BaseVehicle : BaseMountable
 		{
 			Debug.LogWarning("Failed to find dismount position for player :" + player.displayName + " / " + player.userID + " on obj : " + base.gameObject.name);
 			Pool.FreeList(ref obj);
-			return BaseMountable.DISMOUNT_POS_INVALID;
+			res = player.transform.position;
+			return false;
 		}
 		Vector3 pos = player.transform.position;
 		obj.Sort((Vector3 a, Vector3 b) => Vector3.Distance(a, pos).CompareTo(Vector3.Distance(b, pos)));
-		Vector3 result = obj[0];
+		res = obj[0];
 		Pool.FreeList(ref obj);
-		return result;
+		return true;
 	}
 
 	public override bool SupportsChildDeployables()

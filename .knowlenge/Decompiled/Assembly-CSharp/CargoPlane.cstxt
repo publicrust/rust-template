@@ -86,6 +86,7 @@ public class CargoPlane : BaseEntity
 			{
 				baseEntity.globalBroadcast = true;
 				baseEntity.Spawn();
+				Interface.CallHook("OnSupplyDropDropped", baseEntity, this);
 			}
 		}
 		base.transform.position = Vector3.Lerp(startPos, endPos, num);

@@ -1,17 +1,17 @@
 using System;
 using System.Diagnostics;
 using System.IO;
-using System.Runtime.CompilerServices;
 using Facepunch;
 using Facepunch.Network.Raknet;
 using Network;
+using Rust.Demo;
 using UnityEngine;
 
 public class Client : Network.Client
 {
-	public static float MaxReceiveTime = 20f;
+	public static float MaxReceiveTime = 10f;
 
-	public const string DemoHeader = "RUST DEMO FORMAT";
+	public static float MinReceiveFraction = 0.05f;
 
 	private Peer peer;
 
@@ -25,42 +25,15 @@ public class Client : Network.Client
 
 	protected Stopwatch recordTime;
 
-	protected FileStream playbackStream;
-
-	protected BinaryReader playbackReader;
-
-	protected long playbackTime;
-
-	protected Stopwatch playbackTimer;
+	protected Reader demoFile;
 
 	private long lastPlayedPacketTime;
 
-	public override bool IsRecording
-	{
-		[CompilerGenerated]
-		get
-		{
-			return recordStream != null;
-		}
-	}
+	public override bool IsRecording => recordStream != null;
 
-	public override bool IsPlaying
-	{
-		[CompilerGenerated]
-		get
-		{
-			return playbackStream != null;
-		}
-	}
+	public override bool IsPlaying => demoFile != null;
 
-	public override bool PlayingFinished
-	{
-		[CompilerGenerated]
-		get
-		{
-			return playbackStream.Position >= playbackStream.Length;
-		}
-	}
+	public override bool PlayingFinished => demoFile.IsFinished;
 
 	public override bool IsConnected()
 	{
@@ -76,10 +49,9 @@ public class Client : Network.Client
 			return false;
 		}
 		write = new StreamWrite(this, peer);
-		read = new StreamRead(this, peer);
 		connectedAddress = strURL;
 		connectedPort = port;
-		ServerName = string.Empty;
+		ServerName = "";
 		base.Connection = new Connection();
 		return true;
 	}
@@ -98,12 +70,12 @@ public class Client : Network.Client
 		{
 		case 16:
 			base.ConnectionAccepted = true;
-			if (base.Connection.guid != 0)
+			if (base.Connection.guid != 0L)
 			{
 				Console.WriteLine("Multiple PacketType.CONNECTION_REQUEST_ACCEPTED");
 			}
 			base.Connection.guid = peer.incomingGUID;
-			IncomingStats.Add("Unconnected", "RequestAccepted", read.Length);
+			IncomingStats.Add("Unconnected", "RequestAccepted", base.read.Length);
 			return true;
 		case 17:
 			Disconnect("Connection Attempt Failed", sendReasonToServer: false);
@@ -133,7 +105,7 @@ public class Client : Network.Client
 			Disconnect("Connection Banned", sendReasonToServer: false);
 			return true;
 		default:
-			IncomingStats.Add("Unconnected", "Unhandled", read.Length);
+			IncomingStats.Add("Unconnected", "Unhandled", base.read.Length);
 			if (base.Connection != null && peer.incomingGUID != base.Connection.guid)
 			{
 				UnityEngine.Debug.LogWarning("[CLIENT] Unhandled Raknet packet " + type + " from unknown source " + peer.incomingAddress);
@@ -146,21 +118,22 @@ public class Client : Network.Client
 
 	protected void HandleMessage()
 	{
-		read.Start(base.Connection);
-		if (IsRecording)
+		base.read.Start(peer.RawData(), peer.incomingBytesUnread);
+		Decrypt(base.Connection, base.read);
+		if (IsRecording && !IsPlaying)
 		{
-			int unread = read.unread;
-			int position = read.position;
-			read.Position = 0L;
-			read.Read(ReusableBytes, 0, unread);
-			read.Position = position;
+			int unread = base.read.Unread;
+			long position = base.read.Position;
+			base.read.Position = 0L;
+			base.read.Read(ReusableBytes, 0, unread);
+			base.read.Position = position;
 			recordWriter.Write(unread);
 			recordWriter.Write((long)recordTime.Elapsed.TotalMilliseconds);
 			recordWriter.Write(ReusableBytes, 0, unread);
 			recordWriter.Write('\0');
 			recordWriter.Write('\0');
 		}
-		byte b = read.PacketID();
+		byte b = base.read.PacketID();
 		if (HandleRaknetPacket(b))
 		{
 			return;
@@ -168,7 +141,7 @@ public class Client : Network.Client
 		b -= 140;
 		if (!IsPlaying && peer.incomingGUID != base.Connection.guid)
 		{
-			IncomingStats.Add("Error", "WrongGuid", read.Length);
+			IncomingStats.Add("Error", "WrongGuid", base.read.Length);
 			return;
 		}
 		if (!IsPlaying && base.Connection == null)
@@ -176,9 +149,9 @@ public class Client : Network.Client
 			UnityEngine.Debug.LogWarning(string.Concat("[CLIENT] Ignoring message ", (Message.Type)b, " ", b, " clientConnection is null"));
 			return;
 		}
-		if (b > 23)
+		if (b > 25)
 		{
-			UnityEngine.Debug.LogWarning(string.Concat("Invalid Packet (higher than ", Message.Type.EntityFlags, ")"));
+			UnityEngine.Debug.LogWarning(string.Concat("Invalid Packet (higher than ", Message.Type.ConsoleReplicatedVars, ")"));
 			Disconnect("Invalid Packet (" + b + ") " + peer.incomingBytes + "b", sendReasonToServer: true);
 			return;
 		}
@@ -215,13 +188,16 @@ public class Client : Network.Client
 			}
 			cycleTimer.Reset();
 			cycleTimer.Start();
+			int num = Mathf.CeilToInt((float)peer.PendingReceiveCount() * MinReceiveFraction);
+			int num2 = 0;
 			while (peer.Receive())
 			{
 				using (TimeWarning.New("HandleMessage"))
 				{
 					HandleMessage();
 				}
-				if (cycleTimer.Elapsed.TotalMilliseconds > (double)MaxReceiveTime || !IsConnected())
+				num2++;
+				if ((num2 > num && cycleTimer.Elapsed.TotalMilliseconds > (double)MaxReceiveTime) || !IsConnected())
 				{
 					break;
 				}
@@ -247,8 +223,7 @@ public class Client : Network.Client
 			peer = null;
 		}
 		write = null;
-		read = null;
-		connectedAddress = string.Empty;
+		connectedAddress = "";
 		connectedPort = 0;
 		base.Connection = null;
 		OnDisconnected(reason);
@@ -258,7 +233,7 @@ public class Client : Network.Client
 	{
 		if (peer == null)
 		{
-			return string.Empty;
+			return "";
 		}
 		if (connection == null)
 		{
@@ -344,115 +319,55 @@ public class Client : Network.Client
 		}
 	}
 
-	public override byte[] StartPlayback(string filename)
+	public override void StartPlayback(Reader demoFile)
 	{
-		playbackStream = new FileStream(filename, FileMode.Open);
-		if (playbackStream == null)
-		{
-			return null;
-		}
-		playbackReader = new BinaryReader(playbackStream);
-		string text = playbackReader.ReadString();
-		if (text != "RUST DEMO FORMAT")
-		{
-			UnityEngine.Debug.LogWarning("Demo has invalid header #1");
-			StopPlayback();
-			return null;
-		}
-		int count = playbackReader.ReadInt32();
-		byte[] result = playbackReader.ReadBytes(count);
-		playbackTime = 0L;
-		if (playbackReader.ReadChar() != 0)
-		{
-			UnityEngine.Debug.LogWarning("Demo has invalid header #2");
-			StopPlayback();
-			return null;
-		}
+		this.demoFile = demoFile;
 		peer = new DemoPeer();
 		write = new StreamWrite(this, peer);
-		read = new StreamRead(this, peer);
-		PlaybackStats = new PlaybackStatsData();
-		playbackTimer = Stopwatch.StartNew();
-		return result;
 	}
 
 	public override void StopPlayback()
 	{
-		if (playbackReader != null)
-		{
-			playbackReader.Close();
-			playbackReader = null;
-		}
-		if (playbackStream != null)
-		{
-			playbackStream.Dispose();
-			playbackStream = null;
-		}
+		demoFile?.Stop();
+		demoFile = null;
 		peer = null;
 		write = null;
-		read = null;
-		PlaybackStats.DemoLength = TimeSpan.FromMilliseconds(lastPlayedPacketTime);
-		PlaybackStats.TotalTime = playbackTimer.Elapsed;
 	}
 
-	public override void UpdatePlayback(long frameTime, long maxTime)
+	public override void UpdatePlayback(long frameTime)
 	{
-		if (PlayingFinished)
+		if (!PlayingFinished)
 		{
-			return;
-		}
-		PlaybackStats.Frames++;
-		playbackTime += frameTime;
-		Stopwatch stopwatch = Stopwatch.StartNew();
-		while (PlaybackPacket())
-		{
-			if (stopwatch.Elapsed.TotalMilliseconds > (double)maxTime)
+			demoFile.Progress(frameTime);
+			Stopwatch.StartNew();
+			while (!demoFile.IsFinished && PlaybackPacket())
 			{
-				playbackTime = lastPlayedPacketTime;
-				break;
 			}
 		}
 	}
 
-	private bool PlaybackPacket()
+	private unsafe bool PlaybackPacket()
 	{
-		if (PlayingFinished)
+		Packet packet = demoFile.ReadPacket();
+		if (!packet.isValid)
 		{
-			return false;
-		}
-		long position = playbackReader.BaseStream.Position;
-		int count = playbackReader.ReadInt32();
-		long num = playbackReader.ReadInt64();
-		if (num > playbackTime)
-		{
-			playbackReader.BaseStream.Position = position;
-			return false;
-		}
-		byte[] packet = playbackReader.ReadBytes(count);
-		if (playbackReader.ReadChar() != 0)
-		{
-			UnityEngine.Debug.LogWarning("Invalid sequence in demo");
-			StopPlayback();
-			return false;
-		}
-		if (playbackReader.ReadChar() != 0)
-		{
-			UnityEngine.Debug.LogWarning("Invalid sequence in demo");
-			StopPlayback();
 			return false;
 		}
 		DemoPeer demoPeer = (DemoPeer)peer;
 		try
 		{
-			PlaybackStats.Packets++;
-			lastPlayedPacketTime = num;
-			demoPeer.Packet = packet;
-			demoPeer.SetReadPos(0);
-			HandleMessage();
+			fixed (byte* data = packet.Data)
+			{
+				demoPeer.Length = packet.Size;
+				demoPeer.Data = data;
+				demoPeer.SetReadPos(0);
+				HandleMessage();
+			}
 		}
 		finally
 		{
-			demoPeer.Packet = null;
+			demoPeer.Data = null;
+			demoPeer.Length = 0;
 		}
 		return IsPlaying;
 	}

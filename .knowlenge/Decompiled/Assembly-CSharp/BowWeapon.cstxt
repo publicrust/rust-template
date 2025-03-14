@@ -51,8 +51,8 @@ public class BowWeapon : BaseProjectile
 		return base.OnRpcMessage(player, rpc, msg);
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsActiveItem]
+	[RPC_Server]
 	private void BowReload(RPCMessage msg)
 	{
 		ReloadMagazine();

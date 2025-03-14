@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using ConVar;
 using Facepunch;
 using Network;
+using Oxide.Core;
 using ProtoBuf;
 using Rust;
 using UnityEngine;
@@ -68,23 +69,25 @@ public class HotAirBalloon : BaseCombatEntity
 	public static float outsidedecayminutes = 180f;
 
 	[ServerVar]
-	public static float serviceCeiling = 300f;
+	public static float serviceCeiling = 200f;
 
-	private float currentBuoyancy;
+	public float currentBuoyancy;
 
 	public float windForce = 30000f;
 
 	public Vector3 currentWindVec = Vector3.zero;
 
-	private float lastBlastTime;
+	public float lastBlastTime;
 
-	private float avgTerrainHeight;
+	public float avgTerrainHeight;
 
 	public Bounds collapsedBounds;
 
 	public Bounds raisedBounds;
 
 	public GameObject balloonCollider;
+
+	public bool grounded;
 
 	private float nextFuelCheckTime;
 
@@ -181,6 +184,11 @@ public class HotAirBalloon : BaseCombatEntity
 		return WaterLevel.Test(engineHeight.position);
 	}
 
+	public override float GetNetworkTime()
+	{
+		return UnityEngine.Time.fixedTime;
+	}
+
 	public override void PostServerLoad()
 	{
 		base.PostServerLoad();
@@ -240,6 +248,7 @@ public class HotAirBalloon : BaseCombatEntity
 		base.ServerInit();
 		bounds = collapsedBounds;
 		InvokeRandomized(DecayTick, UnityEngine.Random.Range(30f, 60f), 60f, 6f);
+		InvokeRandomized(UpdateIsGrounded, 0f, 3f, 0.2f);
 	}
 
 	public void DecayTick()
@@ -257,15 +266,20 @@ public class HotAirBalloon : BaseCombatEntity
 	[RPC_Server]
 	public void EngineSwitch(RPCMessage msg)
 	{
-		bool b = msg.read.Bit();
-		SetFlag(Flags.On, b);
-		if (IsOn())
+		if (Interface.CallHook("OnHotAirBalloonToggle", this, msg.player) == null)
 		{
-			Invoke(ScheduleOff, 60f);
-		}
-		else
-		{
-			CancelInvoke(ScheduleOff);
+			bool b = msg.read.Bit();
+			SetFlag(Flags.On, b);
+			if (IsOn())
+			{
+				Invoke(ScheduleOff, 60f);
+				Interface.CallHook("OnHotAirBalloonToggled", this, msg.player);
+			}
+			else
+			{
+				CancelInvoke(ScheduleOff);
+				Interface.CallHook("OnHotAirBalloonToggled", this, msg.player);
+			}
 		}
 	}
 
@@ -274,16 +288,23 @@ public class HotAirBalloon : BaseCombatEntity
 		SetFlag(Flags.On, b: false);
 	}
 
+	public void UpdateIsGrounded()
+	{
+		if (!(lastBlastTime + 5f > UnityEngine.Time.time))
+		{
+			List<Collider> obj = Facepunch.Pool.GetList<Collider>();
+			GamePhysics.OverlapSphere(groundSample.transform.position, 1.25f, obj, 1218511105);
+			grounded = obj.Count > 0;
+			Facepunch.Pool.FreeList(ref obj);
+		}
+	}
+
 	protected void FixedUpdate()
 	{
 		if (base.isClient)
 		{
 			return;
 		}
-		List<Collider> obj = Facepunch.Pool.GetList<Collider>();
-		GamePhysics.OverlapSphere(groundSample.transform.position, 1.25f, obj, 1218511105);
-		bool flag = obj.Count > 0;
-		Facepunch.Pool.FreeList(ref obj);
 		if (!HasFuel() || WaterLogged())
 		{
 			SetFlag(Flags.On, b: false);
@@ -294,17 +315,17 @@ public class HotAirBalloon : BaseCombatEntity
 		}
 		SetFlag(Flags.Reserved6, HasFuel());
 		GameObject[] array = killTriggers;
-		foreach (GameObject gameObject in array)
+		foreach (GameObject obj in array)
 		{
 			bool active = (inflationLevel == 1f && myRigidbody.velocity.y < 0f) || myRigidbody.velocity.y < 0.75f;
-			gameObject.SetActive(active);
+			obj.SetActive(active);
 		}
 		float num = inflationLevel;
 		if (IsOn() && inflationLevel < 1f)
 		{
 			inflationLevel = Mathf.Clamp01(inflationLevel + UnityEngine.Time.fixedDeltaTime / 10f);
 		}
-		else if (flag && inflationLevel > 0f && !IsOn() && (UnityEngine.Time.time > lastBlastTime + 30f || WaterLogged()))
+		else if (grounded && inflationLevel > 0f && !IsOn() && (UnityEngine.Time.time > lastBlastTime + 30f || WaterLogged()))
 		{
 			inflationLevel = Mathf.Clamp01(inflationLevel - UnityEngine.Time.fixedDeltaTime / 10f);
 		}
@@ -313,16 +334,19 @@ public class HotAirBalloon : BaseCombatEntity
 			if (inflationLevel == 1f)
 			{
 				bounds = raisedBounds;
+				balloonCollider.SetActive(value: true);
 			}
 			else if (inflationLevel == 0f)
 			{
 				bounds = collapsedBounds;
+				balloonCollider.SetActive(value: false);
 			}
 			SetFlag(Flags.Reserved1, inflationLevel > 0.3f);
 			SetFlag(Flags.Reserved2, inflationLevel >= 1f);
 			SendNetworkUpdate();
-			num = inflationLevel;
+			_ = inflationLevel;
 		}
+		balloonCollider.SetActive(!myRigidbody.IsSleeping() || inflationLevel > 0f);
 		if (IsOn())
 		{
 			if (inflationLevel >= 1f)
@@ -336,27 +360,29 @@ public class HotAirBalloon : BaseCombatEntity
 			currentBuoyancy -= UnityEngine.Time.fixedDeltaTime * 0.1f;
 		}
 		currentBuoyancy = Mathf.Clamp(currentBuoyancy, 0f, 0.8f + 0.2f * base.healthFraction);
-		avgTerrainHeight = Mathf.Lerp(avgTerrainHeight, TerrainMeta.HeightMap.GetHeight(base.transform.position), UnityEngine.Time.deltaTime);
-		float num2 = 1f - Mathf.InverseLerp(avgTerrainHeight + serviceCeiling - 20f, avgTerrainHeight + serviceCeiling, buoyancyPoint.position.y);
-		myRigidbody.AddForceAtPosition(Vector3.up * (0f - UnityEngine.Physics.gravity.y) * myRigidbody.mass * 0.5f * inflationLevel, buoyancyPoint.position, ForceMode.Force);
-		myRigidbody.AddForceAtPosition(Vector3.up * liftAmount * currentBuoyancy * num2, buoyancyPoint.position, ForceMode.Force);
-		Vector3 windAtPos = GetWindAtPos(buoyancyPoint.position);
-		float magnitude = windAtPos.magnitude;
-		float num3 = 1f;
-		float num4 = Mathf.Max(TerrainMeta.HeightMap.GetHeight(buoyancyPoint.position), TerrainMeta.WaterMap.GetHeight(buoyancyPoint.position));
-		float num5 = Mathf.InverseLerp(num4 + 20f, num4 + 60f, buoyancyPoint.position.y);
-		float num6 = 1f;
-		if (UnityEngine.Physics.SphereCast(new Ray(base.transform.position + Vector3.up * 2f, Vector3.down), 1.5f, out var hitInfo, 5f, 1218511105))
+		if (inflationLevel > 0f)
 		{
-			num6 = Mathf.Clamp01(hitInfo.distance / 5f);
+			avgTerrainHeight = Mathf.Lerp(avgTerrainHeight, TerrainMeta.HeightMap.GetHeight(base.transform.position), UnityEngine.Time.deltaTime);
+			float num2 = 1f - Mathf.InverseLerp(avgTerrainHeight + serviceCeiling - 20f, avgTerrainHeight + serviceCeiling, buoyancyPoint.position.y);
+			myRigidbody.AddForceAtPosition(Vector3.up * (0f - UnityEngine.Physics.gravity.y) * myRigidbody.mass * 0.5f * inflationLevel, buoyancyPoint.position, ForceMode.Force);
+			myRigidbody.AddForceAtPosition(Vector3.up * liftAmount * currentBuoyancy * num2, buoyancyPoint.position, ForceMode.Force);
+			Vector3 windAtPos = GetWindAtPos(buoyancyPoint.position);
+			_ = windAtPos.magnitude;
+			float num3 = 1f;
+			float num4 = Mathf.Max(TerrainMeta.HeightMap.GetHeight(buoyancyPoint.position), TerrainMeta.WaterMap.GetHeight(buoyancyPoint.position));
+			float num5 = Mathf.InverseLerp(num4 + 20f, num4 + 60f, buoyancyPoint.position.y);
+			float num6 = 1f;
+			if (UnityEngine.Physics.SphereCast(new Ray(base.transform.position + Vector3.up * 2f, Vector3.down), 1.5f, out var hitInfo, 5f, 1218511105))
+			{
+				num6 = Mathf.Clamp01(hitInfo.distance / 5f);
+			}
+			num3 *= num5 * num2 * num6;
+			num3 *= 0.2f + 0.8f * base.healthFraction;
+			Vector3 vector = windAtPos.normalized * num3 * windForce;
+			currentWindVec = Vector3.Lerp(currentWindVec, vector, UnityEngine.Time.fixedDeltaTime * 0.25f);
+			myRigidbody.AddForceAtPosition(vector * 0.1f, buoyancyPoint.position, ForceMode.Force);
+			myRigidbody.AddForce(vector * 0.9f, ForceMode.Force);
 		}
-		num3 *= num5 * num2 * num6;
-		num3 *= 0.2f + 0.8f * base.healthFraction;
-		Vector3 normalized = windAtPos.normalized;
-		Vector3 vector = normalized * num3 * windForce;
-		currentWindVec = Vector3.Lerp(currentWindVec, vector, UnityEngine.Time.fixedDeltaTime * 0.25f);
-		myRigidbody.AddForceAtPosition(vector * 0.1f, buoyancyPoint.position, ForceMode.Force);
-		myRigidbody.AddForce(vector * 0.9f, ForceMode.Force);
 	}
 
 	public override Vector3 GetLocalVelocityServer()
@@ -428,11 +454,6 @@ public class HotAirBalloon : BaseCombatEntity
 	{
 		float num = pos.y * 6f;
 		return new Vector3(Mathf.Sin(num * ((float)Math.PI / 180f)), 0f, Mathf.Cos(num * ((float)Math.PI / 180f))).normalized * 1f;
-	}
-
-	public override bool PhysicsDriven()
-	{
-		return true;
 	}
 
 	public override bool SupportsChildDeployables()

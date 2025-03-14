@@ -1,4 +1,5 @@
 using System;
+using Oxide.Core;
 using UnityEngine;
 using UnityEngine.AI;
 
@@ -10,7 +11,7 @@ public class NPCPlayer : BasePlayer
 	private float randomOffset;
 
 	[NonSerialized]
-	private Vector3 spawnPos;
+	public Vector3 spawnPos;
 
 	public PlayerInventoryProperties[] loadouts;
 
@@ -18,13 +19,19 @@ public class NPCPlayer : BasePlayer
 
 	public NavMeshAgent NavAgent;
 
+	public float damageScale = 1f;
+
 	private bool _isDormant;
 
-	private float triggerEndTime;
+	public float lastGunShotTime;
 
-	protected float nextTriggerTime;
+	public float triggerEndTime;
+
+	public float nextTriggerTime;
 
 	private float lastThinkTime;
+
+	public Vector3 lastPos;
 
 	protected bool _traversingNavMeshLink;
 
@@ -32,21 +39,11 @@ public class NPCPlayer : BasePlayer
 
 	protected string _currentNavMeshLinkName;
 
-	protected float _currentNavMeshLinkTraversalTime;
-
-	protected float _currentNavMeshLinkTraversalTimeDelta;
-
 	protected Quaternion _currentNavMeshLinkOrientation;
 
 	protected Vector3 _currentNavMeshLinkEndPos;
 
-	private Vector3 lastPos;
-
 	public override bool IsNpc => true;
-
-	public bool AgencyUpdateRequired { get; set; }
-
-	public bool IsOnOffmeshLinkAndReachedNewCoord { get; set; }
 
 	public virtual bool IsDormant
 	{
@@ -57,13 +54,11 @@ public class NPCPlayer : BasePlayer
 		set
 		{
 			_isDormant = value;
-			if (!_isDormant)
-			{
-			}
+			_ = _isDormant;
 		}
 	}
 
-	protected override float PositionTickRate => 0.05f;
+	protected override float PositionTickRate => 0.1f;
 
 	public virtual bool IsOnNavMeshLink
 	{
@@ -89,6 +84,15 @@ public class NPCPlayer : BasePlayer
 		}
 	}
 
+	public bool AgencyUpdateRequired { get; set; }
+
+	public bool IsOnOffmeshLinkAndReachedNewCoord { get; set; }
+
+	public virtual bool IsLoadBalanced()
+	{
+		return false;
+	}
+
 	public override void ServerInit()
 	{
 		if (!base.isClient)
@@ -97,7 +101,7 @@ public class NPCPlayer : BasePlayer
 			randomOffset = UnityEngine.Random.Range(0f, 1f);
 			base.ServerInit();
 			UpdateNetworkGroup();
-			if (loadouts != null && loadouts.Length > 0)
+			if (loadouts != null && loadouts.Length != 0)
 			{
 				loadouts[UnityEngine.Random.Range(0, loadouts.Length)].GiveToPlayer(this);
 			}
@@ -105,9 +109,12 @@ public class NPCPlayer : BasePlayer
 			{
 				Debug.LogWarningFormat("Loadout for NPC {0} was empty.", base.name);
 			}
-			InvokeRepeating(ServerThink_Internal, 0f, 0.1f);
-			lastThinkTime = Time.time;
-			Invoke(EquipTest, 1f);
+			if (!IsLoadBalanced())
+			{
+				InvokeRepeating(ServerThink_Internal, 0f, 0.1f);
+				lastThinkTime = Time.time;
+			}
+			Invoke(EquipTest, 0.25f);
 			finalDestination = base.transform.position;
 			AgencyUpdateRequired = false;
 			IsOnOffmeshLinkAndReachedNewCoord = false;
@@ -137,14 +144,56 @@ public class NPCPlayer : BasePlayer
 
 	public AttackEntity GetAttackEntity()
 	{
-		HeldEntity heldEntity = GetHeldEntity();
-		return heldEntity as AttackEntity;
+		return GetHeldEntity() as AttackEntity;
+	}
+
+	public BaseProjectile GetGun()
+	{
+		AttackEntity attackEntity = GetHeldEntity() as AttackEntity;
+		if (attackEntity == null)
+		{
+			return null;
+		}
+		BaseProjectile baseProjectile = attackEntity as BaseProjectile;
+		if ((bool)baseProjectile)
+		{
+			return baseProjectile;
+		}
+		return null;
+	}
+
+	public virtual float AmmoFractionRemaining()
+	{
+		AttackEntity attackEntity = GetAttackEntity();
+		if ((bool)attackEntity)
+		{
+			return attackEntity.AmmoFraction();
+		}
+		return 0f;
+	}
+
+	public virtual bool IsReloading()
+	{
+		AttackEntity attackEntity = GetAttackEntity();
+		if (!attackEntity)
+		{
+			return false;
+		}
+		return attackEntity.ServerIsReloading();
+	}
+
+	public virtual void AttemptReload()
+	{
+		AttackEntity attackEntity = GetAttackEntity();
+		if (!(attackEntity == null) && attackEntity.CanReload())
+		{
+			attackEntity.ServerReload();
+		}
 	}
 
 	public virtual bool ShotTest()
 	{
-		HeldEntity heldEntity = GetHeldEntity();
-		AttackEntity attackEntity = heldEntity as AttackEntity;
+		AttackEntity attackEntity = GetHeldEntity() as AttackEntity;
 		if (attackEntity == null)
 		{
 			return false;
@@ -182,14 +231,27 @@ public class NPCPlayer : BasePlayer
 			TriggerDown();
 			return true;
 		}
-		attackEntity.ServerUse();
+		attackEntity.ServerUse(damageScale);
+		lastGunShotTime = Time.time;
 		return true;
+	}
+
+	public virtual float GetAimConeScale()
+	{
+		return 1f;
+	}
+
+	public void CancelBurst(float delay = 0.2f)
+	{
+		if (triggerEndTime > Time.time + delay)
+		{
+			triggerEndTime = Time.time + delay;
+		}
 	}
 
 	public bool MeleeAttack()
 	{
-		HeldEntity heldEntity = GetHeldEntity();
-		AttackEntity attackEntity = heldEntity as AttackEntity;
+		AttackEntity attackEntity = GetHeldEntity() as AttackEntity;
 		if (attackEntity == null)
 		{
 			return false;
@@ -199,34 +261,50 @@ public class NPCPlayer : BasePlayer
 		{
 			return false;
 		}
-		baseMelee.ServerUse();
+		baseMelee.ServerUse(damageScale);
 		return true;
 	}
 
 	public virtual void TriggerDown()
 	{
-		HeldEntity heldEntity = GetHeldEntity();
-		AttackEntity attackEntity = heldEntity as AttackEntity;
+		AttackEntity attackEntity = GetHeldEntity() as AttackEntity;
 		if (attackEntity != null)
 		{
-			attackEntity.ServerUse();
+			attackEntity.ServerUse(damageScale);
 		}
+		lastGunShotTime = Time.time;
 		if (Time.time > triggerEndTime)
 		{
 			CancelInvoke(TriggerDown);
-			nextTriggerTime = Time.time + ((!(attackEntity != null)) ? 1f : attackEntity.attackSpacing);
+			nextTriggerTime = Time.time + ((attackEntity != null) ? attackEntity.attackSpacing : 1f);
+		}
+	}
+
+	public virtual void EquipWeapon()
+	{
+		Item slot = inventory.containerBelt.GetSlot(0);
+		if (slot == null || Interface.CallHook("OnNpcEquipWeapon", this, slot) != null)
+		{
+			return;
+		}
+		UpdateActiveItem(inventory.containerBelt.GetSlot(0).uid);
+		BaseEntity heldEntity = slot.GetHeldEntity();
+		if (heldEntity != null)
+		{
+			AttackEntity component = heldEntity.GetComponent<AttackEntity>();
+			if (component != null)
+			{
+				component.TopUpAmmo();
+			}
 		}
 	}
 
 	public void EquipTest()
 	{
-		if (inventory.containerBelt.GetSlot(0) != null)
-		{
-			UpdateActiveItem(inventory.containerBelt.GetSlot(0).uid);
-		}
+		EquipWeapon();
 	}
 
-	public void ServerThink_Internal()
+	internal void ServerThink_Internal()
 	{
 		float delta = Time.time - lastThinkTime;
 		ServerThink(delta);
@@ -282,115 +360,6 @@ public class NPCPlayer : BasePlayer
 		}
 	}
 
-	private void HandleNavMeshLinkTraversal(float delta, ref Vector3 moveToPosition)
-	{
-		if (!_traversingNavMeshLink)
-		{
-			HandleNavMeshLinkTraversalStart(delta);
-		}
-		HandleNavMeshLinkTraversalTick(delta, ref moveToPosition);
-		if (!IsNavMeshLinkTraversalComplete(delta, ref moveToPosition))
-		{
-			_currentNavMeshLinkTraversalTimeDelta += delta;
-		}
-	}
-
-	private bool HandleNavMeshLinkTraversalStart(float delta)
-	{
-		OffMeshLinkData currentOffMeshLinkData = NavAgent.currentOffMeshLinkData;
-		if (!currentOffMeshLinkData.valid || !currentOffMeshLinkData.activated || currentOffMeshLinkData.offMeshLink == null)
-		{
-			return false;
-		}
-		Vector3 normalized = (currentOffMeshLinkData.endPos - currentOffMeshLinkData.startPos).normalized;
-		normalized.y = 0f;
-		Vector3 desiredVelocity = NavAgent.desiredVelocity;
-		desiredVelocity.y = 0f;
-		float num = Vector3.Dot(desiredVelocity, normalized);
-		if (num < 0.1f)
-		{
-			CompleteNavMeshLink();
-			return false;
-		}
-		_currentNavMeshLink = currentOffMeshLinkData;
-		_currentNavMeshLinkName = _currentNavMeshLink.linkType.ToString();
-		if (currentOffMeshLinkData.offMeshLink.biDirectional)
-		{
-			float sqrMagnitude = (currentOffMeshLinkData.endPos - ServerPosition).sqrMagnitude;
-			if (sqrMagnitude < 0.05f)
-			{
-				_currentNavMeshLinkEndPos = currentOffMeshLinkData.startPos;
-				_currentNavMeshLinkOrientation = Quaternion.LookRotation(currentOffMeshLinkData.startPos + Vector3.up * (currentOffMeshLinkData.endPos.y - currentOffMeshLinkData.startPos.y) - currentOffMeshLinkData.endPos);
-			}
-			else
-			{
-				_currentNavMeshLinkEndPos = currentOffMeshLinkData.endPos;
-				_currentNavMeshLinkOrientation = Quaternion.LookRotation(currentOffMeshLinkData.endPos + Vector3.up * (currentOffMeshLinkData.startPos.y - currentOffMeshLinkData.endPos.y) - currentOffMeshLinkData.startPos);
-			}
-		}
-		else
-		{
-			_currentNavMeshLinkEndPos = currentOffMeshLinkData.endPos;
-			_currentNavMeshLinkOrientation = Quaternion.LookRotation(currentOffMeshLinkData.endPos + Vector3.up * (currentOffMeshLinkData.startPos.y - currentOffMeshLinkData.endPos.y) - currentOffMeshLinkData.startPos);
-		}
-		_traversingNavMeshLink = true;
-		NavAgent.ActivateCurrentOffMeshLink(activated: false);
-		NavAgent.obstacleAvoidanceType = ObstacleAvoidanceType.NoObstacleAvoidance;
-		float num2 = Mathf.Max(NavAgent.speed, 2.8f);
-		float magnitude = (_currentNavMeshLink.startPos - _currentNavMeshLink.endPos).magnitude;
-		_currentNavMeshLinkTraversalTime = magnitude / num2;
-		_currentNavMeshLinkTraversalTimeDelta = 0f;
-		if (_currentNavMeshLinkName == "OpenDoorLink" || _currentNavMeshLinkName == "JumpRockLink" || _currentNavMeshLinkName == "JumpFoundationLink")
-		{
-		}
-		return true;
-	}
-
-	private void HandleNavMeshLinkTraversalTick(float delta, ref Vector3 moveToPosition)
-	{
-		if (_currentNavMeshLinkName == "OpenDoorLink")
-		{
-			moveToPosition = Vector3.Lerp(_currentNavMeshLink.startPos, _currentNavMeshLink.endPos, _currentNavMeshLinkTraversalTimeDelta);
-		}
-		else if (_currentNavMeshLinkName == "JumpRockLink")
-		{
-			moveToPosition = Vector3.Lerp(_currentNavMeshLink.startPos, _currentNavMeshLink.endPos, _currentNavMeshLinkTraversalTimeDelta);
-		}
-		else if (_currentNavMeshLinkName == "JumpFoundationLink")
-		{
-			moveToPosition = Vector3.Lerp(_currentNavMeshLink.startPos, _currentNavMeshLink.endPos, _currentNavMeshLinkTraversalTimeDelta);
-		}
-		else
-		{
-			moveToPosition = Vector3.Lerp(_currentNavMeshLink.startPos, _currentNavMeshLink.endPos, _currentNavMeshLinkTraversalTimeDelta);
-		}
-	}
-
-	private bool IsNavMeshLinkTraversalComplete(float delta, ref Vector3 moveToPosition)
-	{
-		if (_currentNavMeshLinkTraversalTimeDelta >= _currentNavMeshLinkTraversalTime)
-		{
-			moveToPosition = _currentNavMeshLink.endPos;
-			_traversingNavMeshLink = false;
-			_currentNavMeshLink = default(OffMeshLinkData);
-			_currentNavMeshLinkTraversalTime = 0f;
-			_currentNavMeshLinkTraversalTimeDelta = 0f;
-			_currentNavMeshLinkName = string.Empty;
-			_currentNavMeshLinkOrientation = Quaternion.identity;
-			CompleteNavMeshLink();
-			return true;
-		}
-		return false;
-	}
-
-	private void CompleteNavMeshLink()
-	{
-		NavAgent.ActivateCurrentOffMeshLink(activated: true);
-		NavAgent.CompleteOffMeshLink();
-		NavAgent.isStopped = false;
-		NavAgent.obstacleAvoidanceType = ObstacleAvoidanceType.HighQualityObstacleAvoidance;
-	}
-
 	private bool ValidateNextPosition(ref Vector3 moveToPosition)
 	{
 		if (!ValidBounds.Test(moveToPosition) && base.transform != null && !base.IsDestroyed)
@@ -432,8 +401,7 @@ public class NPCPlayer : BasePlayer
 
 	public virtual Vector3 GetAimDirection()
 	{
-		float num = Vector3Ex.Distance2D(finalDestination, GetPosition());
-		if (num >= 1f)
+		if (Vector3Ex.Distance2D(finalDestination, GetPosition()) >= 1f)
 		{
 			Vector3 normalized = (finalDestination - GetPosition()).normalized;
 			return new Vector3(normalized.x, 0f, normalized.z);
@@ -454,5 +422,99 @@ public class NPCPlayer : BasePlayer
 			viewAngles = eyes.rotation.eulerAngles;
 			ServerRotation = eyes.rotation;
 		}
+	}
+
+	private void HandleNavMeshLinkTraversal(float delta, ref Vector3 moveToPosition)
+	{
+		if (!_traversingNavMeshLink)
+		{
+			HandleNavMeshLinkTraversalStart(delta);
+		}
+		HandleNavMeshLinkTraversalTick(delta, ref moveToPosition);
+		if (IsNavMeshLinkTraversalComplete(delta, ref moveToPosition))
+		{
+			CompleteNavMeshLink();
+		}
+	}
+
+	private bool HandleNavMeshLinkTraversalStart(float delta)
+	{
+		OffMeshLinkData currentOffMeshLinkData = NavAgent.currentOffMeshLinkData;
+		if (!currentOffMeshLinkData.valid || !currentOffMeshLinkData.activated)
+		{
+			return false;
+		}
+		Vector3 normalized = (currentOffMeshLinkData.endPos - currentOffMeshLinkData.startPos).normalized;
+		normalized.y = 0f;
+		Vector3 desiredVelocity = NavAgent.desiredVelocity;
+		desiredVelocity.y = 0f;
+		if (Vector3.Dot(desiredVelocity, normalized) < 0.1f)
+		{
+			CompleteNavMeshLink();
+			return false;
+		}
+		_currentNavMeshLink = currentOffMeshLinkData;
+		_currentNavMeshLinkName = currentOffMeshLinkData.linkType.ToString();
+		if ((ServerPosition - currentOffMeshLinkData.startPos).sqrMagnitude > (ServerPosition - currentOffMeshLinkData.endPos).sqrMagnitude)
+		{
+			_currentNavMeshLinkEndPos = currentOffMeshLinkData.startPos;
+			_currentNavMeshLinkOrientation = Quaternion.LookRotation(currentOffMeshLinkData.startPos + Vector3.up * (currentOffMeshLinkData.endPos.y - currentOffMeshLinkData.startPos.y) - currentOffMeshLinkData.endPos);
+		}
+		else
+		{
+			_currentNavMeshLinkEndPos = currentOffMeshLinkData.endPos;
+			_currentNavMeshLinkOrientation = Quaternion.LookRotation(currentOffMeshLinkData.endPos + Vector3.up * (currentOffMeshLinkData.startPos.y - currentOffMeshLinkData.endPos.y) - currentOffMeshLinkData.startPos);
+		}
+		_traversingNavMeshLink = true;
+		NavAgent.ActivateCurrentOffMeshLink(activated: false);
+		NavAgent.obstacleAvoidanceType = ObstacleAvoidanceType.NoObstacleAvoidance;
+		if (!(_currentNavMeshLinkName == "OpenDoorLink") && !(_currentNavMeshLinkName == "JumpRockLink"))
+		{
+			_ = _currentNavMeshLinkName == "JumpFoundationLink";
+		}
+		return true;
+	}
+
+	private void HandleNavMeshLinkTraversalTick(float delta, ref Vector3 moveToPosition)
+	{
+		if (_currentNavMeshLinkName == "OpenDoorLink")
+		{
+			moveToPosition = Vector3.MoveTowards(moveToPosition, _currentNavMeshLinkEndPos, NavAgent.speed * delta);
+		}
+		else if (_currentNavMeshLinkName == "JumpRockLink")
+		{
+			moveToPosition = Vector3.MoveTowards(moveToPosition, _currentNavMeshLinkEndPos, NavAgent.speed * delta);
+		}
+		else if (_currentNavMeshLinkName == "JumpFoundationLink")
+		{
+			moveToPosition = Vector3.MoveTowards(moveToPosition, _currentNavMeshLinkEndPos, NavAgent.speed * delta);
+		}
+		else
+		{
+			moveToPosition = Vector3.MoveTowards(moveToPosition, _currentNavMeshLinkEndPos, NavAgent.speed * delta);
+		}
+	}
+
+	private bool IsNavMeshLinkTraversalComplete(float delta, ref Vector3 moveToPosition)
+	{
+		if ((moveToPosition - _currentNavMeshLinkEndPos).sqrMagnitude < 0.01f)
+		{
+			moveToPosition = _currentNavMeshLinkEndPos;
+			_traversingNavMeshLink = false;
+			_currentNavMeshLink = default(OffMeshLinkData);
+			_currentNavMeshLinkName = string.Empty;
+			_currentNavMeshLinkOrientation = Quaternion.identity;
+			CompleteNavMeshLink();
+			return true;
+		}
+		return false;
+	}
+
+	private void CompleteNavMeshLink()
+	{
+		NavAgent.ActivateCurrentOffMeshLink(activated: true);
+		NavAgent.CompleteOffMeshLink();
+		NavAgent.isStopped = false;
+		NavAgent.obstacleAvoidanceType = ObstacleAvoidanceType.HighQualityObstacleAvoidance;
 	}
 }

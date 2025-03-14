@@ -3,14 +3,17 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
-using Facepunch.Steamworks;
 using Rust;
 using Rust.Workshop;
+using Steamworks;
+using Steamworks.Ugc;
 using UnityEngine;
 
 public class WorkshopSkin : MonoBehaviour
 {
 	public static bool AllowApply = true;
+
+	public static bool AllowUnload = true;
 
 	public static float DownloadTimeout = 60f;
 
@@ -26,13 +29,17 @@ public class WorkshopSkin : MonoBehaviour
 
 	private static Queue<ulong> SkinQueue = new Queue<ulong>();
 
-	private static ListDictionary<ulong, Workshop.Item> ItemCache = new ListDictionary<ulong, Workshop.Item>();
+	private static ListDictionary<ulong, Item> ItemCache = new ListDictionary<ulong, Item>();
 
 	private static ListDictionary<ulong, Skin> SkinCache = new ListDictionary<ulong, Skin>();
 
-	private ulong WorkshopID;
+	private ulong RequestedWorkshopID;
+
+	private ulong AppliedWorkshopID;
 
 	private Action OnRefresh;
+
+	private Skin AppliedSkin;
 
 	public static int QueuedCount => ItemQueue.Count + SkinQueue.Count;
 
@@ -45,32 +52,56 @@ public class WorkshopSkin : MonoBehaviour
 		int count2 = ItemQueue.Count;
 		int count3 = SkinCache.Count;
 		int count4 = SkinQueue.Count;
-		if (ItemCache.Count > 0)
-		{
-			TextTable textTable = new TextTable();
-			textTable.AddColumn("id");
-			textTable.AddColumn("status");
-			foreach (KeyValuePair<ulong, Workshop.Item> item in ItemCache)
-			{
-				ulong key = item.Key;
-				Workshop.Item value = item.Value;
-				string text = ((!value.Installed) ? "loading" : "loaded");
-				textTable.AddRow(key.ToString(), text);
-			}
-			stringBuilder.Append(textTable.ToString());
-			stringBuilder.AppendLine();
-		}
+		float num = 0f;
 		stringBuilder.Append("Items: ");
 		stringBuilder.Append(count);
 		stringBuilder.Append(" in cache + ");
 		stringBuilder.Append(count2);
-		stringBuilder.Append(" loading");
+		stringBuilder.Append(" in queue");
 		stringBuilder.AppendLine();
 		stringBuilder.Append("Skins: ");
 		stringBuilder.Append(count3);
 		stringBuilder.Append(" in cache + ");
 		stringBuilder.Append(count4);
-		stringBuilder.Append(" loading");
+		stringBuilder.Append(" in queue");
+		stringBuilder.AppendLine();
+		stringBuilder.AppendLine();
+		if (ItemCache.Count > 0)
+		{
+			TextTable textTable = new TextTable();
+			textTable.AddColumn("id");
+			textTable.AddColumn("item");
+			textTable.AddColumn("icon_requested");
+			textTable.AddColumn("icon_loaded");
+			textTable.AddColumn("assets_requested");
+			textTable.AddColumn("assets_loaded");
+			textTable.AddColumn("requests");
+			textTable.AddColumn("references");
+			textTable.AddColumn("memory");
+			foreach (KeyValuePair<ulong, Item> item in ItemCache)
+			{
+				ulong key = item.Key;
+				Item value = item.Value;
+				Skin val = null;
+				ListHashSet<WorkshopSkin> val2 = null;
+				SkinCache.TryGetValue(key, out val);
+				RefreshQueue.TryGetValue(key, out val2);
+				float num2 = (float)val.GetSizeInBytes() / 1048576f;
+				string text = (value.IsInstalled ? "+" : "-");
+				string text2 = ((val != null && val.IconRequested) ? "+" : "-");
+				string text3 = ((val != null && val.IconLoaded) ? "+" : "-");
+				string text4 = ((val != null && val.AssetsRequested) ? "+" : "-");
+				string text5 = ((val != null && val.AssetsLoaded) ? "+" : "-");
+				string text6 = ((val2 != null) ? val2.Count.ToString() : "0");
+				string text7 = ((val != null) ? val.references.ToString() : "0");
+				string text8 = ((val != null) ? num2.ToString("0.0 MB") : "0.0 MB");
+				textTable.AddRow(key.ToString(), text, text2, text3, text4, text5, text6, text7, text8);
+				num += num2;
+			}
+			stringBuilder.Append(textTable.ToString());
+			stringBuilder.AppendLine();
+		}
+		stringBuilder.Append("Total memory used: " + num.ToString("0.0 MB"));
 		stringBuilder.AppendLine();
 		return stringBuilder.ToString();
 	}
@@ -81,7 +112,7 @@ public class WorkshopSkin : MonoBehaviour
 		return SkinCache[workshopId];
 	}
 
-	public static Workshop.Item GetItem(ulong workshopId)
+	public static Item GetItem(ulong workshopId)
 	{
 		LoadFromWorkshop(workshopId);
 		return ItemCache[workshopId];
@@ -89,7 +120,7 @@ public class WorkshopSkin : MonoBehaviour
 
 	public static void Apply(GameObject gameobj, ulong workshopId, Action callback = null)
 	{
-		if (Global.SteamClient != null)
+		if (SteamClient.IsValid)
 		{
 			WorkshopSkin workshopSkin = gameobj.GetComponent<WorkshopSkin>();
 			if (workshopSkin == null)
@@ -100,23 +131,41 @@ public class WorkshopSkin : MonoBehaviour
 		}
 	}
 
-	protected void OnDisable()
+	public static void Reset(GameObject gameobj)
+	{
+		WorkshopSkin component = gameobj.GetComponent<WorkshopSkin>();
+		if (component != null)
+		{
+			component.UpdateSkinReference(null, 0uL);
+		}
+		MaterialReplacement.Reset(gameobj);
+	}
+
+	public static void Prepare(GameObject gameobj)
+	{
+		if (gameobj.GetComponent<WorkshopSkin>() == null)
+		{
+			gameobj.AddComponent<WorkshopSkin>();
+		}
+	}
+
+	protected void OnDestroy()
 	{
 		if (!Rust.Application.isQuitting)
 		{
-			DequeueSkinRefresh(WorkshopID);
+			UpdateSkinReference(null, 0uL);
 		}
 	}
 
 	private void Apply(ulong workshopId, Action callback = null)
 	{
-		DequeueSkinRefresh(WorkshopID);
-		WorkshopID = workshopId;
+		DequeueSkinRefresh(RequestedWorkshopID);
+		RequestedWorkshopID = workshopId;
 		OnRefresh = callback;
 		Skin val = null;
-		if (SkinCache.TryGetValue(WorkshopID, out val) && val.Loaded)
+		if (SkinCache.TryGetValue(workshopId, out val) && val.AssetsRequested && val.AssetsLoaded)
 		{
-			ApplySkin(val);
+			ApplySkin(val, workshopId);
 		}
 		else
 		{
@@ -126,7 +175,7 @@ public class WorkshopSkin : MonoBehaviour
 
 	private void EnqueueSkinRefresh(ulong workshopId)
 	{
-		if (workshopId != 0)
+		if (workshopId != 0L)
 		{
 			ListHashSet<WorkshopSkin> val = null;
 			if (!RefreshQueue.TryGetValue(workshopId, out val))
@@ -143,28 +192,43 @@ public class WorkshopSkin : MonoBehaviour
 		if (!ItemCache.Contains(workshopId))
 		{
 			TimeWarning.BeginSample("Workshop.GetItem");
-			Workshop.Item item = Global.SteamClient.Workshop.GetItem(workshopId);
+			Item val = new Item(workshopId);
 			TimeWarning.EndSample();
 			TimeWarning.BeginSample("ItemCache.Add");
-			ItemCache.Add(workshopId, item);
+			ItemCache.Add(workshopId, val);
 			TimeWarning.EndSample();
 			TimeWarning.BeginSample("Skin.New");
-			Skin val = new Skin();
+			Skin skin = new Skin();
 			TimeWarning.EndSample();
 			TimeWarning.BeginSample("SkinCache.Add");
-			SkinCache.Add(workshopId, val);
+			SkinCache.Add(workshopId, skin);
 			TimeWarning.EndSample();
-			ItemQueue.Enqueue(workshopId);
-			if (ItemQueue.Count == 1)
+			if (!skin.IconRequested)
 			{
-				Global.Runner.StartCoroutine(ItemQueueCoroutine());
+				skin.IconRequested = true;
+			}
+			if (!skin.AssetsRequested && RefreshQueue.Contains(workshopId))
+			{
+				skin.AssetsRequested = true;
+			}
+			LoadOrUnloadSkinAssets(workshopId);
+		}
+		else
+		{
+			TimeWarning.BeginSample("SkinCache.Get");
+			Skin skin2 = SkinCache[workshopId];
+			TimeWarning.EndSample();
+			if (!skin2.AssetsRequested && RefreshQueue.Contains(workshopId))
+			{
+				skin2.AssetsRequested = true;
+				LoadOrUnloadSkinAssets(workshopId);
 			}
 		}
 	}
 
 	private void DequeueSkinRefresh(ulong workshopId)
 	{
-		if (workshopId == 0)
+		if (workshopId == 0L)
 		{
 			return;
 		}
@@ -175,6 +239,18 @@ public class WorkshopSkin : MonoBehaviour
 			if (val.Count == 0)
 			{
 				RefreshQueue.Remove(workshopId);
+			}
+		}
+	}
+
+	private static void LoadOrUnloadSkinAssets(ulong workshopId)
+	{
+		if (workshopId != 0L)
+		{
+			ItemQueue.Enqueue(workshopId);
+			if (ItemQueue.Count == 1)
+			{
+				Global.Runner.StartCoroutine(ItemQueueCoroutine());
 			}
 		}
 	}
@@ -201,39 +277,39 @@ public class WorkshopSkin : MonoBehaviour
 
 	private static IEnumerator LoadItem(ulong workshopId)
 	{
-		int index = (int)(workshopId / 100000000 % 10);
-		AssetBundle bundle = bundles[index];
-		if (bundle == null)
+		int index = GetBundleIndex(workshopId);
+		AssetBundle assetBundle = bundles[index];
+		if (assetBundle == null)
 		{
-			AssetBundleCreateRequest bundleRequest = bundleRequests[index];
-			if (bundleRequest == null)
+			AssetBundleCreateRequest assetBundleCreateRequest = bundleRequests[index];
+			if (assetBundleCreateRequest == null)
 			{
 				TimeWarning.BeginSample("AssetBundle.LoadFromFileAsync");
-				bundleRequest = (bundleRequests[index] = AssetBundle.LoadFromFileAsync("Bundles/textures/textures." + index + ".bundle"));
+				assetBundleCreateRequest = (bundleRequests[index] = AssetBundle.LoadFromFileAsync("Bundles/textures/textures." + index + ".bundle"));
 				TimeWarning.EndSample();
 			}
-			yield return bundleRequest;
+			yield return assetBundleCreateRequest;
 			TimeWarning.BeginSample("BundleRequest");
-			bundle = (bundles[index] = bundleRequests[index].assetBundle);
+			assetBundle = (bundles[index] = bundleRequests[index].assetBundle);
 			TimeWarning.EndSample();
 		}
 		TimeWarning.BeginSample("WorkshopSkin.LoadItem");
 		TimeWarning.BeginSample("ItemCache.Get");
-		Workshop.Item item = ItemCache[workshopId];
+		Item item = ItemCache[workshopId];
 		TimeWarning.EndSample();
 		TimeWarning.BeginSample("Item.Installed");
-		bool itemInstallComplete = item.Installed;
+		bool flag = item.IsInstalled;
 		TimeWarning.EndSample();
-		if (!itemInstallComplete && bundle != null)
+		if (!flag && assetBundle != null)
 		{
 			TimeWarning.BeginSample("Bundle.Contains");
-			itemInstallComplete = bundle.Contains("Assets/Skins/" + workshopId + "/manifest.txt");
+			flag = assetBundle.Contains("Assets/Skins/" + workshopId + "/manifest.txt");
 			TimeWarning.EndSample();
 		}
-		if (!itemInstallComplete)
+		if (!flag)
 		{
 			TimeWarning.BeginSample("Item.Download");
-			bool itemInstallStarted = item.Download();
+			bool itemInstallStarted = item.Download(highPriority: true);
 			TimeWarning.EndSample();
 			if (itemInstallStarted)
 			{
@@ -241,7 +317,7 @@ public class WorkshopSkin : MonoBehaviour
 				Stopwatch sw = Stopwatch.StartNew();
 				TimeWarning.EndSample();
 				TimeWarning.BeginSample("Item.Installed");
-				while (!item.Installed && sw.Elapsed.TotalSeconds < (double)DownloadTimeout)
+				while (!item.IsInstalled && sw.Elapsed.TotalSeconds < (double)DownloadTimeout)
 				{
 					TimeWarning.EndSample();
 					TimeWarning.EndSample();
@@ -251,19 +327,19 @@ public class WorkshopSkin : MonoBehaviour
 				}
 				TimeWarning.EndSample();
 				TimeWarning.BeginSample("Item.Installed");
-				itemInstallComplete = item.Installed;
+				flag = item.IsInstalled;
 				TimeWarning.EndSample();
 			}
 			if (!itemInstallStarted)
 			{
 				UnityEngine.Debug.LogWarning("Skin download failed: " + workshopId);
 			}
-			else if (!itemInstallComplete)
+			else if (!flag)
 			{
 				UnityEngine.Debug.LogWarning("Skin download timed out: " + workshopId);
 			}
 		}
-		if (itemInstallComplete)
+		if (flag)
 		{
 			SkinQueue.Enqueue(workshopId);
 			if (SkinQueue.Count == 1)
@@ -276,35 +352,56 @@ public class WorkshopSkin : MonoBehaviour
 
 	private static IEnumerator LoadSkin(ulong workshopId)
 	{
-		int index = (int)(workshopId / 100000000 % 10);
-		AssetBundle bundle = bundles[index];
+		int bundleIndex = GetBundleIndex(workshopId);
+		AssetBundle bundle = bundles[bundleIndex];
 		TimeWarning.BeginSample("WorkshopSkin.LoadSkin");
 		TimeWarning.BeginSample("ItemCache.Get");
-		Workshop.Item item = ItemCache[workshopId];
+		Item item = ItemCache[workshopId];
 		TimeWarning.EndSample();
 		TimeWarning.BeginSample("SkinCache.Get");
 		Skin skin = SkinCache[workshopId];
 		TimeWarning.EndSample();
-		TimeWarning.EndSample();
-		yield return Global.Runner.StartCoroutine(skin.FromFolder(workshopId, item.Directory, bundle));
-		TimeWarning.BeginSample("WorkshopSkin.LoadSkin");
-		if (RefreshQueue.Contains(workshopId))
+		if (skin.IconRequested && !skin.IconLoaded)
+		{
+			TimeWarning.EndSample();
+			yield return Global.Runner.StartCoroutine(skin.LoadIcon(workshopId, item.Directory, bundle));
+			TimeWarning.BeginSample("WorkshopSkin.LoadSkin");
+		}
+		if (skin.AssetsRequested && !skin.AssetsLoaded)
+		{
+			TimeWarning.EndSample();
+			yield return Global.Runner.StartCoroutine(skin.LoadAssets(workshopId, item.Directory, bundle));
+			TimeWarning.BeginSample("WorkshopSkin.LoadAssets");
+		}
+		if (!skin.AssetsRequested && skin.AssetsLoaded)
+		{
+			TimeWarning.BeginSample("Skin.UnloadAssets");
+			skin.UnloadAssets();
+			TimeWarning.EndSample();
+		}
+		if (skin.AssetsLoaded && RefreshQueue.Contains(workshopId))
 		{
 			ListHashSet<WorkshopSkin> instances = RefreshQueue[workshopId];
 			while (instances.Count > 0)
 			{
-				instances[0].ApplySkin(skin);
+				WorkshopSkin workshopSkin = instances[0];
 				instances.RemoveAt(0);
+				workshopSkin.ApplySkin(skin, workshopId);
 				TimeWarning.EndSample();
 				yield return null;
-				TimeWarning.BeginSample("WorkshopSkin.LoadSkin");
+				TimeWarning.BeginSample("WorkshopSkin.LoadAssets");
 			}
 			RefreshQueue.Remove(workshopId);
 		}
 		TimeWarning.EndSample();
 	}
 
-	private void ApplySkin(Skin skin)
+	private static int GetBundleIndex(ulong workshopId)
+	{
+		return (int)(workshopId / 100000000 % 10);
+	}
+
+	private void ApplySkin(Skin skin, ulong workshopId)
 	{
 		TimeWarning.BeginSample("WorkshopSkin.ApplySkin");
 		if (!this)
@@ -320,11 +417,39 @@ public class WorkshopSkin : MonoBehaviour
 		if (AllowApply)
 		{
 			skin.Apply(base.gameObject);
+			UpdateSkinReference(skin, workshopId);
 		}
 		if (OnRefresh != null)
 		{
 			OnRefresh();
 		}
 		TimeWarning.EndSample();
+	}
+
+	private void UpdateSkinReference(Skin skin, ulong workshopId)
+	{
+		if (AppliedSkin == skin)
+		{
+			return;
+		}
+		if (AppliedSkin != null)
+		{
+			AppliedSkin.references--;
+			if (AppliedSkin.references < 0)
+			{
+				UnityEngine.Debug.LogWarning("Skin has less than 0 references, this should never happen");
+			}
+			else if (AppliedSkin.references == 0 && !RefreshQueue.Contains(AppliedWorkshopID) && AllowUnload && AppliedSkin.AssetsRequested)
+			{
+				AppliedSkin.AssetsRequested = false;
+				LoadOrUnloadSkinAssets(AppliedWorkshopID);
+			}
+		}
+		AppliedSkin = skin;
+		AppliedWorkshopID = workshopId;
+		if (AppliedSkin != null)
+		{
+			AppliedSkin.references++;
+		}
 	}
 }

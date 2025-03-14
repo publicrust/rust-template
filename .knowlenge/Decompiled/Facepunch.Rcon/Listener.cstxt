@@ -1,33 +1,13 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
-using Facepunch.Rcon;
-using Oxide.Core;
+using System.Threading;
+using Fleck;
 using UnityEngine;
-using WebSocketSharp;
-using WebSocketSharp.Server;
 
 public class Listener
 {
-	public class RConBehaviour : WebSocketBehavior
-	{
-		public Listener Parent;
-
-		protected override void OnMessage(MessageEventArgs e)
-		{
-			if (Parent.OnMessage != null && Interface.CallHook("IOnRconCommand", Context.UserEndPoint, e.Data) == null)
-			{
-				Parent.OnMessage(base.Context.UserEndPoint, base.ID, e.Data);
-			}
-		}
-
-		protected override void OnError(ErrorEventArgs e)
-		{
-			Debug.Log("Rcon Error: " + e.Exception);
-			Debug.Log(e.Message);
-		}
-	}
-
 	public string Password;
 
 	public int Port;
@@ -38,67 +18,132 @@ public class Listener
 
 	public string SslCertificatePassword;
 
-	public Action<IPEndPoint, string, string> OnMessage;
+	public Action<IPAddress, int, string> OnMessage;
+
+	private int nextClientId;
+
+	private readonly Dictionary<int, IWebSocketConnection> clients = new Dictionary<int, IWebSocketConnection>();
+
+	private readonly List<int> deadClients = new List<int>();
 
 	private WebSocketServer server;
 
 	public void Start()
 	{
 		Shutdown();
-		bool secure = !string.IsNullOrEmpty(SslCertificate) && !string.IsNullOrEmpty(SslCertificatePassword);
-		if (Address != null)
+		bool num = !string.IsNullOrEmpty(SslCertificate) && !string.IsNullOrEmpty(SslCertificatePassword);
+		IPAddress address = IPAddress.Any;
+		string arg = (num ? "wss" : "ws");
+		if (Address != null && !IPAddress.TryParse(Address, out address))
 		{
-			IPAddress address = IPAddress.Any;
-			if (!IPAddress.TryParse(Address, out address))
+			address = IPAddress.Any;
+		}
+		string location = $"{arg}://{address}:{Port}";
+		server = new WebSocketServer(location);
+		server.ListenerSocket.NoDelay = true;
+		server.RestartAfterListenError = true;
+		if (num)
+		{
+			X509Certificate2 certificate = new X509Certificate2(SslCertificate, SslCertificatePassword);
+			server.Certificate = certificate;
+		}
+		string requiredPath = "/" + Password;
+		server.Start(delegate(IWebSocketConnection socket)
+		{
+			if (socket.ConnectionInfo.Path != requiredPath)
 			{
-				address = IPAddress.Any;
+				socket.Close();
 			}
-			server = new WebSocketServer(address, Port, secure);
-		}
-		else
-		{
-			server = new WebSocketServer(Port, secure);
-		}
-		if (!string.IsNullOrEmpty(SslCertificate) && !string.IsNullOrEmpty(SslCertificatePassword))
-		{
-			X509Certificate2 serverCertificate = new X509Certificate2(SslCertificate, SslCertificatePassword);
-			server.SslConfiguration.ServerCertificate = serverCertificate;
-		}
-		server.AddWebSocketService("/" + Password, () => new RConBehaviour
-		{
-			IgnoreExtensions = true,
-			Parent = this
+			else
+			{
+				int id = Interlocked.Increment(ref nextClientId);
+				IPAddress ipAddress = socket.ConnectionInfo.ClientIpAddress;
+				socket.OnOpen = delegate
+				{
+					lock (clients)
+					{
+						clients.Add(id, socket);
+					}
+				};
+				socket.OnClose = delegate
+				{
+					lock (clients)
+					{
+						clients.Remove(id);
+					}
+				};
+				socket.OnMessage = delegate(string s)
+				{
+					OnMessage?.Invoke(ipAddress, id, s);
+				};
+				socket.OnError = delegate(Exception e)
+				{
+					Debug.Log("Rcon Error: " + e);
+				};
+			}
 		});
-		server.WaitTime = TimeSpan.FromSeconds(5.0);
-		server.Start();
 	}
 
 	public void Shutdown()
 	{
 		if (server != null)
 		{
-			server.Stop();
+			server.Dispose();
 			server = null;
 		}
 	}
 
 	public void BroadcastMessage(string str)
 	{
-		if (server != null)
+		if (server == null)
 		{
-			server.WebSocketServices.Broadcast(str);
+			return;
+		}
+		lock (clients)
+		{
+			deadClients.Clear();
+			foreach (KeyValuePair<int, IWebSocketConnection> client in clients)
+			{
+				if (client.Value.IsAvailable)
+				{
+					client.Value.Send(str);
+				}
+				else
+				{
+					deadClients.Add(client.Key);
+				}
+			}
+			foreach (int deadClient in deadClients)
+			{
+				if (clients.TryGetValue(deadClient, out var value))
+				{
+					value.Close();
+					clients.Remove(deadClient);
+				}
+			}
 		}
 	}
 
-	public void SendMessage(string target, string str)
+	public void SendMessage(int target, string str)
 	{
 		if (server == null)
 		{
 			return;
 		}
-		foreach (WebSocketServiceHost host in server.WebSocketServices.Hosts)
+		lock (clients)
 		{
-			host.Sessions.SendTo(str, target);
+			if (clients.TryGetValue(target, out var value))
+			{
+				if (!value.IsAvailable)
+				{
+					value.Close();
+					clients.Remove(target);
+				}
+				else
+				{
+					value.Send(str);
+				}
+			}
 		}
 	}
 }

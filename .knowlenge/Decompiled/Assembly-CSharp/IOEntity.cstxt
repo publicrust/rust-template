@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using ConVar;
 using Facepunch;
 using Network;
+using Oxide.Core;
 using ProtoBuf;
 using Rust;
 using UnityEngine;
@@ -57,8 +58,10 @@ public class IOEntity : BaseCombatEntity
 
 		public void Clear()
 		{
+			IOEntity obj = ioEnt;
 			ioEnt = null;
 			entityRef.Set(null);
+			Interface.CallHook("OnIORefCleared", this, obj);
 		}
 
 		public void Set(IOEntity newIOEnt)
@@ -79,6 +82,8 @@ public class IOEntity : BaseCombatEntity
 		public int connectedToSlot;
 
 		public Vector3[] linePoints;
+
+		public float[] slackLevels;
 
 		public ClientIOLine line;
 
@@ -114,6 +119,8 @@ public class IOEntity : BaseCombatEntity
 	[ServerVar]
 	public static int backtracking = 8;
 
+	public const Flags Flag_ShortCircuit = Flags.Reserved7;
+
 	public const Flags Flag_HasPower = Flags.Reserved8;
 
 	public IOSlot[] inputs;
@@ -124,17 +131,17 @@ public class IOEntity : BaseCombatEntity
 
 	public static Queue<IOEntity> _processQueue = new Queue<IOEntity>();
 
-	private int cachedOutputsUsed;
+	public int cachedOutputsUsed;
 
 	private int lastPassthroughEnergy;
 
-	private int lastEnergy;
+	public int lastEnergy;
 
-	protected int currentEnergy;
+	public int currentEnergy;
 
 	private float lastUpdateTime;
 
-	protected bool ensureOutputsUpdated;
+	public bool ensureOutputsUpdated;
 
 	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
 	{
@@ -180,6 +187,17 @@ public class IOEntity : BaseCombatEntity
 		return base.OnRpcMessage(player, rpc, msg);
 	}
 
+	public override void ResetState()
+	{
+		lastResetIndex = 0;
+		cachedOutputsUsed = 0;
+		lastPassthroughEnergy = 0;
+		lastEnergy = 0;
+		currentEnergy = 0;
+		lastUpdateTime = 0f;
+		ensureOutputsUpdated = false;
+	}
+
 	public string GetDisplayName()
 	{
 		if (sourceItem != null)
@@ -199,12 +217,22 @@ public class IOEntity : BaseCombatEntity
 		return true;
 	}
 
-	public bool IsPowered()
+	public virtual bool WantsPassthroughPower()
+	{
+		return WantsPower();
+	}
+
+	public virtual bool AllowDrainFrom(int outputSlot)
+	{
+		return true;
+	}
+
+	public virtual bool IsPowered()
 	{
 		return HasFlag(Flags.Reserved8);
 	}
 
-	public bool IsConnectedTo(IOEntity entity, int slot, int depth)
+	public bool IsConnectedTo(IOEntity entity, int slot, int depth, bool defaultReturn = false)
 	{
 		if (depth > 0 && slot < inputs.Length)
 		{
@@ -218,7 +246,7 @@ public class IOEntity : BaseCombatEntity
 					{
 						return true;
 					}
-					if (iOEntity.IsConnectedTo(entity, depth - 1))
+					if (iOEntity.IsConnectedTo(entity, depth - 1, defaultReturn))
 					{
 						return true;
 					}
@@ -228,7 +256,7 @@ public class IOEntity : BaseCombatEntity
 		return false;
 	}
 
-	public bool IsConnectedTo(IOEntity entity, int depth)
+	public bool IsConnectedTo(IOEntity entity, int depth, bool defaultReturn = false)
 	{
 		if (depth > 0)
 		{
@@ -246,18 +274,19 @@ public class IOEntity : BaseCombatEntity
 					{
 						return true;
 					}
-					if (iOEntity.IsConnectedTo(entity, depth - 1))
+					if (iOEntity.IsConnectedTo(entity, depth - 1, defaultReturn))
 					{
 						return true;
 					}
 				}
 			}
+			return false;
 		}
-		return false;
+		return defaultReturn;
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsVisible(6f)]
+	[RPC_Server]
 	private void Server_RequestData(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
@@ -310,6 +339,7 @@ public class IOEntity : BaseCombatEntity
 				}
 			}
 		}
+		UpdateUsedOutputs();
 		if (IsRootEntity())
 		{
 			Invoke(MarkDirtyForceUpdateOutputs, UnityEngine.Random.Range(1f, 1f));
@@ -350,14 +380,14 @@ public class IOEntity : BaseCombatEntity
 				iOEntity.SendNetworkUpdate();
 			}
 		}
-		IOSlot[] array3 = outputs;
-		foreach (IOSlot iOSlot3 in array3)
+		array = outputs;
+		foreach (IOSlot iOSlot3 in array)
 		{
 			if (iOSlot3.connectedTo.Get() != null)
 			{
 				list.Add(iOSlot3.connectedTo.Get());
-				IOSlot[] array4 = iOSlot3.connectedTo.Get().inputs;
-				foreach (IOSlot iOSlot4 in array4)
+				IOSlot[] array2 = iOSlot3.connectedTo.Get().inputs;
+				foreach (IOSlot iOSlot4 in array2)
 				{
 					if (iOSlot4.connectedTo.Get() != null && iOSlot4.connectedTo.Get().EqualNetID(this))
 					{
@@ -380,14 +410,15 @@ public class IOEntity : BaseCombatEntity
 				item.SendNetworkUpdate();
 			}
 		}
-		for (int m = 0; m < inputs.Length; m++)
+		for (int k = 0; k < inputs.Length; k++)
 		{
-			UpdateFromInput(0, m);
+			UpdateFromInput(0, k);
 		}
 	}
 
 	public void Shutdown()
 	{
+		SendChangedToRoot(forceUpdate: true);
 		ClearConnections();
 	}
 
@@ -397,27 +428,41 @@ public class IOEntity : BaseCombatEntity
 		MarkDirty();
 	}
 
-	public virtual void MarkDirty()
+	public void UpdateUsedOutputs()
 	{
-		if (base.isClient)
-		{
-			return;
-		}
 		cachedOutputsUsed = 0;
 		IOSlot[] array = outputs;
-		foreach (IOSlot iOSlot in array)
+		for (int i = 0; i < array.Length; i++)
 		{
-			if (iOSlot.connectedTo.Get() != null)
+			if (array[i].connectedTo.Get() != null)
 			{
 				cachedOutputsUsed++;
 			}
 		}
-		TouchIOState();
+	}
+
+	public virtual void MarkDirty()
+	{
+		if (!base.isClient)
+		{
+			UpdateUsedOutputs();
+			TouchIOState();
+		}
+	}
+
+	public virtual int DesiredPower()
+	{
+		return ConsumptionAmount();
 	}
 
 	public virtual int ConsumptionAmount()
 	{
 		return 1;
+	}
+
+	public virtual int CalculateCurrentEnergy(int inputAmount, int inputSlot)
+	{
+		return inputAmount;
 	}
 
 	public virtual int GetCurrentEnergy()
@@ -438,9 +483,9 @@ public class IOEntity : BaseCombatEntity
 	public void TouchInternal()
 	{
 		int passthroughAmount = GetPassthroughAmount();
-		bool flag = lastPassthroughEnergy != passthroughAmount;
+		bool num = lastPassthroughEnergy != passthroughAmount;
 		lastPassthroughEnergy = passthroughAmount;
-		if (flag)
+		if (num)
 		{
 			IOStateChanged(currentEnergy, 0);
 			ensureOutputsUpdated = true;
@@ -452,7 +497,7 @@ public class IOEntity : BaseCombatEntity
 	{
 		UpdateHasPower(inputAmount, inputSlot);
 		lastEnergy = currentEnergy;
-		currentEnergy = inputAmount;
+		currentEnergy = CalculateCurrentEnergy(inputAmount, inputSlot);
 		int passthroughAmount = GetPassthroughAmount();
 		bool flag = lastPassthroughEnergy != passthroughAmount;
 		lastPassthroughEnergy = passthroughAmount;
@@ -479,6 +524,55 @@ public class IOEntity : BaseCombatEntity
 
 	public virtual void IOStateChanged(int inputAmount, int inputSlot)
 	{
+	}
+
+	public virtual void OnCircuitChanged(bool forceUpdate)
+	{
+		if (forceUpdate)
+		{
+			MarkDirtyForceUpdateOutputs();
+		}
+	}
+
+	public virtual void SendChangedToRoot(bool forceUpdate)
+	{
+		List<IOEntity> existing = Facepunch.Pool.GetList<IOEntity>();
+		SendChangedToRootRecursive(forceUpdate, ref existing);
+		Facepunch.Pool.FreeList(ref existing);
+	}
+
+	public virtual void SendChangedToRootRecursive(bool forceUpdate, ref List<IOEntity> existing)
+	{
+		bool flag = IsRootEntity();
+		if (existing.Contains(this))
+		{
+			return;
+		}
+		existing.Add(this);
+		bool flag2 = false;
+		for (int i = 0; i < inputs.Length; i++)
+		{
+			IOSlot iOSlot = inputs[i];
+			if (!iOSlot.mainPowerSlot)
+			{
+				continue;
+			}
+			IOEntity iOEntity = iOSlot.connectedTo.Get();
+			if (!(iOEntity == null) && !existing.Contains(iOEntity))
+			{
+				flag2 = true;
+				if (forceUpdate)
+				{
+					iOEntity.ensureOutputsUpdated = true;
+				}
+				iOEntity.SendChangedToRootRecursive(forceUpdate, ref existing);
+			}
+		}
+		if (flag)
+		{
+			forceUpdate = forceUpdate && !flag2;
+			OnCircuitChanged(forceUpdate);
+		}
 	}
 
 	public virtual void UpdateOutputs()
@@ -552,8 +646,8 @@ public class IOEntity : BaseCombatEntity
 			iOConnection.inUse = iOConnection.connectedID != 0;
 			info.msg.ioEntity.inputs.Add(iOConnection);
 		}
-		IOSlot[] array2 = outputs;
-		foreach (IOSlot iOSlot2 in array2)
+		array = outputs;
+		foreach (IOSlot iOSlot2 in array)
 		{
 			ProtoBuf.IOEntity.IOConnection iOConnection2 = Facepunch.Pool.Get<ProtoBuf.IOEntity.IOConnection>();
 			iOConnection2.connectedID = iOSlot2.connectedTo.entityRef.uid;
@@ -565,11 +659,15 @@ public class IOEntity : BaseCombatEntity
 			{
 				iOConnection2.linePointList = Facepunch.Pool.GetList<ProtoBuf.IOEntity.IOConnection.LineVec>();
 				iOConnection2.linePointList.Clear();
-				Vector3[] linePoints = iOSlot2.linePoints;
-				foreach (Vector3 vec in linePoints)
+				for (int j = 0; j < iOSlot2.linePoints.Length; j++)
 				{
+					Vector3 vector = iOSlot2.linePoints[j];
 					ProtoBuf.IOEntity.IOConnection.LineVec lineVec = Facepunch.Pool.Get<ProtoBuf.IOEntity.IOConnection.LineVec>();
-					lineVec.vec = vec;
+					lineVec.vec = vector;
+					if (iOSlot2.slackLevels.Length > j)
+					{
+						lineVec.vec.w = iOSlot2.slackLevels[j];
+					}
 					iOConnection2.linePointList.Add(lineVec);
 				}
 			}
@@ -629,9 +727,9 @@ public class IOEntity : BaseCombatEntity
 		if (!info.fromDisk && base.isClient)
 		{
 			IOSlot[] array = outputs;
-			foreach (IOSlot iOSlot in array)
+			for (int j = 0; j < array.Length; j++)
 			{
-				iOSlot.Clear();
+				array[j].Clear();
 			}
 		}
 		int count2 = info.msg.ioEntity.outputs.Count;
@@ -671,10 +769,14 @@ public class IOEntity : BaseCombatEntity
 				{
 					outputs[l].linePoints = new Vector3[linePointList.Count];
 				}
+				if (outputs[l].slackLevels == null || outputs[l].slackLevels.Length != linePointList.Count)
+				{
+					outputs[l].slackLevels = new float[linePointList.Count];
+				}
 				for (int m = 0; m < linePointList.Count; m++)
 				{
-					ref Vector3 reference = ref outputs[l].linePoints[m];
-					reference = linePointList[m].vec;
+					outputs[l].linePoints[m] = linePointList[m].vec;
+					outputs[l].slackLevels[m] = linePointList[m].vec.w;
 				}
 			}
 		}

@@ -1,11 +1,21 @@
 using System;
 using UnityEngine;
 
-public class PositionLerp : ListComponent<PositionLerp>
+public class PositionLerp : IDisposable
 {
-	public static bool DebugLog;
+	private static ListHashSet<PositionLerp> InstanceList = new ListHashSet<PositionLerp>();
 
-	public static bool DebugDraw;
+	public static bool DebugLog = false;
+
+	public static bool DebugDraw = false;
+
+	public static int TimeOffsetInterval = 16;
+
+	public const int TimeOffsetIntervalMin = 4;
+
+	public const int TimeOffsetIntervalMax = 64;
+
+	private bool enabled = true;
 
 	private Action idleDisable;
 
@@ -21,15 +31,38 @@ public class PositionLerp : ListComponent<PositionLerp>
 
 	private float timeOffset3 = float.MaxValue;
 
+	private int timeOffsetCount;
+
 	private float lastClientTime;
 
 	private float lastServerTime;
 
 	private float extrapolatedTime;
 
+	public bool Enabled
+	{
+		get
+		{
+			return enabled;
+		}
+		set
+		{
+			enabled = value;
+			if (enabled)
+			{
+				InstanceList.Add(this);
+			}
+			else
+			{
+				InstanceList.Remove(this);
+			}
+		}
+	}
+
 	public void Initialize(ILerpTarget target)
 	{
 		this.target = target;
+		Enabled = true;
 	}
 
 	public void Snapshot(Vector3 position, Quaternion rotation, float serverTime)
@@ -38,10 +71,16 @@ public class PositionLerp : ListComponent<PositionLerp>
 		float interpolationSmoothing = target.GetInterpolationSmoothing();
 		float num = interpolationDelay + interpolationSmoothing + 1f;
 		float time = Time.time;
-		timeOffset0 = timeOffset1;
-		timeOffset1 = timeOffset2;
-		timeOffset2 = timeOffset3;
-		timeOffset3 = time - serverTime;
+		timeOffset0 = Mathf.Min(timeOffset0, time - serverTime);
+		timeOffsetCount++;
+		if (timeOffsetCount >= TimeOffsetInterval / 4)
+		{
+			timeOffset3 = timeOffset2;
+			timeOffset2 = timeOffset1;
+			timeOffset1 = timeOffset0;
+			timeOffset0 = float.MaxValue;
+			timeOffsetCount = 0;
+		}
 		float num2 = Mathx.Min(timeOffset0, timeOffset1, timeOffset2, timeOffset3);
 		time = serverTime + num2;
 		if (DebugLog && interpolator.list.Count > 0 && serverTime < lastServerTime)
@@ -74,13 +113,37 @@ public class PositionLerp : ListComponent<PositionLerp>
 		target.SetNetworkRotation(rotation);
 	}
 
+	public void SnapTo(Vector3 position, Quaternion rotation)
+	{
+		interpolator.last = new TransformInterpolator.Entry
+		{
+			pos = position,
+			rot = rotation,
+			time = Time.time
+		};
+		Wipe();
+	}
+
 	public void SnapToEnd()
 	{
 		float interpolationDelay = target.GetInterpolationDelay();
 		TransformInterpolator.Segment segment = interpolator.Query(Time.time, interpolationDelay, 0f, 0f);
 		target.SetNetworkPosition(segment.tick.pos);
 		target.SetNetworkRotation(segment.tick.rot);
+		Wipe();
+	}
+
+	public void Wipe()
+	{
 		interpolator.Clear();
+	}
+
+	public static void WipeAll()
+	{
+		foreach (PositionLerp instance in InstanceList)
+		{
+			instance.Wipe();
+		}
 	}
 
 	protected void DoCycle()
@@ -117,15 +180,10 @@ public class PositionLerp : ListComponent<PositionLerp>
 		{
 			if (idleDisable == null)
 			{
-				idleDisable = IdleDisable;
+				idleDisable = target.LerpIdleDisable;
 			}
-			InvokeHandler.Invoke(this, idleDisable, 0f);
+			InvokeHandler.Invoke(target as Behaviour, idleDisable, 0f);
 		}
-	}
-
-	private void IdleDisable()
-	{
-		base.enabled = false;
 	}
 
 	public void TransformEntries(Matrix4x4 matrix)
@@ -180,10 +238,31 @@ public class PositionLerp : ListComponent<PositionLerp>
 		return (prev.pos - next.pos) / (prev.time - next.time);
 	}
 
+	public void Dispose()
+	{
+		target = null;
+		idleDisable = null;
+		interpolator.Clear();
+		timeOffset0 = float.MaxValue;
+		timeOffset1 = float.MaxValue;
+		timeOffset2 = float.MaxValue;
+		timeOffset3 = float.MaxValue;
+		lastClientTime = 0f;
+		lastServerTime = 0f;
+		extrapolatedTime = 0f;
+		timeOffsetCount = 0;
+		Enabled = false;
+	}
+
+	public static void Clear()
+	{
+		InstanceList.Clear();
+	}
+
 	public static void Cycle()
 	{
-		PositionLerp[] buffer = ListComponent<PositionLerp>.InstanceList.Values.Buffer;
-		int count = ListComponent<PositionLerp>.InstanceList.Count;
+		PositionLerp[] buffer = InstanceList.Values.Buffer;
+		int count = InstanceList.Count;
 		for (int i = 0; i < count; i++)
 		{
 			buffer[i].DoCycle();

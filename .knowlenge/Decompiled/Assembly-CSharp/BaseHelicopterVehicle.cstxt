@@ -4,7 +4,7 @@ using UnityEngine;
 
 public class BaseHelicopterVehicle : BaseVehicle
 {
-	public struct HelicopterInputState_t
+	public class HelicopterInputState
 	{
 		public float throttle;
 
@@ -13,16 +13,27 @@ public class BaseHelicopterVehicle : BaseVehicle
 		public float yaw;
 
 		public float pitch;
+
+		public bool groundControl;
+
+		public void Reset()
+		{
+			throttle = 0f;
+			roll = 0f;
+			yaw = 0f;
+			pitch = 0f;
+			groundControl = false;
+		}
 	}
 
 	[Header("Helicopter")]
-	public Rigidbody rigidBody;
-
 	public float engineThrustMax;
 
 	public Vector3 torqueScale;
 
 	public Transform com;
+
+	public GameObject[] killTriggers;
 
 	[Header("Effects")]
 	public Transform[] GroundPoints;
@@ -33,11 +44,40 @@ public class BaseHelicopterVehicle : BaseVehicle
 
 	public GameObjectRef fireBall;
 
+	public GameObjectRef impactEffectSmall;
+
+	public GameObjectRef impactEffectLarge;
+
+	[Header("Sounds")]
+	public SoundDefinition flightEngineSoundDef;
+
+	public SoundDefinition flightThwopsSoundDef;
+
+	private Sound flightEngineSound;
+
+	private Sound flightThwopsSound;
+
+	private SoundModulation.Modulator flightEngineGainMod;
+
+	private SoundModulation.Modulator flightThwopsGainMod;
+
+	public float rotorGainModSmoothing = 0.25f;
+
+	public float engineGainMin = 0.5f;
+
+	public float engineGainMax = 1f;
+
+	public float thwopGainMin = 0.5f;
+
+	public float thwopGainMax = 1f;
+
+	public float avgTerrainHeight;
+
 	public const Flags Flag_InternalLights = Flags.Reserved6;
 
-	private HelicopterInputState_t currentInputState = default(HelicopterInputState_t);
+	public HelicopterInputState currentInputState = new HelicopterInputState();
 
-	private float lastPlayerInputTime;
+	public float lastPlayerInputTime;
 
 	public float currentThrottle;
 
@@ -49,7 +89,22 @@ public class BaseHelicopterVehicle : BaseVehicle
 
 	public float liftFraction = 0.25f;
 
-	protected float hoverForceScale = 0.99f;
+	public float hoverForceScale = 0.99f;
+
+	public float thrustLerpSpeed = 1f;
+
+	protected Vector3 damageTorque;
+
+	public float nextDamageTime;
+
+	public float nextEffectTime;
+
+	public float pendingImpactDamage;
+
+	public virtual float GetServiceCeiling()
+	{
+		return 1000f;
+	}
 
 	public override Vector3 GetLocalVelocityServer()
 	{
@@ -79,16 +134,15 @@ public class BaseHelicopterVehicle : BaseVehicle
 
 	public virtual void PilotInput(InputState inputState, BasePlayer player)
 	{
-		HelicopterInputState_t helicopterInputState_t = default(HelicopterInputState_t);
-		helicopterInputState_t.throttle = ((!inputState.IsDown(BUTTON.FORWARD)) ? 0f : 1f);
-		helicopterInputState_t.throttle -= ((!inputState.IsDown(BUTTON.BACKWARD)) ? 0f : 1f);
-		helicopterInputState_t.pitch = inputState.current.mouseDelta.y;
-		helicopterInputState_t.roll = 0f - inputState.current.mouseDelta.x;
-		helicopterInputState_t.yaw = ((!inputState.IsDown(BUTTON.RIGHT)) ? 0f : 1f);
-		helicopterInputState_t.yaw -= ((!inputState.IsDown(BUTTON.LEFT)) ? 0f : 1f);
-		helicopterInputState_t.pitch = MouseToBinary(helicopterInputState_t.pitch);
-		helicopterInputState_t.roll = MouseToBinary(helicopterInputState_t.roll);
-		currentInputState = helicopterInputState_t;
+		currentInputState.Reset();
+		currentInputState.throttle = (inputState.IsDown(BUTTON.FORWARD) ? 1f : 0f);
+		currentInputState.throttle -= ((inputState.IsDown(BUTTON.BACKWARD) || inputState.IsDown(BUTTON.DUCK)) ? 1f : 0f);
+		currentInputState.pitch = inputState.current.mouseDelta.y;
+		currentInputState.roll = 0f - inputState.current.mouseDelta.x;
+		currentInputState.yaw = (inputState.IsDown(BUTTON.RIGHT) ? 1f : 0f);
+		currentInputState.yaw -= (inputState.IsDown(BUTTON.LEFT) ? 1f : 0f);
+		currentInputState.pitch = MouseToBinary(currentInputState.pitch);
+		currentInputState.roll = MouseToBinary(currentInputState.roll);
 		lastPlayerInputTime = Time.time;
 	}
 
@@ -100,29 +154,33 @@ public class BaseHelicopterVehicle : BaseVehicle
 		}
 	}
 
-	public virtual HelicopterInputState_t GetDefaultInputState()
+	public virtual void SetDefaultInputState()
 	{
-		HelicopterInputState_t result = default(HelicopterInputState_t);
+		currentInputState.Reset();
 		if (IsMounted())
 		{
 			float num = Vector3.Dot(Vector3.up, base.transform.right);
 			float num2 = Vector3.Dot(Vector3.up, base.transform.forward);
-			result.roll = ((!(num < 0f)) ? 0f : 1f);
-			result.roll -= ((!(num > 0f)) ? 0f : 1f);
+			currentInputState.roll = ((num < 0f) ? 1f : 0f);
+			currentInputState.roll -= ((num > 0f) ? 1f : 0f);
 			if (num2 < -0f)
 			{
-				result.pitch = -1f;
+				currentInputState.pitch = -1f;
 			}
 			else if (num2 > 0f)
 			{
-				result.pitch = 1f;
+				currentInputState.pitch = 1f;
 			}
 		}
 		else
 		{
-			result.throttle = -1f;
+			currentInputState.throttle = -1f;
 		}
-		return result;
+	}
+
+	public virtual bool IsEnginePowered()
+	{
+		return true;
 	}
 
 	public override void VehicleFixedUpdate()
@@ -132,10 +190,24 @@ public class BaseHelicopterVehicle : BaseVehicle
 		{
 			if (Time.time > lastPlayerInputTime + 0.5f)
 			{
-				currentInputState = GetDefaultInputState();
+				SetDefaultInputState();
 			}
 			MovementUpdate();
 			SetFlag(Flags.Reserved6, TOD_Sky.Instance.IsNight);
+			GameObject[] array = killTriggers;
+			foreach (GameObject obj in array)
+			{
+				bool active = rigidBody.velocity.y < 0f;
+				obj.SetActive(active);
+			}
+		}
+	}
+
+	private void OnPhysicsNeighbourChanged()
+	{
+		if (rigidBody != null)
+		{
+			rigidBody.WakeUp();
 		}
 	}
 
@@ -147,27 +219,70 @@ public class BaseHelicopterVehicle : BaseVehicle
 		}
 	}
 
-	public void MovementUpdate()
+	public virtual bool ShouldApplyHoverForce()
 	{
-		HelicopterInputState_t helicopterInputState_t = currentInputState;
-		currentThrottle = Mathf.Lerp(currentThrottle, helicopterInputState_t.throttle, 2f * Time.fixedDeltaTime);
-		currentThrottle = Mathf.Clamp(currentThrottle, -0.8f, 1f);
-		rigidBody.AddRelativeTorque(new Vector3(helicopterInputState_t.pitch * torqueScale.x, helicopterInputState_t.yaw * torqueScale.y, helicopterInputState_t.roll * torqueScale.z), ForceMode.Force);
-		avgThrust = Mathf.Lerp(avgThrust, engineThrustMax * currentThrottle, Time.fixedDeltaTime);
-		float value = Mathf.Clamp01(Vector3.Dot(base.transform.up, Vector3.up));
-		float num = Mathf.InverseLerp(liftDotMax, 1f, value);
-		float num2 = 1f - Mathf.InverseLerp(altForceDotMin, 1f, value);
-		Vector3 force = Vector3.up * engineThrustMax * liftFraction * currentThrottle * num;
-		Vector3 force2 = (base.transform.up - Vector3.up).normalized * engineThrustMax * currentThrottle * num2;
-		float num3 = rigidBody.mass * (0f - Physics.gravity.y);
-		rigidBody.AddForce(base.transform.up * num3 * num * hoverForceScale, ForceMode.Force);
-		rigidBody.AddForce(force, ForceMode.Force);
-		rigidBody.AddForce(force2, ForceMode.Force);
+		return true;
+	}
+
+	public virtual bool IsEngineOn()
+	{
+		return true;
+	}
+
+	public void ClearDamageTorque()
+	{
+		SetDamageTorque(Vector3.zero);
+	}
+
+	public void SetDamageTorque(Vector3 newTorque)
+	{
+		damageTorque = newTorque;
+	}
+
+	public void AddDamageTorque(Vector3 torqueToAdd)
+	{
+		damageTorque += torqueToAdd;
+	}
+
+	public virtual void MovementUpdate()
+	{
+		if (IsEngineOn())
+		{
+			HelicopterInputState helicopterInputState = currentInputState;
+			currentThrottle = Mathf.Lerp(currentThrottle, helicopterInputState.throttle, 2f * Time.fixedDeltaTime);
+			currentThrottle = Mathf.Clamp(currentThrottle, -0.8f, 1f);
+			if (helicopterInputState.pitch != 0f || helicopterInputState.roll != 0f || helicopterInputState.yaw != 0f)
+			{
+				rigidBody.AddRelativeTorque(new Vector3(helicopterInputState.pitch * torqueScale.x, helicopterInputState.yaw * torqueScale.y, helicopterInputState.roll * torqueScale.z), ForceMode.Force);
+			}
+			if (damageTorque != Vector3.zero)
+			{
+				rigidBody.AddRelativeTorque(new Vector3(damageTorque.x, damageTorque.y, damageTorque.z), ForceMode.Force);
+			}
+			avgThrust = Mathf.Lerp(avgThrust, engineThrustMax * currentThrottle, Time.fixedDeltaTime * thrustLerpSpeed);
+			float value = Mathf.Clamp01(Vector3.Dot(base.transform.up, Vector3.up));
+			float num = Mathf.InverseLerp(liftDotMax, 1f, value);
+			float serviceCeiling = GetServiceCeiling();
+			avgTerrainHeight = Mathf.Lerp(avgTerrainHeight, TerrainMeta.HeightMap.GetHeight(base.transform.position), Time.deltaTime);
+			float num2 = 1f - Mathf.InverseLerp(avgTerrainHeight + serviceCeiling - 20f, avgTerrainHeight + serviceCeiling, base.transform.position.y);
+			num *= num2;
+			float num3 = 1f - Mathf.InverseLerp(altForceDotMin, 1f, value);
+			Vector3 force = Vector3.up * engineThrustMax * liftFraction * currentThrottle * num;
+			Vector3 force2 = (base.transform.up - Vector3.up).normalized * engineThrustMax * currentThrottle * num3;
+			if (ShouldApplyHoverForce())
+			{
+				float num4 = rigidBody.mass * (0f - Physics.gravity.y);
+				rigidBody.AddForce(base.transform.up * num4 * num * hoverForceScale, ForceMode.Force);
+			}
+			rigidBody.AddForce(force, ForceMode.Force);
+			rigidBody.AddForce(force2, ForceMode.Force);
+		}
 	}
 
 	public void DelayedImpactDamage()
 	{
-		Hurt(100000f, DamageType.Explosion, this, useProtection: false);
+		Hurt(pendingImpactDamage * MaxHealth(), DamageType.Explosion, this, useProtection: false);
+		pendingImpactDamage = 0f;
 	}
 
 	public virtual bool CollisionDamageEnabled()
@@ -175,16 +290,45 @@ public class BaseHelicopterVehicle : BaseVehicle
 		return true;
 	}
 
-	private void OnCollisionEnter(Collision collision)
+	public void ProcessCollision(Collision collision)
 	{
-		if (!base.isClient && CollisionDamageEnabled())
+		if (base.isClient || !CollisionDamageEnabled() || Time.time < nextDamageTime)
 		{
-			float magnitude = collision.relativeVelocity.magnitude;
-			if ((!collision.gameObject || (collision.gameObject.layer & 0x48A12101) <= 0) && magnitude > 20f && !IsInvoking(DelayedImpactDamage))
+			return;
+		}
+		float magnitude = collision.relativeVelocity.magnitude;
+		if ((bool)collision.gameObject && ((1 << collision.collider.gameObject.layer) & 0x48A12101) <= 0)
+		{
+			return;
+		}
+		float num = Mathf.InverseLerp(5f, 30f, magnitude);
+		if (!(num > 0f))
+		{
+			return;
+		}
+		pendingImpactDamage += Mathf.Max(num, 0.15f);
+		if (Vector3.Dot(base.transform.up, Vector3.up) < 0.5f)
+		{
+			pendingImpactDamage *= 5f;
+		}
+		if (Time.time > nextEffectTime)
+		{
+			nextEffectTime = Time.time + 0.25f;
+			if (impactEffectSmall.isValid)
 			{
-				Invoke(DelayedImpactDamage, 0.015f);
+				Vector3 point = collision.GetContact(0).point;
+				point += (base.transform.position - point) * 0.25f;
+				Effect.server.Run(impactEffectSmall.resourcePath, point, base.transform.up);
 			}
 		}
+		rigidBody.AddForceAtPosition(collision.GetContact(0).normal * (1f + 3f * num), collision.GetContact(0).point, ForceMode.VelocityChange);
+		nextDamageTime = Time.time + 0.333f;
+		Invoke(DelayedImpactDamage, 0.015f);
+	}
+
+	public void OnCollisionEnter(Collision collision)
+	{
+		ProcessCollision(collision);
 	}
 
 	public override void OnKilled(HitInfo info)
@@ -194,27 +338,52 @@ public class BaseHelicopterVehicle : BaseVehicle
 			base.OnKilled(info);
 			return;
 		}
-		Effect.server.Run(explosionEffect.resourcePath, base.transform.position, Vector3.up, null, broadcast: true);
-		Vector3 vector = rigidBody.velocity * 0.25f;
-		GameObject gibSource = serverGibs.Get().GetComponent<ServerGib>()._gibSource;
-		List<ServerGib> list = ServerGib.CreateGibs(serverGibs.resourcePath, base.gameObject, gibSource, vector, 3f);
-		for (int i = 0; i < 12; i++)
+		if (explosionEffect.isValid)
 		{
-			BaseEntity baseEntity = GameManager.server.CreateEntity(fireBall.resourcePath, base.transform.position, base.transform.rotation);
-			if (!baseEntity)
+			Effect.server.Run(explosionEffect.resourcePath, base.transform.position, Vector3.up, null, broadcast: true);
+		}
+		Vector3 vector = rigidBody.velocity * 0.25f;
+		List<ServerGib> list = null;
+		if (serverGibs.isValid)
+		{
+			GameObject gibSource = serverGibs.Get().GetComponent<ServerGib>()._gibSource;
+			list = ServerGib.CreateGibs(serverGibs.resourcePath, base.gameObject, gibSource, vector, 3f);
+		}
+		Vector3 vector2 = CenterPoint();
+		if (fireBall.isValid)
+		{
+			for (int i = 0; i < 12; i++)
 			{
-				continue;
-			}
-			float min = 3f;
-			float max = 10f;
-			Vector3 onUnitSphere = Random.onUnitSphere;
-			baseEntity.transform.position = base.transform.position + new Vector3(0f, 1.5f, 0f) + onUnitSphere * Random.Range(-4f, 4f);
-			Collider component = baseEntity.GetComponent<Collider>();
-			baseEntity.Spawn();
-			baseEntity.SetVelocity(vector + onUnitSphere * Random.Range(min, max));
-			foreach (ServerGib item in list)
-			{
-				Physics.IgnoreCollision(component, item.GetCollider(), ignore: true);
+				BaseEntity baseEntity = GameManager.server.CreateEntity(fireBall.resourcePath, vector2, base.transform.rotation);
+				if (!baseEntity)
+				{
+					continue;
+				}
+				float min = 3f;
+				float max = 10f;
+				Vector3 onUnitSphere = Random.onUnitSphere;
+				onUnitSphere.Normalize();
+				float num = Random.Range(0.5f, 4f);
+				RaycastHit hitInfo;
+				bool num2 = Physics.Raycast(vector2, onUnitSphere, out hitInfo, num, 1218652417);
+				Vector3 position = hitInfo.point;
+				if (!num2)
+				{
+					position = vector2 + onUnitSphere * num;
+				}
+				position -= onUnitSphere * 0.5f;
+				baseEntity.transform.position = position;
+				Collider component = baseEntity.GetComponent<Collider>();
+				baseEntity.Spawn();
+				baseEntity.SetVelocity(vector + onUnitSphere * Random.Range(min, max));
+				if (list == null)
+				{
+					continue;
+				}
+				foreach (ServerGib item in list)
+				{
+					Physics.IgnoreCollision(component, item.GetCollider(), ignore: true);
+				}
 			}
 		}
 		base.OnKilled(info);

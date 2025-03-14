@@ -6,8 +6,7 @@ public class ItemModUseContent : ItemMod
 	{
 		if (item.contents != null && item.contents.itemList.Count != 0)
 		{
-			Item item2 = item.contents.itemList[0];
-			item2.UseItem(amountToConsume);
+			item.contents.itemList[0].UseItem(amountToConsume);
 		}
 	}
 }

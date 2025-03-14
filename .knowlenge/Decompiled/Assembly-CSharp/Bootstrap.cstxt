@@ -1,4 +1,3 @@
-using System;
 using System.Collections;
 using System.Globalization;
 using System.Linq;
@@ -6,12 +5,13 @@ using System.Threading;
 using ConVar;
 using Facepunch;
 using Facepunch.Network.Raknet;
+using Facepunch.Utility;
 using Network;
 using Oxide.Core;
 using Rust;
 using Rust.Ai;
+using TMPro;
 using UnityEngine;
-using UnityEngine.UI;
 
 public class Bootstrap : SingletonComponent<Bootstrap>
 {
@@ -21,11 +21,13 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 
 	public string messageString = "Loading...";
 
+	public CanvasGroup BootstrapUiCanvas;
+
 	public GameObject errorPanel;
 
-	public Text errorText;
+	public TextMeshProUGUI errorText;
 
-	public Text statusText;
+	public TextMeshProUGUI statusText;
 
 	public static bool needsSetup => !bootstrapInitRun;
 
@@ -33,15 +35,11 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 	{
 		get
 		{
-			if (bootstrapInitRun)
+			if (!bootstrapInitRun)
 			{
-				return true;
+				return Object.FindObjectsOfType<GameSetup>().Count() > 0;
 			}
-			if (UnityEngine.Object.FindObjectsOfType<GameSetup>().Count() > 0)
-			{
-				return true;
-			}
-			return false;
+			return true;
 		}
 	}
 
@@ -51,7 +49,7 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		Thread.CurrentThread.CurrentUICulture = CultureInfo.InvariantCulture;
 		UnityEngine.Application.targetFrameRate = 256;
 		UnityEngine.Time.fixedDeltaTime = 0.0625f;
-		UnityEngine.Time.maximumDeltaTime = 0.5f;
+		UnityEngine.Time.maximumDeltaTime = 0.125f;
 	}
 
 	public static void Init_Tier0()
@@ -63,7 +61,7 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		UnityButtons.Register();
 		Output.Install();
 		Facepunch.Pool.ResizeBuffer<Networkable>(65536);
-		Facepunch.Pool.ResizeBuffer<EntityLink>(262144);
+		Facepunch.Pool.ResizeBuffer<EntityLink>(65536);
 		Facepunch.Pool.FillBuffer<Networkable>();
 		Facepunch.Pool.FillBuffer<EntityLink>();
 		NetworkInit();
@@ -72,10 +70,11 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		Interface.Initialize();
 	}
 
-	public unsafe static void Init_Systems()
+	public static void Init_Systems()
 	{
+		Rust.Global.Init();
 		Facepunch.Application.Initialize(new Integration());
-		Facepunch.Performance.GetMemoryUsage = new Func<int>(null, (nint)(delegate*<int>)(&SystemInfoEx.get_systemMemoryUsed));
+		Facepunch.Performance.GetMemoryUsage = () => SystemInfoEx.systemMemoryUsed;
 	}
 
 	public static void Init_Config()
@@ -94,41 +93,69 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 	private IEnumerator Start()
 	{
 		WriteToLog("Bootstrap Startup");
-		WriteToLog(SystemInfoGeneralText.currentInfo);
-		Texture.SetGlobalAnisotropicFilteringLimits(1, 16);
-		yield return StartCoroutine(LoadingUpdate("Loading Bundles"));
-		FileSystem.Backend = new AssetBundleBackend("Bundles/Bundles");
+		BenchmarkTimer.Enabled = Facepunch.Utility.CommandLine.Full.Contains("+autobench");
+		BenchmarkTimer timer = BenchmarkTimer.New("bootstrap");
+		ExceptionReporter.InitializeFromUrl("https://83df169465e84da091c1a3cd2fbffeee:3671b903f9a840ecb68411cf946ab9b6@sentry.io/51080");
+		ExceptionReporter.Disabled = !Facepunch.Utility.CommandLine.Full.Contains("-official") && !Facepunch.Utility.CommandLine.Full.Contains("+official");
+		using (BenchmarkTimer.New("bootstrap;bundles"))
+		{
+			FileSystem.Backend = new AssetBundleBackend("Bundles/Bundles");
+		}
 		if (FileSystem.Backend.isError)
 		{
 			ThrowError(FileSystem.Backend.loadingError);
 		}
+		WriteToLog(SystemInfoGeneralText.currentInfo);
+		UnityEngine.Texture.SetGlobalAnisotropicFilteringLimits(1, 16);
 		if (isErrored)
 		{
 			yield break;
 		}
-		yield return StartCoroutine(LoadingUpdate("Loading Game Manifest"));
-		GameManifest.Load();
-		yield return StartCoroutine(LoadingUpdate("DONE!"));
-		yield return StartCoroutine(LoadingUpdate("Running Self Check"));
-		SelfCheck.Run();
+		using (BenchmarkTimer.New("bootstrap;gamemanifest"))
+		{
+			yield return StartCoroutine(LoadingUpdate("Loading Game Manifest"));
+			GameManifest.Load();
+			yield return StartCoroutine(LoadingUpdate("DONE!"));
+		}
+		using (BenchmarkTimer.New("bootstrap;selfcheck"))
+		{
+			yield return StartCoroutine(LoadingUpdate("Running Self Check"));
+			SelfCheck.Run();
+		}
 		if (isErrored)
 		{
 			yield break;
 		}
 		yield return StartCoroutine(LoadingUpdate("Bootstrap Tier0"));
-		Init_Tier0();
-		ConsoleSystem.UpdateValuesFromCommandLine();
+		using (BenchmarkTimer.New("bootstrap;tier0"))
+		{
+			Init_Tier0();
+		}
+		using (BenchmarkTimer.New("bootstrap;commandlinevalues"))
+		{
+			ConsoleSystem.UpdateValuesFromCommandLine();
+		}
 		yield return StartCoroutine(LoadingUpdate("Bootstrap Systems"));
-		Init_Systems();
+		using (BenchmarkTimer.New("bootstrap;init_systems"))
+		{
+			Init_Systems();
+		}
 		yield return StartCoroutine(LoadingUpdate("Bootstrap Config"));
-		Init_Config();
+		using (BenchmarkTimer.New("bootstrap;init_config"))
+		{
+			Init_Config();
+		}
 		if (!isErrored)
 		{
 			yield return StartCoroutine(LoadingUpdate("Loading Items"));
-			ItemManager.Initialize();
+			using (BenchmarkTimer.New("bootstrap;itemmanager"))
+			{
+				ItemManager.Initialize();
+			}
 			if (!isErrored)
 			{
 				yield return StartCoroutine(DedicatedServerStartup());
+				timer?.Dispose();
 				GameManager.Destroy(base.gameObject);
 			}
 		}
@@ -146,24 +173,25 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 		yield return CoroutineEx.waitForEndOfFrame;
 		UnityEngine.Physics.solverIterationCount = 3;
 		QualitySettings.SetQualityLevel(0);
-		UnityEngine.Object.DontDestroyOnLoad(base.gameObject);
-		UnityEngine.Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/server_console.prefab"));
+		Object.DontDestroyOnLoad(base.gameObject);
+		Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/server_console.prefab"));
 		StartupShared();
 		World.InitSize(ConVar.Server.worldsize);
 		World.InitSeed(ConVar.Server.seed);
 		World.InitSalt(ConVar.Server.salt);
 		World.Url = ConVar.Server.levelurl;
+		World.Transfer = ConVar.Server.leveltransfer;
 		LevelManager.LoadLevel(ConVar.Server.level);
 		yield return CoroutineEx.waitForEndOfFrame;
 		yield return CoroutineEx.waitForEndOfFrame;
 		yield return StartCoroutine(FileSystem_Warmup.Run(0.2f, WriteToLog, "Asset Warmup ({0}/{1})"));
-		yield return StartCoroutine(StartServer(!Facepunch.CommandLine.HasSwitch("-skipload"), string.Empty, allowOutOfDateSaves: false));
-		if (!UnityEngine.Object.FindObjectOfType<Performance>())
+		yield return StartCoroutine(StartServer(!Facepunch.CommandLine.HasSwitch("-skipload"), "", allowOutOfDateSaves: false));
+		if (!Object.FindObjectOfType<Performance>())
 		{
-			UnityEngine.Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/performance.prefab"));
+			Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/performance.prefab"));
 		}
 		Facepunch.Pool.Clear();
-		System.GC.Collect();
+		Rust.GC.Collect();
 		Rust.Application.isLoading = false;
 	}
 
@@ -198,20 +226,16 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 				}
 			}
 		}
-		GameObject server = GameManager.server.CreatePrefab("assets/bundled/prefabs/system/server.prefab");
-		UnityEngine.Object.DontDestroyOnLoad(server);
-		ServerMgr serverMgr = server.GetComponent<ServerMgr>();
+		GameObject gameObject = GameManager.server.CreatePrefab("assets/bundled/prefabs/system/server.prefab");
+		Object.DontDestroyOnLoad(gameObject);
+		ServerMgr serverMgr = gameObject.GetComponent<ServerMgr>();
 		serverMgr.Initialize(doLoad, saveFileOverride, allowOutOfDateSaves);
-		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
-		ColliderGrid.RefreshAll();
 		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
 		SaveRestore.InitializeEntityLinks();
 		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
 		SaveRestore.InitializeEntitySupports();
 		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
 		SaveRestore.InitializeEntityConditionals();
-		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
-		ColliderGrid.RefreshAll();
 		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
 		SaveRestore.GetSaveCache();
 		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
@@ -240,7 +264,7 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 	public void ExitGame()
 	{
 		Debug.Log("Exiting due to Exit Game button on bootstrap error panel");
-		UnityEngine.Application.Quit();
+		Rust.Application.Quit();
 	}
 
 	public static IEnumerator LoadingUpdate(string str)
@@ -255,6 +279,10 @@ public class Bootstrap : SingletonComponent<Bootstrap>
 
 	public static void WriteToLog(string str)
 	{
-		DebugEx.Log(str, StackTraceLogType.None);
+		DebugEx.Log(str);
+	}
+
+	static Bootstrap()
+	{
 	}
 }

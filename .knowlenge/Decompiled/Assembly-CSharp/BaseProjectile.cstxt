@@ -26,8 +26,8 @@ public class BaseProjectile : AttackEntity
 			[Tooltip("Set to 0 to not use inbuilt mag")]
 			public int builtInSize;
 
-			[Tooltip("If using inbuilt mag, will accept these types of ammo")]
 			[InspectorFlags]
+			[Tooltip("If using inbuilt mag, will accept these types of ammo")]
 			public AmmoTypes ammoTypes;
 		}
 
@@ -91,7 +91,32 @@ public class BaseProjectile : AttackEntity
 			return true;
 		}
 
-		public bool Reload(BasePlayer owner)
+		public void SwitchAmmoTypesIfNeeded(BasePlayer owner)
+		{
+			List<Item> list = owner.inventory.FindItemIDs(ammoType.itemid).ToList();
+			if (list.Count != 0)
+			{
+				return;
+			}
+			List<Item> list2 = new List<Item>();
+			owner.inventory.FindAmmo(list2, definition.ammoTypes);
+			if (list2.Count == 0)
+			{
+				return;
+			}
+			list = owner.inventory.FindItemIDs(list2[0].info.itemid).ToList();
+			if (list != null && list.Count != 0)
+			{
+				if (contents > 0)
+				{
+					owner.GiveItem(ItemManager.CreateByItemID(ammoType.itemid, contents, 0uL));
+					contents = 0;
+				}
+				ammoType = list[0].info;
+			}
+		}
+
+		public bool Reload(BasePlayer owner, int desiredAmount = -1)
 		{
 			List<Item> list = owner.inventory.FindItemIDs(ammoType.itemid).ToList();
 			if (list.Count == 0)
@@ -114,17 +139,21 @@ public class BaseProjectile : AttackEntity
 				}
 				ammoType = list[0].info;
 			}
+			int num = desiredAmount;
+			if (num == -1)
+			{
+				num = capacity - contents;
+			}
 			foreach (Item item in list)
 			{
-				int num = capacity - contents;
-				for (int i = 0; i < num; i++)
+				_ = item.amount;
+				int num2 = Mathf.Min(num, item.amount);
+				item.UseItem(num2);
+				contents += num2;
+				num -= num2;
+				if (num <= 0)
 				{
-					if (item.amount <= 0)
-					{
-						break;
-					}
-					contents++;
-					item.UseItem();
+					break;
 				}
 			}
 			return false;
@@ -158,6 +187,14 @@ public class BaseProjectile : AttackEntity
 	public bool canUnloadAmmo = true;
 
 	public Magazine primaryMagazine;
+
+	public bool fractionalReload;
+
+	public float reloadStartDuration;
+
+	public float reloadFractionDuration;
+
+	public float reloadEndDuration;
 
 	[Header("Recoil")]
 	public float aimSway = 3f;
@@ -199,7 +236,13 @@ public class BaseProjectile : AttackEntity
 	[NonSerialized]
 	public bool aiming;
 
+	[NonSerialized]
 	private float nextReloadTime = float.NegativeInfinity;
+
+	[NonSerialized]
+	private float startReloadTime = float.NegativeInfinity;
+
+	private float lastReloadTime = -10f;
 
 	private float stancePenalty;
 
@@ -208,6 +251,8 @@ public class BaseProjectile : AttackEntity
 	protected bool reloadStarted;
 
 	protected bool reloadFinished;
+
+	private int fractionalInsertCounter;
 
 	private static readonly Effect reusableInstance = new Effect();
 
@@ -289,6 +334,42 @@ public class BaseProjectile : AttackEntity
 				}
 				return true;
 			}
+			if (rpc == 240404208 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - ServerFractionalReloadInsert "));
+				}
+				using (TimeWarning.New("ServerFractionalReloadInsert"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsActiveItem.Test("ServerFractionalReloadInsert", this, player))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg4 = rPCMessage;
+							ServerFractionalReloadInsert(msg4);
+						}
+					}
+					catch (Exception exception3)
+					{
+						player.Kick("RPC Error in ServerFractionalReloadInsert");
+						Debug.LogException(exception3);
+					}
+				}
+				return true;
+			}
 			if (rpc == 555589155 && player != null)
 			{
 				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
@@ -313,14 +394,14 @@ public class BaseProjectile : AttackEntity
 							rPCMessage.connection = msg.connection;
 							rPCMessage.player = player;
 							rPCMessage.read = msg.read;
-							RPCMessage msg4 = rPCMessage;
-							StartReload(msg4);
+							RPCMessage msg5 = rPCMessage;
+							StartReload(msg5);
 						}
 					}
-					catch (Exception exception3)
+					catch (Exception exception4)
 					{
 						player.Kick("RPC Error in StartReload");
-						Debug.LogException(exception3);
+						Debug.LogException(exception4);
 					}
 				}
 				return true;
@@ -349,14 +430,14 @@ public class BaseProjectile : AttackEntity
 							rPCMessage.connection = msg.connection;
 							rPCMessage.player = player;
 							rPCMessage.read = msg.read;
-							RPCMessage msg5 = rPCMessage;
-							SwitchAmmoTo(msg5);
+							RPCMessage msg6 = rPCMessage;
+							SwitchAmmoTo(msg6);
 						}
 					}
-					catch (Exception exception4)
+					catch (Exception exception5)
 					{
 						player.Kick("RPC Error in SwitchAmmoTo");
-						Debug.LogException(exception4);
+						Debug.LogException(exception5);
 					}
 				}
 				return true;
@@ -383,6 +464,7 @@ public class BaseProjectile : AttackEntity
 	protected void StartReloadCooldown(float cooldown)
 	{
 		nextReloadTime = CalculateCooldownTime(nextReloadTime, cooldown, catchup: false);
+		startReloadTime = nextReloadTime - cooldown;
 	}
 
 	protected void ResetReloadCooldown()
@@ -429,24 +511,43 @@ public class BaseProjectile : AttackEntity
 	{
 	}
 
-	public virtual void ServerReload()
+	public override bool ServerIsReloading()
 	{
-		StartAttackCooldown(reloadTime);
-		GetOwnerPlayer().SignalBroadcast(Signal.Reload);
-		if (worldModelAnimator != null)
-		{
-			worldModelAnimator.SetTrigger("reload");
-		}
+		return UnityEngine.Time.time < lastReloadTime + reloadTime;
+	}
+
+	public override bool CanReload()
+	{
+		return primaryMagazine.contents < primaryMagazine.capacity;
+	}
+
+	public override float AmmoFraction()
+	{
+		return (float)primaryMagazine.contents / (float)primaryMagazine.capacity;
+	}
+
+	public override void TopUpAmmo()
+	{
 		primaryMagazine.contents = primaryMagazine.capacity;
+	}
+
+	public override void ServerReload()
+	{
+		if (!ServerIsReloading())
+		{
+			lastReloadTime = UnityEngine.Time.time;
+			StartAttackCooldown(reloadTime);
+			GetOwnerPlayer().SignalBroadcast(Signal.Reload);
+			primaryMagazine.contents = primaryMagazine.capacity;
+		}
 	}
 
 	public override UnityEngine.Vector3 ModifyAIAim(UnityEngine.Vector3 eulerInput, float swayModifier = 1f)
 	{
-		bool flag = false;
 		float num = UnityEngine.Time.time * (aimSwaySpeed * 1f + aiAimSwayOffset);
 		float num2 = Mathf.Sin(UnityEngine.Time.time * 2f);
-		float num3 = ((!(num2 < 0f)) ? 1f : (1f - Mathf.Clamp(Mathf.Abs(num2) / 1f, 0f, 1f)));
-		float num4 = ((!flag) ? 1f : 0.6f);
+		float num3 = ((num2 < 0f) ? (1f - Mathf.Clamp(Mathf.Abs(num2) / 1f, 0f, 1f)) : 1f);
+		float num4 = (false ? 0.6f : 1f);
 		float num5 = (aimSway * 1f + aiAimSwayOffset) * num4 * num3 * swayModifier;
 		eulerInput.y += (Mathf.PerlinNoise(num, num) - 0.5f) * num5 * UnityEngine.Time.deltaTime;
 		eulerInput.x += (Mathf.PerlinNoise(num + 0.1f, num + 0.2f) - 0.5f) * num5 * UnityEngine.Time.deltaTime;
@@ -455,6 +556,11 @@ public class BaseProjectile : AttackEntity
 
 	public float GetAIAimcone()
 	{
+		NPCPlayer nPCPlayer = GetOwnerPlayer() as NPCPlayer;
+		if ((bool)nPCPlayer)
+		{
+			return nPCPlayer.GetAimConeScale() * aiAimCone;
+		}
 		return aiAimCone;
 	}
 
@@ -521,19 +627,18 @@ public class BaseProjectile : AttackEntity
 		bool flag = ownerPlayer is IHTNAgent;
 		for (int i = 0; i < component.numProjectiles; i++)
 		{
-			UnityEngine.Vector3 vector = ((!flag) ? AimConeUtil.GetModifiedAimConeDirection(component.projectileSpread + aimCone + GetAIAimcone() * 0.1f, ownerPlayer.eyes.BodyForward()) : AimConeUtil.GetModifiedAimConeDirection(component.projectileSpread + aimCone, ownerPlayer.eyes.rotation * UnityEngine.Vector3.forward));
+			UnityEngine.Vector3 vector = ((!flag) ? AimConeUtil.GetModifiedAimConeDirection(component.projectileSpread + aimCone + GetAIAimcone() * 1f, ownerPlayer.eyes.BodyForward()) : AimConeUtil.GetModifiedAimConeDirection(component.projectileSpread + aimCone, ownerPlayer.eyes.rotation * UnityEngine.Vector3.forward));
 			List<RaycastHit> list = Facepunch.Pool.GetList<RaycastHit>();
 			GamePhysics.TraceAll(new Ray(position, vector), 0f, list, 300f, 1219701521);
 			for (int j = 0; j < list.Count; j++)
 			{
-				RaycastHit hit = list[j];
-				BaseEntity entity = RaycastHitEx.GetEntity(hit);
+				BaseEntity entity = RaycastHitEx.GetEntity(list[j]);
 				if ((entity != null && (entity == this || entity.EqualNetID(this))) || (entity != null && entity.isClient))
 				{
 					continue;
 				}
 				BaseCombatEntity baseCombatEntity = entity as BaseCombatEntity;
-				if (baseCombatEntity != null && (baseEntity == null || entity == baseEntity || entity.EqualNetID(baseEntity)))
+				if ((!(entity != null) || !entity.IsNpc) && baseCombatEntity != null && (baseEntity == null || entity == baseEntity || entity.EqualNetID(baseEntity)))
 				{
 					float num = 0f;
 					foreach (DamageTypeEntry damageType in component2.damageTypes)
@@ -548,7 +653,7 @@ public class BaseProjectile : AttackEntity
 					break;
 				}
 			}
-			UnityEngine.Vector3 vector2 = ((!ownerPlayer.isMounted) ? UnityEngine.Vector3.zero : (vector * 6f));
+			UnityEngine.Vector3 vector2 = (ownerPlayer.isMounted ? (vector * 6f) : UnityEngine.Vector3.zero);
 			CreateProjectileEffectClientside(component.projectileObject.resourcePath, ownerPlayer.eyes.position + vector2, vector * component.projectileVelocity, UnityEngine.Random.Range(1, 100), null, IsSilenced(), forceClientsideEffects: true);
 		}
 	}
@@ -561,7 +666,7 @@ public class BaseProjectile : AttackEntity
 
 	public override void ServerCommand(Item item, string command, BasePlayer player)
 	{
-		if (item != null && command == "unload_ammo")
+		if (item != null && command == "unload_ammo" && !HasReloadCooldown())
 		{
 			UnloadAmmo(item, player);
 		}
@@ -569,8 +674,7 @@ public class BaseProjectile : AttackEntity
 
 	public void UnloadAmmo(Item item, BasePlayer player)
 	{
-		BaseEntity heldEntity = item.GetHeldEntity();
-		BaseProjectile component = heldEntity.GetComponent<BaseProjectile>();
+		BaseProjectile component = item.GetHeldEntity().GetComponent<BaseProjectile>();
 		if (!component.canUnloadAmmo || !component)
 		{
 			return;
@@ -600,8 +704,7 @@ public class BaseProjectile : AttackEntity
 	{
 		if (!(crafter == null) && item != null)
 		{
-			BaseEntity heldEntity = item.GetHeldEntity();
-			BaseProjectile component = heldEntity.GetComponent<BaseProjectile>();
+			BaseProjectile component = item.GetHeldEntity().GetComponent<BaseProjectile>();
 			if ((bool)component)
 			{
 				component.primaryMagazine.contents = 0;
@@ -659,12 +762,47 @@ public class BaseProjectile : AttackEntity
 		return result;
 	}
 
-	protected void ReloadMagazine()
+	public float GetReloadDuration()
+	{
+		if (fractionalReload)
+		{
+			int num = Mathf.Min(primaryMagazine.capacity - primaryMagazine.contents, GetAvailableAmmo());
+			return reloadStartDuration + reloadEndDuration + reloadFractionDuration * (float)num;
+		}
+		return reloadTime;
+	}
+
+	public int GetAvailableAmmo()
 	{
 		BasePlayer ownerPlayer = GetOwnerPlayer();
-		if ((bool)ownerPlayer && Interface.CallHook("OnReloadMagazine", ownerPlayer, this) == null)
+		if (ownerPlayer == null)
 		{
-			primaryMagazine.Reload(ownerPlayer);
+			return 0;
+		}
+		List<Item> obj = Facepunch.Pool.GetList<Item>();
+		ownerPlayer.inventory.FindAmmo(obj, primaryMagazine.definition.ammoTypes);
+		int num = 0;
+		if (obj.Count != 0)
+		{
+			for (int i = 0; i < obj.Count; i++)
+			{
+				Item item = obj[i];
+				if (item.info == primaryMagazine.ammoType)
+				{
+					num += item.amount;
+				}
+			}
+		}
+		Facepunch.Pool.FreeList(ref obj);
+		return num;
+	}
+
+	protected void ReloadMagazine(int desiredAmount = -1)
+	{
+		BasePlayer ownerPlayer = GetOwnerPlayer();
+		if ((bool)ownerPlayer)
+		{
+			primaryMagazine.Reload(ownerPlayer, desiredAmount);
 			SendNetworkUpdateImmediate();
 			ItemManager.DoRemoves();
 			ownerPlayer.inventory.ServerUpdate(0f);
@@ -716,16 +854,70 @@ public class BaseProjectile : AttackEntity
 			reloadStarted = false;
 			reloadFinished = false;
 		}
-		else if (Interface.CallHook("OnReloadWeapon", player, this) == null)
+		else
 		{
 			reloadFinished = false;
 			reloadStarted = true;
-			StartReloadCooldown(reloadTime);
+			fractionalInsertCounter = 0;
+			primaryMagazine.SwitchAmmoTypesIfNeeded(player);
+			StartReloadCooldown(GetReloadDuration());
 		}
 	}
 
 	[RPC_Server]
 	[RPC_Server.IsActiveItem]
+	private void ServerFractionalReloadInsert(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (!VerifyClientRPC(player))
+		{
+			SendNetworkUpdate();
+			reloadStarted = false;
+			reloadFinished = false;
+			return;
+		}
+		if (!reloadStarted)
+		{
+			AntiHack.Log(player, AntiHackType.ReloadHack, "Fractional reload request skipped (" + base.ShortPrefabName + ")");
+			player.stats.combat.Log(this, "reload_skip");
+			reloadStarted = false;
+			reloadFinished = false;
+			return;
+		}
+		if (GetReloadIdle() > 3f)
+		{
+			AntiHack.Log(player, AntiHackType.ReloadHack, "T+" + GetReloadIdle() + "s (" + base.ShortPrefabName + ")");
+			player.stats.combat.Log(this, "reload_time");
+			reloadStarted = false;
+			reloadFinished = false;
+			return;
+		}
+		if (UnityEngine.Time.time < startReloadTime + reloadStartDuration)
+		{
+			AntiHack.Log(player, AntiHackType.ReloadHack, "Fractional reload too early (" + base.ShortPrefabName + ")");
+			player.stats.combat.Log(this, "reload_fraction_too_early");
+			reloadStarted = false;
+			reloadFinished = false;
+		}
+		if (UnityEngine.Time.time < startReloadTime + reloadStartDuration + (float)fractionalInsertCounter * reloadFractionDuration)
+		{
+			AntiHack.Log(player, AntiHackType.ReloadHack, "Fractional reload rate too high (" + base.ShortPrefabName + ")");
+			player.stats.combat.Log(this, "reload_fraction_rate");
+			reloadStarted = false;
+			reloadFinished = false;
+		}
+		else
+		{
+			fractionalInsertCounter++;
+			if (primaryMagazine.contents < primaryMagazine.capacity)
+			{
+				ReloadMagazine(1);
+			}
+		}
+	}
+
+	[RPC_Server.IsActiveItem]
+	[RPC_Server]
 	private void Reload(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
@@ -734,38 +926,49 @@ public class BaseProjectile : AttackEntity
 			SendNetworkUpdate();
 			reloadStarted = false;
 			reloadFinished = false;
+			return;
 		}
-		else if (!reloadStarted)
+		if (!reloadStarted)
 		{
 			AntiHack.Log(player, AntiHackType.ReloadHack, "Request skipped (" + base.ShortPrefabName + ")");
 			player.stats.combat.Log(this, "reload_skip");
 			reloadStarted = false;
 			reloadFinished = false;
+			return;
 		}
-		else if (GetReloadCooldown() > 1f)
+		if (!fractionalReload)
 		{
-			AntiHack.Log(player, AntiHackType.ReloadHack, "T-" + GetReloadCooldown() + "s (" + base.ShortPrefabName + ")");
-			player.stats.combat.Log(this, "reload_time");
-			reloadStarted = false;
-			reloadFinished = false;
+			if (GetReloadCooldown() > 1f)
+			{
+				AntiHack.Log(player, AntiHackType.ReloadHack, "T-" + GetReloadCooldown() + "s (" + base.ShortPrefabName + ")");
+				player.stats.combat.Log(this, "reload_time");
+				reloadStarted = false;
+				reloadFinished = false;
+				return;
+			}
+			if (GetReloadIdle() > 1.5f)
+			{
+				AntiHack.Log(player, AntiHackType.ReloadHack, "T+" + GetReloadIdle() + "s (" + base.ShortPrefabName + ")");
+				player.stats.combat.Log(this, "reload_time");
+				reloadStarted = false;
+				reloadFinished = false;
+				return;
+			}
 		}
-		else if (GetReloadIdle() > 1f)
+		if (fractionalReload)
 		{
-			AntiHack.Log(player, AntiHackType.ReloadHack, "T+" + GetReloadIdle() + "s (" + base.ShortPrefabName + ")");
-			player.stats.combat.Log(this, "reload_time");
-			reloadStarted = false;
-			reloadFinished = false;
+			ResetReloadCooldown();
 		}
-		else
+		reloadStarted = false;
+		reloadFinished = true;
+		if (!fractionalReload)
 		{
-			reloadStarted = false;
-			reloadFinished = true;
 			ReloadMagazine();
 		}
 	}
 
-	[RPC_Server]
 	[RPC_Server.FromOwner]
+	[RPC_Server]
 	private void CLProject(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;
@@ -813,7 +1016,6 @@ public class BaseProjectile : AttackEntity
 			player.stats.combat.Log(this, "count_mismatch");
 			return;
 		}
-		Interface.CallHook("OnWeaponFired", this, msg.player, component, projectileShoot);
 		SignalBroadcast(Signal.Attack, string.Empty, msg.connection);
 		player.CleanupExpiredProjectiles();
 		foreach (ProjectileShoot.Projectile projectile in projectileShoot.projectiles)
@@ -870,23 +1072,23 @@ public class BaseProjectile : AttackEntity
 		using (TimeWarning.New("LogPlayerShooting"))
 		{
 			UnityEngine.Vector3 networkPosition = player.GetNetworkPosition();
-			UnityEngine.Vector3 eulerAngles = player.GetNetworkRotation().eulerAngles;
+			UnityEngine.Quaternion networkRotation = player.GetNetworkRotation();
 			int weaponID = GetItem()?.info.itemid ?? 0;
 			EasyAntiCheat.Server.Hydra.Client client = EACServer.GetClient(player.net.connection);
 			PlayerUseWeapon eventParams = default(PlayerUseWeapon);
 			eventParams.Position = new EasyAntiCheat.Server.Cerberus.Vector3(networkPosition.x, networkPosition.y, networkPosition.z);
-			eventParams.ViewAngles = new EasyAntiCheat.Server.Cerberus.Vector3(eulerAngles.x, eulerAngles.y, eulerAngles.z);
+			eventParams.ViewRotation = new EasyAntiCheat.Server.Cerberus.Quaternion(networkRotation.w, networkRotation.x, networkRotation.y, networkRotation.z);
 			eventParams.WeaponID = weaponID;
 			EACServer.playerTracker.LogPlayerUseWeapon(client, eventParams);
 		}
 	}
 
-	private void CreateProjectileEffectClientside(string prefabName, UnityEngine.Vector3 pos, UnityEngine.Vector3 velocity, int seed, Connection sourceConnection, bool silenced = false, bool forceClientsideEffects = false)
+	public void CreateProjectileEffectClientside(string prefabName, UnityEngine.Vector3 pos, UnityEngine.Vector3 velocity, int seed, Connection sourceConnection, bool silenced = false, bool forceClientsideEffects = false)
 	{
 		Effect effect = reusableInstance;
 		effect.Clear();
 		effect.Init(Effect.Type.Projectile, pos, velocity, sourceConnection);
-		effect.scale = ((!silenced) ? 1f : 0f);
+		effect.scale = (silenced ? 0f : 1f);
 		if (forceClientsideEffects)
 		{
 			effect.scale = 2f;
@@ -899,27 +1101,34 @@ public class BaseProjectile : AttackEntity
 	public void UpdateItemCondition()
 	{
 		Item ownerItem = GetOwnerItem();
-		if (ownerItem == null || UnityEngine.Random.Range(0, 2) != 0)
+		if (ownerItem == null)
 		{
 			return;
 		}
-		ownerItem.LoseCondition(0.5f);
+		float barrelConditionLoss = primaryMagazine.ammoType.GetComponent<ItemModProjectile>().barrelConditionLoss;
+		float num = 0.25f;
+		ownerItem.LoseCondition(num + barrelConditionLoss);
 		if (ownerItem.contents != null && ownerItem.contents.itemList != null)
 		{
-			for (int num = ownerItem.contents.itemList.Count - 1; num >= 0; num--)
+			for (int num2 = ownerItem.contents.itemList.Count - 1; num2 >= 0; num2--)
 			{
-				ownerItem.contents.itemList[num]?.LoseCondition(0.5f);
+				ownerItem.contents.itemList[num2]?.LoseCondition(num + barrelConditionLoss);
 			}
 		}
 	}
 
 	public bool IsSilenced()
 	{
-		if (children != null && (from ProjectileWeaponMod x in children
-			where x != null && x.isSilencer && !x.IsBroken()
-			select x).Any())
+		if (children != null)
 		{
-			return true;
+			foreach (BaseEntity child in children)
+			{
+				ProjectileWeaponMod projectileWeaponMod = child as ProjectileWeaponMod;
+				if (projectileWeaponMod != null && projectileWeaponMod.isSilencer && !projectileWeaponMod.IsBroken())
+				{
+					return true;
+				}
+			}
 		}
 		return false;
 	}

@@ -12,13 +12,13 @@ public struct StateTimer
 	{
 		get
 		{
-			bool flag = ReleaseTime > Time.time;
-			if (!flag && OnFinished != null)
+			bool num = ReleaseTime > Time.time;
+			if (!num && OnFinished != null)
 			{
 				OnFinished();
 				OnFinished = null;
 			}
-			return flag;
+			return num;
 		}
 	}
 

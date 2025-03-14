@@ -8,7 +8,11 @@ public class ANDSwitch : IOEntity
 
 	public override int GetPassthroughAmount(int outputSlot = 0)
 	{
-		return (input1Amount > 0 && input2Amount > 0) ? Mathf.Max(input1Amount, input2Amount) : 0;
+		if (input1Amount <= 0 || input2Amount <= 0)
+		{
+			return 0;
+		}
+		return Mathf.Max(input1Amount, input2Amount);
 	}
 
 	public override void UpdateHasPower(int inputAmount, int inputSlot)

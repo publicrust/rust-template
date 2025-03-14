@@ -2,11 +2,24 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
+using System.Threading.Tasks;
 using Facepunch;
+using Facepunch.Crypt;
+using Newtonsoft.Json;
 using UnityEngine;
+using UnityEngine.Networking;
 
 public static class WebUtil
 {
+	private class AcceptAllCertificates : CertificateHandler
+	{
+		protected override bool ValidateCertificate(byte[] certificateData)
+		{
+			return true;
+		}
+	}
+
 	internal static void Get(string url, Action<string> result)
 	{
 		if (url.Contains("https://localhost"))
@@ -15,18 +28,77 @@ public static class WebUtil
 		}
 		if (Facepunch.Application.Integration.DebugOutput)
 		{
-			UnityEngine.Debug.Log($"[Get] \"{url}\"");
+			UnityEngine.Debug.Log("[Get] \"" + url + "\"");
 		}
-		WWW www = new WWW(url);
-		Facepunch.Application.Controller.StartCoroutine(DownloadStringCoroutine(www, result));
+		UnityWebRequest unityWebRequest = UnityWebRequest.Get(url);
+		unityWebRequest.certificateHandler = new AcceptAllCertificates();
+		Facepunch.Application.Controller.StartCoroutine(DownloadStringCoroutine(unityWebRequest, result));
 	}
 
-	private static IEnumerator DownloadStringCoroutine(WWW www, Action<string> result)
+	private static IEnumerator DownloadStringCoroutine(UnityWebRequest www, Action<string> result)
 	{
-		yield return www;
-		if (www.error == null)
+		yield return www.SendWebRequest();
+		if (www.isNetworkError)
 		{
-			result?.Invoke(www.text);
+			UnityEngine.Debug.LogError("Error with download: " + www.error + " (" + www.url + ")");
+		}
+		else
+		{
+			result(www.downloadHandler.text);
+		}
+		www.Dispose();
+	}
+
+	public static async Task<string> DownloadFileTemp(string url, bool keepextension)
+	{
+		if (!Directory.Exists("temp"))
+		{
+			Directory.CreateDirectory("temp");
+		}
+		string text = "";
+		if (keepextension)
+		{
+			text = Path.GetExtension(url);
+		}
+		string targetName = "temp/" + Md5.Calculate(url.ToLower()) + text;
+		FileInfo fileInfo = new FileInfo(targetName);
+		if (fileInfo.Exists)
+		{
+			return fileInfo.FullName;
+		}
+		using UnityWebRequest request = UnityWebRequest.Get(url);
+		request.certificateHandler = new AcceptAllCertificates();
+		request.SendWebRequest();
+		while (!request.isDone)
+		{
+			await Task.Delay(100);
+		}
+		if (request.isNetworkError || request.isHttpError)
+		{
+			return null;
+		}
+		File.WriteAllBytes(targetName, request.downloadHandler.data);
+		return fileInfo.FullName;
+	}
+
+	private static void DownloadString(UnityWebRequest www, Action<string> result)
+	{
+		UnityWebRequestAsyncOperation unityWebRequestAsyncOperation = www.SendWebRequest();
+		Stopwatch stopwatch = Stopwatch.StartNew();
+		while (!unityWebRequestAsyncOperation.isDone)
+		{
+			if (stopwatch.Elapsed.TotalSeconds > 10.0)
+			{
+				return;
+			}
+		}
+		if (www.isNetworkError)
+		{
+			UnityEngine.Debug.LogError("Error with download: " + www.error);
+		}
+		else
+		{
+			result(www.downloadHandler.text);
 		}
 		www.Dispose();
 	}
@@ -44,13 +116,13 @@ public static class WebUtil
 		}
 		if (Facepunch.Application.Integration.DebugOutput)
 		{
-			UnityEngine.Debug.Log($"[Post] \"{url}\"");
+			UnityEngine.Debug.Log("[Post] \"" + url + "\"");
 		}
 		WWW wWW = new WWW(url, wWWForm);
 		if (wait)
 		{
 			Stopwatch stopwatch = Stopwatch.StartNew();
-			while (!wWW.isDone && stopwatch.Elapsed.Seconds <= 5)
+			while (!wWW.isDone && !(stopwatch.Elapsed.TotalSeconds > 5.0))
 			{
 			}
 			wWW.Dispose();
@@ -59,6 +131,83 @@ public static class WebUtil
 		{
 			Facepunch.Application.Controller.StartCoroutine(PostValuesCoroutine(wWW, result));
 		}
+	}
+
+	internal static async Task<string> PostAsync(string url, Dictionary<string, string> data)
+	{
+		if (url.Contains("https://localhost"))
+		{
+			url = url.Replace("https://localhost", "http://localhost");
+		}
+		WWWForm wWWForm = new WWWForm();
+		foreach (KeyValuePair<string, string> datum in data)
+		{
+			wWWForm.AddField(datum.Key, datum.Value);
+		}
+		if (Facepunch.Application.Integration.DebugOutput)
+		{
+			UnityEngine.Debug.Log("[Post] \"" + url + "\"");
+		}
+		Stopwatch waitTime = Stopwatch.StartNew();
+		using UnityWebRequest request = UnityWebRequest.Post(url, wWWForm);
+		request.SendWebRequest();
+		while (!request.isDone)
+		{
+			if (waitTime.Elapsed.TotalSeconds > 30.0)
+			{
+				return "error: 30 seconds time out";
+			}
+			await Task.Delay(10);
+		}
+		if (request.isNetworkError || request.isHttpError)
+		{
+			return $"error [{request.isNetworkError}|{request.isHttpError}|{request.responseCode}|{request.downloadHandler.text}]";
+		}
+		return request.downloadHandler.text;
+	}
+
+	internal static void PostData(string url, object dataObject, Action<string> result, bool wait = false)
+	{
+		string value = JsonConvert.SerializeObject(dataObject, Formatting.Indented);
+		WWWForm wWWForm = new WWWForm();
+		wWWForm.AddField("data", value);
+		UnityWebRequest unityWebRequest = UnityWebRequest.Post(url, wWWForm);
+		unityWebRequest.certificateHandler = new AcceptAllCertificates();
+		if (wait)
+		{
+			DownloadString(unityWebRequest, result);
+		}
+		else
+		{
+			Facepunch.Application.Controller.StartCoroutine(DownloadStringCoroutine(unityWebRequest, result));
+		}
+	}
+
+	internal static async Task<string> PostDataAsync(string url, object dataObject)
+	{
+		string value = JsonConvert.SerializeObject(dataObject, Formatting.Indented);
+		WWWForm wWWForm = new WWWForm();
+		wWWForm.AddField("data", value);
+		UnityWebRequest www = UnityWebRequest.Post(url, wWWForm);
+		www.certificateHandler = new AcceptAllCertificates();
+		UnityWebRequestAsyncOperation request = www.SendWebRequest();
+		Stopwatch waitTime = Stopwatch.StartNew();
+		while (!request.isDone)
+		{
+			if (waitTime.Elapsed.TotalSeconds > 10.0)
+			{
+				return "timed out";
+			}
+			await Task.Delay(10);
+		}
+		if (www.isNetworkError)
+		{
+			UnityEngine.Debug.LogError("Error with download: " + www.error);
+			return null;
+		}
+		string text = www.downloadHandler.text;
+		www.Dispose();
+		return text;
 	}
 
 	private static IEnumerator PostValuesCoroutine(WWW www, Action<string> result)
@@ -72,11 +221,11 @@ public static class WebUtil
 		{
 			if (www.error != null)
 			{
-				UnityEngine.Debug.LogWarning($"[Post] Error: \"{www.error}\" - \"{www.text}\" ");
+				UnityEngine.Debug.LogWarning("[Post] Error: \"" + www.error + "\" - \"" + www.text + "\" ");
 			}
 			else
 			{
-				UnityEngine.Debug.Log($"[Post] Response: \"{www.text}\"");
+				UnityEngine.Debug.Log("[Post] Response: \"" + www.text + "\"");
 			}
 		}
 		www.Dispose();
@@ -84,6 +233,6 @@ public static class WebUtil
 
 	internal static string Escape(string type)
 	{
-		return WWW.EscapeURL(type);
+		return UnityWebRequest.EscapeURL(type);
 	}
 }

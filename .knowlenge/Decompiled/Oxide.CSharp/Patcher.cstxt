@@ -1,0 +1,127 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using Mono.Cecil;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.Logging;
+using Oxide.CSharp.Patching;
+using Oxide.CSharp.Patching.Validation;
+using Oxide.Logging;
+
+public static class Patcher
+{
+	private static Dictionary<Type, List<PatchValidationAttribute>> Patches;
+
+	private static Type PatchType { get; } = typeof(IPatch);
+
+	private static Type PatchValidationType { get; } = typeof(PatchValidationAttribute);
+
+	private static void GetPatches(Assembly module, ref Dictionary<Type, List<PatchValidationAttribute>> patchTypes)
+	{
+		try
+		{
+			Type[] types = module.GetTypes();
+			foreach (Type type in types)
+			{
+				if (!type.IsAbstract && PatchType.IsAssignableFrom(type))
+				{
+					List<PatchValidationAttribute> validationRules = GetValidationRules(type.GetCustomAttributes(PatchValidationType, inherit: true).Concat(type.Assembly.GetCustomAttributes(PatchValidationType, inherit: true)).ToArray());
+					patchTypes.Add(type, validationRules);
+					Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Patch, "Patcher", $"Found {validationRules.Count} total validators for patch {type.Name}");
+				}
+			}
+		}
+		catch (Exception exception)
+		{
+			Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.Patch, "Patcher", "Failed to read " + (module.GetName()?.Name ?? module.FullName) + " for patches", exception);
+		}
+	}
+
+	private static void GetPatches(Assembly[] modules, ref Dictionary<Type, List<PatchValidationAttribute>> patchTypes)
+	{
+		for (int i = 0; i < modules.Length; i++)
+		{
+			GetPatches(modules[i], ref patchTypes);
+		}
+	}
+
+	public static bool Run(AssemblyDefinition module)
+	{
+		if (Patches == null)
+		{
+			Patches = new Dictionary<Type, List<PatchValidationAttribute>>();
+			GetPatches(AppDomain.CurrentDomain.GetAssemblies(), ref Patches);
+			Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Patch, "Patcher", $"Found {Patches.Count} patches");
+		}
+		PatchContext patchContext = new PatchContext(module);
+		foreach (KeyValuePair<Type, List<PatchValidationAttribute>> patch in Patches)
+		{
+			Type key = patch.Key;
+			List<PatchValidationAttribute> list = (patchContext.PatchValidators = patch.Value);
+			bool flag = false;
+			for (int i = 0; i < list.Count; i++)
+			{
+				if (!list[i].Validate(module))
+				{
+					flag = true;
+					break;
+				}
+			}
+			if (!flag)
+			{
+				try
+				{
+					IPatch obj = (IPatch)Activator.CreateInstance(key, nonPublic: true);
+					patchContext.ContextPatches = 0;
+					obj.Patch(patchContext);
+					Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Patch, "Patcher", $"{key.Name} has applied {patchContext.ContextPatches} patches to {module.Name?.Name ?? module.FullName}");
+				}
+				catch (Exception exception)
+				{
+					Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.Patch, "Patcher", $"{key.Name} has applied {patchContext.ContextPatches} patches to {module.Name?.Name ?? module.FullName} but threw a error", exception);
+				}
+			}
+		}
+		return patchContext.TotalPatches > 0;
+	}
+
+	public static byte[] Run(byte[] data, out bool patched)
+	{
+		try
+		{
+			using MemoryStream stream = new MemoryStream(data);
+			AssemblyDefinition assemblyDefinition = AssemblyDefinition.ReadAssembly(stream);
+			if (Run(assemblyDefinition))
+			{
+				using (MemoryStream memoryStream = new MemoryStream())
+				{
+					assemblyDefinition.Write(memoryStream);
+					patched = true;
+					return memoryStream.ToArray();
+				}
+			}
+		}
+		catch (Exception exception)
+		{
+			Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.Patch, "Patcher", "Failed to patch", exception);
+		}
+		patched = false;
+		return data;
+	}
+
+	public static List<PatchValidationAttribute> GetValidationRules(object[] attributes)
+	{
+		List<PatchValidationAttribute> list = new List<PatchValidationAttribute>();
+		for (int i = 0; i < attributes.Length; i++)
+		{
+			if (attributes[i] as Attribute is PatchValidationAttribute item)
+			{
+				list.Add(item);
+			}
+		}
+		return list;
+	}
+}

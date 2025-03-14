@@ -12,9 +12,9 @@ public class ObjectSpam : MonoBehaviour
 	{
 		for (int i = 0; i < amount; i++)
 		{
-			GameObject gameObject = Object.Instantiate(source);
-			gameObject.transform.position = base.transform.position + Vector3Ex.Range(0f - radius, radius);
-			gameObject.hideFlags = HideFlags.HideInHierarchy | HideFlags.HideInInspector;
+			GameObject obj = Object.Instantiate(source);
+			obj.transform.position = base.transform.position + Vector3Ex.Range(0f - radius, radius);
+			obj.hideFlags = HideFlags.HideInHierarchy | HideFlags.HideInInspector;
 		}
 	}
 }
