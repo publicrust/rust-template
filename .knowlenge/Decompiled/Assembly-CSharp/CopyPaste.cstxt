@@ -1,11 +1,8 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Net;
 using System.Text;
-using System.Threading.Tasks;
 using ConVar;
 using Facepunch;
 using Network;
@@ -29,7 +26,7 @@ public class CopyPaste : ConsoleSystem
 		public bool HasParent;
 	}
 
-	private class PasteOptions
+	public class PasteOptions
 	{
 		public const string Argument_NPCs = "--npcs";
 
@@ -63,6 +60,10 @@ public class CopyPaste : ConsoleSystem
 
 		public bool Players;
 
+		public Vector3 Origin;
+
+		public Quaternion PlayerRotation;
+
 		public Vector3 HeightOffset;
 
 		public PasteOptions(Arg arg)
@@ -76,53 +77,46 @@ public class CopyPaste : ConsoleSystem
 			SnapToTerrain = arg.HasArg("--autosnap-terrain", remove: true);
 			Players = arg.HasArg("--players", remove: true);
 		}
+
+		public PasteOptions(PasteRequest request)
+		{
+			Resources = request.resources;
+			NPCs = request.npcs;
+			Vehicles = request.vehicles;
+			Deployables = request.deployables;
+			FoundationsOnly = request.foundationsOnly;
+			BuildingBlocksOnly = request.buildingBlocksOnly;
+			SnapToTerrain = request.snapToTerrain;
+			Players = request.players;
+			Origin = request.origin;
+			PlayerRotation = Quaternion.Euler(request.playerRotation);
+			HeightOffset = request.heightOffset;
+		}
 	}
-
-	private const string COPY_PASTE_FOLDER = "copypaste";
-
-	private const string EXTENSION = "data";
-
-	private static Dictionary<string, CopyPasteEntityInfo> cachedPastes = new Dictionary<string, CopyPasteEntityInfo>();
-
-	private static CopyPasteEntityInfo clipboard;
 
 	private static CopyPasteHistoryManager playerHistory = new CopyPasteHistoryManager();
 
-	private static string GetPath(string name)
+	private static void PrintPasteNames(StringBuilder builder, string directory)
 	{
-		return ConVar.Server.GetServerFolder("copypaste") + "/" + name + ".data";
+		if (!Directory.Exists(directory))
+		{
+			builder.AppendLine("No pastes found");
+			return;
+		}
+		string[] files = Directory.GetFiles(directory, "*.data");
+		builder.AppendLine($"Found {files.Length} pastes");
+		foreach (string item in files.OrderBy((string x) => x))
+		{
+			string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(item);
+			builder.AppendLine(fileNameWithoutExtension);
+		}
 	}
 
-	private static void SaveClipboardInFile(string saveName)
-	{
-		if (clipboard == null)
-		{
-			UnityEngine.Debug.LogWarning("Clipboard empty");
-		}
-		else
-		{
-			File.WriteAllBytes(GetPath(saveName), clipboard.ToProtoBytes());
-		}
-	}
-
-	private static CopyPasteEntityInfo LoadFileInClipboard(string saveName)
-	{
-		string path = GetPath(saveName);
-		if (!File.Exists(path))
-		{
-			UnityEngine.Debug.LogWarning("Missing file");
-			return null;
-		}
-		CopyPasteEntityInfo copyPasteEntityInfo = CopyPasteEntityInfo.Deserialize(File.ReadAllBytes(path));
-		cachedPastes[saveName] = copyPasteEntityInfo;
-		return copyPasteEntityInfo;
-	}
-
-	private static void CopyEntities(List<BaseEntity> entities, Vector3 originPos, Quaternion originRot)
+	private static void CopyEntities(BasePlayer player, List<BaseEntity> entities, string name, Vector3 originPos, Quaternion originRot)
 	{
 		OrderEntitiesForSave(entities);
-		CopyPasteEntityInfo obj = Facepunch.Pool.Get<CopyPasteEntityInfo>();
-		obj.entities = Facepunch.Pool.GetList<ProtoBuf.Entity>();
+		using CopyPasteEntityInfo copyPasteEntityInfo = Facepunch.Pool.Get<CopyPasteEntityInfo>();
+		copyPasteEntityInfo.entities = Facepunch.Pool.Get<List<ProtoBuf.Entity>>();
 		Transform transform = new GameObject("Align").transform;
 		transform.position = originPos;
 		transform.rotation = originRot;
@@ -133,25 +127,24 @@ public class CopyPaste : ConsoleSystem
 				BaseEntity baseEntity = entity.parentEntity.Get(serverside: true);
 				if (baseEntity != null && (!entities.Contains(baseEntity) || !baseEntity.enableSaving))
 				{
-					UnityEngine.Debug.LogWarning("Skipping " + entity.ShortPrefabName + " as it is parented to an entity not included in the copy (it would become orphaned)");
+					Debug.LogWarning("Skipping " + entity.ShortPrefabName + " as it is parented to an entity not included in the copy (it would become orphaned)");
 				}
 				else
 				{
-					SaveEntity(entity, obj, baseEntity, transform);
+					SaveEntity(entity, copyPasteEntityInfo, baseEntity, transform);
 				}
 			}
 		}
 		UnityEngine.Object.Destroy(transform.gameObject);
-		clipboard = obj.Copy();
-		Facepunch.Pool.Free(ref obj);
+		CopyPasteEntity.ServerInstance?.ClientRPC(RpcTarget.Player("RecievePaste", player), name, copyPasteEntityInfo);
 	}
 
-	private static List<BaseEntity> PasteEntities(CopyPasteEntityInfo toLoad, Vector3 originPoint, Quaternion rotation, PasteOptions options)
+	public static List<BaseEntity> PasteEntitiesInternal(CopyPasteEntityInfo toLoad, PasteOptions options)
 	{
 		toLoad = toLoad.Copy();
 		Transform transform = new GameObject("Align").transform;
-		transform.position = originPoint;
-		transform.rotation = rotation;
+		transform.position = options.Origin;
+		transform.rotation = options.PlayerRotation;
 		List<EntityWrapper> list = new List<EntityWrapper>();
 		Dictionary<ulong, ulong> remapping = new Dictionary<ulong, ulong>();
 		Dictionary<uint, uint> dictionary = new Dictionary<uint, uint>();
@@ -229,7 +222,7 @@ public class CopyPaste : ConsoleSystem
 			}
 			catch (Exception exception)
 			{
-				UnityEngine.Debug.LogException(exception);
+				Debug.LogException(exception);
 				entityWrapper.Entity.Kill();
 			}
 		}
@@ -361,16 +354,35 @@ public class CopyPaste : ConsoleSystem
 
 	private static void GetEntitiesInRadius(Vector3 originPoint, float radius, List<BaseEntity> entityList)
 	{
-		if (!(radius <= 0f))
+		if (radius <= 0f)
 		{
-			List<BaseEntity> list = new List<BaseEntity>();
-			Vis.Entities(originPoint, radius, list);
+			return;
 		}
+		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
+		Vis.Entities(originPoint, radius, obj);
+		foreach (BaseEntity item in obj)
+		{
+			if (!item.isClient)
+			{
+				entityList.Add(item);
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
 	}
 
 	private static void GetEntitiesInBounds(Bounds bounds, List<BaseEntity> entityList)
 	{
-		Vis.Entities(new OBB(bounds), entityList);
+		OBB bounds2 = new OBB(bounds);
+		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
+		Vis.Entities(bounds2, obj);
+		foreach (BaseEntity item in obj)
+		{
+			if (!item.isClient)
+			{
+				entityList.Add(item);
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
 	}
 
 	private static bool CanPrefabBePasted(uint prefabId, PasteOptions options)
@@ -447,76 +459,37 @@ public class CopyPaste : ConsoleSystem
 		}
 	}
 
-	private static CopyPasteEntityInfo GetOrLoadPaste(Arg args, string name)
-	{
-		if (name == "clipboard")
-		{
-			if (clipboard == null)
-			{
-				args.ReplyWith("Clipboard empty");
-				return null;
-			}
-			return clipboard;
-		}
-		if (cachedPastes.TryGetValue(name, out var value))
-		{
-			return value;
-		}
-		value = LoadFileInClipboard(name);
-		if (value != null)
-		{
-			return value;
-		}
-		args.ReplyWith("No save named '" + name + "' found");
-		return null;
-	}
-
 	[ServerVar(Name = "copybox_sv")]
 	public static void copybox_sv(Arg args)
 	{
 		if (!args.HasArgs(3))
 		{
-			args.ReplyWith("Missing args: copybox_sv <center> <size> <rotation>");
+			args.ReplyWith("Missing args: copybox_sv <name> <center> <size> <rotation>");
 			return;
 		}
-		Vector3 vector = args.GetVector3(0);
-		Vector3 vector2 = args.GetVector3(1);
-		Quaternion originRot = Quaternion.Euler(args.GetVector3(2));
+		string @string = args.GetString(0);
+		Vector3 vector = args.GetVector3(1);
+		Vector3 vector2 = args.GetVector3(2);
+		Quaternion originRot = Quaternion.Euler(args.GetVector3(3));
 		Bounds bounds = new Bounds(vector, vector2);
 		List<BaseEntity> obj = Facepunch.Pool.GetList<BaseEntity>();
 		GetEntitiesInBounds(bounds, obj);
-		CopyEntities(obj, vector, originRot);
+		CopyEntities(ArgEx.Player(args), obj, @string, vector, originRot);
 		Facepunch.Pool.FreeList(ref obj);
 	}
 
-	[ServerVar]
-	public static void paste_sv(Arg args)
+	public static void PasteEntities(CopyPasteEntityInfo data, PasteOptions options, ulong steamId)
 	{
-		if (!args.HasArgs(3))
-		{
-			args.ReplyWith("Missing args: paste_sv <name> <origin> <rotation>");
-			return;
-		}
-		ulong steamId = ArgEx.Player(args)?.userID ?? ((BasePlayer.EncryptedValue<ulong>)0uL);
-		string @string = args.GetString(0);
-		Vector3 vector = args.GetVector3(1);
-		Quaternion rotation = Quaternion.Euler(args.GetVector3(2));
-		Vector3 vector2 = args.GetVector3(3);
-		PasteOptions options = new PasteOptions(args)
-		{
-			HeightOffset = vector2
-		};
-		CopyPasteEntityInfo orLoadPaste = GetOrLoadPaste(args, @string);
 		List<BaseEntity> entities;
 		try
 		{
 			Rust.Application.isLoadingSave = true;
 			Rust.Application.isLoading = true;
-			entities = PasteEntities(orLoadPaste, vector, rotation, options);
+			entities = PasteEntitiesInternal(data, options);
 		}
 		catch (Exception exception)
 		{
-			UnityEngine.Debug.LogException(exception);
+			Debug.LogException(exception);
 			return;
 		}
 		finally
@@ -530,7 +503,7 @@ public class CopyPaste : ConsoleSystem
 	[ServerVar]
 	public static void undopaste_sv(Arg args)
 	{
-		ulong steamId = ArgEx.Player(args)?.userID ?? ((BasePlayer.EncryptedValue<ulong>)0uL);
+		ulong steamId = ArgEx.Player(args)?.userID ?? ((EncryptedValue<ulong>)0uL);
 		PasteResult pasteResult = playerHistory.Undo(steamId);
 		if (pasteResult == null)
 		{
@@ -546,9 +519,10 @@ public class CopyPaste : ConsoleSystem
 	[ServerVar]
 	public static void copyradius_sv(Arg args)
 	{
-		Vector3 vector = args.GetVector3(0);
-		float @float = args.GetFloat(1);
-		Quaternion originRot = Quaternion.Euler(args.GetVector3(2));
+		string @string = args.GetString(0);
+		Vector3 vector = args.GetVector3(1);
+		float @float = args.GetFloat(2);
+		Quaternion originRot = Quaternion.Euler(args.GetVector3(3));
 		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
 		if (@float <= 0f)
 		{
@@ -556,19 +530,20 @@ public class CopyPaste : ConsoleSystem
 			return;
 		}
 		GetEntitiesInRadius(vector, @float, obj);
-		CopyEntities(obj, vector, originRot);
+		CopyEntities(ArgEx.Player(args), obj, @string, vector, originRot);
 		Facepunch.Pool.FreeUnmanaged(ref obj);
 	}
 
 	[ServerVar]
 	public static void copybuilding_sv(Arg args)
 	{
-		Vector3 vector = args.GetVector3(0);
-		Vector3 vector2 = args.GetVector3(1);
-		Quaternion originRot = Quaternion.Euler(args.GetVector3(2));
+		string @string = args.GetString(0);
+		Vector3 vector = args.GetVector3(1);
+		Vector3 vector2 = args.GetVector3(2);
+		Quaternion originRot = Quaternion.Euler(args.GetVector3(3));
 		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
 		GetEntitiesLookingAt(vector, vector2, obj);
-		CopyEntities(obj, vector, originRot);
+		CopyEntities(ArgEx.Player(args), obj, @string, vector, originRot);
 		Facepunch.Pool.FreeUnmanaged(ref obj);
 	}
 
@@ -599,6 +574,43 @@ public class CopyPaste : ConsoleSystem
 		args.ReplyWith(stringBuilder.ToString());
 	}
 
+	private static string GetLegacyServerDirectory()
+	{
+		return ConVar.Server.GetServerFolder("copypaste");
+	}
+
+	private static string GetLegacyServerPath(string name)
+	{
+		return GetLegacyServerDirectory() + "/" + name + ".data";
+	}
+
+	[ServerVar]
+	public static void download_paste(Arg arg)
+	{
+		if (!arg.HasArgs())
+		{
+			arg.ReplyWith("Missing args: download_paste <name>");
+			return;
+		}
+		string @string = arg.GetString(0);
+		string legacyServerPath = GetLegacyServerPath(arg.GetString(0));
+		if (!File.Exists(legacyServerPath))
+		{
+			arg.ReplyWith("Paste '" + @string + "' not found");
+			return;
+		}
+		using CopyPasteEntityInfo arg2 = CopyPasteEntityInfo.Deserialize(File.ReadAllBytes(legacyServerPath));
+		CopyPasteEntity.ServerInstance.ClientRPC(RpcTarget.Player("RecievePaste", arg.Connection), @string, arg2);
+	}
+
+	[ServerVar]
+	public static void list_pastes_sv(Arg arg)
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+		PrintPasteNames(stringBuilder, GetLegacyServerDirectory());
+		arg.ReplyWith(stringBuilder.ToString());
+	}
+
 	[ServerVar]
 	public static void killbox_sv(Arg args)
 	{
@@ -616,115 +628,6 @@ public class CopyPaste : ConsoleSystem
 			}
 		}
 		Facepunch.Pool.FreeUnmanaged(ref obj);
-	}
-
-	[ServerVar(Name = "savepaste", Help = "<name>")]
-	public static void save_sv(Arg args)
-	{
-		string @string = args.GetString(0);
-		if (!string.IsNullOrEmpty(@string))
-		{
-			new StringBuilder();
-			SaveClipboardInFile(@string);
-			cachedPastes[@string] = clipboard;
-			args.ReplyWith("Saved paste '" + @string + "' to '" + GetPath(@string) + "'");
-		}
-	}
-
-	[ServerVar(Name = "loadpaste", Help = "<name>")]
-	public static void load_sv(Arg args)
-	{
-		string @string = args.GetString(0);
-		if (!string.IsNullOrEmpty(@string))
-		{
-			clipboard = LoadFileInClipboard(@string);
-			cachedPastes[@string] = clipboard;
-		}
-	}
-
-	[ServerVar(Name = "downloadpaste", Help = "<url> <name>")]
-	public static void downloadpaste(Arg args)
-	{
-		string url = args.GetString(0);
-		string name = args.GetString(1);
-		if (string.IsNullOrEmpty(name))
-		{
-			name = Path.GetFileNameWithoutExtension(url);
-		}
-		string path = GetPath(name);
-		if (File.Exists(path))
-		{
-			if (string.IsNullOrEmpty(name))
-			{
-				args.ReplyWith("Paste '" + name + "' already exists on disk! Provide a differnet filename with `downloadpaste <url> <name>");
-			}
-			else
-			{
-				args.ReplyWith("Paste '" + name + "' already exists on disk! Please use a different name");
-			}
-			return;
-		}
-		using WebClient webClient = new WebClient();
-		BasePlayer player = ArgEx.Player(args);
-		Stopwatch sw = Stopwatch.StartNew();
-		webClient.DownloadFileTaskAsync(new Uri(url), path).ContinueWith(delegate(Task task)
-		{
-			if (task.IsFaulted)
-			{
-				player.ConsoleMessage("Failed to download '" + url + "'");
-			}
-			else
-			{
-				player.ConsoleMessage($"Downloaded paste '{name}' from {url} in {Math.Round(sw.Elapsed.TotalSeconds, 1)}s");
-			}
-		});
-	}
-
-	[ServerVar(Help = "<old> <new>")]
-	public static void renamepaste(Arg args)
-	{
-		if (!args.HasArgs(2))
-		{
-			args.ReplyWith("Missing args: renamepaste <old> <new>");
-			return;
-		}
-		string @string = args.GetString(0);
-		string string2 = args.GetString(1);
-		string path = GetPath(@string);
-		string path2 = GetPath(string2);
-		if (!File.Exists(path))
-		{
-			args.ReplyWith("Paste '" + @string + "' does not exist");
-			return;
-		}
-		if (File.Exists(path2))
-		{
-			args.ReplyWith("Paste '" + string2 + "' already exists, please use a different name");
-			return;
-		}
-		File.Move(path, path2);
-		args.ReplyWith("Renamed paste from '" + @string + "' to '" + string2 + "'");
-		cachedPastes.Remove(@string);
-	}
-
-	[ServerVar(Help = "<name>")]
-	public static void deletepaste(Arg args)
-	{
-		if (!args.HasArgs())
-		{
-			args.ReplyWith("Missing args: deletepaste <name>");
-			return;
-		}
-		string @string = args.GetString(0);
-		string path = GetPath(@string);
-		if (!File.Exists(path))
-		{
-			args.ReplyWith("Paste '" + @string + "' does not exist");
-			return;
-		}
-		File.Delete(path);
-		args.ReplyWith("Deleted paste '" + @string + "'");
-		cachedPastes.Remove(@string);
 	}
 
 	private static Quaternion GetPlayerRotation(BasePlayer ply)

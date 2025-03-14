@@ -80,8 +80,8 @@ public class WaterWell : LiquidContainer
 		SetFlag(Flags.Reserved3, b: false);
 	}
 
-	[RPC_Server]
 	[RPC_Server.MaxDistance(3f)]
+	[RPC_Server]
 	public void RPC_Pump(RPCMessage msg)
 	{
 		BasePlayer player = msg.player;

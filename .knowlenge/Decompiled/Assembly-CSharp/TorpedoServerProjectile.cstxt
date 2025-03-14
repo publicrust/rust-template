@@ -2,8 +2,8 @@ using UnityEngine;
 
 public class TorpedoServerProjectile : ServerProjectile
 {
-	[Tooltip("Make sure to leave some allowance for waves, which affect the true depth.")]
 	[SerializeField]
+	[Tooltip("Make sure to leave some allowance for waves, which affect the true depth.")]
 	private float minWaterDepth = 0.5f;
 
 	[SerializeField]

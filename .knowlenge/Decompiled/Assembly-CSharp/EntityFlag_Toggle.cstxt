@@ -20,8 +20,8 @@ public class EntityFlag_Toggle : EntityComponent<BaseEntity>, IOnPostNetworkUpda
 	[SerializeField]
 	private FlagCheck flagCheck;
 
-	[SerializeField]
 	[Tooltip("Specify any flags that must NOT be on for this toggle to be on")]
+	[SerializeField]
 	private BaseEntity.Flags notFlag;
 
 	[SerializeField]

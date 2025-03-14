@@ -12,11 +12,21 @@ using UnityEngine.Assertions;
 
 public class MixingTable : StorageContainer
 {
+	public enum Type
+	{
+		Mixing,
+		Cooking
+	}
+
 	public GameObject Particles;
+
+	public Type TableType;
 
 	public RecipeList Recipes;
 
 	public bool OnlyAcceptValidIngredients;
+
+	public bool visualFood;
 
 	public float lastTickTimestamp;
 
@@ -24,17 +34,21 @@ public class MixingTable : StorageContainer
 
 	private const float mixTickInterval = 1f;
 
-	public Recipe currentRecipe;
+	protected Recipe currentRecipe;
 
 	public int currentQuantity;
 
 	public ItemDefinition currentProductionItem;
+
+	private int pendingItemId;
 
 	private static Dictionary<int, int> itemCostCache = new Dictionary<int, int>();
 
 	public float RemainingMixTime { get; set; }
 
 	public float TotalMixTime { get; set; }
+
+	public int CookingItemId { get; private set; }
 
 	public BasePlayer MixStartingPlayer { get; private set; }
 
@@ -165,10 +179,10 @@ public class MixingTable : StorageContainer
 		}
 	}
 
-	[RPC_Server.IsVisible(3f)]
-	[RPC_Server.CallsPerSecond(5uL)]
 	[RPC_Server.MaxDistance(3f)]
 	[RPC_Server]
+	[RPC_Server.CallsPerSecond(5uL)]
+	[RPC_Server.IsVisible(3f)]
 	private void SV_FillInventoryForRecipe(RPCMessage msg)
 	{
 		if (msg.player == null)
@@ -176,9 +190,9 @@ public class MixingTable : StorageContainer
 			return;
 		}
 		int num = msg.read.Int32();
-		if (num >= 0 && num < Recipes.Recipes.Length)
+		if (num >= 0 && num < Recipes.AllRecipes.Count)
 		{
-			Recipe recipe = Recipes.Recipes[num];
+			Recipe recipe = Recipes.AllRecipes[num];
 			if (!(recipe == null))
 			{
 				int amount = msg.read.Int32();
@@ -305,7 +319,7 @@ public class MixingTable : StorageContainer
 				return;
 			}
 			InvokeRepeating(TickMix, 1f, 1f);
-			SetFlag(Flags.On, b: true);
+			SetFlag(Flags.On, b: true, recursive: false, networkupdate: false);
 			SendNetworkUpdateImmediate();
 		}
 	}
@@ -317,13 +331,13 @@ public class MixingTable : StorageContainer
 
 	public void StopMixing()
 	{
-		currentRecipe = null;
-		currentQuantity = 0;
-		RemainingMixTime = 0f;
-		CancelInvoke(TickMix);
 		if (IsOn())
 		{
-			SetFlag(Flags.On, b: false);
+			SetFlag(Flags.On, b: false, recursive: false, networkupdate: false);
+			currentRecipe = null;
+			currentQuantity = 0;
+			RemainingMixTime = 0f;
+			CancelInvoke(TickMix);
 			SendNetworkUpdateImmediate();
 		}
 	}
@@ -349,6 +363,7 @@ public class MixingTable : StorageContainer
 
 	public void ProduceItem(Recipe recipe, int quantity)
 	{
+		pendingItemId = recipe.ProducedItem.itemid;
 		StopMixing();
 		ConsumeInventory(recipe, quantity);
 		CreateRecipeItems(recipe, quantity);
@@ -402,6 +417,16 @@ public class MixingTable : StorageContainer
 		ItemManager.DoRemoves();
 	}
 
+	public override void OnItemAddedOrRemoved(Item item, bool added)
+	{
+		base.OnItemAddedOrRemoved(item, added);
+		if (!added && item.info.itemid == pendingItemId)
+		{
+			pendingItemId = 0;
+			SendNetworkUpdateImmediate();
+		}
+	}
+
 	protected virtual void CreateRecipeItems(Recipe recipe, int quantity)
 	{
 		if (recipe == null || recipe.ProducedItem == null)
@@ -416,6 +441,10 @@ public class MixingTable : StorageContainer
 		{
 			int num3 = ((num > stackable) ? stackable : num);
 			Item item = ItemManager.Create(recipe.ProducedItem, num3, 0uL);
+			if (MixStartingPlayer != null && !MixStartingPlayer.IsDestroyed)
+			{
+				item.SetItemOwnership(MixStartingPlayer, ItemOwnershipPhrases.MixingTable);
+			}
 			Facepunch.Rust.Analytics.Azure.OnCraftItem(item.info.shortname, item.amount, MixStartingPlayer, this, inSafezone: false);
 			if (!item.MoveToContainer(base.inventory))
 			{
@@ -434,6 +463,7 @@ public class MixingTable : StorageContainer
 	{
 		base.Save(info);
 		info.msg.mixingTable = Facepunch.Pool.Get<ProtoBuf.MixingTable>();
+		info.msg.mixingTable.pendingItem = pendingItemId;
 		if (info.forDisk)
 		{
 			info.msg.mixingTable.remainingMixTime = RemainingMixTime;
@@ -441,6 +471,7 @@ public class MixingTable : StorageContainer
 		else
 		{
 			info.msg.mixingTable.remainingMixTime = RemainingMixTime - Mathf.Max(UnityEngine.Time.realtimeSinceStartup - lastTickTimestamp, 0f);
+			info.msg.mixingTable.currentRecipe = ((currentRecipe != null && currentRecipe.ProducedItem != null) ? currentRecipe.ProducedItem.itemid : (-1));
 		}
 		info.msg.mixingTable.totalMixTime = TotalMixTime;
 	}
@@ -465,6 +496,8 @@ public class MixingTable : StorageContainer
 		{
 			RemainingMixTime = info.msg.mixingTable.remainingMixTime;
 			TotalMixTime = info.msg.mixingTable.totalMixTime;
+			CookingItemId = info.msg.mixingTable.currentRecipe;
+			pendingItemId = info.msg.mixingTable.pendingItem;
 		}
 	}
 

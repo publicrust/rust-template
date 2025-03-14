@@ -52,6 +52,21 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 		MaterialOutput
 	}
 
+	public class CookingItem
+	{
+		public ItemId itemInstanceID;
+
+		public int slotIndex;
+
+		public float cookingProgress;
+
+		public int itemID;
+
+		public int byproductItemID;
+
+		public int initialStackSize;
+	}
+
 	private static Dictionary<float, HashSet<ItemDefinition>> _materialOutputCache;
 
 	public TemperatureType temperature;
@@ -92,6 +107,14 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 	public int _outputSlotIndex;
 
 	public const float UpdateRate = 0.5f;
+
+	private List<CookingItem> cookingItems = new List<CookingItem>();
+
+	public bool visualFood;
+
+	public SoundDefinition sizzlingSoundDef;
+
+	private Sound sizzlingSound;
 
 	public virtual bool CanRunWithNoFuel => false;
 
@@ -175,16 +198,6 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 		}
 	}
 
-	public override void Save(SaveInfo info)
-	{
-		base.Save(info);
-		if (!info.forDisk)
-		{
-			info.msg.baseOven = Facepunch.Pool.Get<ProtoBuf.BaseOven>();
-			info.msg.baseOven.cookSpeed = GetSmeltingSpeed();
-		}
-	}
-
 	public override void OnInventoryFirstCreated(ItemContainer container)
 	{
 		base.OnInventoryFirstCreated(container);
@@ -218,6 +231,10 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 				item.SetFlag(Item.Flag.Cooking, b: false);
 				item.MarkDirty();
 			}
+		}
+		if (visualFood)
+		{
+			OnItemAddedOrRemovedVisualFood(item, bAdded);
 		}
 	}
 
@@ -451,6 +468,10 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 			base.inventory.temperature = cookingTemperature;
 			UpdateAttachmentTemperature();
 			InvokeRepeating(Cook, 0.5f, 0.5f);
+			if (visualFood)
+			{
+				InvokeRepeating(CookVisuals, 0f, 0.05f);
+			}
 			SetFlag(Flags.On, b: true);
 			Interface.CallHook("OnOvenStarted", this);
 			if (hasOpenFlame)
@@ -481,6 +502,7 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 			}
 		}
 		CancelInvoke(Cook);
+		CancelInvoke(CookVisuals);
 		SetFlag(Flags.On, b: false);
 		if (hasOpenFlame)
 		{
@@ -676,6 +698,20 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 		return base.HasSlot(slot);
 	}
 
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		if (!info.forDisk)
+		{
+			info.msg.baseOven = Facepunch.Pool.Get<ProtoBuf.BaseOven>();
+			info.msg.baseOven.cookSpeed = GetSmeltingSpeed();
+			if (visualFood)
+			{
+				SaveVisualFood(info);
+			}
+		}
+	}
+
 	public override bool SupportsChildDeployables()
 	{
 		return true;
@@ -693,5 +729,184 @@ public class BaseOven : StorageContainer, ISplashable, IIndustrialStorage
 	protected virtual bool CanPickupOven()
 	{
 		return children.Count == 0;
+	}
+
+	private void OnItemAddedOrRemovedVisualFood(Item item, bool bAdded)
+	{
+		if (bAdded)
+		{
+			for (int i = _inputSlotIndex; i <= _inputSlotIndex + inputSlots - 1; i++)
+			{
+				if (base.inventory.GetSlot(i) == item)
+				{
+					AddVisualFood(item, i - _inputSlotIndex);
+					break;
+				}
+			}
+		}
+		if (!bAdded)
+		{
+			if (item.uid.Value != 0L)
+			{
+				TryRemoveVisualFood(item);
+			}
+			RemoveFinishedVisualFood(item);
+		}
+	}
+
+	public override void OnItemPositionChanged(Item item, int from, int to)
+	{
+		base.OnItemPositionChanged(item, from, to);
+		if (from < _inputSlotIndex || to > _inputSlotIndex + inputSlots)
+		{
+			return;
+		}
+		foreach (CookingItem cookingItem in cookingItems)
+		{
+			if (cookingItem.itemInstanceID.Value == item.uid.Value)
+			{
+				MoveVisualFood(item, to);
+			}
+		}
+	}
+
+	public override void OnItemAddedToStack(Item item, int amount)
+	{
+		UpdateVisualFoodAmount(item);
+	}
+
+	public override void OnItemRemovedFromStack(Item item, int amount)
+	{
+		UpdateVisualFoodAmount(item);
+	}
+
+	private void UpdateVisualFoodAmount(Item item)
+	{
+		foreach (CookingItem cookingItem in cookingItems)
+		{
+			if (cookingItem.itemInstanceID.Value == item.uid.Value)
+			{
+				cookingItem.cookingProgress = 0f;
+				cookingItem.initialStackSize = item.amount;
+			}
+		}
+	}
+
+	private void MoveVisualFood(Item item, int to)
+	{
+		foreach (CookingItem cookingItem in cookingItems)
+		{
+			if (cookingItem.itemInstanceID.Value == item.uid.Value)
+			{
+				cookingItem.slotIndex = to - _inputSlotIndex;
+			}
+		}
+		SendNetworkUpdate();
+	}
+
+	public void AddVisualFood(Item item, int slot)
+	{
+		if (!visualFood)
+		{
+			return;
+		}
+		CookingItem cookingItem = cookingItems.Find((CookingItem x) => x.slotIndex == slot);
+		if (cookingItem != null)
+		{
+			if (cookingItem.cookingProgress != 1f)
+			{
+				return;
+			}
+			TryRemoveVisualFood(cookingItem.itemInstanceID);
+		}
+		if (item != null)
+		{
+			CookingItem item2 = new CookingItem
+			{
+				itemInstanceID = item.uid,
+				itemID = item.info.itemid,
+				byproductItemID = item.info.ItemModCookable.becomeOnCooked.itemid,
+				slotIndex = slot,
+				initialStackSize = item.amount,
+				cookingProgress = 0f
+			};
+			cookingItems.Add(item2);
+		}
+		SendNetworkUpdate();
+	}
+
+	public void TryRemoveVisualFood(Item item)
+	{
+		TryRemoveVisualFood(item.uid);
+	}
+
+	public void TryRemoveVisualFood(ItemId itemId)
+	{
+		for (int num = cookingItems.Count - 1; num >= 0; num--)
+		{
+			if (cookingItems[num].itemInstanceID == itemId)
+			{
+				cookingItems.RemoveAt(num);
+			}
+		}
+		SendNetworkUpdate();
+	}
+
+	private void RemoveFinishedVisualFood(Item cookedItem)
+	{
+		for (int num = cookingItems.Count - 1; num >= 0; num--)
+		{
+			if (cookingItems[num].cookingProgress == 1f && cookingItems[num].byproductItemID == cookedItem.info.itemid)
+			{
+				bool flag = true;
+				for (int i = _outputSlotIndex; i <= _outputSlotIndex + outputSlots - 1; i++)
+				{
+					Item slot = base.inventory.GetSlot(i);
+					if (slot != null && slot.info.itemid == cookedItem.info.itemid)
+					{
+						flag = false;
+						break;
+					}
+				}
+				if (flag)
+				{
+					cookingItems.RemoveAt(num);
+				}
+			}
+		}
+		SendNetworkUpdate();
+	}
+
+	private void SaveVisualFood(SaveInfo info)
+	{
+		info.msg.baseOven.cookingItems = Facepunch.Pool.Get<List<ProtoBuf.BaseOven.CookingItem>>();
+		foreach (CookingItem cookingItem2 in cookingItems)
+		{
+			ProtoBuf.BaseOven.CookingItem cookingItem = Facepunch.Pool.Get<ProtoBuf.BaseOven.CookingItem>();
+			cookingItem.itemID = cookingItem2.itemID;
+			cookingItem.slotIndex = cookingItem2.slotIndex;
+			cookingItem.initialStackSize = cookingItem2.initialStackSize;
+			cookingItem.cookingProgress = cookingItem2.cookingProgress;
+			info.msg.baseOven.cookingItems.Add(cookingItem);
+		}
+	}
+
+	private void CookVisuals()
+	{
+		foreach (CookingItem cookingItem in cookingItems)
+		{
+			if (cookingItem.cookingProgress != 1f)
+			{
+				Item slot = base.inventory.GetSlot(cookingItem.slotIndex + _inputSlotIndex);
+				if (slot == null)
+				{
+					cookingItem.cookingProgress = 1f;
+					continue;
+				}
+				float cookTime = slot.info.ItemModCookable.cookTime;
+				float cookingProgress = ((float)(cookingItem.initialStackSize - slot.amount) + (1f - slot.cookTimeLeft / cookTime)) / (float)cookingItem.initialStackSize;
+				cookingItem.cookingProgress = cookingProgress;
+			}
+		}
 	}
 }

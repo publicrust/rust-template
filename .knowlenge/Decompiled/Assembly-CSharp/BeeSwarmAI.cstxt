@@ -1,0 +1,353 @@
+using ConVar;
+using Facepunch;
+using Rust.Ai;
+using UnityEngine;
+
+public class BeeSwarmAI : BaseCombatEntity, ISplashable
+{
+	[Header("Settings")]
+	public float moveSpeed = 2f;
+
+	public float stopThreshold = 0.2f;
+
+	[Header("Animation")]
+	public float ReductionAmount;
+
+	public float ReductionDuration;
+
+	public float Frequency;
+
+	public ParticleSystem PSystem;
+
+	public Light OnFireLight;
+
+	public ParticleSystemForceField AngerForceField;
+
+	private Vector3 pastPosition = Vector3.one;
+
+	private Vector3 velocity = Vector3.zero;
+
+	public const Flags IsAngry = Flags.Reserved12;
+
+	public const Flags IsDying = Flags.Reserved13;
+
+	public const Flags HasTarget = Flags.Reserved14;
+
+	[ServerVar(Help = "How long a swarm will stick around without a target")]
+	public static float killWithoutTargetTime = 180f;
+
+	[ServerVar(Help = "How far away fire has to be to set the swarm on fire")]
+	public static float flameSettingDistance = 5.5f;
+
+	[ServerVar(Help = "How much water a player needs to be in to be ignored")]
+	public static float waterThreshold = 0.6f;
+
+	[ServerVar(Help = "Range to find new targets")]
+	public static float searchRange = 10f;
+
+	[ServerVar(Help = "Range to leave current target alone (should be higher than search)")]
+	public static float breakRange = 15f;
+
+	[ServerVar]
+	public static bool disable = false;
+
+	private BasePlayer targetPlayer;
+
+	private TimeSince timeSinceHadTarget;
+
+	private float targetPlayerLastWaterLevel;
+
+	private bool hasCameFromAHive;
+
+	private TimeSince timeSinceEgress;
+
+	private Vector3 egressDirection = Vector3.one;
+
+	public override void OnFlagsChanged(Flags old, Flags next)
+	{
+		base.OnFlagsChanged(old, next);
+	}
+
+	private void Update()
+	{
+		DoAI();
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (info.fromDisk)
+		{
+			Die();
+		}
+	}
+
+	public override void OnAttacked(HitInfo info)
+	{
+		base.OnAttacked(info);
+		SetFlag(Flags.Reserved12, b: true);
+	}
+
+	public override void ServerInit()
+	{
+		base.ServerInit();
+		SetFlag(Flags.Reserved12, b: true);
+		timeSinceHadTarget = 0f;
+		InvokeRepeating(ThinkAI, 0f, 0.25f);
+	}
+
+	public void SetHasCameFromAHive(bool cameFromHive)
+	{
+		hasCameFromAHive = cameFromHive;
+	}
+
+	public void SetTarget(BasePlayer ply)
+	{
+		targetPlayer = ply;
+	}
+
+	private void ThinkAI()
+	{
+		using (TimeWarning.New("BeeSwarmAI.ThinkAI"))
+		{
+			if (!HasFlag(Flags.Reserved12) || disable)
+			{
+				return;
+			}
+			if (hasCameFromAHive)
+			{
+				if (AI.ignoreplayers || !AI.think)
+				{
+					return;
+				}
+			}
+			else if (AI.effectaiweapons && (AI.ignoreplayers || !AI.think))
+			{
+				return;
+			}
+			if (targetPlayer == null)
+			{
+				targetPlayer = FindTarget(base.transform);
+				if (targetPlayer != null)
+				{
+					targetPlayerLastWaterLevel = targetPlayer.metabolism.wetness.value;
+					timeSinceHadTarget = 0f;
+					SetFlag(Flags.Reserved14, b: true);
+				}
+			}
+			ValidateTarget();
+			if (IsSmoke())
+			{
+				StartDie();
+			}
+			if ((float)timeSinceHadTarget > killWithoutTargetTime)
+			{
+				StartDie();
+			}
+		}
+	}
+
+	private bool IsSmoke()
+	{
+		using PooledList<BaseEntity> pooledList = Facepunch.Pool.Get<PooledList<BaseEntity>>();
+		SingletonComponent<SmokeGrenadeManager>.Instance.GetSmokeAround(base.transform.position, 5f, pooledList);
+		return pooledList != null && pooledList.Count > 0;
+	}
+
+	private void DoAI()
+	{
+		using (TimeWarning.New("BeeSwarmAI.DoAI"))
+		{
+			if (HasFlag(Flags.Reserved12) && !disable && !(targetPlayer == null))
+			{
+				SteerToPlayer();
+				Quaternion b = Quaternion.LookRotation(targetPlayer.transform.position - base.transform.position);
+				base.transform.rotation = Quaternion.Slerp(base.transform.rotation, b, UnityEngine.Time.deltaTime * 2f);
+				if (targetPlayer != null)
+				{
+					targetPlayerLastWaterLevel = targetPlayer.metabolism.wetness.value;
+				}
+			}
+		}
+	}
+
+	private bool IsFire(out Vector3 firePosition)
+	{
+		using PooledList<BaseEntity> pooledList = Facepunch.Pool.Get<PooledList<BaseEntity>>();
+		SingletonComponent<NpcFireManager>.Instance.GetFiresAround(GetTargetEyesPosition(), 2f, pooledList);
+		firePosition = Vector3.zero;
+		foreach (BaseEntity item in pooledList)
+		{
+			if (!(item == null) && !item.IsDestroyed)
+			{
+				if (item is FlameThrower && Vector3.Distance(base.transform.position, item.transform.position) < flameSettingDistance)
+				{
+					SetOnFire();
+				}
+				firePosition = item.transform.position;
+			}
+		}
+		return pooledList.Count > 0;
+	}
+
+	public Vector3 GetTargetEyesPosition()
+	{
+		Vector3 zero = Vector3.zero;
+		if (targetPlayer.eyes == null)
+		{
+			return targetPlayer.transform.position + new Vector3(0f, 1f, 0f);
+		}
+		return targetPlayer.eyes.position;
+	}
+
+	private void ValidateTarget()
+	{
+		if (targetPlayer == null || targetPlayer.InSafeZone() || targetPlayer.IsDead())
+		{
+			targetPlayer = null;
+			SetFlag(Flags.Reserved14, b: false);
+			return;
+		}
+		if (targetPlayer.metabolism.wetness.value > waterThreshold || (float)targetPlayer.TimeSinceLastWaterSplash < 1f || targetPlayer.WaterFactor() > 0.5f)
+		{
+			targetPlayer = null;
+			SetFlag(Flags.Reserved14, b: false);
+			return;
+		}
+		if (Vector3.Distance(base.transform.position, targetPlayer.transform.position) > breakRange)
+		{
+			targetPlayer = null;
+			SetFlag(Flags.Reserved14, b: false);
+			return;
+		}
+		Vector3 p = targetPlayer.transform.position + new Vector3(0f, 1f, 0f);
+		if (!GamePhysics.LineOfSight(base.transform.position, p, 1218519041))
+		{
+			targetPlayer = null;
+			SetFlag(Flags.Reserved14, b: false);
+		}
+	}
+
+	private void SetOnFire()
+	{
+		SetFlag(Flags.Reserved14, b: false);
+		SetFlag(Flags.OnFire, b: true);
+		Invoke(StartDie, 1f);
+	}
+
+	private void SteerToPlayer()
+	{
+		Vector3 targetEyesPosition = GetTargetEyesPosition();
+		Vector3 localTarget = base.transform.InverseTransformPoint(targetEyesPosition);
+		if (IsFire(out var firePosition))
+		{
+			float num = 5f;
+			Vector3 vector = base.transform.position - firePosition;
+			if (vector.magnitude < num)
+			{
+				vector.Normalize();
+				base.transform.position += vector * moveSpeed * UnityEngine.Time.deltaTime;
+				return;
+			}
+		}
+		if (!(Mathf.Abs(localTarget.magnitude) <= stopThreshold))
+		{
+			SteerToTarget(localTarget);
+		}
+	}
+
+	private void SteerToTarget(Vector3 localTarget)
+	{
+		float num = Mathf.Clamp(localTarget.y, -1f, 1f);
+		float num2 = Mathf.Clamp(localTarget.x, -1f, 1f);
+		Vector3 vector = base.transform.forward + base.transform.right * num2 + base.transform.up * num;
+		vector.Normalize();
+		base.transform.position += vector * moveSpeed * UnityEngine.Time.deltaTime;
+	}
+
+	private void StartDie()
+	{
+		SetFlag(Flags.Reserved12, b: false);
+		SetFlag(Flags.Reserved13, b: true);
+		timeSinceEgress = 0f;
+		int num = ((Random.Range(0, 2) != 0) ? 1 : (-1));
+		int num2 = ((Random.Range(0, 2) != 0) ? 1 : (-1));
+		egressDirection = Vector3.right * num + Vector3.forward * num2;
+		InvokeRepeating(Egress, 0f, 0f);
+	}
+
+	public static BasePlayer FindTarget(Transform transform)
+	{
+		using (TimeWarning.New("BeeSwarmAI.FindTarget"))
+		{
+			using PooledList<BasePlayer> pooledList = Facepunch.Pool.Get<PooledList<BasePlayer>>();
+			Query.Server.GetPlayersInSphere(transform.position, searchRange, pooledList, Query.DistanceCheckType.None, includeHumanoidNpcs: true);
+			BasePlayer result = null;
+			float num = float.MaxValue;
+			foreach (BasePlayer item in pooledList)
+			{
+				if (SimpleAIMemory.PlayerIgnoreList.Contains(item) || item.InSafeZone() || item.IsInTutorial || item.IsDead() || item.metabolism.wetness.value > waterThreshold)
+				{
+					continue;
+				}
+				Vector3 p = item.transform.position + new Vector3(0f, 1f, 0f);
+				if (GamePhysics.LineOfSight(transform.position, p, 1218519041))
+				{
+					float sqrMagnitude = (item.transform.position - transform.position).sqrMagnitude;
+					if (sqrMagnitude < num)
+					{
+						num = sqrMagnitude;
+						result = item;
+					}
+				}
+			}
+			return result;
+		}
+	}
+
+	private bool IsUnderWater(BasePlayer ply)
+	{
+		return Mathf.Abs(WaterSystem.OceanLevel - GetTargetEyesPosition().y) > 1f;
+	}
+
+	private void Egress()
+	{
+		base.transform.rotation = Quaternion.LookRotation(egressDirection);
+		SteerToTarget(egressDirection);
+		if ((float)timeSinceEgress > 10f)
+		{
+			Die();
+		}
+	}
+
+	public bool WantsSplash(ItemDefinition splashType, int amount)
+	{
+		if (splashType == null || splashType.shortname == null)
+		{
+			return false;
+		}
+		if (HasFlag(Flags.Reserved13))
+		{
+			return false;
+		}
+		if (amount > 0)
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public int DoSplash(ItemDefinition splashType, int amount)
+	{
+		float num = base.health - 10f;
+		if (num > 0f)
+		{
+			Hurt(num);
+		}
+		if (base.health <= 10f)
+		{
+			StartDie();
+		}
+		return amount;
+	}
+}

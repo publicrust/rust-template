@@ -14,8 +14,8 @@ public sealed class TemporalAntialiasing
 		SolverNoDilate
 	}
 
-	[Range(0.1f, 1f)]
 	[Tooltip("The diameter (in texels) inside which jitter samples are spread. Smaller values result in crisper but more aliased output, while larger values result in more stable, but blurrier, output.")]
+	[Range(0.1f, 1f)]
 	public float jitterSpread = 0.75f;
 
 	[Tooltip("Controls the amount of sharpening applied to the color buffer. High values may introduce dark-border artifacts.")]
@@ -26,8 +26,8 @@ public sealed class TemporalAntialiasing
 	[Range(0f, 0.99f)]
 	public float stationaryBlending = 0.95f;
 
-	[Tooltip("The blend coefficient for a fragment with significant motion. Controls the percentage of history sample blended into the final color.")]
 	[Range(0f, 0.99f)]
+	[Tooltip("The blend coefficient for a fragment with significant motion. Controls the percentage of history sample blended into the final color.")]
 	public float motionBlending = 0.85f;
 
 	public Func<Camera, Vector2, Matrix4x4> jitteredMatrixFunc;

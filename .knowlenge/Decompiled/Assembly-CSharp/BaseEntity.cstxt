@@ -914,6 +914,10 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 	private Action _disableTransferProtectionAction;
 
+	private float cachedBuildingPrivilegeTime;
+
+	private BuildingPrivlidge cachedBuildingPrivilege;
+
 	public const string RpcClientDeprecationNotice = "Use ClientRPC( RpcTarget ) overloads";
 
 	public Spawnable _spawnable;
@@ -1612,6 +1616,30 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		return false;
 	}
 
+	public static void WaterTestFromVolumes(ReadOnlySpan<BaseEntity> entities, ReadOnlySpan<Vector3> starts, ReadOnlySpan<Vector3> ends, ReadOnlySpan<float> radii, Span<WaterLevel.WaterInfo> results)
+	{
+		for (int i = 0; i < entities.Length; i++)
+		{
+			BaseEntity baseEntity = entities[i];
+			ref WaterLevel.WaterInfo reference = ref results[i];
+			if (baseEntity.triggers == null || baseEntity.triggers.Count == 0)
+			{
+				reference.isValid = false;
+				continue;
+			}
+			Vector3 start = starts[i];
+			Vector3 end = ends[i];
+			float radius = radii[i];
+			for (int j = 0; j < baseEntity.triggers.Count; j++)
+			{
+				if (baseEntity.triggers[i] is WaterVolume waterVolume && waterVolume.Test(start, end, radius, out reference))
+				{
+					break;
+				}
+			}
+		}
+	}
+
 	public virtual bool BlocksWaterFor(BasePlayer player)
 	{
 		return false;
@@ -2015,6 +2043,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				List<Connection> subscribers = GetSubscribers();
 				if (subscribers != null && subscribers.Count > 0)
 				{
+					SendDemoTransientEntity();
 					NetWrite netWrite = Network.Net.sv.StartWrite();
 					netWrite.PacketID(Message.Type.EntityFlags);
 					netWrite.EntityID(net.ID);
@@ -2563,6 +2592,11 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 	}
 
+	protected bool PrivilegeCacheDefaultValue()
+	{
+		return base.isClient;
+	}
+
 	public virtual EntityPrivilege GetEntityBuildingPrivilege()
 	{
 		return null;
@@ -2570,23 +2604,42 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 	public virtual BuildingPrivlidge GetBuildingPrivilege()
 	{
-		return GetNearestBuildingPrivledge();
+		return GetNearestBuildingPrivilege(PrivilegeCacheDefaultValue());
 	}
 
-	public BuildingPrivlidge GetNearestBuildingPrivledge()
+	public virtual BuildingPrivlidge GetBuildingPrivilege(bool cached, float cacheDuration = 1f)
 	{
-		return GetBuildingPrivilege(WorldSpaceBounds());
+		return GetNearestBuildingPrivilege(cached, cacheDuration);
+	}
+
+	public BuildingPrivlidge GetNearestBuildingPrivilege()
+	{
+		return GetBuildingPrivilege(PrivilegeCacheDefaultValue());
+	}
+
+	public BuildingPrivlidge GetNearestBuildingPrivilege(bool cached, float cacheDuration = 1f)
+	{
+		return GetBuildingPrivilege(WorldSpaceBounds(), cached, cacheDuration);
 	}
 
 	public BuildingPrivlidge GetBuildingPrivilege(OBB obb)
 	{
-		object obj = Interface.CallHook("OnBuildingPrivilege", this, obb);
+		return GetBuildingPrivilege(obb, PrivilegeCacheDefaultValue());
+	}
+
+	public BuildingPrivlidge GetBuildingPrivilege(OBB obb, bool cached, float cacheDuration = 1f)
+	{
+		object obj = Interface.CallHook("OnBuildingPrivilege", this, obb, cached, cacheDuration);
 		if (obj is BuildingPrivlidge)
 		{
 			return (BuildingPrivlidge)obj;
 		}
+		if (cached && cachedBuildingPrivilegeTime != 0f && UnityEngine.Time.time - cachedBuildingPrivilegeTime < cacheDuration)
+		{
+			return cachedBuildingPrivilege;
+		}
 		BuildingBlock other = null;
-		BuildingPrivlidge result = null;
+		BuildingPrivlidge buildingPrivlidge = null;
 		List<BuildingBlock> obj2 = Facepunch.Pool.Get<List<BuildingBlock>>();
 		Vis.Entities(obb.position, 16f + obb.extents.magnitude, obj2, 2097152);
 		for (int i = 0; i < obj2.Count; i++)
@@ -2603,12 +2656,14 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 				if (!(dominatingBuildingPrivilege == null))
 				{
 					other = buildingBlock;
-					result = dominatingBuildingPrivilege;
+					buildingPrivlidge = dominatingBuildingPrivilege;
 				}
 			}
 		}
 		Facepunch.Pool.FreeUnmanaged(ref obj2);
-		return result;
+		cachedBuildingPrivilegeTime = UnityEngine.Time.time;
+		cachedBuildingPrivilege = buildingPrivlidge;
+		return cachedBuildingPrivilege;
 	}
 
 	public void SV_RPCMessage(uint nameID, Message message)
@@ -2939,6 +2994,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 
 	protected NetWrite ClientRPCStart(string funcName)
 	{
+		SendDemoTransientEntity();
 		NetWrite netWrite = Network.Net.sv.StartWrite();
 		netWrite.PacketID(Message.Type.RPCMessage);
 		netWrite.EntityID(net.ID);
@@ -3280,6 +3336,7 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 		}
 		SingletonComponent<NpcFoodManager>.Instance.Move(this);
 		SingletonComponent<NpcFireManager>.Instance.Move(this);
+		SingletonComponent<SmokeGrenadeManager>.Instance.Move(this);
 		if (net == null)
 		{
 			return;
@@ -3660,16 +3717,31 @@ public class BaseEntity : BaseNetworkable, IOnParentSpawning, IPrefabPreProcess
 			foreach (Connection subscriber in net.group.subscribers)
 			{
 				BasePlayer basePlayer = subscriber.player as BasePlayer;
-				if (!(basePlayer == null))
+				if (basePlayer == null)
 				{
-					if (ShouldNetworkTo(basePlayer))
-					{
-						obj.Add(subscriber);
-					}
-					else
+					continue;
+				}
+				if (ShouldNetworkTo(basePlayer))
+				{
+					obj.Add(subscriber);
+					continue;
+				}
+				if (sourceConnection == null)
+				{
+					obj2.Add(subscriber);
+					continue;
+				}
+				_ = sourceConnection.player;
+				if (IsUnderground())
+				{
+					if (basePlayer.IsUnderground())
 					{
 						obj2.Add(subscriber);
 					}
+				}
+				else
+				{
+					obj2.Add(subscriber);
 				}
 			}
 			if (obj.Count > 0)

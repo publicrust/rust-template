@@ -48,8 +48,8 @@ public class CardGameUI : UIDialog
 		void UpdateInGameUI_NoPlayer(CardGameUI ui);
 	}
 
-	[SerializeField]
 	[Header("Card Game")]
+	[SerializeField]
 	private InfoTextUI primaryInfo;
 
 	[SerializeField]

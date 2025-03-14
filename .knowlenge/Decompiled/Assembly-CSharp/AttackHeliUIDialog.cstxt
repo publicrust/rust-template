@@ -3,8 +3,8 @@ using UnityEngine;
 
 public class AttackHeliUIDialog : UIDialog
 {
-	[SerializeField]
 	[Header("Attack Helicopter")]
+	[SerializeField]
 	private Material compassStripMat;
 
 	[SerializeField]

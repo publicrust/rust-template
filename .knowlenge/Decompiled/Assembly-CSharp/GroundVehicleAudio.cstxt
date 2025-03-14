@@ -5,8 +5,8 @@ public abstract class GroundVehicleAudio : MonoBehaviour, IClientComponent
 	[SerializeField]
 	protected GroundVehicle groundVehicle;
 
-	[SerializeField]
 	[Header("Engine")]
+	[SerializeField]
 	private SoundDefinition engineStartSound;
 
 	[SerializeField]
@@ -34,8 +34,8 @@ public abstract class GroundVehicleAudio : MonoBehaviour, IClientComponent
 	[SerializeField]
 	private float waterSoundsMaxSpeed = 10f;
 
-	[Header("Brakes")]
 	[SerializeField]
+	[Header("Brakes")]
 	private SoundDefinition brakeSoundDef;
 
 	[SerializeField]
@@ -44,7 +44,7 @@ public abstract class GroundVehicleAudio : MonoBehaviour, IClientComponent
 	[SerializeField]
 	private SoundDefinition brakeStopSoundDef;
 
-	[Header("Lights")]
 	[SerializeField]
+	[Header("Lights")]
 	protected SoundDefinition lightsToggleSound;
 }

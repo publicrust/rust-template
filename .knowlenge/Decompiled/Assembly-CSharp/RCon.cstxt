@@ -38,7 +38,8 @@ public class RCon
 		Warning,
 		Chat,
 		Report,
-		ClientPerf
+		ClientPerf,
+		Subscription
 	}
 
 	public struct Response
@@ -58,6 +59,13 @@ public class RCon
 		public IPAddress addr;
 
 		public float banTime;
+	}
+
+	public static class ReservedIdentifiers
+	{
+		public const int PlayerPostionsUpdate = -64001;
+
+		public const int FoundationsUpdate = -64002;
 	}
 
 	internal class RConClient
@@ -362,6 +370,8 @@ public class RCon
 	[ServerVar(Help = "If true, RCON commands will be printed in the console")]
 	public static bool Print = false;
 
+	private static bool _enableSubscriptions;
+
 	internal static RConListener listener = null;
 
 	public static Listener listenerNew = null;
@@ -391,6 +401,42 @@ public class RCon
 	internal static int SERVERDATA_CONSOLE_LOG = 4;
 
 	internal static int SERVERDATA_SWITCH_UTF8 = 5;
+
+	public static bool HasSubscribers
+	{
+		get
+		{
+			if (EnableSubscriptions)
+			{
+				return listenerNew.HasSubscribers;
+			}
+			return false;
+		}
+	}
+
+	[ServerVar(Help = "If true, allow RCON connections to subscribe to server events. This could be a performance hit and should only be used if you need it.", Saved = true, ShowInAdminUI = true)]
+	public static bool EnableSubscriptions
+	{
+		get
+		{
+			return _enableSubscriptions;
+		}
+		set
+		{
+			if (_enableSubscriptions != value)
+			{
+				_enableSubscriptions = value;
+				if (value)
+				{
+					ServerSubscriptions.StartSubscribeFeed();
+				}
+				else
+				{
+					ServerSubscriptions.StopSubscribeFeed();
+				}
+			}
+		}
+	}
 
 	[ServerVar(Help = "Ban an IP address from RCON, preventing it from connecting and kick any clients from this IP, this is permanent and persistent")]
 	public static void ban_ip(ConsoleSystem.Arg arg)
@@ -505,14 +551,38 @@ public class RCon
 		bool flag = arg.HasArg("--json", remove: true);
 		IList<RconClientStats> clientStats = listenerNew.GetClientStats();
 		TextTable textTable = new TextTable();
-		textTable.AddColumns("index", "connection_id", "ip", "port", "connected_time", "inbound_messages", "outbound_messages", "broadcast_messages");
+		textTable.AddColumns("index", "connection_id", "ip", "port", "connected_time", "inbound_messages", "outbound_messages", "broadcast_messages", "subscribed");
 		for (int i = 0; i < clientStats.Count; i++)
 		{
 			RconClientStats rconClientStats = clientStats[i];
 			TimeSpan timeSpan = DateTime.UtcNow.Subtract(rconClientStats.ConnectedAt);
-			textTable.AddRow(i.ToString(), rconClientStats.ConnectionId.ToString(), rconClientStats.IP.ToString(), rconClientStats.Port.ToString(), Math.Floor(timeSpan.TotalSeconds).ToString(), rconClientStats.RecievedMessages.ToString(), rconClientStats.SentMessages.ToString(), rconClientStats.BroadcastedMessages.ToString());
+			textTable.AddRow(i.ToString(), rconClientStats.ConnectionId.ToString(), rconClientStats.IP.ToString(), rconClientStats.Port.ToString(), Math.Floor(timeSpan.TotalSeconds).ToString(), rconClientStats.RecievedMessages.ToString(), rconClientStats.SentMessages.ToString(), rconClientStats.BroadcastedMessages.ToString(), rconClientStats.IsSubscribed.ToString());
 		}
 		arg.ReplyWith(flag ? textTable.ToJson() : textTable.ToString());
+	}
+
+	[ServerVar(Help = "Clears all subscribers from the server.")]
+	public static void clear_subscribers(ConsoleSystem.Arg arg)
+	{
+		listenerNew.ClearSubscribers();
+		arg.ReplyWith("Cleared subscribers");
+	}
+
+	[ServerVar(Help = "Un/Subscribes the current RCON connection to changes in server state. This could be a performance hit and should only be used if you need it.")]
+	public static void subscribe(ConsoleSystem.Arg arg)
+	{
+		if (!EnableSubscriptions)
+		{
+			arg.ReplyWith("Subscriptions are disabled. Enable them with enablesubscriptions");
+			return;
+		}
+		if (!arg.IsRcon || arg.Option.RconConnectionId == 0)
+		{
+			arg.ReplyWith("Must be an RCON connection to subscribe to server state");
+			return;
+		}
+		bool flag = SetEventSubscriber(arg.Option.RconConnectionId);
+		arg.ReplyWith(flag ? "Subscribed" : "Unsubscribed");
 	}
 
 	public static void Initialize()
@@ -587,6 +657,19 @@ public class RCon
 		{
 			listener.Shutdown();
 			listener = null;
+		}
+	}
+
+	public static void SendMessageToSubscribers(string message, int identifier = -1)
+	{
+		if (listenerNew != null)
+		{
+			Response response = default(Response);
+			response.Identifier = identifier;
+			response.Message = message;
+			response.Type = LogType.Subscription;
+			string message2 = JsonConvert.SerializeObject((object)response, (Formatting)1);
+			listenerNew.SendMessageToSubscribers(message2);
 		}
 	}
 
@@ -668,7 +751,7 @@ public class RCon
 			}
 			isInput = false;
 			timer.Restart();
-			string text = ConsoleSystem.Run(ConsoleSystem.Option.Server.Quiet(), cmd.Message);
+			string text = ConsoleSystem.Run(ConsoleSystem.Option.Server.Quiet().WithRconId(cmd.ConnectionId), cmd.Message);
 			timer.Stop();
 			TimeSpan elapsed = timer.Elapsed;
 			if (RconProfiler.mode > 0)
@@ -717,5 +800,10 @@ public class RCon
 				listenerNew.SendMessage(responseConnection, JsonConvert.SerializeObject((object)response, (Formatting)1));
 			}
 		}
+	}
+
+	public static bool SetEventSubscriber(int optionRconConnectionId)
+	{
+		return listenerNew.AddOrRemoveEventListener(optionRconConnectionId);
 	}
 }

@@ -22,7 +22,8 @@ public class Item : Facepunch.Pool.IPooled
 		OnFire = 4,
 		IsLocked = 8,
 		Cooking = 0x10,
-		Radioactive = 0x20
+		Radioactive = 0x20,
+		Refrigerated = 0x40
 	}
 
 	private const string DefaultArmourBreakEffectPath = "assets/bundled/prefabs/fx/armor_break.prefab";
@@ -62,6 +63,8 @@ public class Item : Facepunch.Pool.IPooled
 	public float cookTimeLeft;
 
 	public float radioactivity;
+
+	public List<ItemOwnershipShare> ownershipShares;
 
 	public Flag flags;
 
@@ -400,6 +403,7 @@ public class Item : Facepunch.Pool.IPooled
 		this.OnDirty = null;
 		_condition = 0f;
 		_maxCondition = 100f;
+		ownershipShares = null;
 	}
 
 	void Facepunch.Pool.IPooled.LeavePool()
@@ -525,6 +529,7 @@ public class Item : Facepunch.Pool.IPooled
 		float num = (maxCondition = info.condition.max);
 		condition = num;
 		SetRadioactivity(template);
+		InitializeItemOwnership();
 		OnItemCreated();
 	}
 
@@ -538,12 +543,12 @@ public class Item : Facepunch.Pool.IPooled
 		}
 	}
 
-	public void OnVirginSpawn()
+	public void OnVirginSpawn(BasePlayer creatingPlayer = null)
 	{
 		ItemMod[] itemMods = info.itemMods;
 		for (int i = 0; i < itemMods.Length; i++)
 		{
-			itemMods[i].OnVirginItem(this);
+			itemMods[i].OnVirginItem(this, creatingPlayer);
 		}
 	}
 
@@ -607,6 +612,143 @@ public class Item : Facepunch.Pool.IPooled
 	public bool DoItemSlotsConflict(Item other)
 	{
 		return (info.occupySlots & other.info.occupySlots) != 0;
+	}
+
+	public void AddItemOwnership(string username, string reason, int shareAmount)
+	{
+		if (ownershipShares == null)
+		{
+			return;
+		}
+		if (ownershipShares.Count > 0)
+		{
+			for (int i = 0; i < ownershipShares.Count; i++)
+			{
+				ItemOwnershipShare value = ownershipShares[i];
+				if (value.username == username && value.reason == reason)
+				{
+					value.amount += shareAmount;
+					ownershipShares[i] = value;
+					shareAmount = 0;
+					break;
+				}
+			}
+		}
+		if (shareAmount > 0)
+		{
+			ItemOwnershipShare itemOwnershipShare = default(ItemOwnershipShare);
+			itemOwnershipShare.username = username;
+			itemOwnershipShare.reason = reason;
+			itemOwnershipShare.amount = shareAmount;
+			ItemOwnershipShare item = itemOwnershipShare;
+			ownershipShares.Add(item);
+		}
+		MarkDirty();
+	}
+
+	public void MigrateItemOwnership(Item targetItem, int amount)
+	{
+		if (ownershipShares != null && targetItem.ownershipShares != null)
+		{
+			TransferOwnership(targetItem, amount);
+		}
+	}
+
+	public ItemOwnershipShare TakeOwnershipShare()
+	{
+		if (!HasItemOwnership())
+		{
+			return default(ItemOwnershipShare);
+		}
+		ItemOwnershipShare itemOwnershipShare = ownershipShares[0];
+		itemOwnershipShare.amount--;
+		ownershipShares[0] = itemOwnershipShare;
+		if (itemOwnershipShare.amount <= 0)
+		{
+			ownershipShares.RemoveAt(0);
+		}
+		return itemOwnershipShare;
+	}
+
+	public void ReduceItemOwnership(int amount)
+	{
+		if (ownershipShares != null)
+		{
+			TransferOwnership(null, amount);
+		}
+	}
+
+	private void TransferOwnership(Item targetItem, int amount)
+	{
+		for (int num = ownershipShares.Count - 1; num >= 0; num--)
+		{
+			if (amount <= 0)
+			{
+				return;
+			}
+			ItemOwnershipShare value = ownershipShares[num];
+			int num2 = Mathf.Min(value.amount, amount);
+			targetItem?.AddItemOwnership(value.username, value.reason, num2);
+			amount -= num2;
+			value.amount -= num2;
+			if (value.amount == 0)
+			{
+				ownershipShares.RemoveAt(num);
+			}
+			else
+			{
+				ownershipShares[num] = value;
+			}
+		}
+		MarkDirty();
+	}
+
+	public bool HasItemOwnership()
+	{
+		if (ownershipShares != null)
+		{
+			return ownershipShares.Count > 0;
+		}
+		return false;
+	}
+
+	public Item SetItemOwnership(BasePlayer player, Translate.Phrase reason)
+	{
+		return SetItemOwnership((player != null && !player.IsDestroyed) ? player.displayName : "", reason.token);
+	}
+
+	public Item SetItemOwnership(ItemOwnershipShare ownership)
+	{
+		return SetItemOwnership(ownership.username, ownership.reason);
+	}
+
+	public Item SetItemOwnership(BasePlayer player, string reason)
+	{
+		return SetItemOwnership((player != null && !player.IsDestroyed) ? player.displayName : "", reason);
+	}
+
+	public Item SetItemOwnership(string username, Translate.Phrase reason)
+	{
+		return SetItemOwnership(username, reason?.token ?? "");
+	}
+
+	public Item SetItemOwnership(string username, string reason)
+	{
+		if (ownershipShares == null)
+		{
+			return this;
+		}
+		ownershipShares?.Clear();
+		AddItemOwnership(username, reason, amount);
+		return this;
+	}
+
+	public void InitializeItemOwnership()
+	{
+		if (!(info == null) && info.SupportsItemOwnership() && ownershipShares == null)
+		{
+			ownershipShares = Facepunch.Pool.Get<List<ItemOwnershipShare>>();
+		}
 	}
 
 	public void SetParent(ItemContainer target)
@@ -862,11 +1004,16 @@ public class Item : Facepunch.Pool.IPooled
 						}
 						int num2 = Mathf.Min(num - slot2.amount, amount);
 						slot2.amount += num2;
+						if (slot2.instanceData != null && instanceData != null && (bool)info.GetComponent<ItemModFoodSpoiling>())
+						{
+							slot2.instanceData.dataFloat = Mathf.Min(slot2.instanceData.dataFloat, instanceData.dataFloat);
+						}
 						newcontainer.onItemAddedToStack?.Invoke(slot2, num2);
 						amount -= num2;
 						slot2.MarkDirty();
 						Interface.CallHook("OnItemStacked", slot2, this, newcontainer, num2);
 						MarkDirty();
+						MigrateItemOwnership(slot2, num2);
 						if (amount <= 0)
 						{
 							RemoveFromWorld();
@@ -897,6 +1044,7 @@ public class Item : Facepunch.Pool.IPooled
 						if (item == null || !item.MoveToContainer(newcontainer2, -1, allowStack: false, ignoreStackLimit: false, sourcePlayer, allowSwap: false))
 						{
 							slot2.amount += item.amount;
+							item.MigrateItemOwnership(slot2, item.amount);
 							item.Remove();
 							return false;
 						}
@@ -925,6 +1073,7 @@ public class Item : Facepunch.Pool.IPooled
 			{
 				if (iTargetPos >= 0 && iTargetPos != position && !parent.SlotTaken(this, iTargetPos))
 				{
+					newcontainer.onItemPositionChanged?.Invoke(this, position, iTargetPos);
 					position = iTargetPos;
 					MarkDirty();
 					return true;
@@ -939,7 +1088,7 @@ public class Item : Facepunch.Pool.IPooled
 					DroppedItem droppedItem = item2.Drop(newcontainer.dropPosition, newcontainer.dropVelocity) as DroppedItem;
 					if (droppedItem != null)
 					{
-						droppedItem.DroppedBy = sourcePlayer?.userID ?? ((BasePlayer.EncryptedValue<ulong>)0uL);
+						droppedItem.DroppedBy = sourcePlayer?.userID ?? ((EncryptedValue<ulong>)0uL);
 					}
 				}
 				Interface.CallHook("OnItemStacked", item2, this, newcontainer);
@@ -1014,7 +1163,7 @@ public class Item : Facepunch.Pool.IPooled
 
 	public BaseEntity Drop(Vector3 vPos, Vector3 vVelocity, Quaternion rotation = default(Quaternion))
 	{
-		ulong droppedBy = GetRootContainer()?.playerOwner?.userID ?? ((BasePlayer.EncryptedValue<ulong>)0uL);
+		ulong droppedBy = GetRootContainer()?.playerOwner?.userID ?? ((EncryptedValue<ulong>)0uL);
 		RemoveFromWorld();
 		if (info.AlignWorldModelOnDrop)
 		{
@@ -1192,6 +1341,7 @@ public class Item : Facepunch.Pool.IPooled
 		Item item = ItemManager.CreateByItemID(info.itemid, 1, 0uL);
 		item.amount = split_Amount;
 		item.skin = skin;
+		MigrateItemOwnership(item, split_Amount);
 		if (IsBlueprint())
 		{
 			item.blueprintTarget = blueprintTarget;
@@ -1208,6 +1358,12 @@ public class Item : Facepunch.Pool.IPooled
 			item.instanceData.dataInt = instanceData.dataInt;
 			item.instanceData.ShouldPool = false;
 			item.SetFlag(Flag.IsOn, IsOn());
+		}
+		if (instanceData != null && (bool)info.GetComponent<ItemModFoodSpoiling>())
+		{
+			item.instanceData = new ProtoBuf.Item.InstanceData();
+			item.instanceData.dataFloat = instanceData.dataFloat;
+			item.instanceData.ShouldPool = false;
 		}
 		MarkDirty();
 		return item;
@@ -1313,6 +1469,15 @@ public class Item : Facepunch.Pool.IPooled
 		if (item.instanceData != null && item.instanceData.subEntity.IsValid && (bool)item.info.GetComponent<ItemModSign>())
 		{
 			return false;
+		}
+		if (item.instanceData != null && instanceData != null && (bool)item.info.GetComponent<ItemModFoodSpoiling>())
+		{
+			float dataFloat = item.instanceData.dataFloat;
+			float dataFloat2 = instanceData.dataFloat;
+			if (Mathf.Abs(dataFloat - dataFloat2) > ConVar.Server.maxFoodSpoilTimeDiffForItemStack)
+			{
+				return false;
+			}
 		}
 		return true;
 	}
@@ -1427,6 +1592,7 @@ public class Item : Facepunch.Pool.IPooled
 				amountToConsume = (int)obj;
 			}
 			amount -= amountToConsume;
+			ReduceItemOwnership(amountToConsume);
 			if (amount <= 0)
 			{
 				amount = 0;
@@ -1598,6 +1764,18 @@ public class Item : Facepunch.Pool.IPooled
 		item.streamerName = streamerName;
 		item.text = text;
 		item.cooktime = cookTimeLeft;
+		if (ownershipShares != null)
+		{
+			item.ownership = Facepunch.Pool.Get<List<ItemOwnershipAmount>>();
+			foreach (ItemOwnershipShare ownershipShare in ownershipShares)
+			{
+				ItemOwnershipAmount itemOwnershipAmount = Facepunch.Pool.Get<ItemOwnershipAmount>();
+				itemOwnershipAmount.username = ownershipShare.username;
+				itemOwnershipAmount.reason = ownershipShare.reason;
+				itemOwnershipAmount.amount = ownershipShare.amount;
+				item.ownership.Add(itemOwnershipAmount);
+			}
+		}
 		item.ammoCount = 0;
 		if (heldEntity.uid.IsValid)
 		{
@@ -1638,6 +1816,30 @@ public class Item : Facepunch.Pool.IPooled
 		flags = (Flag)load.flags;
 		worldEnt.uid = load.worldEntity;
 		heldEntity.uid = load.heldEntity;
+		if (load.ownership != null && load.ownership.Count > 0)
+		{
+			if (ownershipShares == null)
+			{
+				ownershipShares = Facepunch.Pool.Get<List<ItemOwnershipShare>>();
+			}
+			else
+			{
+				ownershipShares.Clear();
+			}
+			foreach (ItemOwnershipAmount item2 in load.ownership)
+			{
+				ItemOwnershipShare itemOwnershipShare = default(ItemOwnershipShare);
+				itemOwnershipShare.username = item2.username;
+				itemOwnershipShare.reason = item2.reason;
+				itemOwnershipShare.amount = item2.amount;
+				ItemOwnershipShare item = itemOwnershipShare;
+				ownershipShares.Add(item);
+			}
+		}
+		else if (ownershipShares != null)
+		{
+			Facepunch.Pool.FreeUnmanaged(ref ownershipShares);
+		}
 		if (load.ammoCount == 0)
 		{
 			ammoCount = null;
@@ -1647,6 +1849,7 @@ public class Item : Facepunch.Pool.IPooled
 			ammoCount = load.ammoCount - 1;
 		}
 		SetRadioactivity(info);
+		InitializeItemOwnership();
 		if (isServer)
 		{
 			Network.Net.sv.RegisterUID(uid.Value);

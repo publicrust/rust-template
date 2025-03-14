@@ -30,8 +30,8 @@ public class SetParameterAnimatorBehaviour : StateMachineBehaviour
 
 	public Timing SetParameterTiming;
 
-	[Range(0f, 1f)]
 	[Tooltip("Normalised time of animation")]
+	[Range(0f, 1f)]
 	public float ThresholdTiming;
 
 	private float lastNormalisedTime;

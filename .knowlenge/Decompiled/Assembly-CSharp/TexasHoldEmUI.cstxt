@@ -11,8 +11,8 @@ public class TexasHoldEmUI : MonoBehaviour
 	[SerializeField]
 	private Image[] holeCardBackings;
 
-	[SerializeField]
 	[FormerlySerializedAs("flopCardImages")]
+	[SerializeField]
 	private Image[] communityCardImages;
 
 	[SerializeField]

@@ -114,8 +114,8 @@ public class WheelSwitch : IOEntity
 		CancelPlayerRotation();
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
 	public void BeginRotate(RPCMessage msg)
 	{
 		if (!IsBeingRotated())
@@ -179,8 +179,8 @@ public class WheelSwitch : IOEntity
 		SetFlag(Flags.Reserved4, b: false);
 	}
 
-	[RPC_Server]
 	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
 	public void CancelRotate(RPCMessage msg)
 	{
 		CancelPlayerRotation();

@@ -27,13 +27,24 @@ public static class ServerProfiler
 		public Type Event;
 	}
 
+	public struct Alloc
+	{
+		public unsafe Native.MonoClass* Class;
+
+		public unsafe Native.MonoMethod* LastMethod;
+
+		public uint AlignedSize;
+
+		public uint FlatArraySize;
+	}
+
 	public struct Profile
 	{
 		public unsafe Mark* Marks;
 
-		public unsafe IntPtr* Methods;
+		public unsafe Native.MonoMethod** Methods;
 
-		public unsafe uint* Allocs;
+		public unsafe Alloc* Allocs;
 
 		public uint MarksCreated;
 
@@ -52,7 +63,26 @@ public static class ServerProfiler
 		public uint AllocsCapacity;
 	}
 
-	private static class Native
+	[StructLayout(LayoutKind.Sequential, Size = 64)]
+	public struct MemoryReading
+	{
+		public long Timestamp;
+
+		public ulong WorkingSet;
+
+		public ulong VirtualSet;
+	}
+
+	public struct MemoryState
+	{
+		public unsafe MemoryReading* Readings;
+
+		public uint Created;
+
+		public uint Capacity;
+	}
+
+	public static class Native
 	{
 		[StructLayout(LayoutKind.Explicit)]
 		public struct MonoImage
@@ -64,15 +94,15 @@ public static class ServerProfiler
 		[StructLayout(LayoutKind.Explicit)]
 		public struct MonoClass
 		{
-			private const int ImageOffset = 56;
-
-			[FieldOffset(56)]
-			public unsafe MonoImage* Image;
+			private const int ImageOffset = 64;
 
 			[FieldOffset(64)]
-			public unsafe byte* Name;
+			public unsafe MonoImage* Image;
 
 			[FieldOffset(72)]
+			public unsafe byte* Name;
+
+			[FieldOffset(80)]
 			public unsafe byte* Namespace;
 		}
 
@@ -113,6 +143,9 @@ public static class ServerProfiler
 		public unsafe static extern void GetData(out Profile** profiles, out byte count);
 
 		[DllImport("ServerProfiler.Core")]
+		public unsafe static extern void GetMemoryUsage(out MemoryState* state);
+
+		[DllImport("ServerProfiler.Core")]
 		public static extern bool ReleaseResources();
 	}
 
@@ -120,7 +153,7 @@ public static class ServerProfiler
 
 	private static bool canBeActivated;
 
-	private static Action<IList<Profile>> onDoneCallback;
+	private static Action<IList<Profile>, MemoryState> onDoneCallback;
 
 	private static int mainThreadId;
 
@@ -138,7 +171,7 @@ public static class ServerProfiler
 		Debug.Log("Profiler Initialized!");
 	}
 
-	public static void RecordNextFrames(int frames, Action<IList<Profile>> onDone)
+	public static void RecordNextFrames(int frames, Action<IList<Profile>, MemoryState> onDone)
 	{
 		if (onDone != null && IsEnabled())
 		{
@@ -174,7 +207,9 @@ public static class ServerProfiler
 				list.Add(*profiles[(int)b]);
 			}
 		}
-		onDoneCallback(list);
+		Native.GetMemoryUsage(out var state);
+		MemoryState arg = *state;
+		onDoneCallback(list, arg);
 		onDoneCallback = null;
 		PostUpdateHook.EndOfFrame = (Action)Delegate.Remove(PostUpdateHook.EndOfFrame, new Action(OnFrameEnd));
 	}
@@ -189,66 +224,99 @@ public static class ServerProfiler
 		return stamp / 1000;
 	}
 
-	public unsafe static string GetName(IntPtr methodPtr)
+	public unsafe static void AppendNameTo(Native.MonoMethod* method, StringBuilder builder)
 	{
-		_ = string.Empty;
-		Native.MonoMethod* ptr = (Native.MonoMethod*)(void*)methodPtr;
-		string text = Marshal.PtrToStringAnsi((IntPtr)ptr->Class->Image->AssemblyName);
-		string text2 = Marshal.PtrToStringAnsi((IntPtr)ptr->Class->Name);
-		string text3 = Marshal.PtrToStringAnsi((IntPtr)ptr->Name);
-		return text + "!" + text2 + "::" + text3;
-	}
-
-	public unsafe static void AppendNameTo(IntPtr methodPtr, StringBuilder builder)
-	{
-		Native.MonoMethod* ptr = (Native.MonoMethod*)(void*)methodPtr;
-		for (byte* ptr2 = ptr->Class->Image->AssemblyName; *ptr2 != 0; ptr2++)
+		for (byte* ptr = method->Class->Image->AssemblyName; *ptr != 0; ptr++)
 		{
-			builder.Append((char)(*ptr2));
+			builder.Append((char)(*ptr));
 		}
 		builder.Append('!');
-		for (byte* ptr2 = ptr->Class->Name; *ptr2 != 0; ptr2++)
+		for (byte* ptr = method->Class->Name; *ptr != 0; ptr++)
 		{
-			builder.Append((char)(*ptr2));
+			builder.Append((char)(*ptr));
 		}
 		builder.Append("::");
-		for (byte* ptr2 = ptr->Name; *ptr2 != 0; ptr2++)
+		for (byte* ptr = method->Name; *ptr != 0; ptr++)
 		{
-			builder.Append((char)(*ptr2));
+			builder.Append((char)(*ptr));
 		}
 	}
 
-	public unsafe static void SerializeNameTo(IntPtr methodPtr, MemoryStream stream)
+	public unsafe static void SerializeNameTo(Native.MonoMethod* method, MemoryStream stream)
 	{
 		long position = stream.Position;
 		ushort num = 0;
 		stream.WriteByte(0);
 		stream.WriteByte(0);
-		Native.MonoMethod* ptr = (Native.MonoMethod*)(void*)methodPtr;
-		byte* ptr2 = ptr->Class->Image->AssemblyName;
-		while (*ptr2 != 0)
+		byte* ptr = method->Class->Image->AssemblyName;
+		while (*ptr != 0)
 		{
-			stream.WriteByte(*ptr2);
-			ptr2++;
+			stream.WriteByte(*ptr);
+			ptr++;
 			num++;
 		}
 		stream.WriteByte(33);
 		num++;
-		ptr2 = ptr->Class->Name;
-		while (*ptr2 != 0)
+		ptr = method->Class->Name;
+		while (*ptr != 0)
 		{
-			stream.WriteByte(*ptr2);
-			ptr2++;
+			stream.WriteByte(*ptr);
+			ptr++;
 			num++;
 		}
 		stream.WriteByte(58);
 		stream.WriteByte(58);
 		num += 2;
-		ptr2 = ptr->Name;
-		while (*ptr2 != 0)
+		ptr = method->Name;
+		while (*ptr != 0)
 		{
-			stream.WriteByte(*ptr2);
-			ptr2++;
+			stream.WriteByte(*ptr);
+			ptr++;
+			num++;
+		}
+		byte[] buffer = stream.GetBuffer();
+		buffer[position] = (byte)(num >> 8);
+		buffer[position + 1] = (byte)num;
+	}
+
+	public unsafe static void AppendNameTo(Alloc alloc, StringBuilder builder)
+	{
+		for (byte* ptr = alloc.Class->Image->AssemblyName; *ptr != 0; ptr++)
+		{
+			builder.Append((char)(*ptr));
+		}
+		builder.Append('!');
+		for (byte* ptr = alloc.Class->Name; *ptr != 0; ptr++)
+		{
+			char c = (char)(*ptr);
+			builder.Append(c);
+			if (alloc.FlatArraySize != 0 && c == '[')
+			{
+				builder.Append(alloc.FlatArraySize);
+			}
+		}
+	}
+
+	public unsafe static void SerializeNameTo(Alloc alloc, MemoryStream stream)
+	{
+		long position = stream.Position;
+		ushort num = 0;
+		stream.WriteByte(0);
+		stream.WriteByte(0);
+		byte* ptr = alloc.Class->Image->AssemblyName;
+		while (*ptr != 0)
+		{
+			stream.WriteByte(*ptr);
+			ptr++;
+			num++;
+		}
+		stream.WriteByte(33);
+		num++;
+		ptr = alloc.Class->Name;
+		while (*ptr != 0)
+		{
+			stream.WriteByte(*ptr);
+			ptr++;
 			num++;
 		}
 		byte[] buffer = stream.GetBuffer();

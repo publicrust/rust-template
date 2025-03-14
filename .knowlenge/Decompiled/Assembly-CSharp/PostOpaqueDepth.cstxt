@@ -1,7 +1,7 @@
 using UnityEngine;
 
-[RequireComponent(typeof(CommandBufferManager))]
 [ExecuteInEditMode]
+[RequireComponent(typeof(CommandBufferManager))]
 public class PostOpaqueDepth : MonoBehaviour
 {
 	public RenderTexture postOpaqueDepth;

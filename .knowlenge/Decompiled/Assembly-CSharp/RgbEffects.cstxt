@@ -31,14 +31,14 @@ public class RgbEffects : SingletonComponent<RgbEffects>
 
 	public Color comfortedColor;
 
-	[ClientVar(Name = "static")]
 	[EditorBrowsable(EditorBrowsableState.Never)]
+	[ClientVar(Name = "static")]
 	public static void ConVar_Static(ConsoleSystem.Arg args)
 	{
 	}
 
-	[ClientVar(Name = "pulse")]
 	[EditorBrowsable(EditorBrowsableState.Never)]
+	[ClientVar(Name = "pulse")]
 	public static void ConVar_Pulse(ConsoleSystem.Arg args)
 	{
 	}

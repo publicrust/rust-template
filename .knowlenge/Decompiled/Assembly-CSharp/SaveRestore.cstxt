@@ -27,7 +27,7 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 	}
 
 	[CompilerGenerated]
-	private sealed class <DoAutomatedSave>d__12 : IEnumerator<object>, IEnumerator, IDisposable
+	private sealed class <DoAutomatedSave>d__20 : IEnumerator<object>, IEnumerator, IDisposable
 	{
 		private int <>1__state;
 
@@ -58,7 +58,7 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 		}
 
 		[DebuggerHidden]
-		public <DoAutomatedSave>d__12(int <>1__state)
+		public <DoAutomatedSave>d__20(int <>1__state)
 		{
 			this.<>1__state = <>1__state;
 		}
@@ -145,7 +145,31 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 
 	private static MemoryStream SaveBuffer = new MemoryStream(33554432);
 
+	private static Action<Stream> onSaveComplete;
+
+	private static object callbackLock = new object();
+
+	private static Queue<Stream> saveQueue = new Queue<Stream>();
+
+	private static object saveQueueLock = new object();
+
 	public static string WipeId { get; private set; }
+
+	public static void AddOnSaveCallback(Action<Stream> callback)
+	{
+		lock (callbackLock)
+		{
+			onSaveComplete = (Action<Stream>)Delegate.Combine(onSaveComplete, callback);
+		}
+	}
+
+	public static void RemoveOnSaveCallback(Action<Stream> callback)
+	{
+		lock (callbackLock)
+		{
+			onSaveComplete = (Action<Stream>)Delegate.Remove(onSaveComplete, callback);
+		}
+	}
 
 	public static IEnumerator Save(string strFilename, bool AndWait = false)
 	{
@@ -156,89 +180,31 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 		Stopwatch timerCache = new Stopwatch();
 		Stopwatch timerWrite = new Stopwatch();
 		Stopwatch timerDisk = new Stopwatch();
-		int iEnts = 0;
-		timerCache.Start();
-		using (TimeWarning.New("SaveCache", 100))
-		{
-			Stopwatch sw = Stopwatch.StartNew();
-			BaseEntity[] array = BaseEntity.saveList.ToArray();
-			foreach (BaseEntity baseEntity in array)
-			{
-				if (baseEntity == null || !baseEntity.IsValid())
-				{
-					continue;
-				}
-				try
-				{
-					baseEntity.GetSaveCache();
-				}
-				catch (Exception exception)
-				{
-					UnityEngine.Debug.LogException(exception);
-				}
-				if (sw.Elapsed.TotalMilliseconds > 5.0)
-				{
-					if (!AndWait)
-					{
-						yield return CoroutineEx.waitForEndOfFrame;
-					}
-					sw.Reset();
-					sw.Start();
-				}
-			}
-		}
-		timerCache.Stop();
 		SaveBuffer.Position = 0L;
 		SaveBuffer.SetLength(0L);
+		InitializeWipeId();
+		if (AndWait)
+		{
+			IEnumerator enumerator = WarmUpEntityCaches(AndWait, timerCache);
+			while (enumerator.MoveNext())
+			{
+			}
+		}
+		else
+		{
+			yield return SingletonComponent<SaveRestore>.Instance.StartCoroutine(WarmUpEntityCaches(AndWait, timerCache));
+		}
 		timerWrite.Start();
+		int iEnts = 0;
 		using (TimeWarning.New("SaveWrite", 100))
 		{
 			BinaryWriter writer = new BinaryWriter(SaveBuffer);
-			writer.Write((sbyte)83);
-			writer.Write((sbyte)65);
-			writer.Write((sbyte)86);
-			writer.Write((sbyte)82);
-			InitializeWipeId();
-			SaveExtraData saveExtraData = new SaveExtraData();
-			saveExtraData.WipeId = WipeId;
-			writer.Write((sbyte)74);
-			writer.Write(JsonConvert.SerializeObject((object)saveExtraData));
-			writer.Write((sbyte)68);
-			writer.Write(Epoch.FromDateTime(SaveCreatedTime));
-			writer.Write(264u);
-			BaseNetworkable.SaveInfo saveInfo = default(BaseNetworkable.SaveInfo);
-			saveInfo.forDisk = true;
+			WriteHeader(writer);
 			if (!AndWait)
 			{
 				yield return CoroutineEx.waitForEndOfFrame;
 			}
-			foreach (BaseEntity save in BaseEntity.saveList)
-			{
-				if (save == null || save.IsDestroyed)
-				{
-					UnityEngine.Debug.LogWarning("Entity is NULL but is still in saveList - not destroyed properly? " + save, save);
-					continue;
-				}
-				MemoryStream memoryStream = null;
-				try
-				{
-					memoryStream = save.GetSaveCache();
-				}
-				catch (Exception exception2)
-				{
-					UnityEngine.Debug.LogException(exception2);
-				}
-				if (memoryStream == null || memoryStream.Length <= 0)
-				{
-					UnityEngine.Debug.LogWarningFormat("Skipping saving entity {0} - because {1}", save, (memoryStream == null) ? "savecache is null" : "savecache is 0");
-				}
-				else
-				{
-					writer.Write((uint)memoryStream.Length);
-					writer.Write(memoryStream.GetBuffer(), 0, (int)memoryStream.Length);
-					iEnts++;
-				}
-			}
+			iEnts = WriteEntities(writer);
 		}
 		timerWrite.Stop();
 		if (!AndWait)
@@ -289,6 +255,25 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 		PerformanceLogging.server?.SetTiming("save.write", timerWrite.Elapsed);
 		PerformanceLogging.server?.SetTiming("save.disk", timerDisk.Elapsed);
 		NexusServer.PostGameSaved();
+	}
+
+	private static IEnumerator SaveToStream(Stream stream)
+	{
+		InitializeWipeId();
+		yield return SingletonComponent<SaveRestore>.Instance.StartCoroutine(WarmUpEntityCaches());
+		using (TimeWarning.New("SaveWrite", 100))
+		{
+			BinaryWriter writer = new BinaryWriter(stream);
+			WriteHeader(writer);
+			yield return CoroutineEx.waitForEndOfFrame;
+			WriteEntities(writer);
+		}
+		Action<Stream> action;
+		lock (callbackLock)
+		{
+			action = onSaveComplete;
+		}
+		action(stream);
 	}
 
 	private static void ShiftSaveBackups(string fileName)
@@ -344,6 +329,7 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 	private void Start()
 	{
 		StartCoroutine(SaveRegularly());
+		StartCoroutine(ProcessStreamRequests());
 	}
 
 	private IEnumerator SaveRegularly()
@@ -359,11 +345,29 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 		}
 	}
 
-	[IteratorStateMachine(typeof(<DoAutomatedSave>d__12))]
+	private IEnumerator ProcessStreamRequests()
+	{
+		while (true)
+		{
+			yield return CoroutineEx.waitForEndOfFrame;
+			bool flag = false;
+			Stream result = null;
+			lock (saveQueueLock)
+			{
+				flag = saveQueue.TryDequeue(out result);
+			}
+			if (flag)
+			{
+				StartCoroutine(SaveToStream(result));
+			}
+		}
+	}
+
+	[IteratorStateMachine(typeof(<DoAutomatedSave>d__20))]
 	private IEnumerator DoAutomatedSave(bool AndWait = false)
 	{
 		Interface.CallHook("OnServerSave");
-		return new <DoAutomatedSave>d__12(0)
+		return new <DoAutomatedSave>d__20(0)
 		{
 			<>4__this = this,
 			AndWait = AndWait
@@ -385,6 +389,97 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 		{
 		}
 		return true;
+	}
+
+	public static void RequestSave(Stream stream)
+	{
+		lock (saveQueueLock)
+		{
+			saveQueue.Enqueue(stream);
+		}
+	}
+
+	private static IEnumerator WarmUpEntityCaches(bool isBlocking = false, Stopwatch cacheTimer = null)
+	{
+		cacheTimer?.Start();
+		using (TimeWarning.New("SaveCache", 100))
+		{
+			Stopwatch sw = Stopwatch.StartNew();
+			BaseEntity[] array = BaseEntity.saveList.ToArray();
+			foreach (BaseEntity baseEntity in array)
+			{
+				if (baseEntity == null || !baseEntity.IsValid())
+				{
+					continue;
+				}
+				try
+				{
+					baseEntity.GetSaveCache();
+				}
+				catch (Exception exception)
+				{
+					UnityEngine.Debug.LogException(exception);
+				}
+				if (sw.Elapsed.TotalMilliseconds > 5.0)
+				{
+					if (!isBlocking)
+					{
+						yield return CoroutineEx.waitForEndOfFrame;
+					}
+					sw.Reset();
+					sw.Start();
+				}
+			}
+		}
+		cacheTimer?.Stop();
+	}
+
+	private static void WriteHeader(BinaryWriter writer)
+	{
+		writer.Write((sbyte)83);
+		writer.Write((sbyte)65);
+		writer.Write((sbyte)86);
+		writer.Write((sbyte)82);
+		SaveExtraData saveExtraData = new SaveExtraData();
+		saveExtraData.WipeId = WipeId;
+		writer.Write((sbyte)74);
+		writer.Write(JsonConvert.SerializeObject((object)saveExtraData));
+		writer.Write((sbyte)68);
+		writer.Write(Epoch.FromDateTime(SaveCreatedTime));
+		writer.Write(265u);
+	}
+
+	private static int WriteEntities(BinaryWriter writer)
+	{
+		int num = 0;
+		foreach (BaseEntity save in BaseEntity.saveList)
+		{
+			if (save == null || save.IsDestroyed)
+			{
+				UnityEngine.Debug.LogWarning("Entity is NULL but is still in saveList - not destroyed properly? " + save, save);
+				continue;
+			}
+			MemoryStream memoryStream = null;
+			try
+			{
+				memoryStream = save.GetSaveCache();
+			}
+			catch (Exception exception)
+			{
+				UnityEngine.Debug.LogException(exception);
+			}
+			if (memoryStream == null || memoryStream.Length <= 0)
+			{
+				UnityEngine.Debug.LogWarningFormat("Skipping saving entity {0} - because {1}", save, (memoryStream == null) ? "savecache is null" : "savecache is 0");
+			}
+			else
+			{
+				writer.Write((uint)memoryStream.Length);
+				writer.Write(memoryStream.GetBuffer(), 0, (int)memoryStream.Length);
+				num++;
+			}
+		}
+		return num;
 	}
 
 	public static List<BaseEntity> FindMapEntities()
@@ -478,7 +573,7 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 					binaryReader.ReadChar();
 					SaveCreatedTime = Epoch.ToDateTime(binaryReader.ReadInt32());
 				}
-				if (binaryReader.ReadUInt32() != 264)
+				if (binaryReader.ReadUInt32() != 265)
 				{
 					if (allowOutOfDateSaves)
 					{

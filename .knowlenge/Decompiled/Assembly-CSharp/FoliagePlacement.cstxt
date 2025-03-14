@@ -27,8 +27,8 @@ public class FoliagePlacement : ScriptableObject
 
 	public float RangeFade = 0.1f;
 
-	[Header("LOD")]
 	[Range(0f, 1f)]
+	[Header("LOD")]
 	public float DistanceDensity;
 
 	[Range(1f, 2f)]

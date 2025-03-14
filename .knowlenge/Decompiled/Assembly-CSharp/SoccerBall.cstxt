@@ -2,8 +2,8 @@ using UnityEngine;
 
 public class SoccerBall : BaseCombatEntity
 {
-	[Header("Soccer Ball")]
 	[SerializeField]
+	[Header("Soccer Ball")]
 	private Rigidbody rigidBody;
 
 	[SerializeField]

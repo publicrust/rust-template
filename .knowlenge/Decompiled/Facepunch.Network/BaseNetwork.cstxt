@@ -43,17 +43,19 @@ public abstract class BaseNetwork
 
 	private ConcurrentQueue<NetWrite> writeQueue;
 
-	private ConcurrentQueue<DemoQueueItem> demoQueue;
-
 	private ConcurrentQueue<NetRead> decryptQueue;
 
 	private int readQueueSizeInBytes;
 
 	private int writeQueueSizeInBytes;
 
-	private int demoQueueSizeInBytes;
-
 	private int decryptQueueSizeInBytes;
+
+	private int readQueueCount;
+
+	private int writeQueueCount;
+
+	private int decryptQueueCount;
 
 	private AutoResetEvent mainThreadReset;
 
@@ -62,8 +64,6 @@ public abstract class BaseNetwork
 	private AutoResetEvent writeThreadReset;
 
 	private AutoResetEvent decryptThreadReset;
-
-	private AutoResetEvent demoThreadReset;
 
 	private Thread readThread;
 
@@ -76,6 +76,12 @@ public abstract class BaseNetwork
 	public INetworkCryptography cryptography;
 
 	private List<Connection> tempBufferReadConnections = new List<Connection>();
+
+	private ConcurrentQueue<DemoQueueItem>[] demoQueues = new ConcurrentQueue<DemoQueueItem>[2];
+
+	private AutoResetEvent demoThreadReset;
+
+	private int demoQueueSizeInBytes;
 
 	public FullServerDemos serverDemos;
 
@@ -101,11 +107,11 @@ public abstract class BaseNetwork
 
 	protected abstract int MaxDecryptThreadWaitValue { get; }
 
-	public int ReadQueueLength => readQueue?.Count ?? 0;
+	public int ReadQueueLength => Volatile.Read(ref readQueueCount);
 
-	public int WriteQueueLength => writeQueue?.Count ?? 0;
+	public int WriteQueueLength => Volatile.Read(ref writeQueueCount);
 
-	public int DecryptQueueLength => decryptQueue?.Count ?? 0;
+	public int DecryptQueueLength => Volatile.Read(ref decryptQueueCount);
 
 	public int ReadQueueBytes => readQueueSizeInBytes;
 
@@ -121,7 +127,7 @@ public abstract class BaseNetwork
 
 	public abstract bool SupportsServerDemos { get; }
 
-	protected void MultithreadingInit()
+	protected void MultithreadingInit(IServerCallback callbacks)
 	{
 		if (readThread != null)
 		{
@@ -143,7 +149,6 @@ public abstract class BaseNetwork
 			readQueue = new ConcurrentQueue<NetRead>();
 			writeQueue = new ConcurrentQueue<NetWrite>();
 			decryptQueue = new ConcurrentQueue<NetRead>();
-			demoQueue = new ConcurrentQueue<DemoQueueItem>();
 			readQueueSizeInBytes = 0;
 			writeQueueSizeInBytes = 0;
 			decryptQueueSizeInBytes = 0;
@@ -151,7 +156,6 @@ public abstract class BaseNetwork
 			readThreadReset = new AutoResetEvent(initialState: false);
 			writeThreadReset = new AutoResetEvent(initialState: false);
 			decryptThreadReset = new AutoResetEvent(initialState: false);
-			demoThreadReset = new AutoResetEvent(initialState: false);
 			readThread = new Thread(ReadThread);
 			readThread.IsBackground = true;
 			readThread.Start();
@@ -161,12 +165,7 @@ public abstract class BaseNetwork
 			decryptThread = new Thread(DecryptThread);
 			decryptThread.IsBackground = true;
 			decryptThread.Start();
-			if (SupportsServerDemos)
-			{
-				demoThread = new Thread(DemoThread);
-				demoThread.IsBackground = true;
-				demoThread.Start();
-			}
+			InitDemoSupport(callbacks);
 		}
 	}
 
@@ -188,13 +187,14 @@ public abstract class BaseNetwork
 		{
 			Assert.IsNotNull(connection, "connection != null");
 		}
-		if (writeQueue.Count >= MaxWriteQueueLengthValue || writeQueueSizeInBytes >= MaxWriteQueueBytesValue)
+		if (WriteQueueLength >= MaxWriteQueueLengthValue || writeQueueSizeInBytes >= MaxWriteQueueBytesValue)
 		{
 			UnityEngine.Debug.LogWarning("Main thread stalling: Write queue at capacity, waiting for write thread...");
 			mainThreadReset.WaitOne(MaxMainThreadWaitValue);
 		}
 		writeQueue.Enqueue(write);
 		Interlocked.Add(ref writeQueueSizeInBytes, (int)write.Length);
+		Interlocked.Increment(ref writeQueueCount);
 		writeThreadReset.Set();
 	}
 
@@ -202,12 +202,14 @@ public abstract class BaseNetwork
 	{
 		readQueue.Enqueue(read);
 		Interlocked.Add(ref readQueueSizeInBytes, (int)read.Length);
+		Interlocked.Increment(ref readQueueCount);
 	}
 
 	public void EnqueueDecrypt(NetRead read)
 	{
 		decryptQueue.Enqueue(read);
 		Interlocked.Add(ref decryptQueueSizeInBytes, (int)read.Length);
+		Interlocked.Increment(ref decryptQueueCount);
 		decryptThreadReset.Set();
 	}
 
@@ -248,7 +250,7 @@ public abstract class BaseNetwork
 			{
 				UnityEngine.Debug.LogException(exception);
 			}
-			if (decryptQueue.Count >= MaxDecryptQueueLengthValue || decryptQueueSizeInBytes >= MaxDecryptQueueBytesValue)
+			if (DecryptQueueLength >= MaxDecryptQueueLengthValue || decryptQueueSizeInBytes >= MaxDecryptQueueBytesValue)
 			{
 				readThreadReset.WaitOne(MaxReadThreadWaitValue);
 			}
@@ -271,7 +273,7 @@ public abstract class BaseNetwork
 			{
 				UnityEngine.Debug.LogException(exception);
 			}
-			if (writeQueue.Count <= 0)
+			if (WriteQueueLength <= 0)
 			{
 				writeThreadReset.WaitOne(MaxWriteThreadWaitValue);
 			}
@@ -290,7 +292,7 @@ public abstract class BaseNetwork
 			{
 				UnityEngine.Debug.LogException(exception);
 			}
-			if (readQueue.Count >= MaxReadQueueLengthValue || readQueueSizeInBytes >= MaxReadQueueBytesValue || decryptQueue.Count <= 0)
+			if (ReadQueueLength >= MaxReadQueueLengthValue || readQueueSizeInBytes >= MaxReadQueueBytesValue || DecryptQueueLength <= 0)
 			{
 				decryptThreadReset.WaitOne(MaxDecryptThreadWaitValue);
 			}
@@ -299,7 +301,7 @@ public abstract class BaseNetwork
 
 	private void ReadThreadCycle()
 	{
-		while (decryptQueue.Count < MaxDecryptQueueLengthValue && decryptQueueSizeInBytes < MaxDecryptQueueBytesValue)
+		while (DecryptQueueLength < MaxDecryptQueueLengthValue && decryptQueueSizeInBytes < MaxDecryptQueueBytesValue)
 		{
 			lock (readLock)
 			{
@@ -317,6 +319,7 @@ public abstract class BaseNetwork
 		while (writeQueue.TryDequeue(out result))
 		{
 			Interlocked.Add(ref writeQueueSizeInBytes, -(int)result.Length);
+			Interlocked.Decrement(ref writeQueueCount);
 			mainThreadReset.Set();
 			lock (writeLock)
 			{
@@ -332,9 +335,10 @@ public abstract class BaseNetwork
 	private void DecryptThreadCycle()
 	{
 		NetRead result;
-		while (readQueue.Count < MaxReadQueueLengthValue && readQueueSizeInBytes < MaxReadQueueBytesValue && decryptQueue.TryDequeue(out result))
+		while (ReadQueueLength < MaxReadQueueLengthValue && readQueueSizeInBytes < MaxReadQueueBytesValue && decryptQueue.TryDequeue(out result))
 		{
 			Interlocked.Add(ref decryptQueueSizeInBytes, -(int)result.Length);
+			Interlocked.Decrement(ref decryptQueueCount);
 			readThreadReset.Set();
 			lock (decryptLock)
 			{
@@ -360,6 +364,7 @@ public abstract class BaseNetwork
 			while (readQueue.TryDequeue(out result))
 			{
 				Interlocked.Add(ref readQueueSizeInBytes, -(int)result.Length);
+				Interlocked.Decrement(ref readQueueCount);
 				decryptThreadReset.Set();
 				if (IsConnected())
 				{
@@ -467,9 +472,22 @@ public abstract class BaseNetwork
 		return 0uL;
 	}
 
-	private void DemoThread()
+	private void InitDemoSupport(IServerCallback callbacks)
 	{
-		serverDemos = new FullServerDemos(IsConnected);
+		demoQueues[0] = new ConcurrentQueue<DemoQueueItem>();
+		demoQueues[1] = new ConcurrentQueue<DemoQueueItem>();
+		demoThreadReset = new AutoResetEvent(initialState: false);
+		if (SupportsServerDemos)
+		{
+			demoThread = new Thread(DemoThread);
+			demoThread.IsBackground = true;
+			demoThread.Start(callbacks);
+		}
+	}
+
+	private void DemoThread(object callbacks)
+	{
+		serverDemos = new FullServerDemos(IsConnected, (IServerCallback)callbacks, demoThreadReset);
 		while (IsConnected())
 		{
 			if (!DemoConVars.ServerDemosEnabled)
@@ -496,7 +514,7 @@ public abstract class BaseNetwork
 				{
 					UnityEngine.Debug.LogException(exception2);
 				}
-				if (demoQueue.Count <= 0)
+				if (demoQueues[serverDemos.GetReadChunkBit()].Count <= 0)
 				{
 					demoThreadReset.WaitOne(MaxDemoThreadWaitValue);
 				}
@@ -515,9 +533,10 @@ public abstract class BaseNetwork
 
 	private void DemoThreadCycle()
 	{
-		serverDemos.CycleDiskQuota();
+		serverDemos.Cycle();
+		ConcurrentQueue<DemoQueueItem> concurrentQueue = demoQueues[serverDemos.GetReadChunkBit()];
 		DemoQueueItem result;
-		while (demoQueue.TryDequeue(out result))
+		while (concurrentQueue.TryDequeue(out result))
 		{
 			if (result.write != null)
 			{
@@ -525,7 +544,7 @@ public abstract class BaseNetwork
 				Interlocked.Add(ref demoQueueSizeInBytes, -num);
 				if (result.IgnoreNoConnections || (result.write.connections != null && result.write.connections.Count > 0))
 				{
-					serverDemos.RecordServerDemoPacket(result.write.connections, result.write.Data, num, isOutgoing: true);
+					serverDemos.RecordServerDemoPacket(result.write.connections, result.write.Data, num, isOutgoing: true, result.Timestamp);
 				}
 				result.write.RemoveReference();
 			}
@@ -537,7 +556,7 @@ public abstract class BaseNetwork
 				{
 					tempBufferReadConnections.Clear();
 					tempBufferReadConnections.Add(result.read.connection);
-					serverDemos.RecordServerDemoPacket(tempBufferReadConnections, result.read.Data, num2, isOutgoing: false);
+					serverDemos.RecordServerDemoPacket(tempBufferReadConnections, result.read.Data, num2, isOutgoing: false, result.Timestamp);
 				}
 				result.read.RemoveReference();
 			}
@@ -570,12 +589,14 @@ public abstract class BaseNetwork
 				Interlocked.Add(ref demoQueueSizeInBytes, (int)item.read.Length);
 				item.read.AddReference();
 			}
-			if (demoQueue.Count >= MaxDemoQueueBytesValue)
+			item.Timestamp = DateTime.UtcNow;
+			ConcurrentQueue<DemoQueueItem> obj = demoQueues[serverDemos.GetWriteChunkBit()];
+			if (obj.Count >= MaxDemoQueueBytesValue)
 			{
 				UnityEngine.Debug.LogWarning("Main thread stalling: Demo queue at capacity, waiting for demo thread...");
 				mainThreadReset.WaitOne(MaxMainThreadWaitValue);
 			}
-			demoQueue.Enqueue(item);
+			obj.Enqueue(item);
 			demoThreadReset.Set();
 		}
 	}

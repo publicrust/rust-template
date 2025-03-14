@@ -9,8 +9,8 @@ public class Ballista : BaseSiegeWeapon
 
 	public Transform dismountPositionsParent;
 
-	[SerializeField]
 	[Header("Effects")]
+	[SerializeField]
 	private GameObjectRef fireEffectPrefab;
 
 	public override float DriveWheelVelocity { get; }

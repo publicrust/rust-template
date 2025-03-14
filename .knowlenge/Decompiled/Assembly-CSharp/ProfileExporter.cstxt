@@ -25,35 +25,88 @@ public static class ProfileExporter
 
 	public static class JSON
 	{
-		public static void Export(string filename, IList<ServerProfiler.Profile> profiles)
+		private struct ThreadMetadata
+		{
+			internal int ThreadId;
+
+			internal int AllocationThreadId;
+
+			internal void Emit(StringBuilder builder)
+			{
+				bool isMainThread = ThreadId == ServerProfiler.GetMainThreadId();
+				EmitThreadName(isMainThread, isAllocThread: false, ThreadId, ThreadId, builder);
+				EmitThreadName(isMainThread, isAllocThread: true, AllocationThreadId, ThreadId, builder);
+			}
+
+			private static void EmitThreadName(bool isMainThread, bool isAllocThread, int id, int origId, StringBuilder builder)
+			{
+				builder.Append("{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":0,\"tid\":");
+				builder.Append(id);
+				builder.Append(",\"args\":{\"name\":\"");
+				if (isMainThread)
+				{
+					builder.Append("Main Thread");
+				}
+				else
+				{
+					builder.Append("Thread");
+				}
+				if (isAllocThread)
+				{
+					if (!isMainThread)
+					{
+						builder.Append(' ');
+						builder.Append(origId);
+					}
+					builder.Append(" Allocations");
+				}
+				builder.Append("\"}},");
+			}
+		}
+
+		public static void Export(string filename, IList<ServerProfiler.Profile> profiles, ServerProfiler.MemoryState memState)
 		{
 			Debug.Log("Starting JSON snapshot generation...");
 			Preprocess(profiles, out var mainInfo, out var totalMarkers);
-			StringBuilder stringBuilder = new StringBuilder((int)(totalMarkers * 100));
+			StringBuilder stringBuilder = new StringBuilder((int)(0 + totalMarkers * 100) + 93 * profiles.Count * 2 + (int)(75 * memState.Created));
 			stringBuilder.Append('[');
-			long startTimestamp = 0L;
-			long firstMarkTimestamp = 0L;
-			foreach (ServerProfiler.Profile profile in profiles)
-			{
-				ServerProfiler.Profile mainProfile = profile;
-				if (mainProfile.ThreadId == ServerProfiler.GetMainThreadId())
-				{
-					startTimestamp = mainProfile.Timestamp;
-					if (!ProcessMainProfile(in mainProfile, in mainInfo, stringBuilder, out firstMarkTimestamp))
-					{
-						return;
-					}
-					break;
-				}
-			}
+			int num = 0;
 			foreach (ServerProfiler.Profile profile2 in profiles)
 			{
-				ServerProfiler.Profile workerProfile = profile2;
-				if (workerProfile.ThreadId != ServerProfiler.GetMainThreadId() && !ProcessWorkerProfile(in workerProfile, firstMarkTimestamp, startTimestamp, stringBuilder))
+				num = Math.Max(num, profile2.ThreadId);
+			}
+			List<ThreadMetadata> list = new List<ThreadMetadata>();
+			for (int i = 0; i < profiles.Count; i++)
+			{
+				ServerProfiler.Profile profile = profiles[i];
+				ThreadMetadata item = default(ThreadMetadata);
+				item.ThreadId = profile.ThreadId;
+				num = (item.AllocationThreadId = num + 1);
+				item.Emit(stringBuilder);
+				list.Add(item);
+			}
+			long firstMarkTimestamp = 0L;
+			for (int j = 0; j < profiles.Count; j++)
+			{
+				ServerProfiler.Profile mainProfile = profiles[j];
+				if (mainProfile.ThreadId == ServerProfiler.GetMainThreadId())
+				{
+					if (ProcessMainProfile(in mainProfile, in mainInfo, list[j], stringBuilder, out firstMarkTimestamp))
+					{
+						break;
+					}
+					return;
+				}
+			}
+			for (int k = 0; k < profiles.Count; k++)
+			{
+				ServerProfiler.Profile workerProfile = profiles[k];
+				if (workerProfile.ThreadId != ServerProfiler.GetMainThreadId() && !ProcessWorkerProfile(in workerProfile, list[k], firstMarkTimestamp, stringBuilder))
 				{
 					return;
 				}
 			}
+			ProcessMemoryState(in memState, firstMarkTimestamp, stringBuilder);
 			stringBuilder.Remove(stringBuilder.Length - 1, 1);
 			stringBuilder.Append(']');
 			Debug.Log("Generation done, compressing...");
@@ -68,11 +121,11 @@ public static class ProfileExporter
 			Debug.Log("Snapshot json export done!");
 		}
 
-		private unsafe static bool ProcessMainProfile(in ServerProfiler.Profile mainProfile, in MainThreadInfo info, StringBuilder builder, out long firstMarkTimestamp)
+		private unsafe static bool ProcessMainProfile(in ServerProfiler.Profile mainProfile, in MainThreadInfo info, in ThreadMetadata metadata, StringBuilder builder, out long firstMarkTimestamp)
 		{
 			if (info.FrameStarts == null || info.Frames == 0)
 			{
-				Debug.LogError("Didn't find any main frame info!");
+				Debug.LogError("ServerProfiler: Didn't find any main frame info!");
 				firstMarkTimestamp = 0L;
 				return false;
 			}
@@ -85,7 +138,7 @@ public static class ProfileExporter
 				uint allocInd = info.AllocStarts[b];
 				if (mainProfile.Marks[num2].Event != ServerProfiler.Mark.Type.Enter)
 				{
-					Debug.LogError($"Expecting start to be an Enter event! Index: {num2}, frame: {b}");
+					Debug.LogError($"ServerProfiler: Expecting start to be an Enter event! Index: {num2}, frame: {b}");
 					return false;
 				}
 				uint num3 = mainProfile.MarksCreated - 1;
@@ -97,16 +150,27 @@ public static class ProfileExporter
 				mark.Event = ServerProfiler.Mark.Type.Enter;
 				mark.Timestamp = mainProfile.Marks[num2].Timestamp;
 				AddMark(mark, $"UnityFrame{b}", mainProfile.ThreadId, firstMarkTimestamp, builder);
+				uint totalMem = 0u;
 				for (uint num4 = num2; num4 < num3; num4++)
 				{
 					ServerProfiler.Mark mark2 = mainProfile.Marks[num4];
 					num += AdjustCallstackDepth(in mark2);
 					if (num < 0)
 					{
-						Debug.LogError($"Unexpected callstack depth: {num}, index: {num4}, frame: {b}");
+						Debug.LogError($"ServerProfiler: Unexpected callstack depth: {num}, index: {num4}, frame: {b}");
 						return false;
 					}
-					AddMark(in mainProfile, num4, ref nameInd, ref allocInd, firstMarkTimestamp, builder);
+					if (nameInd > mainProfile.MethodsCreated)
+					{
+						Debug.LogError($"ServerProfiler: Name overflow! Index: {num4}/{num3}, name: {nameInd}/{mainProfile.MethodsCreated}, frame: {b}");
+						return false;
+					}
+					if (allocInd > mainProfile.AllocsCreated)
+					{
+						Debug.LogError($"ServerProfiler: Alloc overflow! Index: {num4}/{num3}, alloc: {allocInd}/{mainProfile.AllocsCreated}, frame: {b}");
+						return false;
+					}
+					AddMark(in mainProfile, in metadata, num4, ref nameInd, ref allocInd, ref totalMem, firstMarkTimestamp, builder);
 				}
 				mark = default(ServerProfiler.Mark);
 				mark.Event = ServerProfiler.Mark.Type.Exit;
@@ -125,8 +189,12 @@ public static class ProfileExporter
 			return true;
 		}
 
-		private unsafe static bool ProcessWorkerProfile(in ServerProfiler.Profile workerProfile, long firstMarkTimestamp, long startTimestamp, StringBuilder builder)
+		private unsafe static bool ProcessWorkerProfile(in ServerProfiler.Profile workerProfile, in ThreadMetadata metadata, long firstMarkTimestamp, StringBuilder builder)
 		{
+			if (workerProfile.MarksCreated == 0)
+			{
+				return true;
+			}
 			uint num = 0u;
 			uint nameInd = 0u;
 			uint allocInd = 0u;
@@ -146,42 +214,97 @@ public static class ProfileExporter
 				num++;
 				if (num >= workerProfile.MarksCreated)
 				{
-					Debug.LogError($"Couldn't find start: {num}/{workerProfile.MarksCreated}, thread: {workerProfile.ThreadId}");
-					return false;
+					return true;
 				}
 			}
-			int num3 = FindStartingDepth(in workerProfile, 0u, workerProfile.MarksCreated);
-			for (num3 += num2; num3 < 0; num3++)
+			if (nameInd >= workerProfile.MethodsCreated)
+			{
+				bool flag = false;
+				for (uint num3 = num; num3 < workerProfile.MarksCreated; num3++)
+				{
+					if (workerProfile.Marks[num3].Event == ServerProfiler.Mark.Type.Exit || workerProfile.Marks[num3].Event == ServerProfiler.Mark.Type.Exception)
+					{
+						flag = true;
+						break;
+					}
+				}
+				if (!flag)
+				{
+					return true;
+				}
+			}
+			int num4 = FindStartingDepth(in workerProfile, 0u, workerProfile.MarksCreated);
+			num4 = num2 - num4;
+			for (int num5 = num4; num5 > 0; num5--)
 			{
 				ServerProfiler.Mark mark = default(ServerProfiler.Mark);
 				mark.Event = ServerProfiler.Mark.Type.Enter;
-				mark.Timestamp = startTimestamp;
-				AddMark(mark, "Unknown", workerProfile.ThreadId, startTimestamp, builder);
+				mark.Timestamp = firstMarkTimestamp;
+				AddMark(mark, "Unknown", workerProfile.ThreadId, firstMarkTimestamp, builder);
 			}
-			for (uint num4 = num; num4 < workerProfile.MarksCreated; num4++)
+			uint totalMem = 0u;
+			for (uint num6 = num; num6 < workerProfile.MarksCreated; num6++)
 			{
-				ServerProfiler.Mark mark2 = workerProfile.Marks[num4];
-				num3 += AdjustCallstackDepth(in mark2);
-				if (num3 < 0)
+				ServerProfiler.Mark mark2 = workerProfile.Marks[num6];
+				num4 += AdjustCallstackDepth(in mark2);
+				if (num4 < 0)
 				{
-					Debug.LogError($"Unexpected callstack depth: {num3}, mark: {num4}, thread: {workerProfile.ThreadId}");
+					Debug.LogError($"ServerProfiler: Unexpected callstack depth: {num4}, mark: {num6}, thread: {workerProfile.ThreadId}");
 					return false;
 				}
-				AddMark(in workerProfile, num4, ref nameInd, ref allocInd, startTimestamp, builder);
+				if (nameInd > workerProfile.MethodsCreated)
+				{
+					Debug.LogError($"ServerProfiler: Name overflow! Index: {num6}, name: {nameInd}");
+					return false;
+				}
+				if (allocInd > workerProfile.AllocsCreated)
+				{
+					Debug.LogError($"ServerProfiler: Alloc overflow! Index: {num6}, alloc: {allocInd}");
+					return false;
+				}
+				AddMark(in workerProfile, in metadata, num6, ref nameInd, ref allocInd, ref totalMem, firstMarkTimestamp, builder);
 			}
 			long timestamp = workerProfile.Marks[workerProfile.MarksCreated - 1].Timestamp;
-			while (num3 > 0)
+			while (num4 > 0)
 			{
 				ServerProfiler.Mark mark3 = default(ServerProfiler.Mark);
 				mark3.Event = ServerProfiler.Mark.Type.Exit;
 				mark3.Timestamp = timestamp;
-				AddMark(mark3, null, workerProfile.ThreadId, startTimestamp, builder);
-				num3--;
+				AddMark(mark3, null, workerProfile.ThreadId, firstMarkTimestamp, builder);
+				num4--;
 			}
 			return true;
 		}
 
-		private unsafe static void AddMark(in ServerProfiler.Profile threadProfile, uint markInd, ref uint nameInd, ref uint allocInd, long startTimestamp, StringBuilder builder)
+		private unsafe static void ProcessMemoryState(in ServerProfiler.MemoryState memState, long firstMarkTimestamp, StringBuilder builder)
+		{
+			ulong num = 0uL;
+			ulong num2 = 0uL;
+			for (uint num3 = 0u; num3 < memState.Created; num3++)
+			{
+				ServerProfiler.MemoryReading memoryReading = memState.Readings[num3];
+				long timestamp = memoryReading.Timestamp;
+				if (timestamp >= firstMarkTimestamp)
+				{
+					ulong num4 = memoryReading.WorkingSet / 1024;
+					if (num4 != num)
+					{
+						long offset = ((num == 0L) ? 0 : ServerProfiler.TimestampToMicros(timestamp - firstMarkTimestamp));
+						EmitCounter("ws", offset, "WorkingSet(KB)", num4, builder);
+						num = num4;
+					}
+					ulong num5 = memoryReading.VirtualSet / 1024;
+					if (num5 != num2)
+					{
+						long offset2 = ((num2 == 0L) ? 0 : ServerProfiler.TimestampToMicros(timestamp - firstMarkTimestamp));
+						EmitCounter("vs", offset2, "VirtualSet(KB)", num5, builder);
+						num2 = num5;
+					}
+				}
+			}
+		}
+
+		private unsafe static void AddMark(in ServerProfiler.Profile threadProfile, in ThreadMetadata metadata, uint markInd, ref uint nameInd, ref uint allocInd, ref uint totalMem, long startTimestamp, StringBuilder builder)
 		{
 			ServerProfiler.Mark mark = threadProfile.Marks[markInd];
 			switch (mark.Event)
@@ -205,15 +328,48 @@ public static class ProfileExporter
 				builder.Append("},");
 				break;
 			case ServerProfiler.Mark.Type.Alloc:
+			{
+				ServerProfiler.Alloc alloc = threadProfile.Allocs[allocInd++];
+				long num = ServerProfiler.TimestampToMicros(mark.Timestamp - startTimestamp);
 				builder.Append("{\"name\":\"");
 				builder.Append("Alloc ");
-				builder.Append(threadProfile.Allocs[allocInd++]);
+				builder.Append(alloc.AlignedSize);
 				builder.Append("b\",\"ph\":\"i\",\"ts\":");
-				builder.Append(ServerProfiler.TimestampToMicros(mark.Timestamp - startTimestamp));
+				builder.Append(num);
 				builder.Append(",\"pid\":0,\"tid\":");
 				builder.Append(threadProfile.ThreadId);
-				builder.Append(",\"s\":\"p\"},");
+				builder.Append(",\"s\":\"t\",\"cat\":\"A\",\"args\":{\"size\":");
+				builder.Append(alloc.AlignedSize);
+				builder.Append(",\"type\":\"");
+				ServerProfiler.AppendNameTo(alloc, builder);
+				builder.Append("\",\"lastMethod\":\"");
+				ServerProfiler.AppendNameTo(alloc.LastMethod, builder);
+				builder.Append("\"}},");
+				builder.Append("{\"name\":\"");
+				builder.Append("Alloc ");
+				builder.Append(alloc.AlignedSize);
+				builder.Append("b\",\"ph\":\"i\",\"ts\":");
+				builder.Append(num);
+				builder.Append(",\"pid\":0,\"tid\":");
+				builder.Append(metadata.AllocationThreadId);
+				builder.Append(",\"s\":\"t\",\"cat\":\"A\",\"args\":{\"size\":");
+				builder.Append(alloc.AlignedSize);
+				builder.Append(",\"type\":\"");
+				ServerProfiler.AppendNameTo(alloc, builder);
+				builder.Append("\",\"lastMethod\":\"");
+				ServerProfiler.AppendNameTo(alloc.LastMethod, builder);
+				builder.Append("\"}},");
+				totalMem += alloc.AlignedSize;
+				if (metadata.ThreadId == ServerProfiler.GetMainThreadId())
+				{
+					EmitCounter("Main Thread", num, "Total(B)", totalMem, builder);
+				}
+				else
+				{
+					EmitCounter("Thread", metadata.ThreadId, num, "Total(B)", totalMem, builder);
+				}
 				break;
+			}
 			case ServerProfiler.Mark.Type.GCBegin:
 				builder.Append("{\"name\":\"");
 				builder.Append("GC.Collect");
@@ -250,6 +406,34 @@ public static class ProfileExporter
 			}
 		}
 
+		private static void EmitCounter(string markName, long offset, string counterName, ulong value, StringBuilder builder)
+		{
+			builder.Append("{\"name\":\"");
+			builder.Append(markName);
+			builder.Append("\",\"ph\":\"C\",\"ts\":");
+			builder.Append(offset);
+			builder.Append(",\"args\":{\"");
+			builder.Append(counterName);
+			builder.Append("\":");
+			builder.Append(value);
+			builder.Append("}},");
+		}
+
+		private static void EmitCounter(string markName, int threadId, long offset, string counterName, ulong value, StringBuilder builder)
+		{
+			builder.Append("{\"name\":\"");
+			builder.Append(markName);
+			builder.Append(" ");
+			builder.Append(threadId);
+			builder.Append("\",\"ph\":\"C\",\"ts\":");
+			builder.Append(offset);
+			builder.Append(",\"args\":{\"");
+			builder.Append(counterName);
+			builder.Append("\":");
+			builder.Append(value);
+			builder.Append("}},");
+		}
+
 		private unsafe static int FindStartingDepth(in ServerProfiler.Profile threadProfile, uint start, uint end)
 		{
 			int num = 0;
@@ -264,21 +448,6 @@ public static class ProfileExporter
 				}
 			}
 			return num2;
-		}
-
-		private unsafe static uint FindFrameStart(in ServerProfiler.Profile threadProfile, uint frameStart, uint frameEnd, int callstackDepth, ref uint namesOffset, ref uint allocOffset)
-		{
-			for (uint num = frameStart; num < frameEnd; num++)
-			{
-				callstackDepth += AdjustCallstackDepth(in threadProfile.Marks[num]);
-				namesOffset += ((threadProfile.Marks[num].Event == ServerProfiler.Mark.Type.Enter) ? 1u : 0u);
-				allocOffset += ((threadProfile.Marks[num].Event == ServerProfiler.Mark.Type.Alloc) ? 1u : 0u);
-				if (callstackDepth == 0)
-				{
-					return num + 1;
-				}
-			}
-			return frameEnd;
 		}
 
 		private static int AdjustCallstackDepth(in ServerProfiler.Mark mark)
@@ -408,8 +577,12 @@ public static class ProfileExporter
 						ServerProfiler.SerializeNameTo(profile.Methods[num++], memoryStream);
 						break;
 					case ServerProfiler.Mark.Type.Alloc:
-						sectionBlock3.Write(profile.Allocs[num2++]);
+					{
+						ServerProfiler.Alloc alloc = profile.Allocs[num2++];
+						ServerProfiler.SerializeNameTo(alloc, memoryStream);
+						sectionBlock3.Write(alloc.AlignedSize);
 						break;
+					}
 					}
 				}
 			}

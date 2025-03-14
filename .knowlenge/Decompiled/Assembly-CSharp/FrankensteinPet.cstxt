@@ -5,8 +5,8 @@ using UnityEngine;
 
 public class FrankensteinPet : BasePet, IAISenses, IAIAttack
 {
-	[ServerVar(Help = "How long before a Frankenstein Pet dies un controlled and not asleep on table")]
 	[Header("Frankenstein")]
+	[ServerVar(Help = "How long before a Frankenstein Pet dies un controlled and not asleep on table")]
 	public static float decayminutes = 180f;
 
 	[Header("Audio")]
