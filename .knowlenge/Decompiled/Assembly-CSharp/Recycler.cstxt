@@ -1,0 +1,249 @@
+#define UNITY_ASSERTIONS
+using System;
+using ConVar;
+using Network;
+using Oxide.Core;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class Recycler : StorageContainer
+{
+	public float recycleEfficiency = 0.5f;
+
+	public SoundDefinition grindingLoopDef;
+
+	public GameObjectRef startSound;
+
+	public GameObjectRef stopSound;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("Recycler.OnRpcMessage"))
+		{
+			if (rpc == 3611438935u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - SVSwitch "));
+				}
+				using (TimeWarning.New("SVSwitch"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.MaxDistance.Test("SVSwitch", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							SVSwitch(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						player.Kick("RPC Error in SVSwitch");
+						Debug.LogException(exception);
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	[RPC_Server]
+	[RPC_Server.MaxDistance(3f)]
+	private void SVSwitch(RPCMessage msg)
+	{
+		bool flag = msg.read.Bit();
+		if (flag != IsOn() && (!flag || HasRecyclable()) && Interface.CallHook("OnRecyclerToggle", this, msg.player) == null)
+		{
+			if (flag)
+			{
+				StartRecycling();
+			}
+			else
+			{
+				StopRecycling();
+			}
+		}
+	}
+
+	public bool MoveItemToOutput(Item newItem)
+	{
+		int num = -1;
+		for (int i = 6; i < 12; i++)
+		{
+			Item slot = inventory.GetSlot(i);
+			if (slot == null)
+			{
+				num = i;
+				break;
+			}
+			if (slot.CanStack(newItem))
+			{
+				if (slot.amount + newItem.amount <= slot.info.stackable)
+				{
+					num = i;
+					break;
+				}
+				int num2 = Mathf.Min(slot.info.stackable - slot.amount, newItem.amount);
+				newItem.UseItem(num2);
+				slot.amount += num2;
+				slot.MarkDirty();
+				newItem.MarkDirty();
+			}
+			if (newItem.amount <= 0)
+			{
+				return true;
+			}
+		}
+		if (num != -1 && newItem.MoveToContainer(inventory, num))
+		{
+			return true;
+		}
+		newItem.Drop(base.transform.position + new Vector3(0f, 2f, 0f), base.transform.forward * 2f);
+		return false;
+	}
+
+	public bool HasRecyclable()
+	{
+		for (int i = 0; i < 6; i++)
+		{
+			Item slot = inventory.GetSlot(i);
+			if (slot != null)
+			{
+				object obj = Interface.CallHook("CanRecycle", this, slot);
+				if (obj is bool)
+				{
+					return (bool)obj;
+				}
+				if (slot.info.Blueprint != null)
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	public void RecycleThink()
+	{
+		bool flag = false;
+		float num = recycleEfficiency;
+		for (int i = 0; i < 6; i++)
+		{
+			Item slot = inventory.GetSlot(i);
+			if (slot == null)
+			{
+				continue;
+			}
+			if (Interface.CallHook("OnRecycleItem", this, slot) != null)
+			{
+				if (!HasRecyclable())
+				{
+					StopRecycling();
+				}
+				return;
+			}
+			if (!(slot.info.Blueprint != null))
+			{
+				continue;
+			}
+			if (slot.hasCondition)
+			{
+				num = Mathf.Clamp01(num * slot.conditionNormalized * slot.maxConditionNormalized);
+			}
+			int num2 = 1;
+			if (slot.amount > 1)
+			{
+				num2 = Mathf.CeilToInt(Mathf.Min(slot.amount, (float)slot.info.stackable * 0.1f));
+			}
+			if (slot.info.Blueprint.scrapFromRecycle > 0)
+			{
+				Item newItem = ItemManager.CreateByName("scrap", slot.info.Blueprint.scrapFromRecycle * num2, 0uL);
+				MoveItemToOutput(newItem);
+			}
+			slot.UseItem(num2);
+			foreach (ItemAmount ingredient in slot.info.Blueprint.ingredients)
+			{
+				float num3 = ingredient.amount / (float)slot.info.Blueprint.amountToCreate;
+				int num4 = 0;
+				if (num3 <= 1f)
+				{
+					for (int j = 0; j < num2; j++)
+					{
+						if (UnityEngine.Random.Range(0f, 1f) <= num)
+						{
+							num4++;
+						}
+					}
+				}
+				else
+				{
+					num4 = Mathf.CeilToInt(Mathf.Clamp(num3 * num * UnityEngine.Random.Range(1f, 1f), 1f, ingredient.amount) * (float)num2);
+				}
+				if (num4 <= 0)
+				{
+					continue;
+				}
+				int num5 = Mathf.CeilToInt((float)num4 / (float)ingredient.itemDef.stackable);
+				for (int k = 0; k < num5; k++)
+				{
+					int num6 = ((num4 <= ingredient.itemDef.stackable) ? num4 : ingredient.itemDef.stackable);
+					Item newItem2 = ItemManager.Create(ingredient.itemDef, num6, 0uL);
+					if (!MoveItemToOutput(newItem2))
+					{
+						flag = true;
+					}
+					num4 -= num6;
+					if (num4 <= 0)
+					{
+						break;
+					}
+				}
+			}
+			break;
+		}
+		if (flag || !HasRecyclable())
+		{
+			StopRecycling();
+		}
+	}
+
+	public void StartRecycling()
+	{
+		if (!IsOn())
+		{
+			InvokeRepeating(RecycleThink, 5f, 5f);
+			Effect.server.Run(startSound.resourcePath, this, 0u, Vector3.zero, Vector3.zero);
+			SetFlag(Flags.On, b: true);
+			SendNetworkUpdateImmediate();
+		}
+	}
+
+	public void StopRecycling()
+	{
+		CancelInvoke(RecycleThink);
+		if (IsOn())
+		{
+			Effect.server.Run(stopSound.resourcePath, this, 0u, Vector3.zero, Vector3.zero);
+			SetFlag(Flags.On, b: false);
+			SendNetworkUpdateImmediate();
+		}
+	}
+
+	public override bool SupportsPooling()
+	{
+		return true;
+	}
+}

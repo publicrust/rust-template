@@ -1,0 +1,188 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using ConVar;
+using Facepunch;
+using Facepunch.Extend;
+using Network;
+using Oxide.Core;
+using Oxide.Core.Extensions;
+using Oxide.Core.RemoteConsole;
+using Oxide.Game.Rust;
+using Oxide.Game.Rust.Libraries;
+using Oxide.Plugins;
+using Rust;
+using UnityEngine;
+
+public class RustExtension : Extension
+{
+	internal static readonly Version AssemblyVersion = Assembly.GetExecutingAssembly().GetName().Version;
+
+	internal static readonly HashSet<string> DefaultReferences = new HashSet<string> { "ApexAI", "Facepunch.Network", "Facepunch.Steamworks", "Facepunch.System", "Facepunch.UnityEngine", "Rust.Data", "Rust.Global", "Rust.Workshop" };
+
+	public static string[] Filter = new string[16]
+	{
+		"alphamapResolution is clamped to the range of", "AngryAnt Behave version", "Failed to load plugin '1' (no source found)", "Floating point textures aren't supported on this device", "HDR RenderTexture format is not supported on this platform.", "Image Effects are not supported on this platform.", "Missing projectileID", "Motion vectors not supported on a platform that does not support", "The image effect Main Camera", "The image effect effect -",
+		"Unable to find shaders", "Unsupported encoding: 'utf8'", "Warning, null renderer for ScaleRenderer!", "[AmplifyColor]", "[AmplifyOcclusion]", "[SpawnHandler] populationCounts"
+	};
+
+	public override string Name => "Rust";
+
+	public override string Author => "Oxide Team";
+
+	public override VersionNumber Version => new VersionNumber(AssemblyVersion.Major, AssemblyVersion.Minor, AssemblyVersion.Build);
+
+	public override string[] WhitelistAssemblies => new string[17]
+	{
+		"Assembly-CSharp", "Assembly-CSharp-firstpass", "DestMath", "Facepunch.Network", "Facepunch.Steamworks", "Facepunch.System", "Facepunch.UnityEngine", "mscorlib", "Oxide.Core", "Oxide.Game.Rust",
+		"protobuf-net", "RustBuild", "Rust.Data", "Rust.Global", "System", "System.Core", "UnityEngine"
+	};
+
+	public override string[] WhitelistNamespaces => new string[13]
+	{
+		"ConVar", "Dest", "Facepunch", "Network", "Oxide.Game.Rust.Cui", "ProtoBuf", "PVT", "Rust", "Steamworks", "System.Collections",
+		"System.Security.Cryptography", "System.Text", "UnityEngine"
+	};
+
+	public RustExtension(ExtensionManager manager)
+		: base(manager)
+	{
+	}
+
+	public override void Load()
+	{
+		base.Manager.RegisterLibrary("Rust", new Oxide.Game.Rust.Libraries.Rust());
+		base.Manager.RegisterLibrary("Command", new Command());
+		base.Manager.RegisterLibrary("Item", new Oxide.Game.Rust.Libraries.Item());
+		base.Manager.RegisterLibrary("Player", new Player());
+		base.Manager.RegisterLibrary("Server", new Oxide.Game.Rust.Libraries.Server());
+		base.Manager.RegisterPluginLoader(new RustPluginLoader());
+	}
+
+	public override void LoadPluginWatchers(string directory)
+	{
+	}
+
+	public override void OnModLoad()
+	{
+		CSharpPluginLoader.PluginReferences.UnionWith(DefaultReferences);
+		if (Interface.Oxide.EnableConsole())
+		{
+			Output.OnMessage += HandleLog;
+		}
+	}
+
+	internal static void ServerConsole()
+	{
+		if (Interface.Oxide.ServerConsole == null)
+		{
+			return;
+		}
+		Interface.Oxide.ServerConsole.Title = () => $"{BasePlayer.activePlayerList.Count} | {ConVar.Server.hostname}";
+		Interface.Oxide.ServerConsole.Status1Left = delegate
+		{
+			string arg = ((ConVar.Server.hostname.Length > 30) ? ConVar.Server.hostname.Truncate(30) : ConVar.Server.hostname);
+			return string.Format("{0} [{1}]", arg, Interface.Oxide.Config.Options.Modded ? "Modded" : "Community");
+		};
+		Interface.Oxide.ServerConsole.Status1Right = () => $"{Performance.current.frameRate}fps, {((ulong)UnityEngine.Time.realtimeSinceStartup).FormatSeconds()}";
+		Interface.Oxide.ServerConsole.Status2Left = delegate
+		{
+			string arg2 = $"{BasePlayer.activePlayerList.Count}/{ConVar.Server.maxplayers} players";
+			int count = BasePlayer.sleepingPlayerList.Count;
+			int count2 = BaseNetworkable.serverEntities.Count;
+			return string.Format("{0}, {1}, {2}", arg2, count + (count.Equals(1) ? " sleeper" : " sleepers"), count2 + (count2.Equals(1) ? " entity" : " entities"));
+		};
+		Interface.Oxide.ServerConsole.Status2Right = delegate
+		{
+			if (Network.Net.sv == null || !Network.Net.sv.IsConnected())
+			{
+				return "not connected";
+			}
+			ulong stat = Network.Net.sv.GetStat(null, NetworkPeer.StatTypeLong.BytesReceived_LastSecond);
+			ulong stat2 = Network.Net.sv.GetStat(null, NetworkPeer.StatTypeLong.BytesSent_LastSecond);
+			return string.Format("{0}/s in, {1}/s out", Utility.FormatBytes(stat) ?? "0", Utility.FormatBytes(stat2) ?? "0");
+		};
+		Interface.Oxide.ServerConsole.Status3Left = delegate
+		{
+			string text = ((!TOD_Sky.Instance) ? DateTime.Now : TOD_Sky.Instance.Cycle.DateTime).ToString("h:mm tt");
+			return $"{text.ToLower()}, {ConVar.Server.level} [{ConVar.Server.worldsize}, {ConVar.Server.seed}]";
+		};
+		Interface.Oxide.ServerConsole.Status3Right = () => $"Oxide {OxideMod.Version} for {BuildInfo.Current.Build.Number} ({Protocol.printable})";
+		Interface.Oxide.ServerConsole.Status3RightColor = ConsoleColor.Yellow;
+		Interface.Oxide.ServerConsole.Input += ServerConsoleOnInput;
+		Interface.Oxide.ServerConsole.Completion = delegate(string input)
+		{
+			if (string.IsNullOrEmpty(input))
+			{
+				return (string[])null;
+			}
+			if (!input.Contains("."))
+			{
+				input = "global." + input;
+			}
+			return ConsoleSystem.Index.All.Where((ConsoleSystem.Command c) => c.FullName.StartsWith(input.ToLower())).ToList().ConvertAll((ConsoleSystem.Command c) => c.FullName)
+				.ToArray();
+		};
+	}
+
+	private static void ServerConsoleOnInput(string input)
+	{
+		if (!string.IsNullOrEmpty(input))
+		{
+			ConsoleSystem.Run(ConsoleSystem.Option.Server, input);
+		}
+	}
+
+	private static void HandleLog(string message, string stackTrace, LogType type)
+	{
+		if (string.IsNullOrEmpty(message) || Filter.Any(message.Contains))
+		{
+			return;
+		}
+		ConsoleColor color = ConsoleColor.Gray;
+		string type2 = "generic";
+		switch (type)
+		{
+		case LogType.Warning:
+			color = ConsoleColor.Yellow;
+			ConVar.Server.Log("Log.Warning.txt", message);
+			type2 = "warning";
+			break;
+		case LogType.Error:
+			color = ConsoleColor.Red;
+			ConVar.Server.Log("Log.Error.txt", message);
+			type2 = "error";
+			break;
+		case LogType.Exception:
+			color = ConsoleColor.Red;
+			ConVar.Server.Log("Log.Exception.txt", message);
+			type2 = "error";
+			break;
+		case LogType.Assert:
+			color = ConsoleColor.Red;
+			ConVar.Server.Log("Log.Assert.txt", message);
+			type2 = "error";
+			break;
+		default:
+			if (message.ToLower().StartsWith("[chat]"))
+			{
+				ConVar.Server.Log("Log.Chat.txt", message);
+				type2 = "chat";
+			}
+			else
+			{
+				ConVar.Server.Log("Log.Log.txt", message);
+			}
+			break;
+		}
+		Interface.Oxide.ServerConsole.AddMessage(message, color);
+		Interface.Oxide.RemoteConsole.SendMessage(new RemoteMessage
+		{
+			Message = message,
+			Identifier = 0,
+			Type = type2,
+			Stacktrace = stackTrace
+		});
+	}
+}

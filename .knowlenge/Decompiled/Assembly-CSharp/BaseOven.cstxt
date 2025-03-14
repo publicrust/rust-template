@@ -1,0 +1,282 @@
+#define UNITY_ASSERTIONS
+using System;
+using ConVar;
+using Network;
+using Oxide.Core;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class BaseOven : StorageContainer, ISplashable
+{
+	public enum TemperatureType
+	{
+		Normal,
+		Warming,
+		Cooking,
+		Smelting,
+		Fractioning
+	}
+
+	public TemperatureType temperature;
+
+	public Menu.Option switchOnMenu;
+
+	public Menu.Option switchOffMenu;
+
+	public ItemAmount[] startupContents;
+
+	public bool allowByproductCreation = true;
+
+	public ItemDefinition fuelType;
+
+	public bool canModFire;
+
+	public bool disabledBySplash = true;
+
+	private const float UpdateRate = 0.5f;
+
+	private float cookingTemperature => temperature switch
+	{
+		TemperatureType.Fractioning => 1500f, 
+		TemperatureType.Cooking => 200f, 
+		TemperatureType.Smelting => 1000f, 
+		TemperatureType.Warming => 50f, 
+		_ => 15f, 
+	};
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("BaseOven.OnRpcMessage"))
+		{
+			if (rpc == 3611438935u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - SVSwitch "));
+				}
+				using (TimeWarning.New("SVSwitch"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.MaxDistance.Test("SVSwitch", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							SVSwitch(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						player.Kick("RPC Error in SVSwitch");
+						Debug.LogException(exception);
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public override void PostServerLoad()
+	{
+		base.PostServerLoad();
+		if (IsOn())
+		{
+			StartCooking();
+		}
+	}
+
+	public override void OnInventoryFirstCreated(ItemContainer container)
+	{
+		base.OnInventoryFirstCreated(container);
+		if (startupContents != null)
+		{
+			ItemAmount[] array = startupContents;
+			foreach (ItemAmount itemAmount in array)
+			{
+				Item item = ItemManager.Create(itemAmount.itemDef, (int)itemAmount.amount, 0uL);
+				item.MoveToContainer(container);
+			}
+		}
+	}
+
+	public override void OnItemAddedOrRemoved(Item item, bool bAdded)
+	{
+		base.OnItemAddedOrRemoved(item, bAdded);
+		if (item != null && item.HasFlag(Item.Flag.OnFire))
+		{
+			item.SetFlag(Item.Flag.OnFire, b: false);
+			item.MarkDirty();
+		}
+	}
+
+	public void OvenFull()
+	{
+		StopCooking();
+	}
+
+	private Item FindBurnable()
+	{
+		object obj = Interface.CallHook("OnFindBurnable", this);
+		if (obj is Item)
+		{
+			return (Item)obj;
+		}
+		if (inventory == null)
+		{
+			return null;
+		}
+		foreach (Item item in inventory.itemList)
+		{
+			ItemModBurnable component = item.info.GetComponent<ItemModBurnable>();
+			if ((bool)component && (fuelType == null || item.info == fuelType))
+			{
+				return item;
+			}
+		}
+		return null;
+	}
+
+	public void Cook()
+	{
+		Item item = FindBurnable();
+		if (item == null)
+		{
+			StopCooking();
+			return;
+		}
+		inventory.OnCycle(0.5f);
+		BaseEntity slot = GetSlot(Slot.FireMod);
+		if ((bool)slot)
+		{
+			slot.SendMessage("Cook", 0.5f, SendMessageOptions.DontRequireReceiver);
+		}
+		ItemModBurnable component = item.info.GetComponent<ItemModBurnable>();
+		item.fuel -= 0.5f * (cookingTemperature / 200f);
+		if (!item.HasFlag(Item.Flag.OnFire))
+		{
+			item.SetFlag(Item.Flag.OnFire, b: true);
+			item.MarkDirty();
+		}
+		if (item.fuel <= 0f)
+		{
+			ConsumeFuel(item, component);
+		}
+	}
+
+	private void ConsumeFuel(Item fuel, ItemModBurnable burnable)
+	{
+		Interface.CallHook("OnConsumeFuel", this, fuel, burnable);
+		if (allowByproductCreation && burnable.byproductItem != null && UnityEngine.Random.Range(0f, 1f) > burnable.byproductChance)
+		{
+			Item item = ItemManager.Create(burnable.byproductItem, burnable.byproductAmount, 0uL);
+			if (!item.MoveToContainer(inventory))
+			{
+				OvenFull();
+				item.Drop(inventory.dropPosition, inventory.dropVelocity);
+			}
+		}
+		if (fuel.amount <= 1)
+		{
+			fuel.Remove();
+			return;
+		}
+		fuel.amount--;
+		fuel.fuel = burnable.fuelAmount;
+		fuel.MarkDirty();
+	}
+
+	[RPC_Server]
+	[RPC_Server.MaxDistance(3f)]
+	private void SVSwitch(RPCMessage msg)
+	{
+		bool flag = msg.read.Bit();
+		if (flag != IsOn() && Interface.CallHook("OnOvenToggle", this, msg.player) == null && (!needsBuildingPrivilegeToUse || msg.player.CanBuild()))
+		{
+			if (flag)
+			{
+				StartCooking();
+			}
+			else
+			{
+				StopCooking();
+			}
+		}
+	}
+
+	public void UpdateAttachmentTemperature()
+	{
+		BaseEntity slot = GetSlot(Slot.FireMod);
+		if ((bool)slot)
+		{
+			slot.SendMessage("ParentTemperatureUpdate", inventory.temperature, SendMessageOptions.DontRequireReceiver);
+		}
+	}
+
+	public virtual void StartCooking()
+	{
+		Item item = FindBurnable();
+		if (item != null)
+		{
+			inventory.temperature = cookingTemperature;
+			UpdateAttachmentTemperature();
+			InvokeRepeating(Cook, 0.5f, 0.5f);
+			SetFlag(Flags.On, b: true);
+		}
+	}
+
+	public virtual void StopCooking()
+	{
+		UpdateAttachmentTemperature();
+		if (inventory != null)
+		{
+			inventory.temperature = 15f;
+			foreach (Item item in inventory.itemList)
+			{
+				if (item.HasFlag(Item.Flag.OnFire))
+				{
+					item.SetFlag(Item.Flag.OnFire, b: false);
+					item.MarkDirty();
+				}
+			}
+		}
+		CancelInvoke(Cook);
+		SetFlag(Flags.On, b: false);
+	}
+
+	public bool wantsSplash(ItemDefinition splashType, int amount)
+	{
+		return IsOn() && disabledBySplash;
+	}
+
+	public int DoSplash(ItemDefinition splashType, int amount)
+	{
+		StopCooking();
+		return Mathf.Min(200, amount);
+	}
+
+	public override bool HasSlot(Slot slot)
+	{
+		if (canModFire && slot == Slot.FireMod)
+		{
+			return true;
+		}
+		return base.HasSlot(slot);
+	}
+
+	public override bool SupportsPooling()
+	{
+		return true;
+	}
+}

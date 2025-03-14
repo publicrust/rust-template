@@ -1,0 +1,233 @@
+#define UNITY_ASSERTIONS
+using System.Collections.Generic;
+using Facepunch;
+using Network;
+using Oxide.Core;
+using ProtoBuf;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class PlayerLoot : EntityComponent<BasePlayer>
+{
+	public BaseEntity entitySource;
+
+	public Item itemSource;
+
+	public List<ItemContainer> containers = new List<ItemContainer>();
+
+	internal bool PositionChecks = true;
+
+	private bool isInvokingSendUpdate;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("PlayerLoot.OnRpcMessage"))
+		{
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public bool IsLooting()
+	{
+		return containers.Count > 0;
+	}
+
+	public void Clear()
+	{
+		if (!IsLooting())
+		{
+			return;
+		}
+		Interface.CallHook("OnPlayerLootEnd", this);
+		MarkDirty();
+		if ((bool)entitySource)
+		{
+			entitySource.SendMessage("PlayerStoppedLooting", base.baseEntity, SendMessageOptions.DontRequireReceiver);
+		}
+		foreach (ItemContainer container in containers)
+		{
+			if (container != null)
+			{
+				container.onDirty -= MarkDirty;
+			}
+		}
+		containers.Clear();
+		entitySource = null;
+		itemSource = null;
+	}
+
+	public ItemContainer FindContainer(uint id)
+	{
+		Check();
+		if (!IsLooting())
+		{
+			return null;
+		}
+		foreach (ItemContainer container in containers)
+		{
+			ItemContainer itemContainer = container.FindContainer(id);
+			if (itemContainer != null)
+			{
+				return itemContainer;
+			}
+		}
+		return null;
+	}
+
+	public Item FindItem(uint id)
+	{
+		Check();
+		if (!IsLooting())
+		{
+			return null;
+		}
+		foreach (ItemContainer container in containers)
+		{
+			Item item = container.FindItemByUID(id);
+			if (item != null && item.IsValid())
+			{
+				return item;
+			}
+		}
+		return null;
+	}
+
+	public void Check()
+	{
+		if (!IsLooting() || !base.baseEntity.isServer)
+		{
+			return;
+		}
+		if (entitySource == null)
+		{
+			base.baseEntity.ChatMessage("Stopping Looting because lootable doesn't exist!");
+			Clear();
+		}
+		else if (!entitySource.CanBeLooted(base.baseEntity))
+		{
+			Clear();
+		}
+		else
+		{
+			if (!PositionChecks)
+			{
+				return;
+			}
+			Vector3 vector = entitySource.GetEstimatedWorldPosition();
+			Collider component = entitySource.GetComponent<Collider>();
+			if ((bool)component)
+			{
+				vector = component.ClosestPointOnBounds(base.baseEntity.eyes.position);
+				BaseEntity parentEntity = entitySource.GetParentEntity();
+				if ((bool)parentEntity)
+				{
+					vector = parentEntity.GetEstimatedWorldPosition() + parentEntity.GetEstimatedWorldRotation() * component.transform.position;
+				}
+			}
+			if ((vector - base.baseEntity.eyes.position).magnitude > 4f)
+			{
+				Clear();
+			}
+		}
+	}
+
+	private void MarkDirty()
+	{
+		if (!isInvokingSendUpdate)
+		{
+			isInvokingSendUpdate = true;
+			Invoke(SendUpdate, 0.1f);
+		}
+	}
+
+	public void SendImmediate()
+	{
+		if (isInvokingSendUpdate)
+		{
+			isInvokingSendUpdate = false;
+			CancelInvoke(SendUpdate);
+		}
+		SendUpdate();
+	}
+
+	private void SendUpdate()
+	{
+		isInvokingSendUpdate = false;
+		if (!base.baseEntity.IsValid())
+		{
+			return;
+		}
+		using PlayerUpdateLoot playerUpdateLoot = Pool.Get<PlayerUpdateLoot>();
+		if ((bool)entitySource && entitySource.net != null)
+		{
+			playerUpdateLoot.entityID = entitySource.net.ID;
+		}
+		if (itemSource != null)
+		{
+			playerUpdateLoot.itemID = itemSource.uid;
+		}
+		if (containers.Count > 0)
+		{
+			playerUpdateLoot.containers = Pool.Get<List<ProtoBuf.ItemContainer>>();
+			foreach (ItemContainer container in containers)
+			{
+				playerUpdateLoot.containers.Add(container.Save());
+			}
+		}
+		base.baseEntity.ClientRPCPlayer(null, base.baseEntity, "UpdateLoot", playerUpdateLoot);
+	}
+
+	public void StartLootingEntity(BaseEntity targetEntity, bool doPositionChecks = true)
+	{
+		Clear();
+		if ((bool)targetEntity && targetEntity.OnStartBeingLooted(base.baseEntity))
+		{
+			Assert.IsTrue(targetEntity.isServer, "Assure is server");
+			PositionChecks = doPositionChecks;
+			entitySource = targetEntity;
+			itemSource = null;
+			MarkDirty();
+			Interface.CallHook("IOnLootEntity", this, targetEntity);
+		}
+	}
+
+	public void AddContainer(ItemContainer container)
+	{
+		if (container != null)
+		{
+			containers.Add(container);
+			container.onDirty += MarkDirty;
+		}
+	}
+
+	public void StartLootingPlayer(BasePlayer player)
+	{
+		Clear();
+		if ((bool)player && (bool)player.inventory)
+		{
+			AddContainer(player.inventory.containerWear);
+			AddContainer(player.inventory.containerMain);
+			AddContainer(player.inventory.containerBelt);
+			PositionChecks = true;
+			entitySource = player;
+			itemSource = null;
+			MarkDirty();
+			Interface.CallHook("IOnLootPlayer", this, player);
+		}
+	}
+
+	public void StartLootingItem(Item item)
+	{
+		Clear();
+		if (item != null && item.contents != null)
+		{
+			PositionChecks = true;
+			containers.Add(item.contents);
+			item.contents.onDirty += MarkDirty;
+			itemSource = item;
+			entitySource = item.GetWorldEntity();
+			MarkDirty();
+			Interface.CallHook("IOnLootItem", this, item);
+		}
+	}
+}

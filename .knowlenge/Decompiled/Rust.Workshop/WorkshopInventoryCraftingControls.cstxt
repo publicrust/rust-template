@@ -1,0 +1,238 @@
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using Facepunch.Steamworks;
+using Newtonsoft.Json;
+using Rust;
+using Rust.UI;
+using Rust.Workshop.Game;
+using UnityEngine;
+using UnityEngine.UI;
+
+public class WorkshopInventoryCraftingControls : MonoBehaviour
+{
+	internal class MarketPrice
+	{
+		public bool success { get; set; }
+
+		public ulong volume { get; set; }
+
+		public string lowest_price { get; set; }
+
+		public string median_price { get; set; }
+	}
+
+	public GameObject Container;
+
+	public Button ConvertToItem;
+
+	internal List<Inventory.Result> CraftingResult = new List<Inventory.Result>();
+
+	public Text WoodAmount;
+
+	public Text ClothAmount;
+
+	public Text MetalAmount;
+
+	public int SelectedCount;
+
+	public Text InfoText;
+
+	public WorkshopCraftInfoModal CraftModal;
+
+	public GameObject CraftingContainer;
+
+	public GameObject CraftingButton;
+
+	private Dictionary<int, MarketPrice> priceCache = new Dictionary<int, MarketPrice>();
+
+	public Inventory.Definition ResultItem { get; private set; }
+
+	public Coroutine MarketCoroutine { get; private set; }
+
+	public void OnEnable()
+	{
+		FillCraftingContainer();
+	}
+
+	private void FillCraftingContainer()
+	{
+		if (Global.SteamClient.Inventory.Definitions == null)
+		{
+			return;
+		}
+		Transform[] array = CraftingContainer.transform.Cast<Transform>().ToArray();
+		for (int i = 0; i < array.Length; i++)
+		{
+			Object.Destroy(array[i].gameObject);
+		}
+		Global.SteamClient.Inventory.Definitions.Where((Inventory.Definition x) => x.Type == "Crate").Select(delegate(Inventory.Definition x)
+		{
+			GameObject obj = Object.Instantiate(CraftingButton);
+			obj.GetComponent<Button>().onClick.AddListener(delegate
+			{
+				CraftModal.Open(x.Id);
+			});
+			obj.GetComponentInChildren<HttpImage>().Load(x.IconUrl);
+			obj.transform.SetParent(CraftingContainer.transform, worldPositionStays: false);
+			return obj;
+		}).ToArray();
+	}
+
+	public void Update()
+	{
+		UpdateCraft();
+		WorkshopInventoryItem[] array = (from x in Container.GetComponentsInChildren<Toggle>()
+			where x.isOn
+			select x.GetComponent<WorkshopInventoryItem>()).ToArray();
+		if (SelectedCount != array.Length)
+		{
+			SelectedCount = array.Length;
+			if (SelectedCount == 0 || CraftingResult.Count > 0)
+			{
+				OnChanged(null);
+			}
+			else
+			{
+				OnChanged(array);
+			}
+		}
+	}
+
+	private void OnChanged(WorkshopInventoryItem[] items)
+	{
+		ResultItem = null;
+		ConvertToItem.gameObject.SetActive(value: false);
+		InfoText.text = "";
+		if (items == null)
+		{
+			return;
+		}
+		IEnumerable<IGrouping<Inventory.Definition, WorkshopInventoryItem>> source = from x in items
+			where x.Item.Definition != null
+			group x by (x.Item.Definition.IngredientFor != null) ? x.Item.Definition.IngredientFor.DefaultIfEmpty().FirstOrDefault().Result : null;
+		if (source.Count() != 1)
+		{
+			InfoText.text = "Multiple item types selected";
+			return;
+		}
+		ResultItem = source.First().Key;
+		if (ResultItem == null)
+		{
+			return;
+		}
+		if (ResultItem.IsGenerator)
+		{
+			if (items.Length != 1)
+			{
+				InfoText.text = "Can only open one at a time";
+				return;
+			}
+			UpdateInfoText(items.Length, items.First().Item.Definition);
+			ConvertToItem.GetComponentInChildren<Text>().text = "Open " + items[0].Item.Definition.Name;
+			ConvertToItem.gameObject.SetActive(value: true);
+			return;
+		}
+		Inventory.Definition itemType = items.First().Item.Definition;
+		if (!items.All((WorkshopInventoryItem x) => x.Item.Definition == itemType))
+		{
+			itemType = null;
+		}
+		UpdateInfoText(items.Length, itemType);
+		ConvertToItem.GetComponentInChildren<Text>().text = $"Break Into {ResultItem.Name}";
+		ConvertToItem.gameObject.SetActive(value: true);
+	}
+
+	private void UpdateInfoText(int length, Inventory.Definition definition)
+	{
+		string text = $"<b>{length}</b> items selected";
+		if (definition != null && definition.PriceDollars > 0.0)
+		{
+			text += string.Format("\nIn Item Store for <b>${0} USD</b>", definition.PriceDollars.ToString("0.00"));
+		}
+		InfoText.text = text;
+		if (definition != null && definition.Marketable)
+		{
+			if (MarketCoroutine != null)
+			{
+				StopCoroutine(MarketCoroutine);
+				MarketCoroutine = null;
+			}
+			MarketCoroutine = StartCoroutine(GetMarketPrice(definition));
+		}
+	}
+
+	private IEnumerator GetMarketPrice(Inventory.Definition definition)
+	{
+		if (priceCache.ContainsKey(definition.Id))
+		{
+			if (priceCache[definition.Id] != null && priceCache[definition.Id].success)
+			{
+				InfoText.text += $"\n<b>{priceCache[definition.Id].volume}</b> on market, lowest price is <b>{priceCache[definition.Id].lowest_price} USD</b>";
+			}
+			yield break;
+		}
+		WWW www = new WWW("http://steamcommunity.com/market/priceoverview/?appid=252490&currency=1&market_hash_name=" + definition.Name.Replace(" ", "%20").Replace("&", "%26"));
+		yield return www;
+		if (www.error != null)
+		{
+			Debug.LogWarning(www.error);
+			priceCache.Add(definition.Id, null);
+			www.Dispose();
+			yield break;
+		}
+		MarketPrice value = JsonConvert.DeserializeObject<MarketPrice>(www.text);
+		priceCache.Add(definition.Id, value);
+		if (priceCache[definition.Id] != null && priceCache[definition.Id].success)
+		{
+			InfoText.text += $"\n<b>{priceCache[definition.Id].volume}</b> on market, lowest price is <b>{priceCache[definition.Id].lowest_price} USD</b>";
+		}
+		www.Dispose();
+	}
+
+	public void DoExchange()
+	{
+		WorkshopInventoryItem[] array = (from x in Container.GetComponentsInChildren<Toggle>()
+			where x.isOn
+			select x.GetComponent<WorkshopInventoryItem>()).ToArray();
+		if (array.Count() != 0)
+		{
+			StartCoroutine(ExchangeItems(array));
+		}
+	}
+
+	private IEnumerator ExchangeItems(WorkshopInventoryItem[] selected)
+	{
+		Inventory.Definition targetItem = ResultItem;
+		foreach (WorkshopInventoryItem obj in selected)
+		{
+			obj.GetComponent<Toggle>().isOn = false;
+			obj.GetComponent<Toggle>().interactable = false;
+		}
+		for (int x = 0; x < selected.Length; x++)
+		{
+			CraftingResult.Add(Global.SteamClient.Inventory.CraftItem(new Inventory.Item[1] { selected[x].Item }, targetItem));
+			yield return new WaitForSeconds(0.1f);
+		}
+	}
+
+	private void UpdateCraft()
+	{
+		CraftingResult.RemoveAll((Inventory.Result x) => !x.IsPending);
+	}
+
+	public void OnRefreshed(Inventory.Item[] items)
+	{
+		ClothAmount.text = items.Where((Inventory.Item x) => x.DefinitionId == 10031).Sum((Inventory.Item x) => x.Quantity).ToString();
+		MetalAmount.text = items.Where((Inventory.Item x) => x.DefinitionId == 14182).Sum((Inventory.Item x) => x.Quantity).ToString();
+		WoodAmount.text = items.Where((Inventory.Item x) => x.DefinitionId == 14183).Sum((Inventory.Item x) => x.Quantity).ToString();
+	}
+
+	public void OnManualRefresh()
+	{
+		CraftingResult.Clear();
+		ClothAmount.text = "-";
+		MetalAmount.text = "-";
+		WoodAmount.text = "-";
+	}
+}

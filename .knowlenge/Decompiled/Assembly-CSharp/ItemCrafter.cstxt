@@ -1,0 +1,303 @@
+using System.Collections.Generic;
+using System.Linq;
+using ConVar;
+using Facepunch;
+using Facepunch.Rust;
+using Facepunch.Steamworks;
+using Oxide.Core;
+using ProtoBuf;
+using Rust;
+using UnityEngine;
+
+public class ItemCrafter : EntityComponent<BasePlayer>
+{
+	public List<ItemContainer> containers = new List<ItemContainer>();
+
+	public Queue<ItemCraftTask> queue = new Queue<ItemCraftTask>();
+
+	public int taskUID;
+
+	public void AddContainer(ItemContainer container)
+	{
+		containers.Add(container);
+	}
+
+	public void ServerUpdate(float delta)
+	{
+		if (queue.Count == 0)
+		{
+			return;
+		}
+		ItemCraftTask itemCraftTask = queue.Peek();
+		if (itemCraftTask.cancelled)
+		{
+			itemCraftTask.owner.Command("note.craft_done", itemCraftTask.taskUID, 0);
+			queue.Dequeue();
+		}
+		else
+		{
+			if (itemCraftTask.endTime > UnityEngine.Time.realtimeSinceStartup)
+			{
+				return;
+			}
+			if (itemCraftTask.endTime == 0f)
+			{
+				itemCraftTask.endTime = UnityEngine.Time.realtimeSinceStartup + itemCraftTask.blueprint.time;
+				if (itemCraftTask.owner != null)
+				{
+					itemCraftTask.owner.Command("note.craft_start", itemCraftTask.taskUID, itemCraftTask.blueprint.time, itemCraftTask.amount);
+					if (itemCraftTask.owner.IsAdmin && Craft.instant)
+					{
+						itemCraftTask.endTime = UnityEngine.Time.realtimeSinceStartup + 1f;
+					}
+				}
+			}
+			else
+			{
+				FinishCrafting(itemCraftTask);
+				if (itemCraftTask.amount <= 0)
+				{
+					queue.Dequeue();
+				}
+				else
+				{
+					itemCraftTask.endTime = 0f;
+				}
+			}
+		}
+	}
+
+	private void CollectIngredient(int item, int amount, List<Item> collect)
+	{
+		foreach (ItemContainer container in containers)
+		{
+			amount -= container.Take(collect, item, amount);
+			if (amount <= 0)
+			{
+				break;
+			}
+		}
+	}
+
+	private void CollectIngredients(ItemBlueprint bp, ItemCraftTask task, int amount = 1, BasePlayer player = null)
+	{
+		List<Item> list = new List<Item>();
+		foreach (ItemAmount ingredient in bp.ingredients)
+		{
+			CollectIngredient(ingredient.itemid, (int)ingredient.amount * amount, list);
+		}
+		task.potentialOwners = new List<ulong>();
+		foreach (Item item in list)
+		{
+			item.CollectedForCrafting(player);
+			if (!task.potentialOwners.Contains(player.userID))
+			{
+				task.potentialOwners.Add(player.userID);
+			}
+		}
+		task.takenItems = list;
+	}
+
+	public bool CraftItem(ItemBlueprint bp, BasePlayer owner, ProtoBuf.Item.InstanceData instanceData = null, int amount = 1, int skinID = 0, Item fromTempBlueprint = null)
+	{
+		if (!CanCraft(bp, amount))
+		{
+			return false;
+		}
+		taskUID++;
+		ItemCraftTask itemCraftTask = Facepunch.Pool.Get<ItemCraftTask>();
+		itemCraftTask.blueprint = bp;
+		CollectIngredients(bp, itemCraftTask, amount, owner);
+		itemCraftTask.endTime = 0f;
+		itemCraftTask.taskUID = taskUID;
+		itemCraftTask.owner = owner;
+		itemCraftTask.instanceData = instanceData;
+		if (itemCraftTask.instanceData != null)
+		{
+			itemCraftTask.instanceData.ShouldPool = false;
+		}
+		itemCraftTask.amount = amount;
+		itemCraftTask.skinID = skinID;
+		if (fromTempBlueprint != null)
+		{
+			fromTempBlueprint.RemoveFromContainer();
+			itemCraftTask.takenItems.Add(fromTempBlueprint);
+			itemCraftTask.conditionScale = 0.5f;
+		}
+		object obj = Interface.CallHook("OnItemCraft", itemCraftTask, owner, fromTempBlueprint);
+		if (obj is bool)
+		{
+			return (bool)obj;
+		}
+		queue.Enqueue(itemCraftTask);
+		if (itemCraftTask.owner != null)
+		{
+			itemCraftTask.owner.Command("note.craft_add", itemCraftTask.taskUID, itemCraftTask.blueprint.targetItem.itemid, amount, itemCraftTask.skinID);
+		}
+		return true;
+	}
+
+	private void FinishCrafting(ItemCraftTask task)
+	{
+		task.amount--;
+		task.numCrafted++;
+		ulong num = 0uL;
+		Facepunch.Steamworks.Inventory.Definition definition = Rust.Global.SteamServer.Inventory.FindDefinition(task.skinID);
+		if (definition != null)
+		{
+			num = definition.GetProperty<ulong>("workshopdownload");
+		}
+		if (num == 0)
+		{
+			num = (ulong)task.skinID;
+		}
+		Item item = ItemManager.CreateByItemID(task.blueprint.targetItem.itemid, 1, num);
+		item.amount = task.blueprint.amountToCreate;
+		if (item.hasCondition && task.conditionScale != 1f)
+		{
+			item.maxCondition *= task.conditionScale;
+			item.condition = item.maxCondition;
+		}
+		item.OnVirginSpawn();
+		foreach (ItemAmount ingredient in task.blueprint.ingredients)
+		{
+			int num2 = (int)ingredient.amount;
+			if (task.takenItems == null)
+			{
+				continue;
+			}
+			foreach (Item takenItem in task.takenItems)
+			{
+				if (takenItem.info == ingredient.itemDef)
+				{
+					int amount = takenItem.amount;
+					int num3 = Mathf.Min(amount, num2);
+					takenItem.UseItem(num2);
+					num2 -= num3;
+				}
+				if (num2 > 0)
+				{
+				}
+			}
+		}
+		Facepunch.Rust.Analytics.Crafting(task.blueprint.targetItem.shortname, task.skinID);
+		task.owner.Command("note.craft_done", task.taskUID, 1, task.amount);
+		Interface.CallHook("OnItemCraftFinished", task, item);
+		item.instanceData = task.instanceData;
+		if (!string.IsNullOrEmpty(task.blueprint.UnlockAchievment))
+		{
+			task.owner.GiveAchievement(task.blueprint.UnlockAchievment);
+		}
+		if (task.owner.inventory.GiveItem(item))
+		{
+			task.owner.Command("note.inv", item.info.itemid, item.amount);
+			return;
+		}
+		ItemContainer itemContainer = containers.First();
+		task.owner.Command("note.inv", item.info.itemid, item.amount);
+		task.owner.Command("note.inv", item.info.itemid, -item.amount);
+		item.Drop(itemContainer.dropPosition, itemContainer.dropVelocity);
+	}
+
+	public bool CancelTask(int iID, bool ReturnItems)
+	{
+		if (queue.Count == 0)
+		{
+			return false;
+		}
+		ItemCraftTask itemCraftTask = queue.FirstOrDefault((ItemCraftTask x) => x.taskUID == iID && !x.cancelled);
+		if (itemCraftTask == null)
+		{
+			return false;
+		}
+		itemCraftTask.cancelled = true;
+		if (itemCraftTask.owner == null)
+		{
+			return true;
+		}
+		Interface.CallHook("OnItemCraftCancelled", itemCraftTask);
+		itemCraftTask.owner.Command("note.craft_done", itemCraftTask.taskUID, 0);
+		if (itemCraftTask.takenItems != null && itemCraftTask.takenItems.Count > 0 && ReturnItems)
+		{
+			foreach (Item takenItem in itemCraftTask.takenItems)
+			{
+				if (takenItem != null && takenItem.amount > 0)
+				{
+					if (takenItem.IsBlueprint() && takenItem.blueprintTargetDef == itemCraftTask.blueprint.targetItem)
+					{
+						takenItem.UseItem(itemCraftTask.numCrafted);
+					}
+					if (takenItem.amount > 0 && !takenItem.MoveToContainer(itemCraftTask.owner.inventory.containerMain))
+					{
+						takenItem.Drop(itemCraftTask.owner.inventory.containerMain.dropPosition, itemCraftTask.owner.inventory.containerMain.dropVelocity);
+						itemCraftTask.owner.Command("note.inv", takenItem.info.itemid, -takenItem.amount);
+					}
+				}
+			}
+		}
+		return true;
+	}
+
+	public bool CancelBlueprint(int itemid)
+	{
+		if (queue.Count == 0)
+		{
+			return false;
+		}
+		ItemCraftTask itemCraftTask = queue.FirstOrDefault((ItemCraftTask x) => x.blueprint.targetItem.itemid == itemid && !x.cancelled);
+		if (itemCraftTask == null)
+		{
+			return false;
+		}
+		return CancelTask(itemCraftTask.taskUID, ReturnItems: true);
+	}
+
+	public void CancelAll(bool returnItems)
+	{
+		foreach (ItemCraftTask item in queue)
+		{
+			CancelTask(item.taskUID, returnItems);
+		}
+	}
+
+	private bool DoesHaveUsableItem(int item, int iAmount)
+	{
+		int num = 0;
+		foreach (ItemContainer container in containers)
+		{
+			num += container.GetAmount(item, onlyUsableAmounts: true);
+		}
+		return num >= iAmount;
+	}
+
+	public bool CanCraft(ItemBlueprint bp, int amount = 1)
+	{
+		if (amount < 1 || amount > 9000)
+		{
+			return false;
+		}
+		object obj = Interface.CallHook("CanCraft", this, bp, amount);
+		if (obj is bool)
+		{
+			return (bool)obj;
+		}
+		foreach (ItemAmount ingredient in bp.ingredients)
+		{
+			if (!DoesHaveUsableItem(ingredient.itemid, (int)ingredient.amount * amount))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	public bool CanCraft(ItemDefinition def, int amount = 1)
+	{
+		ItemBlueprint component = def.GetComponent<ItemBlueprint>();
+		if (CanCraft(component, amount))
+		{
+			return true;
+		}
+		return false;
+	}
+}

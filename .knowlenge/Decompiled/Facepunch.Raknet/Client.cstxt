@@ -1,0 +1,434 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using Facepunch;
+using Facepunch.Network.Raknet;
+using Network;
+using UnityEngine;
+
+public class Client : Network.Client
+{
+	public static float MaxReceiveTime = 20f;
+
+	public const string DemoHeader = "RUST DEMO FORMAT";
+
+	private Peer peer;
+
+	public static byte[] ReusableBytes = new byte[1048576];
+
+	private Stopwatch cycleTimer = Stopwatch.StartNew();
+
+	protected FileStream recordStream;
+
+	protected BinaryWriter recordWriter;
+
+	protected Stopwatch recordTime;
+
+	protected FileStream playbackStream;
+
+	protected BinaryReader playbackReader;
+
+	protected long playbackTime;
+
+	protected Stopwatch playbackTimer;
+
+	private long lastPlayedPacketTime;
+
+	public override bool IsRecording => recordStream != null;
+
+	public override bool IsPlaying => playbackStream != null;
+
+	public override bool PlayingFinished => playbackStream.Position >= playbackStream.Length;
+
+	public override bool IsConnected()
+	{
+		return peer != null;
+	}
+
+	public override bool Connect(string strURL, int port)
+	{
+		base.Connect(strURL, port);
+		peer = Peer.CreateConnection(strURL, port, 12, 400, 0);
+		if (peer == null)
+		{
+			return false;
+		}
+		write = new StreamWrite(peer);
+		read = new StreamRead(peer);
+		connectedAddress = strURL;
+		connectedPort = port;
+		ServerName = "";
+		base.Connection = new Connection();
+		return true;
+	}
+
+	internal bool HandleRaknetPacket(byte type)
+	{
+		if (type >= 140)
+		{
+			return false;
+		}
+		if (IsPlaying)
+		{
+			return true;
+		}
+		switch (type)
+		{
+		case 16:
+			base.ConnectionAccepted = true;
+			if (base.Connection.guid != 0L)
+			{
+				Console.WriteLine("Multiple PacketType.CONNECTION_REQUEST_ACCEPTED");
+			}
+			base.Connection.guid = peer.incomingGUID;
+			IncomingStats.Add("Unconnected", "RequestAccepted", read.Length);
+			return true;
+		case 17:
+			Disconnect("Connection Attempt Failed", sendReasonToServer: false);
+			return true;
+		case 20:
+			Disconnect("Server is Full", sendReasonToServer: false);
+			return true;
+		case 21:
+			if (base.Connection != null && base.Connection.guid != peer.incomingGUID)
+			{
+				return true;
+			}
+			Disconnect(Network.Client.disconnectReason, sendReasonToServer: false);
+			return true;
+		case 22:
+			if (base.Connection == null && base.Connection.guid != peer.incomingGUID)
+			{
+				return true;
+			}
+			Disconnect("Timed Out", sendReasonToServer: false);
+			return true;
+		case 23:
+			if (base.Connection == null && base.Connection.guid != peer.incomingGUID)
+			{
+				return true;
+			}
+			Disconnect("Connection Banned", sendReasonToServer: false);
+			return true;
+		default:
+			IncomingStats.Add("Unconnected", "Unhandled", read.Length);
+			if (base.Connection != null && peer.incomingGUID != base.Connection.guid)
+			{
+				UnityEngine.Debug.LogWarning("[CLIENT] Unhandled Raknet packet " + type + " from unknown source " + peer.incomingAddress);
+				return true;
+			}
+			UnityEngine.Debug.LogWarning("Unhandled Raknet packet " + type);
+			return true;
+		}
+	}
+
+	protected void HandleMessage()
+	{
+		if (IsRecording)
+		{
+			IntPtr source = peer.RawData();
+			int incomingBytes = peer.incomingBytes;
+			Marshal.Copy(source, ReusableBytes, 0, incomingBytes);
+			recordWriter.Write(incomingBytes);
+			recordWriter.Write((long)recordTime.Elapsed.TotalMilliseconds);
+			recordWriter.Write(ReusableBytes, 0, incomingBytes);
+			recordWriter.Write('\0');
+			recordWriter.Write('\0');
+		}
+		byte b = peer.ReadUInt8();
+		if (HandleRaknetPacket(b))
+		{
+			return;
+		}
+		b -= 140;
+		if (!IsPlaying && peer.incomingGUID != base.Connection.guid)
+		{
+			IncomingStats.Add("Error", "WrongGuid", read.Length);
+			return;
+		}
+		if (!IsPlaying && base.Connection == null)
+		{
+			UnityEngine.Debug.LogWarning(string.Concat("[CLIENT] Ignoring message ", (Message.Type)b, " ", b, " clientConnection is null"));
+			return;
+		}
+		if (b > 22)
+		{
+			UnityEngine.Debug.LogWarning(string.Concat("Invalid Packet (higher than ", Message.Type.EAC, ")"));
+			Disconnect("Invalid Packet (" + b + ") " + peer.incomingBytes + "b", sendReasonToServer: true);
+			return;
+		}
+		Message obj = StartMessage((Message.Type)b, base.Connection);
+		if (onMessage != null)
+		{
+			try
+			{
+				using (TimeWarning.New("onMessage"))
+				{
+					onMessage(obj);
+				}
+			}
+			catch (Exception ex)
+			{
+				UnityEngine.Debug.LogException(ex);
+				if (!IsPlaying)
+				{
+					Disconnect(ex.Message + "\n" + ex.StackTrace, sendReasonToServer: true);
+				}
+			}
+		}
+		obj.Clear();
+		Pool.Free(ref obj);
+	}
+
+	public override void Cycle()
+	{
+		using (TimeWarning.New("Raknet.Client.Cycle"))
+		{
+			if (IsPlaying || !IsConnected())
+			{
+				return;
+			}
+			cycleTimer.Reset();
+			cycleTimer.Start();
+			while (peer.Receive())
+			{
+				using (TimeWarning.New("HandleMessage"))
+				{
+					HandleMessage();
+				}
+				if (cycleTimer.Elapsed.TotalMilliseconds > (double)MaxReceiveTime || !IsConnected())
+				{
+					break;
+				}
+			}
+		}
+	}
+
+	public override void Disconnect(string reason, bool sendReasonToServer)
+	{
+		if (sendReasonToServer && write != null && write.Start())
+		{
+			write.PacketID(Message.Type.DisconnectReason);
+			write.String(reason);
+			write.Send(new SendInfo(broadcast: true)
+			{
+				method = SendMethod.ReliableUnordered,
+				priority = Priority.Immediate
+			});
+		}
+		if (peer != null)
+		{
+			peer.Close();
+			peer = null;
+		}
+		write = null;
+		read = null;
+		connectedAddress = "";
+		connectedPort = 0;
+		base.Connection = null;
+		OnDisconnected(reason);
+	}
+
+	public override string GetDebug(Connection connection)
+	{
+		if (peer == null)
+		{
+			return "";
+		}
+		if (connection == null)
+		{
+			return peer.GetStatisticsString(0uL);
+		}
+		return peer.GetStatisticsString(connection.guid);
+	}
+
+	public override ulong GetStat(Connection connection, StatTypeLong type)
+	{
+		if (peer == null)
+		{
+			return 0uL;
+		}
+		return peer.GetStat(connection, type);
+	}
+
+	public override int GetAveragePing()
+	{
+		if (base.Connection == null)
+		{
+			return 1;
+		}
+		return peer.GetPingAverage(base.Connection.guid);
+	}
+
+	public override int GetLastPing()
+	{
+		if (base.Connection == null)
+		{
+			return 1;
+		}
+		return peer.GetPingLast(base.Connection.guid);
+	}
+
+	public override int GetLowestPing()
+	{
+		if (base.Connection == null)
+		{
+			return 1;
+		}
+		return peer.GetPingLowest(base.Connection.guid);
+	}
+
+	public override bool StartRecording(string targetFilename, byte[] header)
+	{
+		if (recordStream != null)
+		{
+			return false;
+		}
+		recordStream = new FileStream(targetFilename, FileMode.Create);
+		recordWriter = new BinaryWriter(recordStream);
+		recordTime = Stopwatch.StartNew();
+		recordWriter.Write("RUST DEMO FORMAT");
+		recordWriter.Write(header.Length);
+		recordWriter.Write(header);
+		recordWriter.Write('\0');
+		return true;
+	}
+
+	public override void StopRecording()
+	{
+		if (recordStream != null)
+		{
+			recordTime = null;
+			recordWriter.Close();
+			recordWriter = null;
+			recordStream.Dispose();
+			recordStream = null;
+		}
+	}
+
+	public override void ManualRecordPacket(byte packetId, byte[] data, int length)
+	{
+		if (IsRecording)
+		{
+			recordWriter.Write(length + 1);
+			recordWriter.Write((long)recordTime.Elapsed.TotalMilliseconds);
+			recordWriter.Write((byte)(packetId + 140));
+			recordWriter.Write(data, 0, length);
+			recordWriter.Write('\0');
+			recordWriter.Write('\0');
+		}
+	}
+
+	public override byte[] StartPlayback(string filename)
+	{
+		playbackStream = new FileStream(filename, FileMode.Open);
+		if (playbackStream == null)
+		{
+			return null;
+		}
+		playbackReader = new BinaryReader(playbackStream);
+		if (playbackReader.ReadString() != "RUST DEMO FORMAT")
+		{
+			UnityEngine.Debug.LogWarning("Demo has invalid header #1");
+			StopPlayback();
+			return null;
+		}
+		int count = playbackReader.ReadInt32();
+		byte[] result = playbackReader.ReadBytes(count);
+		playbackTime = 0L;
+		if (playbackReader.ReadChar() != 0)
+		{
+			UnityEngine.Debug.LogWarning("Demo has invalid header #2");
+			StopPlayback();
+			return null;
+		}
+		peer = new DemoPeer();
+		write = new StreamWrite(peer);
+		read = new StreamRead(peer);
+		PlaybackStats = new PlaybackStatsData();
+		playbackTimer = Stopwatch.StartNew();
+		return result;
+	}
+
+	public override void StopPlayback()
+	{
+		if (playbackReader != null)
+		{
+			playbackReader.Close();
+			playbackReader = null;
+		}
+		if (playbackStream != null)
+		{
+			playbackStream.Dispose();
+			playbackStream = null;
+		}
+		peer = null;
+		write = null;
+		read = null;
+		PlaybackStats.DemoLength = TimeSpan.FromMilliseconds(lastPlayedPacketTime);
+		PlaybackStats.TotalTime = playbackTimer.Elapsed;
+	}
+
+	public override void UpdatePlayback(long frameTime, long maxTime)
+	{
+		if (PlayingFinished)
+		{
+			return;
+		}
+		PlaybackStats.Frames++;
+		playbackTime += frameTime;
+		Stopwatch stopwatch = Stopwatch.StartNew();
+		while (PlaybackPacket())
+		{
+			if (stopwatch.Elapsed.TotalMilliseconds > (double)maxTime)
+			{
+				playbackTime = lastPlayedPacketTime;
+				break;
+			}
+		}
+	}
+
+	private bool PlaybackPacket()
+	{
+		if (PlayingFinished)
+		{
+			return false;
+		}
+		long position = playbackReader.BaseStream.Position;
+		int count = playbackReader.ReadInt32();
+		long num = playbackReader.ReadInt64();
+		if (num > playbackTime)
+		{
+			playbackReader.BaseStream.Position = position;
+			return false;
+		}
+		byte[] packet = playbackReader.ReadBytes(count);
+		if (playbackReader.ReadChar() != 0)
+		{
+			UnityEngine.Debug.LogWarning("Invalid sequence in demo");
+			StopPlayback();
+			return false;
+		}
+		if (playbackReader.ReadChar() != 0)
+		{
+			UnityEngine.Debug.LogWarning("Invalid sequence in demo");
+			StopPlayback();
+			return false;
+		}
+		DemoPeer demoPeer = (DemoPeer)peer;
+		try
+		{
+			PlaybackStats.Packets++;
+			lastPlayedPacketTime = num;
+			demoPeer.Packet = packet;
+			demoPeer.SetReadPos(0);
+			HandleMessage();
+		}
+		finally
+		{
+			demoPeer.Packet = null;
+		}
+		return IsPlaying;
+	}
+}

@@ -1,0 +1,182 @@
+using System;
+using System.Collections;
+using System.IO;
+using Facepunch.Extend;
+using Facepunch.Steamworks;
+using Facepunch.Utility;
+using Rust.Workshop;
+using Rust.Workshop.Import;
+using UnityEngine;
+
+internal class ImportVersion2 : SingletonComponent<ImportVersion2>
+{
+	private AssetBundle Bundle;
+
+	protected WorkshopInterface Interface => GetComponentInParent<WorkshopInterface>();
+
+	public void OnDisable()
+	{
+		if (Bundle != null)
+		{
+			Bundle.Unload(unloadAllLoadedObjects: true);
+			Bundle = null;
+			Debug.Log("CLEANUP BUNDLE");
+		}
+	}
+
+	internal void DoImport(Workshop.Item item, Skin skin, Action onImportFinished)
+	{
+		StartCoroutine(RunImport(item, skin, onImportFinished));
+	}
+
+	private IEnumerator RunImport(Workshop.Item item, Skin skin, Action onImportFinished)
+	{
+		if (Bundle != null)
+		{
+			Bundle.Unload(unloadAllLoadedObjects: true);
+			Bundle = null;
+		}
+		Interface.LoadingBar.Active = true;
+		Interface.LoadingBar.Text = "Downloading..";
+		Interface.LoadingBar.Progress = 0f;
+		if (!item.Installed)
+		{
+			item.Download();
+			while (item.Downloading)
+			{
+				Interface.LoadingBar.Progress = (float)item.DownloadProgress;
+				Interface.LoadingBar.SubText = $"{item.BytesDownloaded.FormatBytes()} / {item.BytesTotalDownload.FormatBytes()}";
+				yield return null;
+			}
+			Interface.LoadingBar.SubText = "";
+			Interface.LoadingBar.Text = "Installing..";
+			while (!item.Installed)
+			{
+				Interface.LoadingBar.Text = "Installing";
+				yield return null;
+			}
+		}
+		string text = item.Directory.FullName + "/bundle";
+		if (File.Exists(text))
+		{
+			Interface.LoadingBar.Text = "Loading Item";
+			yield return StartCoroutine(LoadItem(item.Directory.FullName, text, skin));
+		}
+		else
+		{
+			Debug.LogWarning("No Bundle Found!");
+			Os.OpenFolder(item.Directory.FullName);
+			Interface.LoadingBar.Text = "Couldn't Load";
+			Interface.LoadingBar.SubText = "So we're going to open the folder so you can update it manually";
+			yield return new WaitForSeconds(5f);
+		}
+		onImportFinished();
+		Interface.LoadingBar.Active = false;
+	}
+
+	public IEnumerator LoadItem(string Folder, string BundleName, Skin skin)
+	{
+		AssetBundleCreateRequest request = AssetBundle.LoadFromFileAsync(BundleName);
+		Interface.LoadingBar.Text = "Loading Asset Bundle";
+		yield return new WaitUntil(() => request.isDone);
+		if (request.assetBundle == null)
+		{
+			Debug.LogWarning("Asset bundle is null!");
+			yield break;
+		}
+		Bundle = request.assetBundle;
+		WorkshopSkinBase asset = request.assetBundle.LoadAsset<WorkshopSkinBase>("Meta.asset");
+		if (asset == null)
+		{
+			string[] allAssetNames = request.assetBundle.GetAllAssetNames();
+			foreach (string text in allAssetNames)
+			{
+				asset = request.assetBundle.LoadAsset<WorkshopSkinBase>(text);
+				if (asset != null)
+				{
+					break;
+				}
+			}
+		}
+		if (asset == null)
+		{
+			Os.OpenFolder(Folder);
+			Interface.LoadingBar.Text = "Couldn't Load";
+			Interface.LoadingBar.SubText = "So we're going to open the folder so you can update it manually";
+			yield return new WaitForSeconds(5f);
+		}
+		else
+		{
+			Interface.LoadingBar.Text = "SettingSkin";
+			yield return StartCoroutine(ProcessMaterial(0, asset.skinMaterial0, skin));
+			yield return StartCoroutine(ProcessMaterial(1, asset.skinMaterial1, skin));
+			yield return StartCoroutine(ProcessMaterial(2, asset.skinMaterial2, skin));
+			yield return StartCoroutine(ProcessMaterial(3, asset.skinMaterial3, skin));
+		}
+	}
+
+	private IEnumerator ProcessMaterial(int v, Material inputMaterial, Skin skin)
+	{
+		if (inputMaterial == null || skin.Materials.Length <= v)
+		{
+			yield break;
+		}
+		Interface.LoadingBar.Text = "Loading Material " + (v + 1);
+		yield return null;
+		ImportTexture("_MainTex", inputMaterial, skin.Materials[v], normal: false, skin, v);
+		ImportTexture("_BumpMap", inputMaterial, skin.Materials[v], normal: true, skin, v);
+		ImportTexture("_OcclusionMap", inputMaterial, skin.Materials[v], normal: false, skin, v);
+		if (ImportTexture("_SpecGlossMap", inputMaterial, skin.Materials[v], normal: false, skin, v) == null)
+		{
+			Texture2D texture2D = ImportTexture("_MetallicGlossMap", inputMaterial, skin.Materials[v], normal: false, skin, v, "_SpecGlossMap");
+			if (texture2D != null)
+			{
+				ConvertMetalToSpec(texture2D, skin.Materials[v]);
+			}
+		}
+	}
+
+	private Texture2D ImportTexture(string name, Material inputMaterial, Material outputMaterial, bool normal, Skin skin, int group, string targetName = null)
+	{
+		if (targetName == null)
+		{
+			targetName = name;
+		}
+		UnityEngine.Texture texture = outputMaterial.GetTexture(name);
+		UnityEngine.Texture texture2 = inputMaterial.GetTexture(name);
+		if (texture2 == null)
+		{
+			return null;
+		}
+		if (texture == null || texture2.name == texture.name)
+		{
+			return null;
+		}
+		texture2 = Facepunch.Utility.Texture.LimitSize(texture2 as Texture2D, skin.Skinnable.Groups[group].MaxTextureSize, skin.Skinnable.Groups[group].MaxTextureSize);
+		outputMaterial.SetTexture(targetName, texture2);
+		return texture2 as Texture2D;
+	}
+
+	private Texture2D ConvertMetalToSpec(Texture2D tex, Material outputMaterial)
+	{
+		tex = Facepunch.Utility.Texture.CreateReadableCopy(tex);
+		for (int i = 0; i < tex.height; i++)
+		{
+			for (int j = 0; j < tex.width; j++)
+			{
+				UnityEngine.Color pixel = tex.GetPixel(j, i);
+				if (pixel.a == 0f)
+				{
+					pixel.a = 0.007843138f;
+				}
+				UnityEngine.Color color = new UnityEngine.Color(pixel.r, pixel.r, pixel.r, pixel.a);
+				tex.SetPixel(j, i, color);
+			}
+		}
+		tex.Apply();
+		outputMaterial.SetTexture("_SpecGlossMap", tex);
+		outputMaterial.SetFloat("_Glossiness", 1f);
+		outputMaterial.SetColor("_SpecColor", UnityEngine.Color.white);
+		return tex;
+	}
+}

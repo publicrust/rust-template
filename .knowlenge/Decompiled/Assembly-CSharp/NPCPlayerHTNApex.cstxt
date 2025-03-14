@@ -1,0 +1,481 @@
+using System;
+using System.Collections.Generic;
+using Apex.AI;
+using Apex.AI.Components;
+using Rust.Ai;
+using UnityEngine;
+using UnityEngine.AI;
+
+public class NPCPlayerHTNApex : NPCPlayer, IContextProvider, IAIAgent
+{
+	public GameObjectRef RadioEffect;
+
+	public GameObjectRef DeathEffect;
+
+	public int agentTypeIndex;
+
+	private float timeAtDestination;
+
+	private float attackTargetVisibleFor;
+
+	private BaseEntity lastAttackTarget;
+
+	private NPCHumanHTNApexContext _aiContext;
+
+	private List<Vector3> pointSamples = new List<Vector3>();
+
+	public BaseNpc.AiStatistics Stats;
+
+	public StateTimer BusyTimer;
+
+	private UtilityAIComponent utilityAiComponent;
+
+	public BaseNpc.Behaviour _currentBehavior;
+
+	public int AgentTypeIndex
+	{
+		get
+		{
+			return agentTypeIndex;
+		}
+		set
+		{
+			agentTypeIndex = value;
+		}
+	}
+
+	public NPCHumanHTNApexContext AiContext
+	{
+		get
+		{
+			if (_aiContext == null)
+			{
+				SetupAiContext();
+			}
+			return _aiContext;
+		}
+	}
+
+	public float TimeAtDestination => timeAtDestination;
+
+	public Vector3 Destination
+	{
+		get
+		{
+			if (IsNavRunning())
+			{
+				return GetNavAgent.destination;
+			}
+			return Entity.ServerPosition;
+		}
+		set
+		{
+			if (IsNavRunning())
+			{
+				GetNavAgent.destination = value;
+			}
+		}
+	}
+
+	public bool IsStopped
+	{
+		get
+		{
+			if (IsNavRunning())
+			{
+				return GetNavAgent.isStopped;
+			}
+			return true;
+		}
+		set
+		{
+			if (IsNavRunning())
+			{
+				GetNavAgent.isStopped = value;
+			}
+		}
+	}
+
+	public bool AutoBraking
+	{
+		get
+		{
+			if (IsNavRunning())
+			{
+				return GetNavAgent.autoBraking;
+			}
+			return false;
+		}
+		set
+		{
+			if (IsNavRunning())
+			{
+				GetNavAgent.autoBraking = value;
+			}
+		}
+	}
+
+	public bool HasPath
+	{
+		get
+		{
+			if (IsNavRunning())
+			{
+				return GetNavAgent.hasPath;
+			}
+			return false;
+		}
+	}
+
+	public Vector3 GuardPosition { get; set; }
+
+	public float AttackTargetVisibleFor => attackTargetVisibleFor;
+
+	public BaseEntity AttackTarget { get; set; }
+
+	public Memory.SeenInfo AttackTargetMemory { get; set; }
+
+	public BaseCombatEntity CombatTarget => AttackTarget as BaseCombatEntity;
+
+	public Vector3 AttackPosition => eyes.position;
+
+	public Vector3 CrouchedAttackPosition
+	{
+		get
+		{
+			if (IsDucked())
+			{
+				return AttackPosition;
+			}
+			return AttackPosition - Vector3.down * 1f;
+		}
+	}
+
+	public BaseNpc.Behaviour CurrentBehaviour
+	{
+		get
+		{
+			return _currentBehavior;
+		}
+		set
+		{
+			_currentBehavior = value;
+			BehaviourChanged();
+		}
+	}
+
+	public float currentBehaviorDuration { get; set; }
+
+	public BaseCombatEntity Entity => this;
+
+	public NavMeshAgent GetNavAgent
+	{
+		get
+		{
+			if (NavAgent == null)
+			{
+				NavAgent = GetComponent<NavMeshAgent>();
+				if (NavAgent == null)
+				{
+					Debug.LogErrorFormat("{0} has no nav agent!", base.name);
+				}
+			}
+			return NavAgent;
+		}
+	}
+
+	public BaseNpc.AiStatistics GetStats => Stats;
+
+	public float GetAttackRange => WeaponAttackRange();
+
+	public Vector3 GetAttackOffset => new Vector3(0f, 1.8f, 0f);
+
+	public Vector3 CurrentAimAngles => eyes.BodyForward();
+
+	public float GetStamina => 1f;
+
+	public float GetEnergy => 1f;
+
+	public float GetAttackCost => 0f;
+
+	public float GetSleep => 1f;
+
+	public float GetStuckDuration => 0f;
+
+	public float GetLastStuckTime => 0f;
+
+	public BaseEntity FoodTarget { get; set; }
+
+	public override void ServerInit()
+	{
+		if (!base.isClient)
+		{
+			base.ServerInit();
+			GuardPosition = GetPosition();
+			InvokeRandomized(RadioChatter, 10f, 10f, 5f);
+		}
+	}
+
+	public void RadioChatter()
+	{
+		Effect.server.Run(RadioEffect.resourcePath, this, StringPool.Get("head"), Vector3.zero, Vector3.zero);
+	}
+
+	public override void OnKilled(HitInfo info)
+	{
+		base.OnKilled(info);
+		Effect.server.Run(DeathEffect.resourcePath, this, 0u, Vector3.zero, Vector3.zero);
+	}
+
+	public override void Hurt(HitInfo info)
+	{
+		base.Hurt(info);
+	}
+
+	public override void MovementUpdate(float delta)
+	{
+		base.MovementUpdate(delta);
+		if ((IsNavRunning() && !NavAgent.hasPath) || Vector3Ex.Distance2D(finalDestination, GetPosition()) < stoppingDistance)
+		{
+			timeAtDestination += delta;
+		}
+		else
+		{
+			timeAtDestination = 0f;
+		}
+		modelState.aiming = timeAtDestination > 0.25f && AttackTarget != null;
+	}
+
+	public void BehaviourChanged()
+	{
+		currentBehaviorDuration = 0f;
+	}
+
+	public override void ServerThink(float delta)
+	{
+		base.ServerThink(delta);
+		currentBehaviorDuration += delta;
+		UpdateAttackTargetVisibility(delta);
+	}
+
+	public void UpdateAttackTargetVisibility(float delta)
+	{
+		if (AttackTarget == null || (lastAttackTarget != null && lastAttackTarget != AttackTarget) || !AttackTarget.IsVisible(AttackPosition))
+		{
+			attackTargetVisibleFor = 0f;
+		}
+		else
+		{
+			attackTargetVisibleFor += delta;
+		}
+		lastAttackTarget = AttackTarget;
+	}
+
+	public void UpdateDestination(Vector3 newDest)
+	{
+		SetDestination(newDest);
+	}
+
+	public void UpdateDestination(Transform tx)
+	{
+		Debug.LogWarning("NPCPlayerApex not implemented : UpdateDestination (Transform tx)");
+		SetDestination(tx.position);
+	}
+
+	public override void SetDestination(Vector3 newDestination)
+	{
+		base.SetDestination(newDestination);
+		IsStopped = false;
+		Destination = newDestination;
+	}
+
+	public float WeaponAttackRange()
+	{
+		AttackEntity attackEntity = GetHeldEntity() as AttackEntity;
+		if (attackEntity == null)
+		{
+			return 0f;
+		}
+		return attackEntity.effectiveRange;
+	}
+
+	public void StopMoving()
+	{
+		if (IsNavRunning() && !NavAgent.isStopped)
+		{
+			NavAgent.isStopped = true;
+		}
+		finalDestination = GetPosition();
+	}
+
+	public override float DesiredMoveSpeed()
+	{
+		float running = 0f;
+		float ducking = ((!modelState.ducked) ? 0f : 1f);
+		float num = 1f;
+		if (CurrentBehaviour == BaseNpc.Behaviour.Wander)
+		{
+			num = 0.6f;
+		}
+		else
+		{
+			num = 1f;
+			float num2 = Vector3.Dot(NavAgent.desiredVelocity.normalized, eyes.BodyForward());
+			num2 = ((!(num2 > 0.75f)) ? 0f : Mathf.Clamp01((num2 - 0.75f) / 0.25f));
+			running = num2;
+		}
+		return GetSpeed(running, ducking) * num;
+	}
+
+	public override Vector3 GetAimDirection()
+	{
+		float num = Vector3Ex.Distance2D(finalDestination, GetPosition());
+		if (CurrentBehaviour == BaseNpc.Behaviour.Wander)
+		{
+			if (NavAgent.desiredVelocity.magnitude > 0.1f)
+			{
+				return NavAgent.desiredVelocity.normalized;
+			}
+			return eyes.BodyForward();
+		}
+		if (CurrentBehaviour == BaseNpc.Behaviour.Attack && AttackTarget != null)
+		{
+			return (AttackTarget.CenterPoint() - CenterPoint()).normalized;
+		}
+		if (num >= 1f)
+		{
+			Vector3 vector = finalDestination - GetPosition();
+			return new Vector3(vector.x, 0f, vector.z);
+		}
+		return eyes.BodyForward();
+	}
+
+	public void StartAttack()
+	{
+		if (IsAlive())
+		{
+			ShotTest();
+		}
+	}
+
+	public bool AttackReady()
+	{
+		return true;
+	}
+
+	public override float StartHealth()
+	{
+		return UnityEngine.Random.Range(500f, 500f);
+	}
+
+	public override float StartMaxHealth()
+	{
+		return 500f;
+	}
+
+	public override float MaxHealth()
+	{
+		return 500f;
+	}
+
+	protected virtual void SetupAiContext()
+	{
+		_aiContext = new NPCHumanHTNApexContext(this);
+	}
+
+	public IAIContext GetContext(Guid aiId)
+	{
+		return AiContext;
+	}
+
+	public bool IsNavRunning()
+	{
+		return GetNavAgent != null && GetNavAgent.enabled && GetNavAgent.isOnNavMesh;
+	}
+
+	public void Pause()
+	{
+		if (GetNavAgent != null && GetNavAgent.enabled)
+		{
+			GetNavAgent.enabled = false;
+		}
+		if (utilityAiComponent == null)
+		{
+			utilityAiComponent = Entity.GetComponent<UtilityAIComponent>();
+		}
+		if (utilityAiComponent != null)
+		{
+			utilityAiComponent.Pause();
+		}
+	}
+
+	public void Resume()
+	{
+		if (GetNavAgent == null)
+		{
+			return;
+		}
+		if (!GetNavAgent.isOnNavMesh)
+		{
+			if (!NavMesh.SamplePosition(ServerPosition, out var hit, GetNavAgent.height * 2f, -1))
+			{
+				return;
+			}
+			ServerPosition = hit.position;
+		}
+		GetNavAgent.enabled = true;
+		if (utilityAiComponent == null)
+		{
+			utilityAiComponent = Entity.GetComponent<UtilityAIComponent>();
+		}
+		if (utilityAiComponent != null)
+		{
+			utilityAiComponent.Resume();
+		}
+	}
+
+	public float FearLevel(BaseEntity ent)
+	{
+		return 0f;
+	}
+
+	public float GetWantsToAttack(BaseEntity target)
+	{
+		if (target == null)
+		{
+			return 0f;
+		}
+		if (!target.HasAnyTrait(TraitFlag.Animal | TraitFlag.Human))
+		{
+			return 0f;
+		}
+		if ((bool)target.GetComponent<NPCPlayerApex>())
+		{
+			return 0f;
+		}
+		if (target.Health() <= 0f)
+		{
+			return 0f;
+		}
+		return 1f;
+	}
+
+	public bool BusyTimerActive()
+	{
+		return BusyTimer.IsActive;
+	}
+
+	public void SetBusyFor(float dur)
+	{
+		BusyTimer.Activate(dur);
+	}
+
+	public bool WantsToEat(BaseEntity ent)
+	{
+		return false;
+	}
+
+	public void Eat()
+	{
+	}
+}

@@ -1,0 +1,794 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using ConVar;
+using Facepunch;
+using Facepunch.Steamworks;
+using Network;
+using Oxide.Core;
+using ProtoBuf;
+using Rust;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class PlayerInventory : EntityComponent<BasePlayer>
+{
+	public enum Type
+	{
+		Main,
+		Belt,
+		Wear
+	}
+
+	public ItemContainer containerMain;
+
+	public ItemContainer containerBelt;
+
+	public ItemContainer containerWear;
+
+	public ItemCrafter crafting;
+
+	public PlayerLoot loot;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("PlayerInventory.OnRpcMessage"))
+		{
+			if (rpc == 2116208967 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - ItemCmd "));
+				}
+				using (TimeWarning.New("ItemCmd"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!BaseEntity.RPC_Server.FromOwner.Test("ItemCmd", GetBaseEntity(), player))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							BaseEntity.RPCMessage rPCMessage = default(BaseEntity.RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							BaseEntity.RPCMessage msg2 = rPCMessage;
+							ItemCmd(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						player.Kick("RPC Error in ItemCmd");
+						Debug.LogException(exception);
+					}
+				}
+				return true;
+			}
+			if (rpc == 4191184484u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - MoveItem "));
+				}
+				using (TimeWarning.New("MoveItem"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!BaseEntity.RPC_Server.FromOwner.Test("MoveItem", GetBaseEntity(), player))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							BaseEntity.RPCMessage rPCMessage = default(BaseEntity.RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							BaseEntity.RPCMessage msg3 = rPCMessage;
+							MoveItem(msg3);
+						}
+					}
+					catch (Exception exception2)
+					{
+						player.Kick("RPC Error in MoveItem");
+						Debug.LogException(exception2);
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	protected void Initialize()
+	{
+		containerMain = new ItemContainer();
+		containerMain.SetFlag(ItemContainer.Flag.IsPlayer, b: true);
+		containerBelt = new ItemContainer();
+		containerBelt.SetFlag(ItemContainer.Flag.IsPlayer, b: true);
+		containerBelt.SetFlag(ItemContainer.Flag.Belt, b: true);
+		containerWear = new ItemContainer();
+		containerWear.SetFlag(ItemContainer.Flag.IsPlayer, b: true);
+		containerWear.SetFlag(ItemContainer.Flag.Clothing, b: true);
+		crafting = GetComponent<ItemCrafter>();
+		crafting.AddContainer(containerMain);
+		crafting.AddContainer(containerBelt);
+		loot = GetComponent<PlayerLoot>();
+		if (!loot)
+		{
+			loot = base.gameObject.AddComponent<PlayerLoot>();
+		}
+	}
+
+	public void DoDestroy()
+	{
+		if (containerMain != null)
+		{
+			containerMain.Kill();
+			containerMain = null;
+		}
+		if (containerBelt != null)
+		{
+			containerBelt.Kill();
+			containerBelt = null;
+		}
+		if (containerWear != null)
+		{
+			containerWear.Kill();
+			containerWear = null;
+		}
+	}
+
+	public void ServerInit(BasePlayer owner)
+	{
+		Initialize();
+		containerMain.ServerInitialize(null, 24);
+		if (containerMain.uid == 0)
+		{
+			containerMain.GiveUID();
+		}
+		containerBelt.ServerInitialize(null, 6);
+		if (containerBelt.uid == 0)
+		{
+			containerBelt.GiveUID();
+		}
+		containerWear.ServerInitialize(null, 6);
+		if (containerWear.uid == 0)
+		{
+			containerWear.GiveUID();
+		}
+		containerMain.playerOwner = owner;
+		containerBelt.playerOwner = owner;
+		containerWear.playerOwner = owner;
+		containerWear.onItemAddedRemoved = OnClothingChanged;
+		containerWear.canAcceptItem = CanWearItem;
+		containerBelt.canAcceptItem = CanEquipItem;
+		containerMain.onPreItemRemove = OnItemRemoved;
+		containerWear.onPreItemRemove = OnItemRemoved;
+		containerBelt.onPreItemRemove = OnItemRemoved;
+		containerMain.onDirty += OnContentsDirty;
+		containerBelt.onDirty += OnContentsDirty;
+		containerWear.onDirty += OnContentsDirty;
+		containerBelt.onItemAddedRemoved = OnItemAddedOrRemoved;
+		containerMain.onItemAddedRemoved = OnItemAddedOrRemoved;
+	}
+
+	public void OnItemAddedOrRemoved(Item item, bool bAdded)
+	{
+		if (item.info.isHoldable)
+		{
+			Invoke(UpdatedVisibleHolsteredItems, 0.1f);
+		}
+		if (bAdded)
+		{
+			BasePlayer basePlayer = base.baseEntity;
+			if (!basePlayer.HasPlayerFlag(BasePlayer.PlayerFlags.DisplaySash) && basePlayer.IsHostileItem(item))
+			{
+				base.baseEntity.SetPlayerFlag(BasePlayer.PlayerFlags.DisplaySash, b: true);
+			}
+		}
+	}
+
+	public void UpdatedVisibleHolsteredItems()
+	{
+		List<HeldEntity> obj = Facepunch.Pool.GetList<HeldEntity>();
+		Item[] array = AllItems();
+		foreach (Item item in array)
+		{
+			if (!item.info.isHoldable)
+			{
+				continue;
+			}
+			BaseEntity heldEntity = item.GetHeldEntity();
+			if (!(heldEntity == null))
+			{
+				HeldEntity component = item.GetHeldEntity().GetComponent<HeldEntity>();
+				if (!(component == null))
+				{
+					obj.Add(component);
+				}
+			}
+		}
+		IOrderedEnumerable<HeldEntity> orderedEnumerable = obj.OrderByDescending((HeldEntity x) => x.hostileScore);
+		bool flag = true;
+		bool flag2 = true;
+		bool flag3 = true;
+		foreach (HeldEntity item2 in orderedEnumerable)
+		{
+			if (!(item2 == null) && item2.holsterInfo.displayWhenHolstered)
+			{
+				if (flag3 && !item2.IsDeployed() && item2.holsterInfo.slot == HeldEntity.HolsterInfo.HolsterSlot.BACK)
+				{
+					item2.SetVisibleWhileHolstered(visible: true);
+					flag3 = false;
+				}
+				else if (flag2 && !item2.IsDeployed() && item2.holsterInfo.slot == HeldEntity.HolsterInfo.HolsterSlot.RIGHT_THIGH)
+				{
+					item2.SetVisibleWhileHolstered(visible: true);
+					flag2 = false;
+				}
+				else if (flag && !item2.IsDeployed() && item2.holsterInfo.slot == HeldEntity.HolsterInfo.HolsterSlot.LEFT_THIGH)
+				{
+					item2.SetVisibleWhileHolstered(visible: true);
+					flag = false;
+				}
+				else
+				{
+					item2.SetVisibleWhileHolstered(visible: false);
+				}
+			}
+		}
+		Facepunch.Pool.FreeList(ref obj);
+	}
+
+	private void OnContentsDirty()
+	{
+		if (base.baseEntity != null)
+		{
+			base.baseEntity.InvalidateNetworkCache();
+		}
+	}
+
+	private bool CanMoveItemsFrom(BaseEntity entity, Item item)
+	{
+		StorageContainer storageContainer = entity as StorageContainer;
+		if ((bool)storageContainer && !storageContainer.CanMoveFrom(base.baseEntity, item))
+		{
+			return false;
+		}
+		return true;
+	}
+
+	[BaseEntity.RPC_Server]
+	[BaseEntity.RPC_Server.FromOwner]
+	private void ItemCmd(BaseEntity.RPCMessage msg)
+	{
+		uint id = msg.read.UInt32();
+		string text = msg.read.String();
+		Item item = FindItemUID(id);
+		if (item == null || Interface.CallHook("OnItemAction", item, text) != null || item.IsLocked() || !CanMoveItemsFrom(item.parent.entityOwner, item))
+		{
+			return;
+		}
+		if (text == "drop")
+		{
+			int num = item.amount;
+			if (msg.read.unread >= 4)
+			{
+				num = msg.read.Int32();
+			}
+			base.baseEntity.stats.Add("item_drop", 1);
+			if (num < item.amount)
+			{
+				item.SplitItem(num)?.Drop(base.baseEntity.eyes.position, base.baseEntity.eyes.BodyForward() * 4f + Vector3Ex.Range(-0.5f, 0.5f));
+			}
+			else
+			{
+				item.Drop(base.baseEntity.eyes.position, base.baseEntity.eyes.BodyForward() * 4f + Vector3Ex.Range(-0.5f, 0.5f));
+			}
+			base.baseEntity.SignalBroadcast(BaseEntity.Signal.Gesture, "drop_item");
+		}
+		else
+		{
+			item.ServerCommand(text, base.baseEntity);
+			ItemManager.DoRemoves();
+			ServerUpdate(0f);
+		}
+	}
+
+	[BaseEntity.RPC_Server]
+	[BaseEntity.RPC_Server.FromOwner]
+	private void MoveItem(BaseEntity.RPCMessage msg)
+	{
+		uint id = msg.read.UInt32();
+		uint num = msg.read.UInt32();
+		int num2 = msg.read.Int8();
+		int num3 = msg.read.UInt16();
+		Item item = FindItemUID(id);
+		if (item == null || Interface.CallHook("CanMoveItem", item, this, num, num2, num3) != null || !CanMoveItemsFrom(item.parent.entityOwner, item))
+		{
+			return;
+		}
+		if (num3 <= 0)
+		{
+			num3 = item.amount;
+		}
+		num3 = Mathf.Clamp(num3, 1, item.info.stackable);
+		if (num == 0)
+		{
+			GiveItem(item);
+			return;
+		}
+		ItemContainer itemContainer = FindContainer(num);
+		if (itemContainer == null)
+		{
+			return;
+		}
+		ItemContainer parent = item.parent;
+		if ((parent != null && parent.IsLocked()) || itemContainer.IsLocked() || itemContainer.PlayerItemInputBlocked())
+		{
+			return;
+		}
+		using (TimeWarning.New("Split"))
+		{
+			if (item.amount > num3)
+			{
+				Item item2 = item.SplitItem(num3);
+				if (!item2.MoveToContainer(itemContainer, num2))
+				{
+					item.amount += item2.amount;
+					item2.Remove();
+				}
+				ItemManager.DoRemoves();
+				ServerUpdate(0f);
+				return;
+			}
+		}
+		if (item.MoveToContainer(itemContainer, num2))
+		{
+			ItemManager.DoRemoves();
+			ServerUpdate(0f);
+		}
+	}
+
+	private void OnClothingChanged(Item item, bool bAdded)
+	{
+		base.baseEntity.SV_ClothingChanged();
+		ItemManager.DoRemoves();
+		ServerUpdate(0f);
+	}
+
+	private void OnItemRemoved(Item item)
+	{
+		base.baseEntity.InvalidateNetworkCache();
+	}
+
+	private bool CanEquipItem(Item item)
+	{
+		object obj = Interface.CallHook("CanEquipItem", this, item);
+		if (obj is bool)
+		{
+			return (bool)obj;
+		}
+		ItemModContainerRestriction component = item.info.GetComponent<ItemModContainerRestriction>();
+		if (component == null)
+		{
+			return true;
+		}
+		Item[] array = containerBelt.itemList.ToArray();
+		foreach (Item item2 in array)
+		{
+			if (item2 != item)
+			{
+				ItemModContainerRestriction component2 = item2.info.GetComponent<ItemModContainerRestriction>();
+				if (!(component2 == null) && !component.CanExistWith(component2) && !item2.MoveToContainer(containerMain))
+				{
+					item2.Drop(base.baseEntity.eyes.position, base.baseEntity.eyes.BodyForward() * 2f);
+				}
+			}
+		}
+		return true;
+	}
+
+	private bool CanWearItem(Item item)
+	{
+		ItemModWearable component = item.info.GetComponent<ItemModWearable>();
+		if (component == null)
+		{
+			return false;
+		}
+		object obj = Interface.CallHook("CanWearItem", this, item);
+		if (obj is bool)
+		{
+			return (bool)obj;
+		}
+		Item[] array = containerWear.itemList.ToArray();
+		foreach (Item item2 in array)
+		{
+			if (item2 != item)
+			{
+				ItemModWearable component2 = item2.info.GetComponent<ItemModWearable>();
+				if (!(component2 == null) && !component.CanExistWith(component2) && !item2.MoveToContainer(containerMain))
+				{
+					item2.Drop(base.baseEntity.eyes.position, base.baseEntity.eyes.BodyForward() * 2f);
+				}
+			}
+		}
+		return true;
+	}
+
+	public void ServerUpdate(float delta)
+	{
+		loot.Check();
+		if (delta > 0f)
+		{
+			crafting.ServerUpdate(delta);
+		}
+		float currentTemperature = base.baseEntity.currentTemperature;
+		UpdateContainer(delta, Type.Main, containerMain, bSendInventoryToEveryone: false, currentTemperature);
+		UpdateContainer(delta, Type.Belt, containerBelt, bSendInventoryToEveryone: true, currentTemperature);
+		UpdateContainer(delta, Type.Wear, containerWear, bSendInventoryToEveryone: true, currentTemperature);
+	}
+
+	public void UpdateContainer(float delta, Type type, ItemContainer container, bool bSendInventoryToEveryone, float temperature)
+	{
+		if (container != null)
+		{
+			container.temperature = temperature;
+			if (delta > 0f)
+			{
+				container.OnCycle(delta);
+			}
+			if (container.dirty)
+			{
+				SendUpdatedInventory(type, container, bSendInventoryToEveryone);
+				base.baseEntity.InvalidateNetworkCache();
+			}
+		}
+	}
+
+	public void SendSnapshot()
+	{
+		using (TimeWarning.New("PlayerInventory.SendSnapshot"))
+		{
+			SendUpdatedInventory(Type.Main, containerMain);
+			SendUpdatedInventory(Type.Belt, containerBelt, bSendInventoryToEveryone: true);
+			SendUpdatedInventory(Type.Wear, containerWear, bSendInventoryToEveryone: true);
+		}
+	}
+
+	public void SendUpdatedInventory(Type type, ItemContainer container, bool bSendInventoryToEveryone = false)
+	{
+		using UpdateItemContainer updateItemContainer = Facepunch.Pool.Get<UpdateItemContainer>();
+		updateItemContainer.type = (int)type;
+		if (container != null)
+		{
+			container.dirty = false;
+			updateItemContainer.container = Facepunch.Pool.Get<List<ProtoBuf.ItemContainer>>();
+			updateItemContainer.container.Add(container.Save());
+		}
+		if (bSendInventoryToEveryone)
+		{
+			base.baseEntity.ClientRPC(null, "UpdatedItemContainer", updateItemContainer);
+		}
+		else
+		{
+			base.baseEntity.ClientRPCPlayer(null, base.baseEntity, "UpdatedItemContainer", updateItemContainer);
+		}
+	}
+
+	public Item FindItemUID(uint id)
+	{
+		if (id == 0)
+		{
+			return null;
+		}
+		if (containerMain != null)
+		{
+			Item item = containerMain.FindItemByUID(id);
+			if (item != null && item.IsValid())
+			{
+				return item;
+			}
+		}
+		if (containerBelt != null)
+		{
+			Item item2 = containerBelt.FindItemByUID(id);
+			if (item2 != null && item2.IsValid())
+			{
+				return item2;
+			}
+		}
+		if (containerWear != null)
+		{
+			Item item3 = containerWear.FindItemByUID(id);
+			if (item3 != null && item3.IsValid())
+			{
+				return item3;
+			}
+		}
+		return loot.FindItem(id);
+	}
+
+	public Item FindItemID(string itemName)
+	{
+		ItemDefinition itemDefinition = ItemManager.FindItemDefinition(itemName);
+		if (itemDefinition == null)
+		{
+			return null;
+		}
+		return FindItemID(itemDefinition.itemid);
+	}
+
+	public Item FindItemID(int id)
+	{
+		if (containerMain != null)
+		{
+			Item item = containerMain.FindItemByItemID(id);
+			if (item != null && item.IsValid())
+			{
+				return item;
+			}
+		}
+		if (containerBelt != null)
+		{
+			Item item2 = containerBelt.FindItemByItemID(id);
+			if (item2 != null && item2.IsValid())
+			{
+				return item2;
+			}
+		}
+		if (containerWear != null)
+		{
+			Item item3 = containerWear.FindItemByItemID(id);
+			if (item3 != null && item3.IsValid())
+			{
+				return item3;
+			}
+		}
+		return null;
+	}
+
+	public List<Item> FindItemIDs(int id)
+	{
+		List<Item> list = new List<Item>();
+		if (containerMain != null)
+		{
+			list.AddRange(containerMain.FindItemsByItemID(id));
+		}
+		if (containerBelt != null)
+		{
+			list.AddRange(containerBelt.FindItemsByItemID(id));
+		}
+		if (containerWear != null)
+		{
+			list.AddRange(containerWear.FindItemsByItemID(id));
+		}
+		return list;
+	}
+
+	public ItemContainer FindContainer(uint id)
+	{
+		using (TimeWarning.New("FindContainer"))
+		{
+			ItemContainer itemContainer = containerMain.FindContainer(id);
+			if (itemContainer != null)
+			{
+				return itemContainer;
+			}
+			itemContainer = containerBelt.FindContainer(id);
+			if (itemContainer != null)
+			{
+				return itemContainer;
+			}
+			itemContainer = containerWear.FindContainer(id);
+			if (itemContainer != null)
+			{
+				return itemContainer;
+			}
+			return loot.FindContainer(id);
+		}
+	}
+
+	public ItemContainer GetContainer(Type id)
+	{
+		return id switch
+		{
+			Type.Main => containerMain, 
+			Type.Belt => containerBelt, 
+			Type.Wear => containerWear, 
+			_ => null, 
+		};
+	}
+
+	public bool GiveItem(Item item, ItemContainer container = null)
+	{
+		if (item == null)
+		{
+			return false;
+		}
+		int position = -1;
+		GetIdealPickupContainer(item, ref container, ref position);
+		if (container != null && item.MoveToContainer(container, position))
+		{
+			return true;
+		}
+		if (item.MoveToContainer(containerMain))
+		{
+			return true;
+		}
+		if (item.MoveToContainer(containerBelt))
+		{
+			return true;
+		}
+		return false;
+	}
+
+	protected void GetIdealPickupContainer(Item item, ref ItemContainer container, ref int position)
+	{
+		if (item.info.stackable > 1)
+		{
+			if (containerBelt != null && containerBelt.FindItemByItemID(item.info.itemid) != null)
+			{
+				container = containerBelt;
+				return;
+			}
+			if (containerMain != null && containerMain.FindItemByItemID(item.info.itemid) != null)
+			{
+				container = containerMain;
+				return;
+			}
+		}
+		if (item.info.isUsable)
+		{
+			container = containerBelt;
+		}
+	}
+
+	public void Strip()
+	{
+		containerMain.Clear();
+		containerBelt.Clear();
+		containerWear.Clear();
+		ItemManager.DoRemoves();
+	}
+
+	public void GiveDefaultItems()
+	{
+		Strip();
+		ulong skin = 0uL;
+		int infoInt = base.baseEntity.GetInfoInt("client.rockskin", 0);
+		if (infoInt > 0 && base.baseEntity.blueprints.steamInventory.HasItem(infoInt))
+		{
+			Facepunch.Steamworks.Inventory.Definition definition = Rust.Global.SteamServer.Inventory.FindDefinition(infoInt);
+			if (definition != null)
+			{
+				skin = definition.GetProperty<ulong>("workshopdownload");
+			}
+		}
+		GiveItem(ItemManager.CreateByName("rock", 1, skin), containerBelt);
+		GiveItem(ItemManager.CreateByName("torch", 1, 0uL), containerBelt);
+	}
+
+	public ProtoBuf.PlayerInventory Save(bool bForDisk)
+	{
+		ProtoBuf.PlayerInventory playerInventory = Facepunch.Pool.Get<ProtoBuf.PlayerInventory>();
+		if (bForDisk)
+		{
+			playerInventory.invMain = containerMain.Save();
+		}
+		playerInventory.invBelt = containerBelt.Save();
+		playerInventory.invWear = containerWear.Save();
+		return playerInventory;
+	}
+
+	public void Load(ProtoBuf.PlayerInventory msg)
+	{
+		if (msg.invMain != null)
+		{
+			containerMain.Load(msg.invMain);
+		}
+		if (msg.invBelt != null)
+		{
+			containerBelt.Load(msg.invBelt);
+		}
+		if (msg.invWear != null)
+		{
+			containerWear.Load(msg.invWear);
+		}
+	}
+
+	public int Take(List<Item> collect, int itemid, int amount)
+	{
+		int num = 0;
+		if (containerMain != null)
+		{
+			num += containerMain.Take(collect, itemid, amount);
+		}
+		if (amount == num)
+		{
+			return num;
+		}
+		if (containerBelt != null)
+		{
+			num += containerBelt.Take(collect, itemid, amount);
+		}
+		if (amount == num)
+		{
+			return num;
+		}
+		if (containerWear != null)
+		{
+			num += containerWear.Take(collect, itemid, amount);
+		}
+		return num;
+	}
+
+	public int GetAmount(int itemid)
+	{
+		if (itemid == 0)
+		{
+			return 0;
+		}
+		int num = 0;
+		if (containerMain != null)
+		{
+			num += containerMain.GetAmount(itemid, onlyUsableAmounts: true);
+		}
+		if (containerBelt != null)
+		{
+			num += containerBelt.GetAmount(itemid, onlyUsableAmounts: true);
+		}
+		if (containerWear != null)
+		{
+			num += containerWear.GetAmount(itemid, onlyUsableAmounts: true);
+		}
+		return num;
+	}
+
+	public Item[] AllItems()
+	{
+		List<Item> list = new List<Item>();
+		if (containerMain != null)
+		{
+			list.AddRange(containerMain.itemList);
+		}
+		if (containerBelt != null)
+		{
+			list.AddRange(containerBelt.itemList);
+		}
+		if (containerWear != null)
+		{
+			list.AddRange(containerWear.itemList);
+		}
+		return list.ToArray();
+	}
+
+	public void FindAmmo(List<Item> list, AmmoTypes ammoType)
+	{
+		if (containerMain != null)
+		{
+			containerMain.FindAmmo(list, ammoType);
+		}
+		if (containerBelt != null)
+		{
+			containerBelt.FindAmmo(list, ammoType);
+		}
+	}
+
+	public bool HasAmmo(AmmoTypes ammoType)
+	{
+		return containerMain.HasAmmo(ammoType) || containerBelt.HasAmmo(ammoType);
+	}
+}

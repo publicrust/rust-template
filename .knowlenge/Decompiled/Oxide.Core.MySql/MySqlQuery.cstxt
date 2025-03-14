@@ -1,0 +1,119 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using MySql.Data.MySqlClient;
+using Oxide.Core.Database;
+
+public class MySqlQuery
+{
+	private MySqlCommand _cmd;
+
+	private MySqlConnection _connection;
+
+	private IAsyncResult _result;
+
+	public Action<List<Dictionary<string, object>>> Callback { get; internal set; }
+
+	public Action<int> CallbackNonQuery { get; internal set; }
+
+	public Sql Sql { get; internal set; }
+
+	public Connection Connection { get; internal set; }
+
+	public bool NonQuery { get; internal set; }
+
+	private void Cleanup()
+	{
+		if (_cmd != null)
+		{
+			_cmd.Dispose();
+			_cmd = null;
+		}
+		_connection = null;
+	}
+
+	public bool Handle()
+	{
+		List<Dictionary<string, object>> list = null;
+		int nonQueryResult = 0;
+		long lastInsertRowId = 0L;
+		try
+		{
+			if (Connection == null)
+			{
+				throw new Exception("Connection is null");
+			}
+			_connection = (MySqlConnection)Connection.Con;
+			if (_connection.State == ConnectionState.Closed)
+			{
+				_connection.Open();
+			}
+			_cmd = _connection.CreateCommand();
+			_cmd.CommandTimeout = 120;
+			_cmd.CommandText = Sql.SQL;
+			Sql.AddParams(_cmd, Sql.Arguments, "@");
+			_result = (NonQuery ? _cmd.BeginExecuteNonQuery() : _cmd.BeginExecuteReader());
+			_result.AsyncWaitHandle.WaitOne();
+			if (NonQuery)
+			{
+				nonQueryResult = _cmd.EndExecuteNonQuery(_result);
+			}
+			else
+			{
+				using MySqlDataReader mySqlDataReader = _cmd.EndExecuteReader(_result);
+				list = new List<Dictionary<string, object>>();
+				while (mySqlDataReader.Read() && (!Connection.ConnectionPersistent || (Connection.Con.State != 0 && Connection.Con.State != ConnectionState.Broken)))
+				{
+					Dictionary<string, object> dictionary = new Dictionary<string, object>();
+					for (int i = 0; i < mySqlDataReader.FieldCount; i++)
+					{
+						dictionary.Add(mySqlDataReader.GetName(i), mySqlDataReader.GetValue(i));
+					}
+					list.Add(dictionary);
+				}
+			}
+			lastInsertRowId = _cmd.LastInsertedId;
+			Cleanup();
+		}
+		catch (Exception ex)
+		{
+			string text = "MySql handle raised an exception";
+			if (Connection?.Plugin != null)
+			{
+				text += $" in '{Connection.Plugin.Name} v{Connection.Plugin.Version}' plugin";
+			}
+			Interface.Oxide.LogException(text, ex);
+			Cleanup();
+		}
+		Interface.Oxide.NextTick(delegate
+		{
+			Connection?.Plugin?.TrackStart();
+			try
+			{
+				if (Connection != null)
+				{
+					Connection.LastInsertRowId = lastInsertRowId;
+				}
+				if (!NonQuery)
+				{
+					Callback(list);
+				}
+				else
+				{
+					CallbackNonQuery?.Invoke(nonQueryResult);
+				}
+			}
+			catch (Exception ex2)
+			{
+				string text2 = "MySql command callback raised an exception";
+				if (Connection?.Plugin != null)
+				{
+					text2 += $" in '{Connection.Plugin.Name} v{Connection.Plugin.Version}' plugin";
+				}
+				Interface.Oxide.LogException(text2, ex2);
+			}
+			Connection?.Plugin?.TrackEnd();
+		});
+		return true;
+	}
+}

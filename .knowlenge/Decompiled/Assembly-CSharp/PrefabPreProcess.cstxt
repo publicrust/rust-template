@@ -1,0 +1,326 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+using UnityEngine.AI;
+using UnityEngine.EventSystems;
+using UnityEngine.UI;
+using UnityStandardAssets.ImageEffects;
+
+public class PrefabPreProcess : IPrefabProcessor
+{
+	public static Type[] clientsideOnlyTypes = new Type[26]
+	{
+		typeof(IClientComponent),
+		typeof(ImageEffectLayer),
+		typeof(MeshFilter),
+		typeof(Renderer),
+		typeof(AudioSource),
+		typeof(AudioListener),
+		typeof(ParticleEmitter),
+		typeof(ParticleSystemRenderer),
+		typeof(ParticleSystem),
+		typeof(ParticleEmitFromParentObject),
+		typeof(Light),
+		typeof(LODGroup),
+		typeof(Animator),
+		typeof(AnimationEvents),
+		typeof(PlayerVoiceSpeaker),
+		typeof(PlayerVoiceRecorder),
+		typeof(ParticleScaler),
+		typeof(PostEffectsBase),
+		typeof(TOD_ImageEffect),
+		typeof(Tree),
+		typeof(Projector),
+		typeof(StandaloneInputModule),
+		typeof(UIBehaviour),
+		typeof(Canvas),
+		typeof(CanvasRenderer),
+		typeof(GraphicRaycaster)
+	};
+
+	public static Type[] serversideOnlyTypes = new Type[2]
+	{
+		typeof(IServerComponent),
+		typeof(NavMeshObstacle)
+	};
+
+	public bool isClientside;
+
+	public bool isServerside;
+
+	internal Dictionary<string, GameObject> prefabList = new Dictionary<string, GameObject>(StringComparer.OrdinalIgnoreCase);
+
+	private List<Component> destroyList = new List<Component>();
+
+	private List<GameObject> cleanupList = new List<GameObject>();
+
+	public PrefabPreProcess(bool clientside, bool serverside)
+	{
+		isClientside = clientside;
+		isServerside = serverside;
+	}
+
+	public GameObject Find(string strPrefab)
+	{
+		if (prefabList.TryGetValue(strPrefab, out var value))
+		{
+			if (value == null)
+			{
+				prefabList.Remove(strPrefab);
+				return null;
+			}
+			return value;
+		}
+		return null;
+	}
+
+	public bool NeedsProcessing(GameObject go)
+	{
+		if (go.CompareTag("NoPreProcessing"))
+		{
+			return false;
+		}
+		if (HasComponents<IPrefabPreProcess>(go.transform) || HasComponents<IEditorComponent>(go.transform))
+		{
+			return true;
+		}
+		if (!isClientside)
+		{
+			if (clientsideOnlyTypes.Any((Type type) => HasComponents(go.transform, type)))
+			{
+				return true;
+			}
+			if (HasComponents<IClientComponentEx>(go.transform))
+			{
+				return true;
+			}
+		}
+		if (!isServerside)
+		{
+			if (serversideOnlyTypes.Any((Type type) => HasComponents(go.transform, type)))
+			{
+				return true;
+			}
+			if (HasComponents<IServerComponentEx>(go.transform))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public bool ProcessObject(string name, GameObject go, bool isBundling = false, bool resetLocalTransform = true)
+	{
+		if (!NeedsProcessing(go))
+		{
+			return false;
+		}
+		if (!isClientside)
+		{
+			Type[] array = clientsideOnlyTypes;
+			foreach (Type t in array)
+			{
+				DestroyComponents(t, go, isClientside, isServerside);
+			}
+			foreach (IClientComponentEx item in FindComponents<IClientComponentEx>(go.transform))
+			{
+				item.PreClientComponentCull(this);
+			}
+		}
+		if (!isServerside)
+		{
+			Type[] array2 = serversideOnlyTypes;
+			foreach (Type t2 in array2)
+			{
+				DestroyComponents(t2, go, isClientside, isServerside);
+			}
+			foreach (IServerComponentEx item2 in FindComponents<IServerComponentEx>(go.transform))
+			{
+				item2.PreServerComponentCull(this);
+			}
+		}
+		DestroyComponents(typeof(IEditorComponent), go, isClientside, isServerside);
+		if (resetLocalTransform)
+		{
+			go.transform.localPosition = Vector3.zero;
+			go.transform.localRotation = Quaternion.identity;
+		}
+		List<Transform> list = FindComponents<Transform>(go.transform);
+		foreach (IPrefabPreProcess item3 in FindComponents<IPrefabPreProcess>(go.transform))
+		{
+			item3.PreProcess(this, go, name, isServerside, isClientside, isBundling);
+		}
+		foreach (Transform item4 in list)
+		{
+			if ((bool)item4 && (bool)item4.gameObject)
+			{
+				if (isServerside && item4.gameObject.CompareTag("Server Cull"))
+				{
+					NominateForDeletion(item4.gameObject);
+				}
+				if (isClientside && item4.gameObject.CompareTag("Client Cull"))
+				{
+					NominateForDeletion(item4.gameObject);
+				}
+			}
+		}
+		RunCleanupQueue();
+		return true;
+	}
+
+	public void Process(string name, GameObject go)
+	{
+		if (!go.CompareTag("NoPreProcessing"))
+		{
+			if (NeedsProcessing(go))
+			{
+				ProcessObject(name, go);
+			}
+			AddPrefab(name, go);
+		}
+	}
+
+	public void AddPrefab(string name, GameObject go)
+	{
+		go.SetActive(value: false);
+		prefabList.Add(name, go);
+	}
+
+	private static void DestroyComponents(Type t, GameObject go, bool client, bool server)
+	{
+		List<Component> list = new List<Component>();
+		FindComponents(go.transform, list, t);
+		foreach (Component item in list)
+		{
+			DeferredMeshDecal[] components = item.GetComponents<DeferredMeshDecal>();
+			foreach (DeferredMeshDecal deferredMeshDecal in components)
+			{
+				if (deferredMeshDecal != null)
+				{
+					UnityEngine.Object.DestroyImmediate(deferredMeshDecal, allowDestroyingAssets: true);
+				}
+			}
+		}
+		foreach (Component item2 in list)
+		{
+			RealmedRemove component = item2.GetComponent<RealmedRemove>();
+			if (!(component != null) || component.ShouldDelete(item2, client, server))
+			{
+				UnityEngine.Object.DestroyImmediate(item2, allowDestroyingAssets: true);
+			}
+		}
+	}
+
+	private static bool HasComponents<T>(Transform transform)
+	{
+		if (transform.GetComponent<T>() != null)
+		{
+			return true;
+		}
+		foreach (Transform item in transform)
+		{
+			if (item.GetComponent<BaseEntity>() == null && HasComponents<T>(item))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static bool HasComponents(Transform transform, Type t)
+	{
+		if (transform.GetComponent(t) != null)
+		{
+			return true;
+		}
+		foreach (Transform item in transform)
+		{
+			if (item.GetComponent<BaseEntity>() == null && HasComponents(item, t))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static List<T> FindComponents<T>(Transform transform)
+	{
+		List<T> list = new List<T>();
+		FindComponents(transform, list);
+		return list;
+	}
+
+	private static void FindComponents<T>(Transform transform, List<T> list)
+	{
+		list.AddRange(transform.GetComponents<T>());
+		foreach (Transform item in transform)
+		{
+			if (item.GetComponent<BaseEntity>() == null)
+			{
+				FindComponents(item, list);
+			}
+		}
+	}
+
+	private static List<Component> FindComponents(Transform transform, Type t)
+	{
+		List<Component> list = new List<Component>();
+		FindComponents(transform, list, t);
+		return list;
+	}
+
+	private static void FindComponents(Transform transform, List<Component> list, Type t)
+	{
+		list.AddRange(transform.GetComponents(t));
+		foreach (Transform item in transform)
+		{
+			if (item.GetComponent<BaseEntity>() == null)
+			{
+				FindComponents(item, list, t);
+			}
+		}
+	}
+
+	public void RemoveComponent(Component c)
+	{
+		if (!(c == null))
+		{
+			destroyList.Add(c);
+		}
+	}
+
+	public void NominateForDeletion(GameObject gameObj)
+	{
+		cleanupList.Add(gameObj);
+	}
+
+	private void RunCleanupQueue()
+	{
+		foreach (Component destroy in destroyList)
+		{
+			UnityEngine.Object.DestroyImmediate(destroy, allowDestroyingAssets: true);
+		}
+		destroyList.Clear();
+		foreach (GameObject cleanup in cleanupList)
+		{
+			DoCleanup(cleanup);
+		}
+		cleanupList.Clear();
+	}
+
+	private void DoCleanup(GameObject go)
+	{
+		if (!(go == null) && (from x in go.GetComponentsInChildren<Component>(includeInactive: true)
+			where !(x is Transform)
+			select x).Count() <= 0)
+		{
+			Transform parent = go.transform.parent;
+			if (!(parent == null))
+			{
+				UnityEngine.Object.DestroyImmediate(go, allowDestroyingAssets: true);
+				DoCleanup(parent.gameObject);
+			}
+		}
+	}
+}

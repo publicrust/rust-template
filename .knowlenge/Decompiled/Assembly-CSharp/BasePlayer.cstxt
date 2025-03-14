@@ -1,0 +1,3812 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using ConVar;
+using EasyAntiCheat.Server.Hydra.Cerberus;
+using Facepunch;
+using Facepunch.Extend;
+using Facepunch.Math;
+using Facepunch.Rust;
+using Network;
+using Network.Visibility;
+using Oxide.Core;
+using Oxide.Core.Libraries.Covalence;
+using ProtoBuf;
+using Rust;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class BasePlayer : BaseCombatEntity
+{
+	public enum CameraMode
+	{
+		FirstPerson,
+		ThirdPerson,
+		Eyes
+	}
+
+	public enum NetworkQueue
+	{
+		Update,
+		UpdateDistance,
+		Count
+	}
+
+	private class NetworkQueueList
+	{
+		public HashSet<BaseNetworkable> queueInternal = new HashSet<BaseNetworkable>();
+
+		public int MaxLength;
+
+		public int Length => queueInternal.Count();
+
+		public bool Contains(BaseNetworkable ent)
+		{
+			return queueInternal.Contains(ent);
+		}
+
+		public void Add(BaseNetworkable ent)
+		{
+			if (!Contains(ent))
+			{
+				queueInternal.Add(ent);
+			}
+			MaxLength = Mathf.Max(MaxLength, queueInternal.Count());
+		}
+
+		public void Add(BaseNetworkable[] ent)
+		{
+			foreach (BaseNetworkable ent2 in ent)
+			{
+				Add(ent2);
+			}
+		}
+
+		public void Clear(Group group)
+		{
+			using (TimeWarning.New("NetworkQueueList.Clear"))
+			{
+				if (group != null)
+				{
+					if (!group.isGlobal)
+					{
+						queueInternal.RemoveWhere((BaseNetworkable x) => x == null || x.net == null || x.net.group == null || x.net.group == group);
+					}
+				}
+				else
+				{
+					queueInternal.RemoveWhere((BaseNetworkable x) => x == null || x.net == null || x.net.group == null || !x.net.group.isGlobal);
+				}
+			}
+		}
+	}
+
+	[Flags]
+	public enum PlayerFlags
+	{
+		InBuildingPrivilege = 1,
+		HasBuildingPrivilege = 2,
+		IsAdmin = 4,
+		ReceivingSnapshot = 8,
+		Sleeping = 0x10,
+		Spectating = 0x20,
+		Wounded = 0x40,
+		IsDeveloper = 0x80,
+		Connected = 0x100,
+		VoiceMuted = 0x200,
+		ThirdPersonViewmode = 0x400,
+		EyesViewmode = 0x800,
+		ChatMute = 0x1000,
+		NoSprint = 0x2000,
+		Aiming = 0x4000,
+		DisplaySash = 0x8000
+	}
+
+	private struct FiredProjectile
+	{
+		public ItemDefinition itemDef;
+
+		public ItemModProjectile itemMod;
+
+		public Projectile projectilePrefab;
+
+		public float firedTime;
+
+		public AttackEntity weaponSource;
+
+		public AttackEntity weaponPrefab;
+
+		public Projectile.Modifier projectileModifier;
+
+		public Item pickupItem;
+
+		public float integrity;
+
+		public UnityEngine.Vector3 origin;
+
+		public UnityEngine.Vector3 position;
+
+		public UnityEngine.Vector3 velocity;
+	}
+
+	public class SpawnPoint
+	{
+		public UnityEngine.Vector3 pos;
+
+		public Quaternion rot;
+	}
+
+	[Header("BasePlayer")]
+	public GameObjectRef fallDamageEffect;
+
+	[InspectorFlags]
+	public PlayerFlags playerFlags;
+
+	[NonSerialized]
+	public PlayerEyes eyes;
+
+	[NonSerialized]
+	public PlayerInventory inventory;
+
+	[NonSerialized]
+	public PlayerBlueprints blueprints;
+
+	[NonSerialized]
+	public PlayerMetabolism metabolism;
+
+	[NonSerialized]
+	public PlayerInput input;
+
+	[NonSerialized]
+	public BaseMovement movement;
+
+	[NonSerialized]
+	public BaseCollision collision;
+
+	public PlayerBelt Belt;
+
+	[NonSerialized]
+	private Collider triggerCollider;
+
+	[NonSerialized]
+	private Rigidbody physicsRigidbody;
+
+	[NonSerialized]
+	public ulong userID;
+
+	[NonSerialized]
+	public string UserIDString;
+
+	private string _displayName;
+
+	private ProtectionProperties cachedProtection;
+
+	private const int displayNameMaxLength = 32;
+
+	public bool clothingBlocksAiming;
+
+	public float clothingMoveSpeedReduction;
+
+	[NonSerialized]
+	public bool isInAir;
+
+	[NonSerialized]
+	public bool isOnPlayer;
+
+	[NonSerialized]
+	public float violationLevel;
+
+	[NonSerialized]
+	public float lastViolationTime;
+
+	[NonSerialized]
+	public float lastAdminCheatTime;
+
+	[NonSerialized]
+	public AntiHackType lastViolationType;
+
+	[NonSerialized]
+	public float speedhackDeltaTime;
+
+	[NonSerialized]
+	public float speedhackDistance;
+
+	[NonSerialized]
+	public int speedhackTickets;
+
+	[NonSerialized]
+	public Queue<float> speedhackHistory = new Queue<float>();
+
+	[NonSerialized]
+	public float flyhackDistanceVertical;
+
+	[NonSerialized]
+	public float flyhackDistanceHorizontal;
+
+	[NonSerialized]
+	public PlayerModel playerModel;
+
+	private const float drinkRange = 1.5f;
+
+	[NonSerialized]
+	private NetworkQueueList[] networkQueue = new NetworkQueueList[2]
+	{
+		new NetworkQueueList(),
+		new NetworkQueueList()
+	};
+
+	[NonSerialized]
+	private NetworkQueueList SnapshotQueue = new NetworkQueueList();
+
+	[NonSerialized]
+	private bool lightsOn = true;
+
+	[NonSerialized]
+	public ModelState modelState = new ModelState
+	{
+		onground = true
+	};
+
+	[NonSerialized]
+	private ModelState modelStateTick;
+
+	[NonSerialized]
+	private bool wantsSendModelState;
+
+	[NonSerialized]
+	private float nextModelStateUpdate;
+
+	[NonSerialized]
+	private EntityRef mounted;
+
+	public List<BuildingPrivlidge> buildingPrivilege = new List<BuildingPrivlidge>();
+
+	private Dictionary<int, FiredProjectile> firedProjectiles = new Dictionary<int, FiredProjectile>();
+
+	[NonSerialized]
+	public PlayerStatistics stats;
+
+	[NonSerialized]
+	public uint svActiveItemID;
+
+	[NonSerialized]
+	public float NextChatTime;
+
+	[NonSerialized]
+	public float nextSuicideTime;
+
+	protected UnityEngine.Vector3 viewAngles = default(UnityEngine.Vector3);
+
+	private float lastPlayerTick;
+
+	private const float playerTickRate = 0.0625f;
+
+	public static List<BasePlayer> activePlayerList = new List<BasePlayer>();
+
+	public static List<BasePlayer> sleepingPlayerList = new List<BasePlayer>();
+
+	[NonSerialized]
+	private PlayerLifeStory lifeStory;
+
+	[NonSerialized]
+	public PlayerLifeStory previousLifeStory;
+
+	private int SpectateOffset = 1000000;
+
+	private string spectateFilter = string.Empty;
+
+	private float lastUpdateTime = float.NegativeInfinity;
+
+	private float cachedThreatLevel;
+
+	[NonSerialized]
+	public InputState serverInput = new InputState();
+
+	[NonSerialized]
+	private float lastTickTime;
+
+	[NonSerialized]
+	private float lastStallTime;
+
+	[NonSerialized]
+	private float lastInputTime;
+
+	private PlayerTick lastReceivedTick = new PlayerTick();
+
+	private float tickDeltaTime;
+
+	private bool tickNeedsFinalizing;
+
+	private UnityEngine.Vector3 tickViewAngles;
+
+	private TickInterpolator tickInterpolator = new TickInterpolator();
+
+	private float woundedDuration;
+
+	private float woundedStartTime;
+
+	private float lastWoundedTime = float.NegativeInfinity;
+
+	[NonSerialized]
+	public IPlayer IPlayer;
+
+	public Connection Connection => (net != null) ? net.connection : null;
+
+	public string displayName
+	{
+		get
+		{
+			return _displayName;
+		}
+		set
+		{
+			_displayName = value;
+		}
+	}
+
+	public override TraitFlag Traits => base.Traits | TraitFlag.Human | TraitFlag.Food | TraitFlag.Meat | TraitFlag.Alive;
+
+	public bool IsReceivingSnapshot => HasPlayerFlag(PlayerFlags.ReceivingSnapshot);
+
+	public bool IsAdmin => HasPlayerFlag(PlayerFlags.IsAdmin);
+
+	public bool IsDeveloper => HasPlayerFlag(PlayerFlags.IsDeveloper);
+
+	public bool IsAiming => HasPlayerFlag(PlayerFlags.Aiming);
+
+	public bool IsFlying => modelState != null && modelState.flying;
+
+	public bool IsConnected
+	{
+		get
+		{
+			if (base.isServer)
+			{
+				if (Network.Net.sv == null)
+				{
+					return false;
+				}
+				if (net == null)
+				{
+					return false;
+				}
+				if (net.connection == null)
+				{
+					return false;
+				}
+				return true;
+			}
+			return false;
+		}
+	}
+
+	public bool isMounted => mounted.IsValid(base.isServer);
+
+	protected override float PositionTickRate => 0.05f;
+
+	public UnityEngine.Vector3 estimatedVelocity { get; private set; }
+
+	public float estimatedSpeed { get; private set; }
+
+	public float estimatedSpeed2D { get; private set; }
+
+	public int secondsConnected { get; private set; }
+
+	public float desyncTime { get; private set; }
+
+	public float currentComfort
+	{
+		get
+		{
+			if (triggers == null)
+			{
+				return 0f;
+			}
+			float num = 0f;
+			for (int i = 0; i < triggers.Count; i++)
+			{
+				TriggerComfort triggerComfort = triggers[i] as TriggerComfort;
+				if (!(triggerComfort == null))
+				{
+					float num2 = triggerComfort.CalculateComfort(base.transform.position, this);
+					if (num2 > num)
+					{
+						num = num2;
+					}
+				}
+			}
+			return num;
+		}
+	}
+
+	public bool hasPreviousLife => previousLifeStory != null;
+
+	public float timeSinceLastTick
+	{
+		get
+		{
+			if (lastTickTime == 0f)
+			{
+				return 0f;
+			}
+			return UnityEngine.Time.time - lastTickTime;
+		}
+	}
+
+	public float IdleTime
+	{
+		get
+		{
+			if (lastInputTime == 0f)
+			{
+				return 0f;
+			}
+			return UnityEngine.Time.time - lastInputTime;
+		}
+	}
+
+	public bool isStalled
+	{
+		get
+		{
+			if (IsDead())
+			{
+				return false;
+			}
+			if (IsSleeping())
+			{
+				return false;
+			}
+			return timeSinceLastTick > 1f;
+		}
+	}
+
+	public bool wasStalled
+	{
+		get
+		{
+			if (isStalled)
+			{
+				lastStallTime = UnityEngine.Time.time;
+			}
+			return UnityEngine.Time.time - lastStallTime < 1f;
+		}
+	}
+
+	public float secondsSinceWoundedStarted => UnityEngine.Time.realtimeSinceStartup - woundedStartTime;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("BasePlayer.OnRpcMessage"))
+		{
+			if (rpc == 2177997023u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - ClientKeepConnectionAlive "));
+				}
+				using (TimeWarning.New("ClientKeepConnectionAlive"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.FromOwner.Test("ClientKeepConnectionAlive", this, player))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							ClientKeepConnectionAlive(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						player.Kick("RPC Error in ClientKeepConnectionAlive");
+						Debug.LogException(exception);
+					}
+				}
+				return true;
+			}
+			if (rpc == 618836810 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - ClientLoadingComplete "));
+				}
+				using (TimeWarning.New("ClientLoadingComplete"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.FromOwner.Test("ClientLoadingComplete", this, player))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg3 = rPCMessage;
+							ClientLoadingComplete(msg3);
+						}
+					}
+					catch (Exception exception2)
+					{
+						player.Kick("RPC Error in ClientLoadingComplete");
+						Debug.LogException(exception2);
+					}
+				}
+				return true;
+			}
+			if (rpc == 2248815946u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - OnPlayerLanded "));
+				}
+				using (TimeWarning.New("OnPlayerLanded"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.FromOwner.Test("OnPlayerLanded", this, player))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg4 = rPCMessage;
+							OnPlayerLanded(msg4);
+						}
+					}
+					catch (Exception exception3)
+					{
+						player.Kick("RPC Error in OnPlayerLanded");
+						Debug.LogException(exception3);
+					}
+				}
+				return true;
+			}
+			if (rpc == 3322107216u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - OnProjectileAttack "));
+				}
+				using (TimeWarning.New("OnProjectileAttack"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.FromOwner.Test("OnProjectileAttack", this, player))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg5 = rPCMessage;
+							OnProjectileAttack(msg5);
+						}
+					}
+					catch (Exception exception4)
+					{
+						player.Kick("RPC Error in OnProjectileAttack");
+						Debug.LogException(exception4);
+					}
+				}
+				return true;
+			}
+			if (rpc == 3595933759u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - OnProjectileRicochet "));
+				}
+				using (TimeWarning.New("OnProjectileRicochet"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.FromOwner.Test("OnProjectileRicochet", this, player))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg6 = rPCMessage;
+							OnProjectileRicochet(msg6);
+						}
+					}
+					catch (Exception exception5)
+					{
+						player.Kick("RPC Error in OnProjectileRicochet");
+						Debug.LogException(exception5);
+					}
+				}
+				return true;
+			}
+			if (rpc == 3890520017u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - OnProjectileUpdate "));
+				}
+				using (TimeWarning.New("OnProjectileUpdate"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.FromOwner.Test("OnProjectileUpdate", this, player))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg7 = rPCMessage;
+							OnProjectileUpdate(msg7);
+						}
+					}
+					catch (Exception exception6)
+					{
+						player.Kick("RPC Error in OnProjectileUpdate");
+						Debug.LogException(exception6);
+					}
+				}
+				return true;
+			}
+			if (rpc == 2695790948u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - PerformanceReport "));
+				}
+				using (TimeWarning.New("PerformanceReport"))
+				{
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg8 = rPCMessage;
+							PerformanceReport(msg8);
+						}
+					}
+					catch (Exception exception7)
+					{
+						player.Kick("RPC Error in PerformanceReport");
+						Debug.LogException(exception7);
+					}
+				}
+				return true;
+			}
+			if (rpc == 540658179 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_Assist "));
+				}
+				using (TimeWarning.New("RPC_Assist"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test("RPC_Assist", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg9 = rPCMessage;
+							RPC_Assist(msg9);
+						}
+					}
+					catch (Exception exception8)
+					{
+						player.Kick("RPC Error in RPC_Assist");
+						Debug.LogException(exception8);
+					}
+				}
+				return true;
+			}
+			if (rpc == 1739731598 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_KeepAlive "));
+				}
+				using (TimeWarning.New("RPC_KeepAlive"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test("RPC_KeepAlive", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg10 = rPCMessage;
+							RPC_KeepAlive(msg10);
+						}
+					}
+					catch (Exception exception9)
+					{
+						player.Kick("RPC Error in RPC_KeepAlive");
+						Debug.LogException(exception9);
+					}
+				}
+				return true;
+			}
+			if (rpc == 1233366563 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_LootPlayer "));
+				}
+				using (TimeWarning.New("RPC_LootPlayer"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test("RPC_LootPlayer", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg11 = rPCMessage;
+							RPC_LootPlayer(msg11);
+						}
+					}
+					catch (Exception exception10)
+					{
+						player.Kick("RPC Error in RPC_LootPlayer");
+						Debug.LogException(exception10);
+					}
+				}
+				return true;
+			}
+			if (rpc == 3021566908u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - SV_Drink "));
+				}
+				using (TimeWarning.New("SV_Drink"))
+				{
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg12 = rPCMessage;
+							SV_Drink(msg12);
+						}
+					}
+					catch (Exception exception11)
+					{
+						player.Kick("RPC Error in SV_Drink");
+						Debug.LogException(exception11);
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public override BasePlayer ToPlayer()
+	{
+		return this;
+	}
+
+	public string GetSubName(int maxlen = 32)
+	{
+		string text = displayName;
+		if (text.Length > maxlen)
+		{
+			text = text.Substring(0, maxlen) + "..";
+		}
+		return text;
+	}
+
+	public bool CanInteract()
+	{
+		return !IsDead() && !IsSleeping() && !IsWounded();
+	}
+
+	public override float StartHealth()
+	{
+		return UnityEngine.Random.Range(50f, 60f);
+	}
+
+	public override float StartMaxHealth()
+	{
+		return 100f;
+	}
+
+	public override float MaxHealth()
+	{
+		return 100f;
+	}
+
+	public override float MaxVelocity()
+	{
+		return (!IsSleeping()) ? GetMaxSpeed() : 0f;
+	}
+
+	public override void InitShared()
+	{
+		Belt = new PlayerBelt(this);
+		cachedProtection = ScriptableObject.CreateInstance<ProtectionProperties>();
+		baseProtection = ScriptableObject.CreateInstance<ProtectionProperties>();
+		inventory = GetComponent<PlayerInventory>();
+		blueprints = GetComponent<PlayerBlueprints>();
+		metabolism = GetComponent<PlayerMetabolism>();
+		eyes = GetComponent<PlayerEyes>();
+		input = GetComponent<PlayerInput>();
+		base.InitShared();
+	}
+
+	public override void DestroyShared()
+	{
+		UnityEngine.Object.Destroy(cachedProtection);
+		UnityEngine.Object.Destroy(baseProtection);
+		base.DestroyShared();
+	}
+
+	public static void ServerCycle(float deltaTime)
+	{
+		activePlayerList.RemoveAll((BasePlayer x) => x == null);
+		List<BasePlayer> obj = Facepunch.Pool.Get<List<BasePlayer>>();
+		obj.AddRange(activePlayerList);
+		for (int i = 0; i < obj.Count; i++)
+		{
+			if (!(obj[i] == null))
+			{
+				obj[i].ServerUpdate(deltaTime);
+			}
+		}
+		if (ConVar.Server.idlekick > 0 && ((ServerMgr.AvailableSlots <= 0 && ConVar.Server.idlekickmode == 1) || ConVar.Server.idlekickmode == 2))
+		{
+			for (int j = 0; j < obj.Count; j++)
+			{
+				if (!(obj[j].IdleTime < (float)(ConVar.Server.idlekick * 60)) && (!obj[j].IsAdmin || ConVar.Server.idlekickadmins != 0) && (!obj[j].IsDeveloper || ConVar.Server.idlekickadmins != 0))
+				{
+					obj[j].Kick("Idle for " + ConVar.Server.idlekick + " minutes");
+				}
+			}
+		}
+		Facepunch.Pool.FreeList(ref obj);
+	}
+
+	public Bounds GetBounds(bool ducked)
+	{
+		return new Bounds(base.transform.position + GetOffset(ducked), GetSize(ducked));
+	}
+
+	public Bounds GetBounds()
+	{
+		return GetBounds(modelState.ducked);
+	}
+
+	public UnityEngine.Vector3 GetCenter(bool ducked)
+	{
+		return base.transform.position + GetOffset(ducked);
+	}
+
+	public UnityEngine.Vector3 GetCenter()
+	{
+		return GetCenter(modelState.ducked);
+	}
+
+	public UnityEngine.Vector3 GetOffset(bool ducked)
+	{
+		if (ducked)
+		{
+			return new UnityEngine.Vector3(0f, 0.55f, 0f);
+		}
+		return new UnityEngine.Vector3(0f, 0.9f, 0f);
+	}
+
+	public UnityEngine.Vector3 GetOffset()
+	{
+		return GetOffset(modelState.ducked);
+	}
+
+	public UnityEngine.Vector3 GetSize(bool ducked)
+	{
+		if (ducked)
+		{
+			return new UnityEngine.Vector3(1f, 1.1f, 1f);
+		}
+		return new UnityEngine.Vector3(1f, 1.8f, 1f);
+	}
+
+	public UnityEngine.Vector3 GetSize()
+	{
+		return GetSize(modelState.ducked);
+	}
+
+	public float GetHeight(bool ducked)
+	{
+		if (ducked)
+		{
+			return 1.1f;
+		}
+		return 1.8f;
+	}
+
+	public float GetHeight()
+	{
+		return GetHeight(modelState.ducked);
+	}
+
+	public float GetRadius()
+	{
+		return 0.5f;
+	}
+
+	public float GetJumpHeight()
+	{
+		return 1.5f;
+	}
+
+	public float MaxDeployDistance(Item item)
+	{
+		return 8f;
+	}
+
+	public float GetMinSpeed()
+	{
+		return GetSpeed(0f, 1f);
+	}
+
+	public float GetMaxSpeed()
+	{
+		return GetSpeed(1f, 0f) * (1f - clothingMoveSpeedReduction);
+	}
+
+	public float GetSpeed(float running, float ducking)
+	{
+		return Mathf.Lerp(Mathf.Lerp(2.8f, 5.5f, running), 1.7f, ducking);
+	}
+
+	public override void OnAttacked(HitInfo info)
+	{
+		if (Interface.CallHook("IOnBasePlayerAttacked", this, info) != null)
+		{
+			return;
+		}
+		float health_old = base.health;
+		if (base.isServer)
+		{
+			HitArea boneArea = info.boneArea;
+			if (boneArea != (HitArea)(-1))
+			{
+				List<Item> obj = Facepunch.Pool.GetList<Item>();
+				obj.AddRange(inventory.containerWear.itemList);
+				for (int i = 0; i < obj.Count; i++)
+				{
+					Item item = obj[i];
+					if (item != null)
+					{
+						ItemModWearable component = item.info.GetComponent<ItemModWearable>();
+						if (!(component == null) && component.ProtectsArea(boneArea))
+						{
+							item.OnAttacked(info);
+						}
+					}
+				}
+				Facepunch.Pool.FreeList(ref obj);
+				inventory.ServerUpdate(0f);
+			}
+		}
+		base.OnAttacked(info);
+		if (base.isServer && base.isServer && info.hasDamage)
+		{
+			if (!info.damageTypes.Has(DamageType.Bleeding) && info.damageTypes.IsBleedCausing() && !IsWounded() && !IsImmortal())
+			{
+				metabolism.bleeding.Add(info.damageTypes.Total() * 0.2f);
+			}
+			CheckDeathCondition(info);
+			if (net != null && net.connection != null)
+			{
+				Effect effect = new Effect();
+				effect.Init(Effect.Type.Generic, base.transform.position, base.transform.forward);
+				effect.pooledString = "assets/bundled/prefabs/fx/takedamage_hit.prefab";
+				EffectNetwork.Send(effect, net.connection);
+			}
+			string text = StringPool.Get(info.HitBone);
+			UnityEngine.Vector3 normalized = (info.PointEnd - info.PointStart).normalized;
+			bool flag = UnityEngine.Vector3.Dot(normalized, eyes.BodyForward()) > 0.4f;
+			if (info.isHeadshot)
+			{
+				if (flag)
+				{
+					SignalBroadcast(Signal.Flinch_RearHead, string.Empty);
+				}
+				else
+				{
+					SignalBroadcast(Signal.Flinch_Head, string.Empty);
+				}
+				BasePlayer initiatorPlayer = info.InitiatorPlayer;
+				Effect.server.Run("assets/bundled/prefabs/fx/headshot.prefab", this, 0u, new UnityEngine.Vector3(0f, 2f, 0f), UnityEngine.Vector3.zero, (!(initiatorPlayer != null)) ? null : initiatorPlayer.net.connection);
+				if ((bool)initiatorPlayer)
+				{
+					initiatorPlayer.stats.Add("headshot", 1);
+				}
+			}
+			else if (flag)
+			{
+				SignalBroadcast(Signal.Flinch_RearTorso, string.Empty);
+			}
+			else if (text == "spine" || text == "spine2")
+			{
+				SignalBroadcast(Signal.Flinch_Stomach, string.Empty);
+			}
+			else
+			{
+				SignalBroadcast(Signal.Flinch_Chest, string.Empty);
+			}
+		}
+		if (stats != null)
+		{
+			if (IsWounded())
+			{
+				stats.combat.Log(info, health_old, base.health, "wounded");
+			}
+			else if (IsDead())
+			{
+				stats.combat.Log(info, health_old, base.health, "killed");
+			}
+			else
+			{
+				stats.combat.Log(info, health_old, base.health);
+			}
+		}
+	}
+
+	public void UpdatePlayerCollider(bool state)
+	{
+		if (triggerCollider == null)
+		{
+			triggerCollider = base.gameObject.GetComponent<Collider>();
+		}
+		if (triggerCollider.enabled != state)
+		{
+			RemoveFromTriggers();
+		}
+		triggerCollider.enabled = state;
+	}
+
+	public void UpdatePlayerRigidbody(bool state)
+	{
+		if (physicsRigidbody == null)
+		{
+			physicsRigidbody = base.gameObject.GetComponent<Rigidbody>();
+		}
+		if (state)
+		{
+			if (physicsRigidbody == null)
+			{
+				physicsRigidbody = base.gameObject.AddComponent<Rigidbody>();
+				physicsRigidbody.useGravity = false;
+				physicsRigidbody.isKinematic = true;
+				physicsRigidbody.mass = 1f;
+				physicsRigidbody.interpolation = RigidbodyInterpolation.None;
+				physicsRigidbody.collisionDetectionMode = CollisionDetectionMode.Discrete;
+			}
+		}
+		else if (physicsRigidbody != null)
+		{
+			GameManager.Destroy(physicsRigidbody);
+			physicsRigidbody = null;
+		}
+	}
+
+	public bool CanAttack()
+	{
+		HeldEntity heldEntity = GetHeldEntity();
+		if (heldEntity == null)
+		{
+			return false;
+		}
+		bool flag = IsSwimming();
+		bool flag2 = heldEntity.CanBeUsedInWater();
+		if (modelState.onLadder)
+		{
+			return false;
+		}
+		if (!flag && !modelState.onground)
+		{
+			return false;
+		}
+		if (flag && !flag2)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public bool OnLadder()
+	{
+		return modelState.onLadder;
+	}
+
+	public bool IsSwimming()
+	{
+		return modelState.waterLevel >= 0.65f;
+	}
+
+	public bool IsHeadUnderwater()
+	{
+		return modelState.waterLevel > 0.75f;
+	}
+
+	public bool IsOnGround()
+	{
+		return modelState.onground;
+	}
+
+	public bool IsRunning()
+	{
+		if (modelState != null)
+		{
+			return modelState.sprinting;
+		}
+		return false;
+	}
+
+	public bool IsDucked()
+	{
+		if (modelState != null)
+		{
+			return modelState.ducked;
+		}
+		return false;
+	}
+
+	public void ChatMessage(string msg)
+	{
+		if (base.isServer && Interface.CallHook("OnMessagePlayer", msg, this) == null)
+		{
+			SendConsoleCommand("chat.add", 0, msg);
+		}
+	}
+
+	public void ConsoleMessage(string msg)
+	{
+		if (base.isServer)
+		{
+			SendConsoleCommand("echo " + msg);
+		}
+	}
+
+	public override float PenetrationResistance(HitInfo info)
+	{
+		return 100f;
+	}
+
+	public override void ScaleDamage(HitInfo info)
+	{
+		if (info.UseProtection)
+		{
+			HitArea boneArea = info.boneArea;
+			if (boneArea != (HitArea)(-1))
+			{
+				cachedProtection.Clear();
+				cachedProtection.Add(inventory.containerWear.itemList, boneArea);
+				cachedProtection.Multiply(DamageType.Arrow, ConVar.Server.arrowarmor);
+				cachedProtection.Multiply(DamageType.Bullet, ConVar.Server.bulletarmor);
+				cachedProtection.Multiply(DamageType.Slash, ConVar.Server.meleearmor);
+				cachedProtection.Multiply(DamageType.Blunt, ConVar.Server.meleearmor);
+				cachedProtection.Multiply(DamageType.Stab, ConVar.Server.meleearmor);
+				cachedProtection.Multiply(DamageType.Bleeding, ConVar.Server.bleedingarmor);
+				cachedProtection.Scale(info.damageTypes);
+			}
+			else
+			{
+				baseProtection.Scale(info.damageTypes);
+			}
+		}
+		if ((bool)info.damageProperties)
+		{
+			info.damageProperties.ScaleDamage(info);
+		}
+	}
+
+	private void UpdateMoveSpeedFromClothing()
+	{
+		float num = 0f;
+		float num2 = 0f;
+		bool flag = false;
+		foreach (Item item in inventory.containerWear.itemList)
+		{
+			ItemModWearable component = item.info.GetComponent<ItemModWearable>();
+			if ((bool)component)
+			{
+				if (component.blocksAiming)
+				{
+					flag = true;
+				}
+				if (component.movementProperties != null)
+				{
+					num2 += component.movementProperties.speedReduction;
+					num = Mathf.Max(num, component.movementProperties.minSpeedReduction);
+				}
+			}
+		}
+		clothingMoveSpeedReduction = Mathf.Max(num2, num);
+		clothingBlocksAiming = flag;
+	}
+
+	private void UpdateProtectionFromClothing()
+	{
+		baseProtection.Clear();
+		baseProtection.Add(inventory.containerWear.itemList);
+		float num = 1f / (float)inventory.containerWear.capacity;
+		for (int i = 0; i < baseProtection.amounts.Length; i++)
+		{
+			if (i != 17)
+			{
+				baseProtection.amounts[i] *= num;
+			}
+		}
+	}
+
+	public override string Categorize()
+	{
+		return "player";
+	}
+
+	public override string ToString()
+	{
+		if (_name == null)
+		{
+			if (base.isServer)
+			{
+				_name = string.Format("{1}[{0}/{2}]", (net != null) ? net.ID : 0u, displayName, userID);
+			}
+			else
+			{
+				_name = base.ShortPrefabName;
+			}
+		}
+		return _name;
+	}
+
+	public string GetDebugStatus()
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+		stringBuilder.AppendFormat("Entity: {0}\n", ToString());
+		stringBuilder.AppendFormat("Name: {0}\n", displayName);
+		stringBuilder.AppendFormat("SteamID: {0}\n", userID);
+		foreach (PlayerFlags value in Enum.GetValues(typeof(PlayerFlags)))
+		{
+			stringBuilder.AppendFormat("{1}: {0}\n", HasPlayerFlag(value), value);
+		}
+		return stringBuilder.ToString();
+	}
+
+	public override Item GetItem(uint itemId)
+	{
+		if (inventory == null)
+		{
+			return null;
+		}
+		return inventory.FindItemUID(itemId);
+	}
+
+	public bool TriggeredAntiHack(float seconds = 1f, float score = float.PositiveInfinity)
+	{
+		return UnityEngine.Time.realtimeSinceStartup - lastViolationTime < seconds || violationLevel > score;
+	}
+
+	public bool UsedAdminCheat(float seconds = 1f)
+	{
+		return UnityEngine.Time.realtimeSinceStartup - lastAdminCheatTime < seconds;
+	}
+
+	public int GetAntiHackKicks()
+	{
+		return AntiHack.GetKickRecord(this);
+	}
+
+	public void ResetAntiHack()
+	{
+		violationLevel = 0f;
+		lastViolationTime = 0f;
+		speedhackDeltaTime = 0f;
+		speedhackDistance = 0f;
+		speedhackTickets = 0;
+		speedhackHistory.Clear();
+		flyhackDistanceVertical = 0f;
+		flyhackDistanceHorizontal = 0f;
+	}
+
+	public override bool CanBeLooted(BasePlayer player)
+	{
+		object obj = Interface.CallHook("CanLootPlayer", this, player);
+		if (obj is bool)
+		{
+			return (bool)obj;
+		}
+		if (player == this)
+		{
+			return false;
+		}
+		return IsWounded() || IsSleeping();
+	}
+
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
+	public void RPC_LootPlayer(RPCMessage msg)
+	{
+		if (msg.player.CanInteract() && CanBeLooted(msg.player))
+		{
+			msg.player.inventory.loot.StartLootingEntity(this);
+			msg.player.inventory.loot.AddContainer(inventory.containerMain);
+			msg.player.inventory.loot.AddContainer(inventory.containerWear);
+			msg.player.inventory.loot.AddContainer(inventory.containerBelt);
+			msg.player.inventory.loot.SendImmediate();
+			msg.player.ClientRPCPlayer(null, msg.player, "RPC_OpenLootPanel", "player_corpse");
+		}
+	}
+
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
+	public void RPC_Assist(RPCMessage msg)
+	{
+		if (msg.player.CanInteract() && !(msg.player == this) && IsWounded())
+		{
+			StopWounded();
+			msg.player.stats.Add("wounded_assisted", 1);
+			stats.Add("wounded_healed", 1);
+		}
+	}
+
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
+	public void RPC_KeepAlive(RPCMessage msg)
+	{
+		if (msg.player.CanInteract() && !(msg.player == this) && IsWounded())
+		{
+			ProlongWounding(10f);
+		}
+	}
+
+	[RPC_Server]
+	private void SV_Drink(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		UnityEngine.Vector3 vector = msg.read.Vector3();
+		if (vector.IsNaNOrInfinity() || !player || !player.metabolism.CanConsume() || WaterFactor() < 0.02f || UnityEngine.Vector3.Distance(player.transform.position, vector) > 5f || !WaterLevel.Test(vector))
+		{
+			return;
+		}
+		ItemDefinition atPoint = WaterResource.GetAtPoint(vector);
+		if (!(atPoint == null))
+		{
+			ItemModConsumable component = atPoint.GetComponent<ItemModConsumable>();
+			Item item = ItemManager.Create(atPoint, component.amountToConsume, 0uL);
+			ItemModConsume component2 = item.info.GetComponent<ItemModConsume>();
+			if (component2.CanDoAction(item, player))
+			{
+				component2.DoAction(item, player);
+			}
+			item?.Remove();
+			player.metabolism.MarkConsumption();
+		}
+	}
+
+	public int GetQueuedUpdateCount(NetworkQueue queue)
+	{
+		return networkQueue[(int)queue].Length;
+	}
+
+	public void SendSnapshots(HashSet<Networkable> ents)
+	{
+		using (TimeWarning.New("SendSnapshots"))
+		{
+			foreach (Networkable ent in ents)
+			{
+				SnapshotQueue.Add(ent.handler as BaseNetworkable);
+			}
+		}
+	}
+
+	public void QueueUpdate(NetworkQueue queue, BaseNetworkable ent)
+	{
+		if (!IsConnected)
+		{
+			return;
+		}
+		switch (queue)
+		{
+		case NetworkQueue.Update:
+			networkQueue[0].Add(ent);
+			break;
+		case NetworkQueue.UpdateDistance:
+			if (!IsReceivingSnapshot && !networkQueue[1].Contains(ent) && !networkQueue[0].Contains(ent))
+			{
+				NetworkQueueList networkQueueList = networkQueue[1];
+				float num = Distance(ent as BaseEntity);
+				if (num < 20f)
+				{
+					QueueUpdate(NetworkQueue.Update, ent);
+				}
+				else
+				{
+					networkQueueList.Add(ent);
+				}
+			}
+			break;
+		}
+	}
+
+	public void SendEntityUpdate()
+	{
+		using (TimeWarning.New("SendEntityUpdate"))
+		{
+			SendEntityUpdates(SnapshotQueue);
+			SendEntityUpdates(networkQueue[0]);
+			SendEntityUpdates(networkQueue[1]);
+		}
+	}
+
+	public void ClearEntityQueue(Group group = null)
+	{
+		SnapshotQueue.Clear(group);
+		networkQueue[0].Clear(group);
+		networkQueue[1].Clear(group);
+	}
+
+	private void SendEntityUpdates(NetworkQueueList queue)
+	{
+		if (queue.queueInternal.Count == 0)
+		{
+			return;
+		}
+		int num = ((!IsReceivingSnapshot) ? ConVar.Server.updatebatch : ConVar.Server.updatebatchspawn);
+		List<BaseNetworkable> obj = Facepunch.Pool.GetList<BaseNetworkable>();
+		using (TimeWarning.New("SendEntityUpdates.SendEntityUpdates"))
+		{
+			int num2 = 0;
+			foreach (BaseNetworkable item in queue.queueInternal)
+			{
+				SendEntitySnapshot(item);
+				obj.Add(item);
+				num2++;
+				if (num2 > num)
+				{
+					break;
+				}
+			}
+		}
+		if (num > queue.queueInternal.Count())
+		{
+			queue.queueInternal.Clear();
+		}
+		else
+		{
+			using (TimeWarning.New("SendEntityUpdates.Remove"))
+			{
+				for (int i = 0; i < obj.Count; i++)
+				{
+					queue.queueInternal.Remove(obj[i]);
+				}
+			}
+		}
+		if (queue.queueInternal.Count == 0 && queue.MaxLength > 2048)
+		{
+			queue.queueInternal.Clear();
+			queue.queueInternal = new HashSet<BaseNetworkable>();
+			queue.MaxLength = 0;
+		}
+		Facepunch.Pool.FreeList(ref obj);
+	}
+
+	private void SendEntitySnapshot(BaseNetworkable ent)
+	{
+		using (TimeWarning.New("SendEntitySnapshot"))
+		{
+			if (!(ent == null) && ent.net != null && ent.ShouldNetworkTo(this) && Network.Net.sv.write.Start())
+			{
+				net.connection.validate.entityUpdates++;
+				SaveInfo saveInfo = default(SaveInfo);
+				saveInfo.forConnection = net.connection;
+				saveInfo.forDisk = false;
+				SaveInfo saveInfo2 = saveInfo;
+				Network.Net.sv.write.PacketID(Message.Type.Entities);
+				Network.Net.sv.write.UInt32(net.connection.validate.entityUpdates);
+				ent.ToStreamForNetwork(Network.Net.sv.write, saveInfo2);
+				Network.Net.sv.write.Send(new SendInfo(net.connection));
+			}
+		}
+	}
+
+	public bool HasPlayerFlag(PlayerFlags f)
+	{
+		return (playerFlags & f) == f;
+	}
+
+	public bool IsBuildingBlocked(UnityEngine.Vector3 position, Quaternion rotation, Bounds bounds)
+	{
+		if (HasPlayerFlag(PlayerFlags.InBuildingPrivilege) && !HasPlayerFlag(PlayerFlags.HasBuildingPrivilege))
+		{
+			return true;
+		}
+		return BuildingPrivlidge.IsBlocked(this, position, rotation, bounds);
+	}
+
+	public bool IsBuildingAuthed(UnityEngine.Vector3 position, Quaternion rotation, Bounds bounds)
+	{
+		if (!HasPlayerFlag(PlayerFlags.HasBuildingPrivilege))
+		{
+			return false;
+		}
+		return BuildingPrivlidge.IsAuthed(this, position, rotation, bounds);
+	}
+
+	public void SetPlayerFlag(PlayerFlags f, bool b)
+	{
+		if (b)
+		{
+			if (HasPlayerFlag(f))
+			{
+				return;
+			}
+			playerFlags |= f;
+		}
+		else
+		{
+			if (!HasPlayerFlag(f))
+			{
+				return;
+			}
+			playerFlags &= ~f;
+		}
+		SendNetworkUpdate();
+	}
+
+	public void LightToggle()
+	{
+		lightsOn = !lightsOn;
+		SetLightsOn(lightsOn);
+	}
+
+	public void SetLightsOn(bool isOn)
+	{
+		Item activeItem = GetActiveItem();
+		if (activeItem != null)
+		{
+			BaseEntity heldEntity = activeItem.GetHeldEntity();
+			if (heldEntity != null)
+			{
+				HeldEntity component = heldEntity.GetComponent<HeldEntity>();
+				if ((bool)component)
+				{
+					component.SendMessage("SetLightsOn", !component.LightsOn(), SendMessageOptions.DontRequireReceiver);
+				}
+			}
+		}
+		foreach (Item item in inventory.containerWear.itemList)
+		{
+			ItemModWearable component2 = item.info.GetComponent<ItemModWearable>();
+			if ((bool)component2 && component2.emissive)
+			{
+				item.SetFlag(Item.Flag.IsOn, !item.HasFlag(Item.Flag.IsOn));
+				item.MarkDirty();
+			}
+		}
+	}
+
+	public HeldEntity GetHeldEntity()
+	{
+		if (base.isServer)
+		{
+			Item activeItem = GetActiveItem();
+			if (activeItem == null)
+			{
+				return null;
+			}
+			return activeItem.GetHeldEntity() as HeldEntity;
+		}
+		return null;
+	}
+
+	private void UpdateModelState()
+	{
+		if (!IsDead() && !IsSpectating())
+		{
+			wantsSendModelState = true;
+		}
+	}
+
+	private void SendModelState()
+	{
+		if (wantsSendModelState && !(nextModelStateUpdate > UnityEngine.Time.time))
+		{
+			wantsSendModelState = false;
+			nextModelStateUpdate = UnityEngine.Time.time + 0.1f;
+			if (!IsDead() && !IsSpectating())
+			{
+				modelState.sleeping = IsSleeping();
+				ClientRPC(null, "OnModelState", modelState);
+			}
+		}
+	}
+
+	public BaseMountable GetMounted()
+	{
+		return mounted.Get(base.isServer) as BaseMountable;
+	}
+
+	public void MountObject(BaseMountable mount, int desiredSeat = 0)
+	{
+		mounted.Set(mount);
+		SendNetworkUpdate();
+	}
+
+	public void EnsureDismounted()
+	{
+		if (isMounted)
+		{
+			GetMounted().DismountPlayer();
+		}
+	}
+
+	public void DismountObject()
+	{
+		mounted.Set(null);
+		SendNetworkUpdate();
+	}
+
+	public bool IsSleeping()
+	{
+		return HasPlayerFlag(PlayerFlags.Sleeping);
+	}
+
+	public bool IsSpectating()
+	{
+		return HasPlayerFlag(PlayerFlags.Spectating);
+	}
+
+	public void SetInsideBuildingPrivilege(BuildingPrivlidge privlidge, bool inside)
+	{
+		buildingPrivilege.RemoveAll((BuildingPrivlidge x) => x == privlidge || x == null);
+		if (inside)
+		{
+			buildingPrivilege.Add(privlidge);
+		}
+		UpdatePrivilegeFlags(GetBuildingPrivilege());
+	}
+
+	private void UpdatePrivilegeFlags(BuildingPrivlidge bp)
+	{
+		SetPlayerFlag(PlayerFlags.InBuildingPrivilege, bp);
+		SetPlayerFlag(PlayerFlags.HasBuildingPrivilege, (bool)bp && bp.IsAuthed(this));
+	}
+
+	public BuildingPrivlidge GetBuildingPrivilege()
+	{
+		BuildingPrivlidge buildingPrivlidge = null;
+		for (int i = 0; i < buildingPrivilege.Count; i++)
+		{
+			BuildingPrivlidge buildingPrivlidge2 = buildingPrivilege[i];
+			if (!buildingPrivlidge2.Dominates(buildingPrivlidge))
+			{
+				continue;
+			}
+			if (!buildingPrivlidge2.CheckEntity(this))
+			{
+				if (ConVar.Global.developer > 0)
+				{
+					Debug.LogWarning(ToString() + " is inside an out of range building privilege.");
+				}
+			}
+			else
+			{
+				buildingPrivlidge = buildingPrivlidge2;
+			}
+		}
+		return buildingPrivlidge;
+	}
+
+	public bool CanBuild()
+	{
+		if (!HasPlayerFlag(PlayerFlags.InBuildingPrivilege))
+		{
+			return true;
+		}
+		return HasPlayerFlag(PlayerFlags.HasBuildingPrivilege);
+	}
+
+	[RPC_Server]
+	[RPC_Server.FromOwner]
+	public void OnProjectileAttack(RPCMessage msg)
+	{
+		PlayerProjectileAttack playerProjectileAttack = PlayerProjectileAttack.Deserialize(msg.read);
+		if (playerProjectileAttack == null)
+		{
+			return;
+		}
+		PlayerAttack playerAttack = playerProjectileAttack.playerAttack;
+		HitInfo hitInfo = new HitInfo();
+		hitInfo.LoadFromAttack(playerAttack.attack, serverSide: true);
+		hitInfo.Initiator = this;
+		hitInfo.ProjectileID = playerAttack.projectileID;
+		hitInfo.ProjectileDistance = playerProjectileAttack.hitDistance;
+		hitInfo.ProjectileVelocity = playerProjectileAttack.hitVelocity;
+		hitInfo.Predicted = msg.connection;
+		if (hitInfo.IsNaNOrInfinity())
+		{
+			AntiHack.Log(this, AntiHackType.ProjectileHack, "Contains NaN (" + playerAttack.projectileID + ")");
+			playerProjectileAttack.ResetToPool();
+			playerProjectileAttack = null;
+			stats.combat.Log(hitInfo, "projectile_nan");
+			return;
+		}
+		if (!firedProjectiles.TryGetValue(playerAttack.projectileID, out var value))
+		{
+			AntiHack.Log(this, AntiHackType.ProjectileHack, "Missing ID (" + playerAttack.projectileID + ")");
+			playerProjectileAttack.ResetToPool();
+			playerProjectileAttack = null;
+			stats.combat.Log(hitInfo, "projectile_invalid");
+			return;
+		}
+		if (value.integrity <= 0f)
+		{
+			AntiHack.Log(this, AntiHackType.ProjectileHack, "Integrity is zero (" + playerAttack.projectileID + ")");
+			playerProjectileAttack.ResetToPool();
+			playerProjectileAttack = null;
+			stats.combat.Log(hitInfo, "projectile_integrity");
+			return;
+		}
+		if (value.firedTime < UnityEngine.Time.realtimeSinceStartup - 8f)
+		{
+			AntiHack.Log(this, AntiHackType.ProjectileHack, "Lifetime is zero (" + playerAttack.projectileID + ")");
+			playerProjectileAttack.ResetToPool();
+			playerProjectileAttack = null;
+			stats.combat.Log(hitInfo, "projectile_lifetime");
+			return;
+		}
+		hitInfo.Weapon = value.weaponSource;
+		hitInfo.WeaponPrefab = value.weaponPrefab;
+		hitInfo.ProjectilePrefab = value.projectilePrefab;
+		hitInfo.damageProperties = value.projectilePrefab.damageProperties;
+		if (ConVar.AntiHack.projectile_protection > 0 && (bool)hitInfo.HitEntity)
+		{
+			bool flag = true;
+			float num = 1f + ConVar.AntiHack.projectile_forgiveness;
+			float projectile_clientframes = ConVar.AntiHack.projectile_clientframes;
+			float projectile_serverframes = ConVar.AntiHack.projectile_serverframes;
+			float num2 = Mathx.Decrement(value.firedTime);
+			float num3 = Mathx.Increment(UnityEngine.Time.realtimeSinceStartup);
+			float num4 = num3 - num2;
+			float num5 = projectile_clientframes / 60f;
+			float num6 = projectile_serverframes * Mathx.Max(UnityEngine.Time.deltaTime, UnityEngine.Time.smoothDeltaTime, UnityEngine.Time.fixedDeltaTime);
+			float num7 = (desyncTime + num4 + num5 + num6) * num;
+			if (ConVar.AntiHack.projectile_protection >= 2)
+			{
+				float num8 = hitInfo.HitEntity.MaxVelocity();
+				float num9 = hitInfo.HitEntity.BoundsPadding() + num7 * num8;
+				float num10 = hitInfo.HitEntity.Distance2D(hitInfo.HitPositionWorld);
+				if (num10 > num9)
+				{
+					string text = hitInfo.ProjectilePrefab.name;
+					string shortPrefabName = hitInfo.HitEntity.ShortPrefabName;
+					AntiHack.Log(this, AntiHackType.ProjectileHack, "Entity too far away (" + text + " on " + shortPrefabName + " with " + num10 + "m > " + num9 + "m in " + num7 + "s)");
+					stats.combat.Log(hitInfo, "projectile_distance");
+					flag = false;
+				}
+			}
+			if (ConVar.AntiHack.projectile_protection >= 1)
+			{
+				float num11 = value.itemMod.GetMaxVelocity();
+				BaseProjectile baseProjectile = hitInfo.Weapon as BaseProjectile;
+				if ((bool)baseProjectile)
+				{
+					num11 *= baseProjectile.projectileVelocityScale;
+				}
+				float num12 = hitInfo.ProjectilePrefab.initialDistance + num7 * num11;
+				float num13 = UnityEngine.Vector3.Distance(value.origin, hitInfo.HitPositionWorld);
+				if (num13 > num12)
+				{
+					string text2 = hitInfo.ProjectilePrefab.name;
+					string shortPrefabName2 = hitInfo.HitEntity.ShortPrefabName;
+					AntiHack.Log(this, AntiHackType.ProjectileHack, "Traveled too fast (" + text2 + " on " + shortPrefabName2 + " with " + num13 + "m > " + num12 + "m in " + num7 + "s)");
+					stats.combat.Log(hitInfo, "projectile_speed");
+					flag = false;
+				}
+			}
+			if (ConVar.AntiHack.projectile_protection >= 3)
+			{
+				UnityEngine.Vector3 pointStart = hitInfo.PointStart;
+				UnityEngine.Vector3 vector = hitInfo.HitPositionWorld + hitInfo.HitNormalWorld.normalized * 0.001f;
+				UnityEngine.Vector3 position = value.position;
+				UnityEngine.Vector3 vector2 = pointStart;
+				UnityEngine.Vector3 vector3 = hitInfo.PositionOnRay(vector);
+				UnityEngine.Vector3 vector4 = vector;
+				bool flag2 = GamePhysics.LineOfSight(position, vector2, vector3, vector4, 2162688);
+				if (!flag2)
+				{
+					stats.Add("hit_" + hitInfo.HitEntity.Categorize() + "_indirect_los", 1, Stats.Server);
+				}
+				else
+				{
+					stats.Add("hit_" + hitInfo.HitEntity.Categorize() + "_direct_los", 1, Stats.Server);
+				}
+				if (!flag2)
+				{
+					string text3 = hitInfo.ProjectilePrefab.name;
+					string shortPrefabName3 = hitInfo.HitEntity.ShortPrefabName;
+					AntiHack.Log(this, AntiHackType.ProjectileHack, string.Concat("Line of sight (", text3, " on ", shortPrefabName3, ") ", position, " ", vector2, " ", vector3, " ", vector4));
+					stats.combat.Log(hitInfo, "projectile_los");
+					flag = false;
+				}
+			}
+			if (!flag)
+			{
+				AntiHack.AddViolation(this, AntiHackType.ProjectileHack, ConVar.AntiHack.projectile_penalty);
+				playerProjectileAttack.ResetToPool();
+				playerProjectileAttack = null;
+				return;
+			}
+		}
+		value.position = hitInfo.HitPositionWorld + hitInfo.ProjectileVelocity.normalized * 0.001f;
+		hitInfo.ProjectilePrefab.CalculateDamage(hitInfo, value.projectileModifier, value.integrity);
+		if (hitInfo.ProjectilePrefab.penetrationPower <= 0f || hitInfo.HitEntity == null)
+		{
+			value.integrity = 0f;
+		}
+		else
+		{
+			float num14 = hitInfo.HitEntity.PenetrationResistance(hitInfo) / hitInfo.ProjectilePrefab.penetrationPower;
+			value.integrity = Mathf.Clamp01(value.integrity - num14);
+		}
+		value.itemMod.ServerProjectileHit(hitInfo);
+		if ((bool)hitInfo.HitEntity)
+		{
+			stats.Add(value.itemMod.category + "_hit_" + hitInfo.HitEntity.Categorize(), 1);
+		}
+		if (value.integrity <= 0f && hitInfo.ProjectilePrefab.remainInWorld)
+		{
+			CreateWorldProjectile(hitInfo, value.itemDef, value.itemMod, hitInfo.ProjectilePrefab, value.pickupItem);
+		}
+		firedProjectiles[playerAttack.projectileID] = value;
+		if (Interface.CallHook("OnPlayerAttack", this, hitInfo) == null)
+		{
+			if ((bool)hitInfo.HitEntity)
+			{
+				hitInfo.HitEntity.OnAttacked(hitInfo);
+			}
+			Effect.server.ImpactEffect(hitInfo);
+			playerProjectileAttack.ResetToPool();
+			playerProjectileAttack = null;
+		}
+	}
+
+	[RPC_Server.FromOwner]
+	[RPC_Server]
+	public void OnProjectileRicochet(RPCMessage msg)
+	{
+		PlayerProjectileRicochet playerProjectileRicochet = PlayerProjectileRicochet.Deserialize(msg.read);
+		if (playerProjectileRicochet == null)
+		{
+			return;
+		}
+		if (playerProjectileRicochet.hitPosition.IsNaNOrInfinity() || playerProjectileRicochet.inVelocity.IsNaNOrInfinity() || playerProjectileRicochet.outVelocity.IsNaNOrInfinity())
+		{
+			AntiHack.Log(this, AntiHackType.ProjectileHack, "Contains NaN (" + playerProjectileRicochet.projectileID + ")");
+			playerProjectileRicochet.ResetToPool();
+			playerProjectileRicochet = null;
+			return;
+		}
+		if (!firedProjectiles.TryGetValue(playerProjectileRicochet.projectileID, out var value))
+		{
+			AntiHack.Log(this, AntiHackType.ProjectileHack, "Missing ID (" + playerProjectileRicochet.projectileID + ")");
+			playerProjectileRicochet.ResetToPool();
+			playerProjectileRicochet = null;
+			return;
+		}
+		if (value.firedTime < UnityEngine.Time.realtimeSinceStartup - 8f)
+		{
+			AntiHack.Log(this, AntiHackType.ProjectileHack, "Lifetime is zero (" + playerProjectileRicochet.projectileID + ")");
+			playerProjectileRicochet.ResetToPool();
+			playerProjectileRicochet = null;
+			return;
+		}
+		UnityEngine.Vector3 normalized = playerProjectileRicochet.inVelocity.normalized;
+		UnityEngine.Vector3 normalized2 = playerProjectileRicochet.outVelocity.normalized;
+		if (ConVar.AntiHack.projectile_protection >= 3)
+		{
+			UnityEngine.Vector3 position = value.position;
+			UnityEngine.Vector3 vector = playerProjectileRicochet.hitPosition - normalized * 0.001f;
+			UnityEngine.Vector3 p = playerProjectileRicochet.hitPosition + normalized2 * 0.001f;
+			if (!GamePhysics.LineOfSight(position, vector, p, 2162688))
+			{
+				string text = value.projectilePrefab.name;
+				AntiHack.Log(this, AntiHackType.ProjectileHack, string.Concat("Line of sight (", text, " on ricochet) ", position, " ", vector));
+				playerProjectileRicochet.ResetToPool();
+				playerProjectileRicochet = null;
+				return;
+			}
+		}
+		value.position = playerProjectileRicochet.hitPosition + normalized2 * 0.001f;
+		firedProjectiles[playerProjectileRicochet.projectileID] = value;
+		playerProjectileRicochet.ResetToPool();
+		playerProjectileRicochet = null;
+	}
+
+	[RPC_Server]
+	[RPC_Server.FromOwner]
+	public void OnProjectileUpdate(RPCMessage msg)
+	{
+		PlayerProjectileUpdate playerProjectileUpdate = PlayerProjectileUpdate.Deserialize(msg.read);
+		if (playerProjectileUpdate == null)
+		{
+			return;
+		}
+		if (playerProjectileUpdate.curPosition.IsNaNOrInfinity())
+		{
+			AntiHack.Log(this, AntiHackType.ProjectileHack, "Contains NaN (" + playerProjectileUpdate.projectileID + ")");
+			playerProjectileUpdate.ResetToPool();
+			playerProjectileUpdate = null;
+			return;
+		}
+		if (!firedProjectiles.TryGetValue(playerProjectileUpdate.projectileID, out var value))
+		{
+			AntiHack.Log(this, AntiHackType.ProjectileHack, "Missing ID (" + playerProjectileUpdate.projectileID + ")");
+			playerProjectileUpdate.ResetToPool();
+			playerProjectileUpdate = null;
+			return;
+		}
+		if (value.firedTime < UnityEngine.Time.realtimeSinceStartup - 8f)
+		{
+			AntiHack.Log(this, AntiHackType.ProjectileHack, "Lifetime is zero (" + playerProjectileUpdate.projectileID + ")");
+			playerProjectileUpdate.ResetToPool();
+			playerProjectileUpdate = null;
+			return;
+		}
+		if (ConVar.AntiHack.projectile_protection >= 3)
+		{
+			UnityEngine.Vector3 position = value.position;
+			UnityEngine.Vector3 curPosition = playerProjectileUpdate.curPosition;
+			if (!GamePhysics.LineOfSight(position, curPosition, 2162688))
+			{
+				string text = value.projectilePrefab.name;
+				AntiHack.Log(this, AntiHackType.ProjectileHack, string.Concat("Line of sight (", text, " on update) ", position, " ", curPosition));
+				playerProjectileUpdate.ResetToPool();
+				playerProjectileUpdate = null;
+				return;
+			}
+		}
+		value.position = playerProjectileUpdate.curPosition;
+		firedProjectiles[playerProjectileUpdate.projectileID] = value;
+		playerProjectileUpdate.ResetToPool();
+		playerProjectileUpdate = null;
+	}
+
+	protected virtual void CreateWorldProjectile(HitInfo info, ItemDefinition itemDef, ItemModProjectile itemMod, Projectile projectilePrefab, Item recycleItem)
+	{
+		UnityEngine.Vector3 projectileVelocity = info.ProjectileVelocity;
+		Item item = ((recycleItem == null) ? ItemManager.Create(itemDef, 1, 0uL) : recycleItem);
+		BaseEntity baseEntity = item.CreateWorldObject(info.HitPositionWorld, Quaternion.LookRotation(projectileVelocity.normalized));
+		Rigidbody component = baseEntity.GetComponent<Rigidbody>();
+		if (Interface.CallHook("OnCreateWorldProjectile", info, item) != null)
+		{
+			return;
+		}
+		if (!info.DidHit)
+		{
+			baseEntity.Kill(DestroyMode.Gib);
+			return;
+		}
+		if (projectilePrefab.breakProbability > 0f && UnityEngine.Random.value <= projectilePrefab.breakProbability)
+		{
+			baseEntity.Kill(DestroyMode.Gib);
+			return;
+		}
+		if (projectilePrefab.conditionLoss > 0f)
+		{
+			item.LoseCondition(projectilePrefab.conditionLoss * 100f);
+			if (item.isBroken)
+			{
+				baseEntity.Kill(DestroyMode.Gib);
+				return;
+			}
+		}
+		if (projectilePrefab.stickProbability > 0f && UnityEngine.Random.value <= projectilePrefab.stickProbability)
+		{
+			if (info.HitEntity == null)
+			{
+				component.isKinematic = true;
+				return;
+			}
+			Quaternion rotation = ((info.HitBone != 0) ? Quaternion.LookRotation(info.HitNormalLocal * -1f) : Quaternion.LookRotation(info.HitEntity.transform.InverseTransformDirection(projectileVelocity.normalized)));
+			component.isKinematic = true;
+			baseEntity.SetParent(info.HitEntity, info.HitBone);
+			baseEntity.transform.position = info.HitPositionLocal;
+			baseEntity.transform.rotation = rotation;
+		}
+		else
+		{
+			component.AddForce(projectileVelocity.normalized * 200f);
+			component.WakeUp();
+		}
+	}
+
+	public void CleanupExpiredProjectiles()
+	{
+		foreach (KeyValuePair<int, FiredProjectile> item in firedProjectiles.Where((KeyValuePair<int, FiredProjectile> x) => x.Value.firedTime < UnityEngine.Time.realtimeSinceStartup - 8f - 1f).ToList())
+		{
+			firedProjectiles.Remove(item.Key);
+		}
+	}
+
+	public bool HasFiredProjectile(int id)
+	{
+		return firedProjectiles.ContainsKey(id);
+	}
+
+	public void NoteFiredProjectile(int projectileid, UnityEngine.Vector3 startPos, UnityEngine.Vector3 startVel, AttackEntity attackEnt, ItemDefinition firedItemDef, Item pickupItem = null)
+	{
+		BaseProjectile baseProjectile = attackEnt as BaseProjectile;
+		ItemModProjectile component = firedItemDef.GetComponent<ItemModProjectile>();
+		Projectile component2 = component.projectileObject.Get().GetComponent<Projectile>();
+		if (startPos.IsNaNOrInfinity() || startVel.IsNaNOrInfinity())
+		{
+			string text = component2.name;
+			AntiHack.Log(this, AntiHackType.ProjectileHack, "Contains NaN (" + text + ")");
+			stats.combat.Log(baseProjectile, "projectile_nan");
+			return;
+		}
+		if (ConVar.AntiHack.projectile_protection > 0)
+		{
+			bool flag = true;
+			if (ConVar.AntiHack.projectile_protection >= 2)
+			{
+				float num = 5f;
+				float num2 = UnityEngine.Vector3.Distance(eyes.position, startPos);
+				if (num2 > num)
+				{
+					string text2 = component2.name;
+					AntiHack.Log(this, AntiHackType.ProjectileHack, "Distance (" + text2 + " on launch with " + num2 + "m > " + num + "m)");
+					flag = false;
+				}
+			}
+			if (ConVar.AntiHack.projectile_protection >= 3)
+			{
+				UnityEngine.Vector3 position = eyes.position;
+				UnityEngine.Vector3 vector = startPos;
+				if (!GamePhysics.LineOfSight(position, vector, 2162688))
+				{
+					string text3 = component2.name;
+					AntiHack.Log(this, AntiHackType.ProjectileHack, string.Concat("Line of sight (", text3, " on launch) ", position, " ", vector));
+					flag = false;
+				}
+			}
+			if (!flag)
+			{
+				AntiHack.AddViolation(this, AntiHackType.ProjectileHack, ConVar.AntiHack.projectile_penalty);
+				startPos = eyes.position;
+			}
+		}
+		FiredProjectile firedProjectile = default(FiredProjectile);
+		firedProjectile.itemDef = firedItemDef;
+		firedProjectile.itemMod = component;
+		firedProjectile.projectilePrefab = component2;
+		firedProjectile.firedTime = UnityEngine.Time.realtimeSinceStartup;
+		firedProjectile.weaponSource = attackEnt;
+		firedProjectile.weaponPrefab = ((!(attackEnt == null)) ? GameManager.server.FindPrefab(StringPool.Get(attackEnt.prefabID)).GetComponent<AttackEntity>() : null);
+		firedProjectile.projectileModifier = ((!(baseProjectile == null)) ? baseProjectile.GetProjectileModifier() : Projectile.Modifier.Default);
+		firedProjectile.pickupItem = pickupItem;
+		firedProjectile.integrity = 1f;
+		firedProjectile.origin = startPos;
+		firedProjectile.position = startPos;
+		firedProjectile.velocity = startVel;
+		FiredProjectile value = firedProjectile;
+		firedProjectiles.Add(projectileid, value);
+	}
+
+	public override bool CanUseNetworkCache(Connection connection)
+	{
+		if (net == null)
+		{
+			return true;
+		}
+		if (net.connection != connection)
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		bool flag = net != null && net.connection == info.forConnection;
+		info.msg.basePlayer = Facepunch.Pool.Get<ProtoBuf.BasePlayer>();
+		info.msg.basePlayer.userid = userID;
+		info.msg.basePlayer.name = displayName;
+		info.msg.basePlayer.playerFlags = (int)playerFlags;
+		info.msg.basePlayer.heldEntity = svActiveItemID;
+		if (IsConnected && (IsAdmin || IsDeveloper))
+		{
+			info.msg.basePlayer.skinCol = net.connection.info.GetFloat("global.skincol", -1f);
+			info.msg.basePlayer.skinTex = net.connection.info.GetFloat("global.skintex", -1f);
+			info.msg.basePlayer.skinMesh = net.connection.info.GetFloat("global.skinmesh", -1f);
+		}
+		else
+		{
+			info.msg.basePlayer.skinCol = -1f;
+			info.msg.basePlayer.skinTex = -1f;
+			info.msg.basePlayer.skinMesh = -1f;
+		}
+		if (info.forDisk || flag)
+		{
+			info.msg.basePlayer.metabolism = metabolism.Save();
+		}
+		if (!info.forDisk && !flag)
+		{
+			info.msg.basePlayer.playerFlags &= -5;
+			info.msg.basePlayer.playerFlags &= -129;
+		}
+		info.msg.basePlayer.inventory = inventory.Save(info.forDisk || flag);
+		modelState.sleeping = IsSleeping();
+		info.msg.basePlayer.modelState = modelState.Copy();
+		if (!info.forDisk)
+		{
+			info.msg.basePlayer.mounted = mounted.uid;
+		}
+		if (flag)
+		{
+			info.msg.basePlayer.persistantData = SingletonComponent<ServerMgr>.Instance.persistance.GetPlayerInfo(userID);
+		}
+		if (info.forDisk)
+		{
+			info.msg.basePlayer.currentLife = lifeStory;
+			info.msg.basePlayer.previousLife = previousLifeStory;
+		}
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (info.msg.basePlayer != null)
+		{
+			ProtoBuf.BasePlayer basePlayer = info.msg.basePlayer;
+			userID = basePlayer.userid;
+			UserIDString = userID.ToString();
+			if (basePlayer.name != null)
+			{
+				_displayName = basePlayer.name;
+				if (string.IsNullOrEmpty(_displayName.Trim()))
+				{
+					_displayName = "Blaster :D";
+				}
+			}
+			playerFlags = (PlayerFlags)basePlayer.playerFlags;
+			if (basePlayer.metabolism != null)
+			{
+				metabolism.Load(basePlayer.metabolism);
+			}
+			if (basePlayer.inventory != null)
+			{
+				inventory.Load(basePlayer.inventory);
+			}
+			if (basePlayer.modelState != null)
+			{
+				if (modelState != null)
+				{
+					modelState.ResetToPool();
+					modelState = null;
+				}
+				modelState = basePlayer.modelState;
+				basePlayer.modelState = null;
+			}
+		}
+		if (info.fromDisk)
+		{
+			lifeStory = info.msg.basePlayer.currentLife;
+			if (lifeStory != null)
+			{
+				lifeStory.ShouldPool = false;
+			}
+			previousLifeStory = info.msg.basePlayer.previousLife;
+			if (previousLifeStory != null)
+			{
+				previousLifeStory.ShouldPool = false;
+			}
+			SetPlayerFlag(PlayerFlags.Sleeping, b: false);
+			StartSleeping();
+			SetPlayerFlag(PlayerFlags.Connected, b: false);
+			if (lifeStory == null && IsAlive())
+			{
+				LifeStoryStart();
+			}
+		}
+	}
+
+	public bool CanSuicide()
+	{
+		if (IsAdmin || IsDeveloper)
+		{
+			return true;
+		}
+		return UnityEngine.Time.realtimeSinceStartup > nextSuicideTime;
+	}
+
+	public void MarkSuicide()
+	{
+		nextSuicideTime = UnityEngine.Time.realtimeSinceStartup + 60f;
+	}
+
+	public Item GetActiveItem()
+	{
+		if (svActiveItemID == 0)
+		{
+			return null;
+		}
+		if (IsDead())
+		{
+			return null;
+		}
+		if (inventory == null || inventory.containerBelt == null)
+		{
+			return null;
+		}
+		return inventory.containerBelt.FindItemByUID(svActiveItemID);
+	}
+
+	public void MovePosition(UnityEngine.Vector3 newPos)
+	{
+		base.transform.position = newPos;
+		tickInterpolator.Reset(newPos);
+	}
+
+	public override void ServerInit()
+	{
+		stats = new PlayerStatistics(this);
+		if (userID == 0)
+		{
+			userID = (ulong)(76561190000000000L + UnityEngine.Random.Range(0, 10000000));
+			UserIDString = userID.ToString();
+		}
+		UpdatePlayerCollider(state: true);
+		UpdatePlayerRigidbody(!IsSleeping());
+		base.ServerInit();
+		inventory.ServerInit(this);
+		metabolism.ServerInit(this);
+	}
+
+	internal override void DoServerDestroy()
+	{
+		base.DoServerDestroy();
+		if ((bool)inventory)
+		{
+			inventory.DoDestroy();
+		}
+		sleepingPlayerList.Remove(this);
+	}
+
+	protected void ServerUpdate(float deltaTime)
+	{
+		if (!Network.Net.sv.IsConnected())
+		{
+			return;
+		}
+		LifeStoryUpdate(deltaTime);
+		FinalizeTick(deltaTime);
+		desyncTime = Mathf.Max(timeSinceLastTick - deltaTime, 0f);
+		if (!(UnityEngine.Time.realtimeSinceStartup < lastPlayerTick + 0.0625f))
+		{
+			if (lastPlayerTick < UnityEngine.Time.realtimeSinceStartup - 6.25f)
+			{
+				lastPlayerTick = UnityEngine.Time.realtimeSinceStartup - UnityEngine.Random.Range(0f, 0.0625f);
+			}
+			while (lastPlayerTick < UnityEngine.Time.realtimeSinceStartup)
+			{
+				lastPlayerTick += 0.0625f;
+			}
+			if (IsConnected)
+			{
+				ConnectedPlayerUpdate(0.0625f);
+			}
+		}
+	}
+
+	private void ConnectedPlayerUpdate(float deltaTime)
+	{
+		SendEntityUpdate();
+		if (IsReceivingSnapshot)
+		{
+			if (SnapshotQueue.Length == 0 && EACServer.IsAuthenticated(userID))
+			{
+				EnterGame();
+			}
+			return;
+		}
+		if (IsAlive())
+		{
+			metabolism.ServerUpdate(this, deltaTime);
+			if (timeSinceLastTick > (float)ConVar.Server.playertimeout)
+			{
+				lastTickTime = 0f;
+				Kick("Unresponsive");
+				return;
+			}
+		}
+		int num = (int)net.connection.GetSecondsConnected();
+		int num2 = num - secondsConnected;
+		if (num2 > 0)
+		{
+			stats.Add("time", num2, Stats.Server);
+			secondsConnected = num;
+		}
+		SendModelState();
+	}
+
+	private void EnterGame()
+	{
+		SetPlayerFlag(PlayerFlags.ReceivingSnapshot, b: false);
+		ClientRPCPlayer(null, this, "FinishLoading");
+		if (net != null)
+		{
+			EACServer.OnFinishLoading(net.connection);
+		}
+		Debug.LogFormat("{0} has entered the game", this);
+	}
+
+	[RPC_Server.FromOwner]
+	[RPC_Server]
+	private void ClientKeepConnectionAlive(RPCMessage msg)
+	{
+		lastTickTime = UnityEngine.Time.time;
+	}
+
+	[RPC_Server]
+	[RPC_Server.FromOwner]
+	private void ClientLoadingComplete(RPCMessage msg)
+	{
+	}
+
+	public void PlayerInit(Connection c)
+	{
+		using (TimeWarning.New("PlayerInit", 10L))
+		{
+			CancelInvoke(base.KillMessage);
+			SetPlayerFlag(PlayerFlags.Connected, b: true);
+			activePlayerList.Add(this);
+			userID = c.userid;
+			UserIDString = userID.ToString();
+			_displayName = StringEx.ToPrintable(c.username, 32);
+			c.player = this;
+			tickInterpolator.Reset(base.transform.position);
+			lastTickTime = 0f;
+			lastInputTime = 0f;
+			SetPlayerFlag(PlayerFlags.ReceivingSnapshot, b: true);
+			stats.Init();
+			previousLifeStory = SingletonComponent<ServerMgr>.Instance.persistance.GetLastLifeStory(userID);
+			SetPlayerFlag(PlayerFlags.IsAdmin, c.authLevel > 0);
+			SetPlayerFlag(PlayerFlags.IsDeveloper, DeveloperList.IsDeveloper(this));
+			if (IsDead() && net.SwitchGroup(BaseNetworkable.LimboNetworkGroup))
+			{
+				SendNetworkGroupChange();
+			}
+			net.OnConnected(c);
+			net.StartSubscriber();
+			SendAsSnapshot(net.connection);
+			ClientRPCPlayer(null, this, "StartLoading");
+			Interface.CallHook("OnPlayerInit", this);
+			if (net != null)
+			{
+				EACServer.OnStartLoading(net.connection);
+			}
+			SendGlobalSnapshot();
+			SendFullSnapshot();
+		}
+	}
+
+	public void SendDeathInformation()
+	{
+		ClientRPCPlayer(null, this, "OnDied");
+	}
+
+	public void SendRespawnOptions()
+	{
+		using RespawnInformation respawnInformation = Facepunch.Pool.Get<RespawnInformation>();
+		respawnInformation.spawnOptions = Facepunch.Pool.Get<List<RespawnInformation.SpawnOptions>>();
+		SleepingBag[] array = SleepingBag.FindForPlayer(userID, ignoreTimers: true);
+		foreach (SleepingBag sleepingBag in array)
+		{
+			RespawnInformation.SpawnOptions spawnOptions = Facepunch.Pool.Get<RespawnInformation.SpawnOptions>();
+			spawnOptions.id = sleepingBag.net.ID;
+			spawnOptions.name = sleepingBag.niceName;
+			spawnOptions.type = RespawnInformation.SpawnOptions.RespawnType.SleepingBag;
+			spawnOptions.unlockSeconds = sleepingBag.unlockSeconds;
+			respawnInformation.spawnOptions.Add(spawnOptions);
+		}
+		respawnInformation.previousLife = previousLifeStory;
+		respawnInformation.fadeIn = previousLifeStory != null && previousLifeStory.timeDied > Epoch.Current - 5;
+		ClientRPCPlayer(null, this, "OnRespawnInformation", respawnInformation);
+	}
+
+	public virtual void StartSleeping()
+	{
+		if (!IsSleeping() && Interface.CallHook("OnPlayerSleep", this) == null)
+		{
+			EnsureDismounted();
+			SetPlayerFlag(PlayerFlags.Sleeping, b: true);
+			if (!sleepingPlayerList.Contains(this))
+			{
+				sleepingPlayerList.Add(this);
+			}
+			CancelInvoke(InventoryUpdate);
+			inventory.loot.Clear();
+			inventory.crafting.CancelAll(returnItems: true);
+			UpdatePlayerCollider(state: true);
+			UpdatePlayerRigidbody(state: false);
+		}
+	}
+
+	public virtual void EndSleeping()
+	{
+		if (IsSleeping())
+		{
+			SetPlayerFlag(PlayerFlags.Sleeping, b: false);
+			sleepingPlayerList.Remove(this);
+			InvokeRepeating(InventoryUpdate, 1f, 0.1f * UnityEngine.Random.Range(0.99f, 1.01f));
+			UpdatePlayerCollider(state: true);
+			UpdatePlayerRigidbody(state: true);
+			Interface.CallHook("OnPlayerSleepEnded", this);
+		}
+	}
+
+	public virtual void EndLooting()
+	{
+		if ((bool)inventory.loot)
+		{
+			inventory.loot.Clear();
+		}
+	}
+
+	public virtual void OnDisconnected()
+	{
+		stats.Save();
+		EndLooting();
+		if (IsAlive() || IsSleeping())
+		{
+			StartSleeping();
+		}
+		else
+		{
+			Invoke(base.KillMessage, 0f);
+		}
+		activePlayerList.Remove(this);
+		SetPlayerFlag(PlayerFlags.Connected, b: false);
+		if (net != null)
+		{
+			net.OnDisconnected();
+		}
+		ResetAntiHack();
+	}
+
+	private void InventoryUpdate()
+	{
+		if (IsConnected && !IsDead())
+		{
+			inventory.ServerUpdate(0.1f);
+		}
+	}
+
+	[RPC_Server.FromOwner]
+	[RPC_Server]
+	private void OnPlayerLanded(RPCMessage msg)
+	{
+		float num = msg.read.Float();
+		if (float.IsNaN(num) || float.IsInfinity(num))
+		{
+			return;
+		}
+		float num2 = Mathf.InverseLerp(-15f, -100f, num);
+		if (num2 != 0f && Interface.CallHook("OnPlayerLand", this, num2) == null)
+		{
+			metabolism.bleeding.Add(num2 * 0.5f);
+			float num3 = num2 * 500f;
+			Hurt(num3, DamageType.Fall);
+			if (num3 > 20f && fallDamageEffect.isValid)
+			{
+				Effect.server.Run(fallDamageEffect.resourcePath, base.transform.position, UnityEngine.Vector3.zero);
+			}
+			Interface.CallHook("OnPlayerLanded", this, num2);
+		}
+	}
+
+	private void SV_StartLootingPlayer(uint entityID)
+	{
+		BasePlayer basePlayer = BaseNetworkable.serverEntities.Find(entityID) as BasePlayer;
+		if (!(basePlayer == null))
+		{
+			inventory.loot.StartLootingPlayer(basePlayer);
+		}
+	}
+
+	public void SendGlobalSnapshot()
+	{
+		using (TimeWarning.New("SendGlobalSnapshot", 10L))
+		{
+			EnterVisibility(Network.Net.sv.visibility.Get(0u));
+		}
+	}
+
+	public void SendFullSnapshot()
+	{
+		using (TimeWarning.New("SendFullSnapshot"))
+		{
+			foreach (Group item in net.subscriber.subscribed)
+			{
+				if (item.ID != 0)
+				{
+					EnterVisibility(item);
+				}
+			}
+		}
+	}
+
+	public override UnityEngine.Vector3 GetNetworkRotation()
+	{
+		return viewAngles;
+	}
+
+	public override void OnNetworkGroupLeave(Group group)
+	{
+		base.OnNetworkGroupLeave(group);
+		LeaveVisibility(group);
+	}
+
+	private void LeaveVisibility(Group group)
+	{
+		ServerMgr.OnLeaveVisibility(net.connection, group);
+		ClearEntityQueue(group);
+	}
+
+	public override void OnNetworkGroupEnter(Group group)
+	{
+		base.OnNetworkGroupEnter(group);
+		if (!IsReceivingSnapshot)
+		{
+			EnterVisibility(group);
+		}
+	}
+
+	private void EnterVisibility(Group group)
+	{
+		ServerMgr.OnEnterVisibility(net.connection, group);
+		SendSnapshots(group.networkables);
+	}
+
+	public void CheckDeathCondition(HitInfo info = null)
+	{
+		Assert.IsTrue(base.isServer, "CheckDeathCondition called on client!");
+		if (!IsSpectating() && !IsDead() && metabolism.ShouldDie())
+		{
+			Die(info);
+		}
+	}
+
+	public override void OnKilled(HitInfo info)
+	{
+		SetPlayerFlag(PlayerFlags.HasBuildingPrivilege, b: false);
+		SetPlayerFlag(PlayerFlags.InBuildingPrivilege, b: false);
+		EnsureDismounted();
+		EndSleeping();
+		EndLooting();
+		ClearHostileTime();
+		stats.Add("deaths", 1, Stats.All);
+		UpdatePlayerCollider(state: false);
+		UpdatePlayerRigidbody(state: false);
+		StopWounded();
+		inventory.crafting.CancelAll(returnItems: true);
+		if (EACServer.playerTracker != null)
+		{
+			using (TimeWarning.New("playerTracker.LogPlayerDespawn"))
+			{
+				PlayerDespawn despawn = default(PlayerDespawn);
+				despawn.Client = EACServer.GetClient(userID);
+				EACServer.playerTracker.LogPlayerDespawn(despawn);
+			}
+		}
+		using (TimeWarning.New("Create corpse"))
+		{
+			LootableCorpse lootableCorpse = DropCorpse("assets/prefabs/player/player_corpse.prefab") as LootableCorpse;
+			if ((bool)lootableCorpse)
+			{
+				lootableCorpse.SetFlag(Flags.Reserved5, HasPlayerFlag(PlayerFlags.DisplaySash));
+				lootableCorpse.TakeFrom(inventory.containerMain, inventory.containerWear, inventory.containerBelt);
+				lootableCorpse.playerName = displayName;
+				lootableCorpse.playerSteamID = userID;
+				lootableCorpse.Spawn();
+				lootableCorpse.TakeChildren(this);
+				ResourceDispenser component = lootableCorpse.GetComponent<ResourceDispenser>();
+				int num = 2;
+				if (lifeStory != null)
+				{
+					num += Mathf.Clamp(Mathf.FloorToInt(lifeStory.secondsAlive / 180f), 0, 20);
+				}
+				component.containedItems.Add(new ItemAmount(ItemManager.FindItemDefinition("fat.animal"), num));
+			}
+		}
+		inventory.Strip();
+		if (lastDamage == DamageType.Fall)
+		{
+			stats.Add("death_fall", 1);
+		}
+		string empty = string.Empty;
+		string empty2 = string.Empty;
+		if (info != null)
+		{
+			if ((bool)info.Initiator)
+			{
+				if (info.Initiator == this)
+				{
+					empty = ToString() + " was suicide by " + lastDamage;
+					empty2 = "You died: suicide by " + lastDamage;
+					if (lastDamage == DamageType.Suicide)
+					{
+						Facepunch.Rust.Analytics.Death("suicide");
+						stats.Add("death_suicide", 1, Stats.All);
+					}
+					else
+					{
+						Facepunch.Rust.Analytics.Death("selfinflicted");
+						stats.Add("death_selfinflicted", 1);
+					}
+				}
+				else if (info.Initiator is BasePlayer)
+				{
+					BasePlayer basePlayer = info.Initiator.ToPlayer();
+					empty = ToString() + " was killed by " + basePlayer.ToString();
+					empty2 = "You died: killed by " + basePlayer.displayName + " (" + basePlayer.userID + ")";
+					basePlayer.stats.Add("kill_player", 1, Stats.All);
+					if (info.WeaponPrefab != null)
+					{
+						Facepunch.Rust.Analytics.Death(info.WeaponPrefab.ShortPrefabName);
+					}
+					else
+					{
+						Facepunch.Rust.Analytics.Death("player");
+					}
+				}
+				else
+				{
+					empty = ToString() + " was killed by " + info.Initiator.ShortPrefabName + " (" + info.Initiator.Categorize() + ")";
+					empty2 = "You died: killed by " + info.Initiator.Categorize();
+					stats.Add("death_" + info.Initiator.Categorize(), 1);
+					Facepunch.Rust.Analytics.Death(info.Initiator.Categorize());
+				}
+			}
+			else if (lastDamage == DamageType.Fall)
+			{
+				empty = ToString() + " was killed by fall!";
+				empty2 = "You died: killed by fall!";
+				Facepunch.Rust.Analytics.Death("fall");
+			}
+			else
+			{
+				empty = ToString() + " was killed by " + info.damageTypes.GetMajorityDamageType();
+				empty2 = "You died: " + info.damageTypes.GetMajorityDamageType();
+			}
+		}
+		else
+		{
+			empty = string.Concat(ToString(), " died (", lastDamage, ")");
+			empty2 = "You died: " + lastDamage;
+		}
+		using (TimeWarning.New("LogMessage"))
+		{
+			Debug.Log(empty);
+			ConsoleMessage(empty2);
+		}
+		SendNetworkUpdateImmediate();
+		LifeStoryLogDeath(info, lastDamage);
+		LifeStoryEnd();
+		if (net.connection == null)
+		{
+			Invoke(base.KillMessage, 0f);
+			return;
+		}
+		SendRespawnOptions();
+		SendDeathInformation();
+		stats.Save();
+	}
+
+	public void RespawnAt(UnityEngine.Vector3 position, Quaternion rotation)
+	{
+		SetPlayerFlag(PlayerFlags.Wounded, b: false);
+		SetPlayerFlag(PlayerFlags.HasBuildingPrivilege, b: false);
+		SetPlayerFlag(PlayerFlags.InBuildingPrivilege, b: false);
+		SetPlayerFlag(PlayerFlags.ReceivingSnapshot, b: true);
+		SetPlayerFlag(PlayerFlags.DisplaySash, b: false);
+		ServerPerformance.spawns++;
+		base.transform.position = position;
+		base.transform.rotation = rotation;
+		tickInterpolator.Reset(position);
+		lastTickTime = 0f;
+		StopWounded();
+		StopSpectating();
+		UpdateNetworkGroup();
+		UpdatePlayerCollider(state: true);
+		UpdatePlayerRigidbody(state: false);
+		StartSleeping();
+		LifeStoryStart();
+		metabolism.Reset();
+		InitializeHealth(StartHealth(), StartMaxHealth());
+		inventory.GiveDefaultItems();
+		SendNetworkUpdateImmediate();
+		ClearEntityQueue();
+		ClientRPCPlayer(null, this, "StartLoading");
+		Networkable networkable = net;
+		Interface.CallHook("OnPlayerRespawned", this);
+		if (networkable != null)
+		{
+			EACServer.OnStartLoading(net.connection);
+		}
+		SendFullSnapshot();
+	}
+
+	public void Respawn()
+	{
+		SpawnPoint spawnPoint = ServerMgr.FindSpawnPoint();
+		object obj = Interface.CallHook("OnPlayerRespawn", this);
+		if (obj is SpawnPoint)
+		{
+			spawnPoint = (SpawnPoint)obj;
+		}
+		RespawnAt(spawnPoint.pos, spawnPoint.rot);
+	}
+
+	public bool IsImmortal()
+	{
+		if ((IsAdmin || IsDeveloper) && IsConnected && net.connection != null && net.connection.info.GetBool("global.god"))
+		{
+			return true;
+		}
+		if (WoundingCausingImmportality())
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public float TimeAlive()
+	{
+		return lifeStory.secondsAlive;
+	}
+
+	public override void Hurt(HitInfo info)
+	{
+		if (IsDead() || IsImmortal() || Interface.CallHook("IOnBasePlayerHurt", this, info) != null)
+		{
+			return;
+		}
+		if (ConVar.Server.pve && (bool)info.Initiator && info.Initiator is BasePlayer && info.Initiator != this)
+		{
+			BasePlayer basePlayer = info.Initiator as BasePlayer;
+			basePlayer.Hurt(info.damageTypes.Total(), DamageType.Generic);
+			return;
+		}
+		metabolism.pending_health.Subtract(info.damageTypes.Total() * 10f);
+		base.Hurt(info);
+		if (EACServer.playerTracker != null && info.Initiator != null && info.Initiator is BasePlayer)
+		{
+			PlayerTakeDamage takeDamage = default(PlayerTakeDamage);
+			BasePlayer basePlayer2 = info.Initiator.ToPlayer();
+			takeDamage.VictimClient = EACServer.GetClient(userID);
+			takeDamage.AttackerClient = EACServer.GetClient(basePlayer2.userID);
+			takeDamage.HitBoneID = (int)info.HitBone;
+			if (info.isHeadshot)
+			{
+				takeDamage.Flags |= PlayerTakeDamageFlags.PlayerTakeDamageFlagHeadshot;
+			}
+			takeDamage.WeaponID = 0;
+			if (info.Weapon != null)
+			{
+				Item item = info.Weapon.GetItem();
+				if (item != null)
+				{
+					takeDamage.WeaponID = item.info.itemid;
+				}
+			}
+			UnityEngine.Vector3 position = basePlayer2.eyes.position;
+			UnityEngine.Vector3 eulerAngles = basePlayer2.eyes.rotation.eulerAngles;
+			UnityEngine.Vector3 position2 = eyes.position;
+			UnityEngine.Vector3 eulerAngles2 = eyes.rotation.eulerAngles;
+			takeDamage.AttackerPosition = new EasyAntiCheat.Server.Hydra.Cerberus.Vector3(position.x, position.y, position.z);
+			takeDamage.AttackerViewAngles = new EasyAntiCheat.Server.Hydra.Cerberus.Vector3(eulerAngles.x, eulerAngles.y, eulerAngles.z);
+			takeDamage.VictimPosition = new EasyAntiCheat.Server.Hydra.Cerberus.Vector3(position2.x, position2.y, position2.z);
+			takeDamage.VictimViewAngles = new EasyAntiCheat.Server.Hydra.Cerberus.Vector3(eulerAngles2.x, eulerAngles2.y, eulerAngles2.z);
+			EACServer.playerTracker.LogPlayerTakeDamage(takeDamage);
+		}
+		metabolism.SendChangesToClient();
+		if (info.PointStart != UnityEngine.Vector3.zero)
+		{
+			ClientRPCPlayer(null, this, "DirectionalDamage", info.PointStart, (int)info.damageTypes.GetMajorityDamageType());
+		}
+	}
+
+	public static BasePlayer FindByID(ulong userID)
+	{
+		using (TimeWarning.New("BasePlayer.FindByID"))
+		{
+			return activePlayerList.Find((BasePlayer x) => x.userID == userID);
+		}
+	}
+
+	public static BasePlayer FindSleeping(ulong userID)
+	{
+		using (TimeWarning.New("BasePlayer.FindSleeping"))
+		{
+			return sleepingPlayerList.Find((BasePlayer x) => x.userID == userID);
+		}
+	}
+
+	public void Command(string strCommand, params object[] arguments)
+	{
+		if (net.connection != null)
+		{
+			ConsoleNetwork.SendClientCommand(net.connection, strCommand, arguments);
+		}
+	}
+
+	public override void OnInvalidPosition()
+	{
+		if (!IsDead())
+		{
+			Die();
+		}
+	}
+
+	private static BasePlayer Find(string strNameOrIDOrIP, List<BasePlayer> list)
+	{
+		BasePlayer basePlayer = list.Find((BasePlayer x) => x.UserIDString == strNameOrIDOrIP);
+		if ((bool)basePlayer)
+		{
+			return basePlayer;
+		}
+		BasePlayer basePlayer2 = list.Find((BasePlayer x) => x.displayName.StartsWith(strNameOrIDOrIP, StringComparison.CurrentCultureIgnoreCase));
+		if ((bool)basePlayer2)
+		{
+			return basePlayer2;
+		}
+		BasePlayer basePlayer3 = list.Find((BasePlayer x) => x.net != null && x.net.connection != null && x.net.connection.ipaddress == strNameOrIDOrIP);
+		if ((bool)basePlayer3)
+		{
+			return basePlayer3;
+		}
+		return null;
+	}
+
+	public static BasePlayer Find(string strNameOrIDOrIP)
+	{
+		return Find(strNameOrIDOrIP, activePlayerList);
+	}
+
+	public static BasePlayer FindSleeping(string strNameOrIDOrIP)
+	{
+		return Find(strNameOrIDOrIP, sleepingPlayerList);
+	}
+
+	public void SendConsoleCommand(string command, params object[] obj)
+	{
+		ConsoleNetwork.SendClientCommand(net.connection, command, obj);
+	}
+
+	public void UpdateRadiation(float fAmount)
+	{
+		metabolism.radiation_level.Increase(fAmount);
+	}
+
+	public override float RadiationExposureFraction()
+	{
+		float num = Mathf.Clamp(baseProtection.amounts[17], 0f, 1f);
+		return 1f - num;
+	}
+
+	public override float RadiationProtection()
+	{
+		return baseProtection.amounts[17] * 100f;
+	}
+
+	public override void OnHealthChanged(float oldvalue, float newvalue)
+	{
+		if (Interface.CallHook("OnPlayerHealthChange", this, oldvalue, newvalue) == null)
+		{
+			base.OnHealthChanged(oldvalue, newvalue);
+			metabolism.isDirty = true;
+		}
+	}
+
+	public void SV_ClothingChanged()
+	{
+		UpdateProtectionFromClothing();
+		UpdateMoveSpeedFromClothing();
+	}
+
+	public bool IsNoob()
+	{
+		return !HasPlayerFlag(PlayerFlags.DisplaySash);
+	}
+
+	public bool HasHostileItem()
+	{
+		using (TimeWarning.New("BasePlayer.HasHostileItem"))
+		{
+			foreach (Item item in inventory.containerBelt.itemList)
+			{
+				if (IsHostileItem(item))
+				{
+					return true;
+				}
+			}
+			foreach (Item item2 in inventory.containerMain.itemList)
+			{
+				if (IsHostileItem(item2))
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+	}
+
+	public bool IsHostileItem(Item item)
+	{
+		if (!item.info.isHoldable)
+		{
+			return false;
+		}
+		ItemModEntity component = item.info.GetComponent<ItemModEntity>();
+		if (component == null)
+		{
+			return false;
+		}
+		GameObject gameObject = component.entityPrefab.Get();
+		if (gameObject == null)
+		{
+			return false;
+		}
+		AttackEntity component2 = gameObject.GetComponent<AttackEntity>();
+		if (component2 == null)
+		{
+			return false;
+		}
+		return component2.hostile;
+	}
+
+	public override void GiveItem(Item item, GiveItemReason reason = GiveItemReason.Generic)
+	{
+		if (reason == GiveItemReason.ResourceHarvested)
+		{
+			stats.Add($"harvest.{item.info.shortname}", item.amount);
+		}
+		if (inventory.GiveItem(item))
+		{
+			if (!string.IsNullOrEmpty(item.name))
+			{
+				Command("note.inv", item.info.itemid, item.amount, item.name, (int)reason);
+			}
+			else
+			{
+				Command("note.inv", item.info.itemid, item.amount, string.Empty, (int)reason);
+			}
+		}
+		else
+		{
+			item.Drop(inventory.containerMain.dropPosition, inventory.containerMain.dropVelocity);
+		}
+	}
+
+	public override void AttackerInfo(PlayerLifeStory.DeathInfo info)
+	{
+		info.attackerName = displayName;
+		info.attackerSteamID = userID;
+	}
+
+	public override void Die(HitInfo info = null)
+	{
+		using (TimeWarning.New("Player.Die"))
+		{
+			if (!IsDead() && Interface.CallHook("OnPlayerDie", this, info) == null)
+			{
+				if (Belt != null)
+				{
+					UnityEngine.Vector3 vector = new UnityEngine.Vector3(UnityEngine.Random.Range(-2f, 2f), 0.2f, UnityEngine.Random.Range(-2f, 2f));
+					Belt.DropActive(vector.normalized * 3f);
+				}
+				if (!WoundInsteadOfDying(info))
+				{
+					base.Die(info);
+				}
+			}
+		}
+	}
+
+	public void Kick(string reason)
+	{
+		if (IsConnected)
+		{
+			Network.Net.sv.Kick(net.connection, reason);
+			Interface.CallHook("OnPlayerKicked", this, reason);
+		}
+	}
+
+	public override UnityEngine.Vector3 GetDropPosition()
+	{
+		return eyes.position;
+	}
+
+	public override UnityEngine.Vector3 GetDropVelocity()
+	{
+		return eyes.BodyForward() * 3f * UnityEngine.Random.Range(1f, 1.5f);
+	}
+
+	public virtual void SetInfo(string key, string val)
+	{
+		if (IsConnected)
+		{
+			net.connection.info.Set(key, val);
+		}
+	}
+
+	public virtual int GetInfoInt(string key, int defaultVal)
+	{
+		if (!IsConnected)
+		{
+			return defaultVal;
+		}
+		return net.connection.info.GetInt(key, defaultVal);
+	}
+
+	[RPC_Server]
+	public void PerformanceReport(RPCMessage msg)
+	{
+		int num = msg.read.Int32();
+		int num2 = msg.read.Int32();
+		float num3 = msg.read.Float();
+		int num4 = msg.read.Int32();
+		Debug.LogFormat("{0}{1}{2}{3}{4}", (num + "MB").PadRight(9), (num2 + "MB").PadRight(9), (num3.ToString("0") + "FPS").PadRight(8), NumberExtensions.FormatSeconds(num4).PadRight(9), displayName);
+	}
+
+	public override bool ShouldNetworkTo(BasePlayer player)
+	{
+		if (IsSpectating() && player != this && !player.net.connection.info.GetBool("global.specnet"))
+		{
+			return false;
+		}
+		return base.ShouldNetworkTo(player);
+	}
+
+	internal void GiveAchievement(string name)
+	{
+		if (Rust.GameInfo.HasAchievements)
+		{
+			ClientRPCPlayer(null, this, "RecieveAchievement", name);
+		}
+	}
+
+	internal void LifeStoryStart()
+	{
+		Assert.IsTrue(lifeStory == null, "Stomping old lifeStory");
+		lifeStory = new PlayerLifeStory
+		{
+			ShouldPool = false
+		};
+		lifeStory.timeBorn = (uint)Epoch.Current;
+	}
+
+	internal void LifeStoryEnd()
+	{
+		SingletonComponent<ServerMgr>.Instance.persistance.AddLifeStory(userID, lifeStory);
+		previousLifeStory = lifeStory;
+		lifeStory = null;
+	}
+
+	internal void LifeStoryUpdate(float deltaTime)
+	{
+		if (lifeStory != null)
+		{
+			lifeStory.secondsAlive += deltaTime;
+			if (IsSleeping())
+			{
+				lifeStory.secondsSleeping += deltaTime;
+			}
+		}
+	}
+
+	internal void LifeStoryLogDeath(HitInfo deathBlow, DamageType lastDamage)
+	{
+		if (lifeStory == null)
+		{
+			return;
+		}
+		lifeStory.timeDied = (uint)Epoch.Current;
+		PlayerLifeStory.DeathInfo deathInfo = Facepunch.Pool.Get<PlayerLifeStory.DeathInfo>();
+		deathInfo.lastDamageType = (int)lastDamage;
+		if (deathBlow != null)
+		{
+			if (deathBlow.Initiator != null)
+			{
+				deathBlow.Initiator.AttackerInfo(deathInfo);
+			}
+			if (deathBlow.WeaponPrefab != null)
+			{
+				deathInfo.inflictorName = deathBlow.WeaponPrefab.ShortPrefabName;
+			}
+			if (deathBlow.HitBone != 0)
+			{
+				deathInfo.hitBone = StringPool.Get(deathBlow.HitBone);
+			}
+			else
+			{
+				deathInfo.hitBone = string.Empty;
+			}
+		}
+		else if (base.SecondsSinceAttacked <= 60f && lastAttacker != null)
+		{
+			lastAttacker.AttackerInfo(deathInfo);
+		}
+		lifeStory.deathInfo = deathInfo;
+	}
+
+	private void Tick_Spectator()
+	{
+		int num = 0;
+		if (serverInput.WasJustPressed(BUTTON.JUMP))
+		{
+			num++;
+		}
+		if (serverInput.WasJustPressed(BUTTON.DUCK))
+		{
+			num--;
+		}
+		if (num != 0)
+		{
+			SpectateOffset += num;
+			using (TimeWarning.New("UpdateSpectateTarget"))
+			{
+				UpdateSpectateTarget(spectateFilter);
+			}
+		}
+	}
+
+	public void UpdateSpectateTarget(string strName)
+	{
+		spectateFilter = strName;
+		IEnumerable<BaseEntity> enumerable = null;
+		if (spectateFilter.StartsWith("@"))
+		{
+			string filter = spectateFilter.Substring(1);
+			IEnumerable<BaseNetworkable> source = from x in BaseNetworkable.serverEntities
+				where StringEx.Contains(x.name, filter, CompareOptions.IgnoreCase)
+				where x != this
+				select x;
+			enumerable = source.Cast<BaseEntity>();
+		}
+		else
+		{
+			IEnumerable<BasePlayer> source2 = activePlayerList.Where((BasePlayer x) => !x.IsSpectating() && !x.IsDead() && !x.IsSleeping());
+			if (strName.Length > 0)
+			{
+				source2 = from x in source2
+					where StringEx.Contains(x.displayName, spectateFilter, CompareOptions.IgnoreCase) || x.UserIDString.Contains(spectateFilter)
+					where x != this
+					select x;
+			}
+			source2 = source2.OrderBy((BasePlayer x) => x.displayName);
+			enumerable = source2.Cast<BaseEntity>();
+		}
+		BaseEntity[] array = enumerable.ToArray();
+		if (array.Length == 0)
+		{
+			ChatMessage("No valid spectate targets!");
+			return;
+		}
+		BaseEntity baseEntity = array[SpectateOffset % array.Length];
+		if (!(baseEntity != null))
+		{
+			return;
+		}
+		if (baseEntity is BasePlayer)
+		{
+			ChatMessage("Spectating: " + (baseEntity as BasePlayer).displayName);
+		}
+		else
+		{
+			ChatMessage("Spectating: " + baseEntity.ToString());
+		}
+		ClearEntityQueue();
+		using (TimeWarning.New("SendEntitySnapshot"))
+		{
+			SendEntitySnapshot(baseEntity);
+		}
+		UnityEngine.TransformEx.Identity(base.gameObject);
+		using (TimeWarning.New("SetParent"))
+		{
+			SetParent(baseEntity);
+		}
+	}
+
+	public void StartSpectating()
+	{
+		if (!IsSpectating() && Interface.CallHook("OnPlayerSpectate", this, spectateFilter) == null)
+		{
+			SetPlayerFlag(PlayerFlags.Spectating, b: true);
+			UnityEngine.TransformEx.SetLayerRecursive(base.gameObject, 10);
+			CancelInvoke(InventoryUpdate);
+			ChatMessage("Becoming Spectator");
+			UpdateSpectateTarget(spectateFilter);
+		}
+	}
+
+	public void StopSpectating()
+	{
+		if (IsSpectating() && Interface.CallHook("OnPlayerSpectateEnd", this, spectateFilter) == null)
+		{
+			SetParent(null);
+			SetPlayerFlag(PlayerFlags.Spectating, b: false);
+			UnityEngine.TransformEx.SetLayerRecursive(base.gameObject, 17);
+		}
+	}
+
+	public void Teleport(BasePlayer player)
+	{
+		Teleport(player.transform.position);
+	}
+
+	public void Teleport(string strName, bool playersOnly)
+	{
+		BaseEntity[] array = Util.FindTargets(strName, playersOnly);
+		if (array != null && array.Length != 0)
+		{
+			BaseEntity baseEntity = array[UnityEngine.Random.Range(0, array.Length)];
+			Teleport(baseEntity.transform.position);
+		}
+	}
+
+	public void Teleport(UnityEngine.Vector3 position)
+	{
+		MovePosition(position);
+		ClientRPCPlayer(null, this, "ForcePositionTo", position);
+	}
+
+	public override float GetThreatLevel()
+	{
+		EnsureUpdated();
+		return cachedThreatLevel;
+	}
+
+	public void EnsureUpdated()
+	{
+		if (UnityEngine.Time.realtimeSinceStartup - lastUpdateTime < 30f)
+		{
+			return;
+		}
+		lastUpdateTime = UnityEngine.Time.realtimeSinceStartup;
+		cachedThreatLevel = 0f;
+		if (IsSleeping())
+		{
+			return;
+		}
+		if (inventory.containerWear.itemList.Count > 2)
+		{
+			cachedThreatLevel += 1f;
+		}
+		foreach (Item item in inventory.containerBelt.itemList)
+		{
+			BaseEntity heldEntity = item.GetHeldEntity();
+			if ((bool)heldEntity && heldEntity is BaseProjectile && !(heldEntity is BowWeapon))
+			{
+				cachedThreatLevel += 2f;
+				break;
+			}
+		}
+	}
+
+	public void OnReceivedTick(Stream stream)
+	{
+		using (TimeWarning.New("OnReceiveTickFromStream"))
+		{
+			PlayerTick playerTick = null;
+			using (TimeWarning.New("lastReceivedTick = data.Copy"))
+			{
+				playerTick = PlayerTick.Deserialize(stream, lastReceivedTick, isDelta: true);
+			}
+			using (TimeWarning.New("lastReceivedTick = data.Copy"))
+			{
+				lastReceivedTick = playerTick.Copy();
+			}
+			using (TimeWarning.New("OnReceiveTick"))
+			{
+				OnReceiveTick(playerTick, wasStalled);
+			}
+			using (TimeWarning.New("EACStateUpdate"))
+			{
+				EACStateUpdate();
+			}
+			lastTickTime = UnityEngine.Time.time;
+			playerTick.Dispose();
+		}
+	}
+
+	private void EACStateUpdate()
+	{
+		if (EACServer.playerTracker == null || IsReceivingSnapshot)
+		{
+			return;
+		}
+		UnityEngine.Vector3 position = eyes.position;
+		UnityEngine.Vector3 eulerAngles = eyes.rotation.eulerAngles;
+		EasyAntiCheat.Server.Hydra.Cerberus.PlayerTick tick = default(EasyAntiCheat.Server.Hydra.Cerberus.PlayerTick);
+		tick.Client = EACServer.GetClient(userID);
+		tick.PlayerPosition = new EasyAntiCheat.Server.Hydra.Cerberus.Vector3(position.x, position.y, position.z);
+		tick.PlayerViewAngles = new EasyAntiCheat.Server.Hydra.Cerberus.Vector3(eulerAngles.x, eulerAngles.y, eulerAngles.z);
+		if (!IsOnGround())
+		{
+			tick.Flags |= PlayerTickFlags.PlayerTickFlagAirborne;
+		}
+		using (TimeWarning.New("playerTracker.LogPlayerState"))
+		{
+			try
+			{
+				EACServer.playerTracker.LogPlayerTick(tick);
+			}
+			catch (Exception exception)
+			{
+				Debug.LogWarning("Disabling EAC Logging due to exception");
+				EACServer.playerTracker = null;
+				Debug.LogException(exception);
+			}
+		}
+	}
+
+	private void OnReceiveTick(PlayerTick msg, bool wasPlayerStalled)
+	{
+		if (msg.inputState != null)
+		{
+			serverInput.Flip(msg.inputState);
+		}
+		if (Interface.CallHook("OnPlayerTick", this, msg, wasPlayerStalled) != null)
+		{
+			return;
+		}
+		if (serverInput.current.buttons != serverInput.previous.buttons)
+		{
+			lastInputTime = UnityEngine.Time.time;
+		}
+		if (IsReceivingSnapshot)
+		{
+			return;
+		}
+		if (IsSpectating())
+		{
+			using (TimeWarning.New("Tick_Spectator"))
+			{
+				Tick_Spectator();
+				return;
+			}
+		}
+		if (IsDead())
+		{
+			return;
+		}
+		if (IsSleeping())
+		{
+			if (serverInput.WasJustPressed(BUTTON.FIRE_PRIMARY) || serverInput.WasJustPressed(BUTTON.FIRE_SECONDARY) || serverInput.WasJustPressed(BUTTON.JUMP) || serverInput.WasJustPressed(BUTTON.DUCK))
+			{
+				EndSleeping();
+				SendNetworkUpdateImmediate();
+			}
+			UpdateActiveItem(0u);
+			return;
+		}
+		UpdateActiveItem(msg.activeItem);
+		UpdateModelStateFromTick(msg);
+		if (!IsWounded())
+		{
+			UpdatePositionFromTick(msg, wasPlayerStalled);
+			UpdateRotationFromTick(msg);
+		}
+	}
+
+	internal void UpdateActiveItem(uint itemID)
+	{
+		Assert.IsTrue(base.isServer, "Realm should be server!");
+		if (svActiveItemID == itemID)
+		{
+			return;
+		}
+		Item activeItem = GetActiveItem();
+		svActiveItemID = 0u;
+		if (activeItem != null)
+		{
+			HeldEntity heldEntity = activeItem.GetHeldEntity() as HeldEntity;
+			if (heldEntity != null)
+			{
+				heldEntity.SetHeld(bHeld: false);
+			}
+		}
+		svActiveItemID = itemID;
+		SendNetworkUpdate();
+		Item activeItem2 = GetActiveItem();
+		if (activeItem2 != null)
+		{
+			HeldEntity heldEntity2 = activeItem2.GetHeldEntity() as HeldEntity;
+			if (heldEntity2 != null)
+			{
+				heldEntity2.SetHeld(bHeld: true);
+			}
+		}
+		inventory.UpdatedVisibleHolsteredItems();
+	}
+
+	internal void UpdateModelStateFromTick(PlayerTick tick)
+	{
+		if (tick.modelState != null && !ModelState.Equal(modelStateTick, tick.modelState))
+		{
+			if (modelStateTick != null)
+			{
+				modelStateTick.ResetToPool();
+			}
+			modelStateTick = tick.modelState;
+			tick.modelState = null;
+			tickNeedsFinalizing = true;
+		}
+	}
+
+	internal void UpdatePositionFromTick(PlayerTick tick, bool wasPlayerStalled)
+	{
+		if (tick.position.IsNaNOrInfinity() || tick.eyePos.IsNaNOrInfinity())
+		{
+			Kick("Kicked: Invalid Position");
+		}
+		else
+		{
+			if (isMounted || (modelState != null && modelState.sitting) || (tick.modelState != null && tick.modelState.sitting))
+			{
+				return;
+			}
+			if (wasPlayerStalled)
+			{
+				float num = UnityEngine.Vector3.Distance(tick.position, tickInterpolator.EndPoint);
+				if (num > 0.01f)
+				{
+					AntiHack.ResetTimer(this);
+				}
+				if (num > 0.5f)
+				{
+					ClientRPCPlayer(null, this, "ForcePositionTo", tickInterpolator.EndPoint);
+				}
+				return;
+			}
+			if (modelState == null || !modelState.flying || (!IsAdmin && !IsDeveloper))
+			{
+				float num2 = UnityEngine.Vector3.Distance(tick.position, tickInterpolator.EndPoint);
+				if (num2 > 5f)
+				{
+					AntiHack.ResetTimer(this);
+					ClientRPCPlayer(null, this, "ForcePositionTo", tickInterpolator.EndPoint);
+					return;
+				}
+			}
+			tickInterpolator.AddPoint(tick.position);
+			tickNeedsFinalizing = true;
+		}
+	}
+
+	internal void UpdateRotationFromTick(PlayerTick tick)
+	{
+		if (tick.inputState != null)
+		{
+			if (tick.inputState.aimAngles.IsNaNOrInfinity())
+			{
+				Kick("Kicked: Invalid Rotation");
+				return;
+			}
+			tickViewAngles = tick.inputState.aimAngles;
+			tickNeedsFinalizing = true;
+		}
+	}
+
+	public void UpdateEstimatedVelocity(UnityEngine.Vector3 lastPos, UnityEngine.Vector3 currentPos, float deltaTime)
+	{
+		estimatedVelocity = (currentPos - lastPos) / deltaTime;
+		estimatedSpeed = estimatedVelocity.magnitude;
+		estimatedSpeed2D = estimatedVelocity.Magnitude2D();
+		if (estimatedSpeed < 0.01f)
+		{
+			estimatedSpeed = 0f;
+		}
+		if (estimatedSpeed2D < 0.01f)
+		{
+			estimatedSpeed2D = 0f;
+		}
+	}
+
+	private void FinalizeTick(float deltaTime)
+	{
+		tickDeltaTime += deltaTime;
+		if (IsReceivingSnapshot || !tickNeedsFinalizing)
+		{
+			return;
+		}
+		tickNeedsFinalizing = false;
+		using (TimeWarning.New("ModelState"))
+		{
+			if (modelStateTick != null)
+			{
+				if (modelState != null)
+				{
+					if (modelStateTick.flying && !IsAdmin && !IsDeveloper)
+					{
+						AntiHack.NoteAdminHack(this);
+					}
+					if (ConVar.AntiHack.modelstate && TriggeredAntiHack())
+					{
+						modelStateTick.ducked = modelState.ducked;
+					}
+					modelState.ResetToPool();
+					modelState = null;
+				}
+				modelState = modelStateTick;
+				modelStateTick = null;
+				UpdateModelState();
+			}
+		}
+		using (TimeWarning.New("Transform"))
+		{
+			UpdateEstimatedVelocity(tickInterpolator.StartPoint, tickInterpolator.EndPoint, tickDeltaTime);
+			bool flag = tickInterpolator.StartPoint != tickInterpolator.EndPoint;
+			bool flag2 = UnityEngine.Vector3.Angle(tickViewAngles, viewAngles) > 0.01f;
+			if (flag)
+			{
+				if (AntiHack.ValidateMove(this, tickInterpolator, tickDeltaTime))
+				{
+					base.transform.position = tickInterpolator.EndPoint;
+					AntiHack.FadeViolations(this, tickDeltaTime);
+				}
+				else
+				{
+					flag = false;
+					ClientRPCPlayer(null, this, "ForcePositionTo", base.transform.position);
+				}
+			}
+			tickInterpolator.Reset(base.transform.position);
+			if (flag2)
+			{
+				viewAngles = tickViewAngles;
+				base.transform.hasChanged = true;
+			}
+			if (flag || flag2)
+			{
+				eyes.NetworkUpdate(Quaternion.Euler(viewAngles));
+			}
+		}
+		using (TimeWarning.New("AntiHack.EnforceViolations"))
+		{
+			AntiHack.EnforceViolations(this);
+		}
+		tickDeltaTime = 0f;
+	}
+
+	public bool IsWounded()
+	{
+		return HasPlayerFlag(PlayerFlags.Wounded);
+	}
+
+	private bool WoundInsteadOfDying(HitInfo info)
+	{
+		if (IsWounded())
+		{
+			return false;
+		}
+		if (!EligibleForWounding(info))
+		{
+			return false;
+		}
+		lastWoundedTime = UnityEngine.Time.realtimeSinceStartup;
+		base.health = UnityEngine.Random.Range(2, 6);
+		metabolism.bleeding.value = 0f;
+		StartWounded();
+		return true;
+	}
+
+	public virtual bool EligibleForWounding(HitInfo info)
+	{
+		object obj = Interface.CallHook("CanBeWounded", this, info);
+		if (obj is bool)
+		{
+			return (bool)obj;
+		}
+		if (!ConVar.Server.woundingenabled)
+		{
+			return false;
+		}
+		if (IsSleeping())
+		{
+			return false;
+		}
+		if (info == null)
+		{
+			return false;
+		}
+		if (UnityEngine.Time.realtimeSinceStartup - lastWoundedTime < 60f)
+		{
+			return false;
+		}
+		if (info.WeaponPrefab is BaseMelee)
+		{
+			return true;
+		}
+		if (info.WeaponPrefab is BaseProjectile)
+		{
+			return !info.isHeadshot;
+		}
+		return info.damageTypes.GetMajorityDamageType() switch
+		{
+			DamageType.Suicide => false, 
+			DamageType.Fall => true, 
+			DamageType.Bite => true, 
+			DamageType.Bleeding => true, 
+			DamageType.Hunger => true, 
+			DamageType.Thirst => true, 
+			DamageType.Poison => true, 
+			_ => false, 
+		};
+	}
+
+	public void StartWounded()
+	{
+		if (!IsWounded() && Interface.CallHook("OnPlayerWound", this) == null)
+		{
+			stats.Add("wounded", 1);
+			woundedDuration = UnityEngine.Random.Range(40f, 50f);
+			woundedStartTime = UnityEngine.Time.realtimeSinceStartup;
+			SetPlayerFlag(PlayerFlags.Wounded, b: true);
+			SendNetworkUpdateImmediate();
+			Invoke(WoundingTick, 1f);
+		}
+	}
+
+	public void StopWounded()
+	{
+		if (Interface.CallHook("OnPlayerRecover", this) == null)
+		{
+			SetPlayerFlag(PlayerFlags.Wounded, b: false);
+			CancelInvoke(WoundingTick);
+		}
+	}
+
+	public void ProlongWounding(float delay)
+	{
+		woundedDuration = Mathf.Max(woundedDuration, Mathf.Min(secondsSinceWoundedStarted + delay, woundedDuration + delay));
+	}
+
+	private void WoundingTick()
+	{
+		using (TimeWarning.New("WoundingTick"))
+		{
+			if (IsDead())
+			{
+				return;
+			}
+			if (secondsSinceWoundedStarted >= woundedDuration)
+			{
+				if (UnityEngine.Random.Range(0, 100) < 20)
+				{
+					if (Interface.CallHook("OnPlayerRecover", this) == null)
+					{
+						SetPlayerFlag(PlayerFlags.Wounded, b: false);
+					}
+				}
+				else
+				{
+					Die();
+				}
+			}
+			else
+			{
+				Invoke(WoundingTick, 1f);
+			}
+		}
+	}
+
+	private bool WoundingCausingImmportality()
+	{
+		if (!IsWounded())
+		{
+			return false;
+		}
+		if (secondsSinceWoundedStarted > 0.25f)
+		{
+			return false;
+		}
+		return true;
+	}
+}

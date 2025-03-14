@@ -1,0 +1,97 @@
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using Facepunch.Steamworks;
+using Network;
+using Rust;
+
+public static class Auth_Steam
+{
+	internal static List<Connection> waitingList = new List<Connection>();
+
+	public static IEnumerator Run(Connection connection)
+	{
+		connection.authStatus = string.Empty;
+		if (!Global.SteamServer.Auth.StartSession(connection.token, connection.userid))
+		{
+			ConnectionAuth.Reject(connection, "Steam Auth Failed");
+			yield break;
+		}
+		waitingList.Add(connection);
+		Stopwatch timeout = Stopwatch.StartNew();
+		while (timeout.Elapsed.TotalSeconds < 30.0 && connection.active && !(connection.authStatus != string.Empty))
+		{
+			yield return null;
+		}
+		waitingList.Remove(connection);
+		if (connection.active)
+		{
+			if (connection.authStatus.Length == 0)
+			{
+				ConnectionAuth.Reject(connection, "Steam Auth Timeout");
+				Global.SteamServer.Auth.EndSession(connection.userid);
+			}
+			else if (connection.authStatus == "banned")
+			{
+				ConnectionAuth.Reject(connection, "Auth: " + connection.authStatus);
+				Global.SteamServer.Auth.EndSession(connection.userid);
+			}
+			else if (connection.authStatus == "gamebanned")
+			{
+				ServerUsers.Set(connection.userid, ServerUsers.UserGroup.Banned, connection.username, "GAMEBAN");
+				ConsoleNetwork.BroadcastToAllClients("chat.add", 0, "<color=#fff>SERVER</color> Kicking " + connection.username + " (banned by Facepunch)");
+				ConnectionAuth.Reject(connection, "Steam Auth: " + connection.authStatus);
+				Global.SteamServer.Auth.EndSession(connection.userid);
+			}
+			else if (connection.authStatus == "vacbanned")
+			{
+				ServerUsers.Set(connection.userid, ServerUsers.UserGroup.Banned, connection.username, "VAC");
+				ConsoleNetwork.BroadcastToAllClients("chat.add", 0, "<color=#fff>SERVER</color> Kicking " + connection.username + " (banned by Valve Anti Cheat)");
+				ConnectionAuth.Reject(connection, "Steam Auth: " + connection.authStatus);
+				Global.SteamServer.Auth.EndSession(connection.userid);
+			}
+			else if (connection.authStatus != "ok")
+			{
+				ConnectionAuth.Reject(connection, "Steam Auth Error: " + connection.authStatus);
+				Global.SteamServer.Auth.EndSession(connection.userid);
+			}
+			else
+			{
+				Global.SteamServer.UpdatePlayer(connection.userid, connection.username, 0);
+			}
+		}
+	}
+
+	public static bool ValidateConnecting(ulong steamid, ulong ownerSteamID, ServerAuth.Status response)
+	{
+		Connection connection = waitingList.Find((Connection x) => x.userid == steamid);
+		if (connection == null)
+		{
+			return false;
+		}
+		connection.ownerid = ownerSteamID;
+		if (ServerUsers.Is(ownerSteamID, ServerUsers.UserGroup.Banned) || ServerUsers.Is(steamid, ServerUsers.UserGroup.Banned))
+		{
+			connection.authStatus = "banned";
+			return true;
+		}
+		switch (response)
+		{
+		case ServerAuth.Status.OK:
+			connection.authStatus = "ok";
+			return true;
+		case ServerAuth.Status.VACBanned:
+			connection.authStatus = "vacbanned";
+			return true;
+		case ServerAuth.Status.PublisherIssuedBan:
+			connection.authStatus = "gamebanned";
+			return true;
+		case ServerAuth.Status.VACCheckTimedOut:
+			connection.authStatus = "ok";
+			return true;
+		default:
+			connection.authStatus = response.ToString();
+			return true;
+		}
+	}
+}

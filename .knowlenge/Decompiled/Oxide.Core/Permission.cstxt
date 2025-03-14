@@ -1,0 +1,755 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Oxide.Core;
+using Oxide.Core.Libraries;
+using Oxide.Core.Plugins;
+
+public class Permission : Library
+{
+	private readonly Dictionary<Plugin, HashSet<string>> permset;
+
+	private Dictionary<string, UserData> userdata;
+
+	private Dictionary<string, GroupData> groupdata;
+
+	private Func<string, bool> validate;
+
+	public override bool IsGlobal => false;
+
+	public bool IsLoaded { get; private set; }
+
+	public Permission()
+	{
+		permset = new Dictionary<Plugin, HashSet<string>>();
+		LoadFromDatafile();
+	}
+
+	private void LoadFromDatafile()
+	{
+		Utility.DatafileToProto<Dictionary<string, UserData>>("oxide.users");
+		Utility.DatafileToProto<Dictionary<string, GroupData>>("oxide.groups");
+		userdata = ProtoStorage.Load<Dictionary<string, UserData>>(new string[1] { "oxide.users" }) ?? new Dictionary<string, UserData>();
+		groupdata = ProtoStorage.Load<Dictionary<string, GroupData>>(new string[1] { "oxide.groups" }) ?? new Dictionary<string, GroupData>();
+		foreach (KeyValuePair<string, GroupData> groupdatum in groupdata)
+		{
+			if (!string.IsNullOrEmpty(groupdatum.Value.ParentGroup) && HasCircularParent(groupdatum.Key, groupdatum.Value.ParentGroup))
+			{
+				Interface.Oxide.LogWarning("Detected circular parent group for '{0}'! Removing parent '{1}'", groupdatum.Key, groupdatum.Value.ParentGroup);
+				groupdatum.Value.ParentGroup = null;
+			}
+		}
+		IsLoaded = true;
+	}
+
+	[LibraryFunction("Export")]
+	public void Export(string prefix = "auth")
+	{
+		if (IsLoaded)
+		{
+			Interface.Oxide.DataFileSystem.WriteObject(prefix + ".groups", groupdata);
+			Interface.Oxide.DataFileSystem.WriteObject(prefix + ".users", userdata);
+		}
+	}
+
+	private void SaveUsers()
+	{
+		ProtoStorage.Save(userdata, "oxide.users");
+	}
+
+	private void SaveGroups()
+	{
+		ProtoStorage.Save(groupdata, "oxide.groups");
+	}
+
+	public void RegisterValidate(Func<string, bool> val)
+	{
+		validate = val;
+	}
+
+	public void CleanUp()
+	{
+		if (!IsLoaded || validate == null)
+		{
+			return;
+		}
+		string[] array = userdata.Keys.Where((string k) => !validate(k)).ToArray();
+		if (array.Length != 0)
+		{
+			string[] array2 = array;
+			foreach (string key in array2)
+			{
+				userdata.Remove(key);
+			}
+			SaveUsers();
+		}
+	}
+
+	public void MigrateGroup(string oldGroup, string newGroup)
+	{
+		if (IsLoaded && GroupExists(oldGroup))
+		{
+			string fileDataPath = ProtoStorage.GetFileDataPath("oxide.groups.data");
+			File.Copy(fileDataPath, fileDataPath + ".old", overwrite: true);
+			string[] groupPermissions = GetGroupPermissions(oldGroup);
+			foreach (string perm in groupPermissions)
+			{
+				GrantGroupPermission(newGroup, perm, null);
+			}
+			if (GetUsersInGroup(oldGroup).Length == 0)
+			{
+				RemoveGroup(oldGroup);
+			}
+			SaveGroups();
+		}
+	}
+
+	[LibraryFunction("RegisterPermission")]
+	public void RegisterPermission(string name, Plugin owner)
+	{
+		if (string.IsNullOrEmpty(name))
+		{
+			return;
+		}
+		name = name.ToLower();
+		if (PermissionExists(name))
+		{
+			Interface.Oxide.LogWarning("Duplicate permission registered '{0}' (by plugin '{1}')", name, owner.Title);
+			return;
+		}
+		if (!permset.TryGetValue(owner, out var value))
+		{
+			value = new HashSet<string>();
+			permset.Add(owner, value);
+			owner.OnRemovedFromManager.Add(owner_OnRemovedFromManager);
+		}
+		value.Add(name);
+		string text = owner.Name.ToLower() + ".";
+		if (!name.StartsWith(text) && !owner.IsCorePlugin)
+		{
+			Interface.Oxide.LogWarning("Missing plugin name prefix '{0}' for permission '{1}' (by plugin '{2}')", text, name, owner.Title);
+		}
+	}
+
+	[LibraryFunction("PermissionExists")]
+	public bool PermissionExists(string name, Plugin owner = null)
+	{
+		if (string.IsNullOrEmpty(name))
+		{
+			return false;
+		}
+		name = name.ToLower();
+		if (owner == null)
+		{
+			if (permset.Count > 0)
+			{
+				if (name.Equals("*"))
+				{
+					return true;
+				}
+				if (name.EndsWith("*"))
+				{
+					name = name.TrimEnd('*');
+					return permset.Values.SelectMany((HashSet<string> v) => v).Any((string p) => p.StartsWith(name));
+				}
+			}
+			return permset.Values.Any((HashSet<string> v) => v.Contains(name));
+		}
+		if (!permset.TryGetValue(owner, out var value))
+		{
+			return false;
+		}
+		if (value.Count > 0)
+		{
+			if (name.Equals("*"))
+			{
+				return true;
+			}
+			if (name.EndsWith("*"))
+			{
+				name = name.TrimEnd('*');
+				return value.Any((string p) => p.StartsWith(name));
+			}
+		}
+		return value.Contains(name);
+	}
+
+	private void owner_OnRemovedFromManager(Plugin sender, PluginManager manager)
+	{
+		permset.Remove(sender);
+	}
+
+	[LibraryFunction("UserIdValid")]
+	public bool UserIdValid(string id)
+	{
+		if (validate != null)
+		{
+			return validate(id);
+		}
+		return true;
+	}
+
+	[LibraryFunction("UserExists")]
+	public bool UserExists(string id)
+	{
+		return userdata.ContainsKey(id);
+	}
+
+	private UserData GetUserData(string id)
+	{
+		if (!userdata.TryGetValue(id, out var value))
+		{
+			userdata.Add(id, value = new UserData());
+		}
+		return value;
+	}
+
+	[LibraryFunction("UpdateNickname")]
+	public void UpdateNickname(string id, string nickname)
+	{
+		if (UserExists(id))
+		{
+			GetUserData(id).LastSeenNickname = nickname;
+		}
+	}
+
+	[LibraryFunction("UserHasAnyGroup")]
+	public bool UserHasAnyGroup(string id)
+	{
+		if (UserExists(id))
+		{
+			return GetUserData(id).Groups.Count > 0;
+		}
+		return false;
+	}
+
+	[LibraryFunction("GroupsHavePermission")]
+	public bool GroupsHavePermission(HashSet<string> groups, string perm)
+	{
+		return groups.Any((string group) => GroupHasPermission(group, perm));
+	}
+
+	[LibraryFunction("GroupHasPermission")]
+	public bool GroupHasPermission(string name, string perm)
+	{
+		if (!GroupExists(name) || string.IsNullOrEmpty(perm))
+		{
+			return false;
+		}
+		if (!groupdata.TryGetValue(name.ToLower(), out var value))
+		{
+			return false;
+		}
+		if (!value.Perms.Contains(perm.ToLower()))
+		{
+			return GroupHasPermission(value.ParentGroup, perm);
+		}
+		return true;
+	}
+
+	[LibraryFunction("UserHasPermission")]
+	public bool UserHasPermission(string id, string perm)
+	{
+		if (string.IsNullOrEmpty(perm))
+		{
+			return false;
+		}
+		perm = perm.ToLower();
+		UserData userData = GetUserData(id);
+		if (userData.Perms.Contains(perm))
+		{
+			return true;
+		}
+		return GroupsHavePermission(userData.Groups, perm);
+	}
+
+	[LibraryFunction("GetUserGroups")]
+	public string[] GetUserGroups(string id)
+	{
+		return GetUserData(id).Groups.ToArray();
+	}
+
+	[LibraryFunction("GetUserPermissions")]
+	public string[] GetUserPermissions(string id)
+	{
+		UserData userData = GetUserData(id);
+		List<string> list = userData.Perms.ToList();
+		foreach (string group in userData.Groups)
+		{
+			list.AddRange(GetGroupPermissions(group));
+		}
+		return new HashSet<string>(list).ToArray();
+	}
+
+	[LibraryFunction("GetGroupPermissions")]
+	public string[] GetGroupPermissions(string name, bool parents = false)
+	{
+		if (!GroupExists(name))
+		{
+			return new string[0];
+		}
+		if (!groupdata.TryGetValue(name.ToLower(), out var value))
+		{
+			return new string[0];
+		}
+		List<string> list = value.Perms.ToList();
+		if (parents)
+		{
+			list.AddRange(GetGroupPermissions(value.ParentGroup));
+		}
+		return new HashSet<string>(list).ToArray();
+	}
+
+	[LibraryFunction("GetPermissions")]
+	public string[] GetPermissions()
+	{
+		return new HashSet<string>(permset.Values.SelectMany((HashSet<string> v) => v)).ToArray();
+	}
+
+	[LibraryFunction("GetPermissionUsers")]
+	public string[] GetPermissionUsers(string perm)
+	{
+		if (string.IsNullOrEmpty(perm))
+		{
+			return new string[0];
+		}
+		perm = perm.ToLower();
+		HashSet<string> hashSet = new HashSet<string>();
+		foreach (KeyValuePair<string, UserData> userdatum in userdata)
+		{
+			if (userdatum.Value.Perms.Contains(perm))
+			{
+				hashSet.Add($"{userdatum.Key}({userdatum.Value.LastSeenNickname})");
+			}
+		}
+		return hashSet.ToArray();
+	}
+
+	[LibraryFunction("GetPermissionGroups")]
+	public string[] GetPermissionGroups(string perm)
+	{
+		if (string.IsNullOrEmpty(perm))
+		{
+			return new string[0];
+		}
+		perm = perm.ToLower();
+		HashSet<string> hashSet = new HashSet<string>();
+		foreach (KeyValuePair<string, GroupData> groupdatum in groupdata)
+		{
+			if (groupdatum.Value.Perms.Contains(perm))
+			{
+				hashSet.Add(groupdatum.Key);
+			}
+		}
+		return hashSet.ToArray();
+	}
+
+	[LibraryFunction("AddUserGroup")]
+	public void AddUserGroup(string id, string name)
+	{
+		if (GroupExists(name) && GetUserData(id).Groups.Add(name.ToLower()))
+		{
+			SaveUsers();
+			Interface.Call("OnUserGroupAdded", id, name);
+		}
+	}
+
+	[LibraryFunction("RemoveUserGroup")]
+	public void RemoveUserGroup(string id, string name)
+	{
+		if (!GroupExists(name))
+		{
+			return;
+		}
+		UserData userData = GetUserData(id);
+		if (name.Equals("*"))
+		{
+			if (userData.Groups.Count > 0)
+			{
+				userData.Groups.Clear();
+				SaveUsers();
+			}
+		}
+		else if (userData.Groups.Remove(name.ToLower()))
+		{
+			SaveUsers();
+			Interface.Call("OnUserGroupRemoved", id, name);
+		}
+	}
+
+	[LibraryFunction("UserHasGroup")]
+	public bool UserHasGroup(string id, string name)
+	{
+		if (!GroupExists(name))
+		{
+			return false;
+		}
+		return GetUserData(id).Groups.Contains(name.ToLower());
+	}
+
+	[LibraryFunction("GroupExists")]
+	public bool GroupExists(string group)
+	{
+		if (!string.IsNullOrEmpty(group))
+		{
+			if (!group.Equals("*"))
+			{
+				return groupdata.ContainsKey(group.ToLower());
+			}
+			return true;
+		}
+		return false;
+	}
+
+	[LibraryFunction("GetGroups")]
+	public string[] GetGroups()
+	{
+		return groupdata.Keys.ToArray();
+	}
+
+	[LibraryFunction("GetUsersInGroup")]
+	public string[] GetUsersInGroup(string group)
+	{
+		if (!GroupExists(group))
+		{
+			return new string[0];
+		}
+		group = group.ToLower();
+		return (from u in userdata
+			where u.Value.Groups.Contains(@group)
+			select $"{u.Key} ({u.Value.LastSeenNickname})").ToArray();
+	}
+
+	[LibraryFunction("GetGroupTitle")]
+	public string GetGroupTitle(string group)
+	{
+		if (!GroupExists(group))
+		{
+			return string.Empty;
+		}
+		if (!groupdata.TryGetValue(group.ToLower(), out var value))
+		{
+			return string.Empty;
+		}
+		return value.Title;
+	}
+
+	[LibraryFunction("GetGroupRank")]
+	public int GetGroupRank(string group)
+	{
+		if (!GroupExists(group))
+		{
+			return 0;
+		}
+		if (!groupdata.TryGetValue(group.ToLower(), out var value))
+		{
+			return 0;
+		}
+		return value.Rank;
+	}
+
+	[LibraryFunction("GrantUserPermission")]
+	public void GrantUserPermission(string id, string perm, Plugin owner)
+	{
+		if (!PermissionExists(perm, owner))
+		{
+			return;
+		}
+		UserData data = GetUserData(id);
+		perm = perm.ToLower();
+		if (perm.EndsWith("*"))
+		{
+			HashSet<string> value;
+			if (owner == null)
+			{
+				value = new HashSet<string>(permset.Values.SelectMany((HashSet<string> v) => v));
+			}
+			else if (!permset.TryGetValue(owner, out value))
+			{
+				return;
+			}
+			if (perm.Equals("*"))
+			{
+				if (!value.Aggregate(seed: false, (bool c, string s) => c | data.Perms.Add(s)))
+				{
+					return;
+				}
+			}
+			else
+			{
+				perm = perm.TrimEnd('*');
+				if (!value.Where((string s) => s.StartsWith(perm)).Aggregate(seed: false, (bool c, string s) => c | data.Perms.Add(s)))
+				{
+					return;
+				}
+			}
+			SaveUsers();
+		}
+		else if (data.Perms.Add(perm))
+		{
+			SaveUsers();
+			Interface.Call("OnUserPermissionGranted", id, perm);
+		}
+	}
+
+	[LibraryFunction("RevokeUserPermission")]
+	public void RevokeUserPermission(string id, string perm)
+	{
+		if (string.IsNullOrEmpty(perm))
+		{
+			return;
+		}
+		UserData userData = GetUserData(id);
+		perm = perm.ToLower();
+		if (perm.EndsWith("*"))
+		{
+			if (perm.Equals("*"))
+			{
+				if (userData.Perms.Count <= 0)
+				{
+					return;
+				}
+				userData.Perms.Clear();
+			}
+			else
+			{
+				perm = perm.TrimEnd('*');
+				if (userData.Perms.RemoveWhere((string s) => s.StartsWith(perm)) <= 0)
+				{
+					return;
+				}
+			}
+			SaveUsers();
+		}
+		else if (userData.Perms.Remove(perm))
+		{
+			SaveUsers();
+			Interface.Call("OnUserPermissionRevoked", id, perm);
+		}
+	}
+
+	[LibraryFunction("GrantGroupPermission")]
+	public void GrantGroupPermission(string name, string perm, Plugin owner)
+	{
+		if (!PermissionExists(perm, owner) || !GroupExists(name) || !groupdata.TryGetValue(name.ToLower(), out var data))
+		{
+			return;
+		}
+		perm = perm.ToLower();
+		if (perm.EndsWith("*"))
+		{
+			HashSet<string> value;
+			if (owner == null)
+			{
+				value = new HashSet<string>(permset.Values.SelectMany((HashSet<string> v) => v));
+			}
+			else if (!permset.TryGetValue(owner, out value))
+			{
+				return;
+			}
+			if (perm.Equals("*"))
+			{
+				if (!value.Aggregate(seed: false, (bool c, string s) => c | data.Perms.Add(s)))
+				{
+					return;
+				}
+			}
+			else
+			{
+				perm = perm.TrimEnd('*').ToLower();
+				if (!value.Where((string s) => s.StartsWith(perm)).Aggregate(seed: false, (bool c, string s) => c | data.Perms.Add(s)))
+				{
+					return;
+				}
+			}
+			SaveGroups();
+		}
+		else if (data.Perms.Add(perm))
+		{
+			SaveGroups();
+			Interface.Call("OnGroupPermissionGranted", name, perm);
+		}
+	}
+
+	[LibraryFunction("RevokeGroupPermission")]
+	public void RevokeGroupPermission(string name, string perm)
+	{
+		if (!GroupExists(name) || string.IsNullOrEmpty(perm) || !groupdata.TryGetValue(name.ToLower(), out var value))
+		{
+			return;
+		}
+		perm = perm.ToLower();
+		if (perm.EndsWith("*"))
+		{
+			if (perm.Equals("*"))
+			{
+				if (value.Perms.Count <= 0)
+				{
+					return;
+				}
+				value.Perms.Clear();
+			}
+			else
+			{
+				perm = perm.TrimEnd('*').ToLower();
+				if (value.Perms.RemoveWhere((string s) => s.StartsWith(perm)) <= 0)
+				{
+					return;
+				}
+			}
+			SaveGroups();
+		}
+		else if (value.Perms.Remove(perm))
+		{
+			SaveGroups();
+			Interface.Call("OnGroupPermissionRevoked", name, perm);
+		}
+	}
+
+	[LibraryFunction("CreateGroup")]
+	public bool CreateGroup(string group, string title, int rank)
+	{
+		if (GroupExists(group) || string.IsNullOrEmpty(group))
+		{
+			return false;
+		}
+		GroupData value = new GroupData
+		{
+			Title = title,
+			Rank = rank
+		};
+		groupdata.Add(group.ToLower(), value);
+		SaveGroups();
+		return true;
+	}
+
+	[LibraryFunction("RemoveGroup")]
+	public bool RemoveGroup(string group)
+	{
+		if (!GroupExists(group))
+		{
+			return false;
+		}
+		group = group.ToLower();
+		groupdata.Remove(group);
+		if (userdata.Values.Aggregate(seed: false, (bool current, UserData userData) => current | userData.Groups.Remove(group)))
+		{
+			SaveUsers();
+		}
+		SaveGroups();
+		return true;
+	}
+
+	[LibraryFunction("SetGroupTitle")]
+	public bool SetGroupTitle(string group, string title)
+	{
+		if (!GroupExists(group))
+		{
+			return false;
+		}
+		if (!groupdata.TryGetValue(group.ToLower(), out var value))
+		{
+			return false;
+		}
+		if (value.Title == title)
+		{
+			return true;
+		}
+		value.Title = title;
+		SaveGroups();
+		return true;
+	}
+
+	[LibraryFunction("SetGroupRank")]
+	public bool SetGroupRank(string group, int rank)
+	{
+		if (!GroupExists(group))
+		{
+			return false;
+		}
+		if (!groupdata.TryGetValue(group.ToLower(), out var value))
+		{
+			return false;
+		}
+		if (value.Rank == rank)
+		{
+			return true;
+		}
+		value.Rank = rank;
+		SaveGroups();
+		return true;
+	}
+
+	[LibraryFunction("GetGroupParent")]
+	public string GetGroupParent(string group)
+	{
+		if (!GroupExists(group))
+		{
+			return string.Empty;
+		}
+		group = group.ToLower();
+		if (groupdata.TryGetValue(group, out var value))
+		{
+			return value.ParentGroup;
+		}
+		return string.Empty;
+	}
+
+	[LibraryFunction("SetGroupParent")]
+	public bool SetGroupParent(string group, string parent)
+	{
+		if (!GroupExists(group))
+		{
+			return false;
+		}
+		group = group.ToLower();
+		if (!groupdata.TryGetValue(group, out var value))
+		{
+			return false;
+		}
+		if (string.IsNullOrEmpty(parent))
+		{
+			value.ParentGroup = null;
+			SaveGroups();
+			return true;
+		}
+		if (!GroupExists(parent) || group.Equals(parent.ToLower()))
+		{
+			return false;
+		}
+		parent = parent.ToLower();
+		if (!string.IsNullOrEmpty(value.ParentGroup) && value.ParentGroup.Equals(parent))
+		{
+			return true;
+		}
+		if (HasCircularParent(group, parent))
+		{
+			return false;
+		}
+		value.ParentGroup = parent;
+		SaveGroups();
+		return true;
+	}
+
+	private bool HasCircularParent(string group, string parent)
+	{
+		if (!groupdata.TryGetValue(parent, out var value))
+		{
+			return false;
+		}
+		HashSet<string> hashSet = new HashSet<string> { group, parent };
+		while (!string.IsNullOrEmpty(value.ParentGroup))
+		{
+			if (!hashSet.Add(value.ParentGroup))
+			{
+				return true;
+			}
+			if (!groupdata.TryGetValue(value.ParentGroup, out value))
+			{
+				return false;
+			}
+		}
+		return false;
+	}
+}

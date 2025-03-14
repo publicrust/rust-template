@@ -1,0 +1,476 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using RustNative;
+using UnityEngine;
+
+[RequireComponent(typeof(Camera))]
+[RequireComponent(typeof(Camera))]
+[RequireComponent(typeof(Camera))]
+public class CoverageQueries : MonoBehaviour
+{
+	public class BufferSet
+	{
+		public int width;
+
+		public int height;
+
+		public Texture2D inputTexture;
+
+		public RenderTexture resultTexture;
+
+		public IntPtr readbackInst = IntPtr.Zero;
+
+		public Color[] inputData = new Color[0];
+
+		public Color32[] resultData = new Color32[0];
+
+		private Material coverageMat;
+
+		public void Attach(Material coverageMat)
+		{
+			this.coverageMat = coverageMat;
+		}
+
+		public void Dispose(bool data = true)
+		{
+			if (inputTexture != null)
+			{
+				UnityEngine.Object.DestroyImmediate(inputTexture);
+				inputTexture = null;
+			}
+			if (resultTexture != null)
+			{
+				RenderTexture.active = null;
+				UnityEngine.Object.DestroyImmediate(resultTexture);
+				resultTexture = null;
+			}
+			if (readbackInst != IntPtr.Zero)
+			{
+				RustNative.Graphics.BufferReadback.Destroy(readbackInst);
+				readbackInst = IntPtr.Zero;
+			}
+			if (data)
+			{
+				inputData = new Color[0];
+				resultData = new Color32[0];
+			}
+		}
+
+		public bool CheckResize(int count)
+		{
+			if (count > inputData.Length || (resultTexture != null && !resultTexture.IsCreated()))
+			{
+				Dispose(data: false);
+				width = Mathf.CeilToInt(Mathf.Sqrt(count));
+				height = Mathf.CeilToInt((float)count / (float)width);
+				inputTexture = new Texture2D(width, height, TextureFormat.RGBAFloat, mipmap: false, linear: true);
+				inputTexture.name = "_Input";
+				inputTexture.filterMode = FilterMode.Point;
+				inputTexture.wrapMode = TextureWrapMode.Clamp;
+				resultTexture = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+				resultTexture.name = "_Result";
+				resultTexture.filterMode = FilterMode.Point;
+				resultTexture.wrapMode = TextureWrapMode.Clamp;
+				resultTexture.useMipMap = false;
+				resultTexture.Create();
+				readbackInst = RustNative.Graphics.BufferReadback.CreateForTexture(resultTexture.GetNativeTexturePtr(), (uint)width, (uint)height, (uint)resultTexture.format);
+				int newSize = width * height;
+				Array.Resize(ref inputData, newSize);
+				Array.Resize(ref resultData, newSize);
+				return true;
+			}
+			return false;
+		}
+
+		public void UploadData()
+		{
+			if (inputData.Length > 0)
+			{
+				inputTexture.SetPixels(inputData);
+				inputTexture.Apply();
+			}
+		}
+
+		public void Dispatch(int count)
+		{
+			if (inputData.Length > 0)
+			{
+				RenderBuffer activeColorBuffer = UnityEngine.Graphics.activeColorBuffer;
+				RenderBuffer activeDepthBuffer = UnityEngine.Graphics.activeDepthBuffer;
+				coverageMat.SetTexture("_Input", inputTexture);
+				UnityEngine.Graphics.Blit(inputTexture, resultTexture, coverageMat, 0);
+				UnityEngine.Graphics.SetRenderTarget(activeColorBuffer, activeDepthBuffer);
+			}
+		}
+
+		public void IssueRead()
+		{
+			if (readbackInst != IntPtr.Zero)
+			{
+				RustNative.Graphics.BufferReadback.IssueRead(readbackInst);
+			}
+		}
+
+		public void GetResults()
+		{
+			if (readbackInst != IntPtr.Zero && resultData.Length > 0)
+			{
+				RustNative.Graphics.BufferReadback.GetData(readbackInst, ref resultData[0]);
+			}
+		}
+	}
+
+	public class Query
+	{
+		public struct Input
+		{
+			public Vector3 position;
+
+			public float radius;
+
+			public int sampleCount;
+
+			public float smoothingSpeed;
+		}
+
+		public struct Internal
+		{
+			public int id;
+
+			public void Reset()
+			{
+				id = -1;
+			}
+		}
+
+		public struct Result
+		{
+			public int passed;
+
+			public float coverage;
+
+			public float smoothCoverage;
+
+			public float weightedCoverage;
+
+			public float weightedSmoothCoverage;
+
+			public bool originOccluded;
+
+			public int frame;
+
+			public float originVisibility;
+
+			public float originSmoothVisibility;
+
+			public void Reset()
+			{
+				passed = 0;
+				coverage = 1f;
+				smoothCoverage = 1f;
+				weightedCoverage = 1f;
+				weightedSmoothCoverage = 1f;
+				originOccluded = false;
+				frame = -1;
+				originVisibility = 0f;
+				originSmoothVisibility = 0f;
+			}
+		}
+
+		public Input input = default(Input);
+
+		public Internal intern = default(Internal);
+
+		public Result result = default(Result);
+
+		public bool IsRegistered => intern.id >= 0;
+
+		public Query()
+		{
+			Reset();
+		}
+
+		public Query(Vector3 position, float radius, int sampleCount, float smoothingSpeed = 15f)
+		{
+			Reset();
+			input.position = position;
+			input.radius = radius;
+			input.sampleCount = sampleCount;
+			input.smoothingSpeed = smoothingSpeed;
+		}
+
+		private void Reset()
+		{
+			intern.Reset();
+			result.Reset();
+		}
+
+		public void Register()
+		{
+			RegisterQuery(this);
+		}
+
+		public void Update(Vector3 position, float radius)
+		{
+			if (intern.id >= 0)
+			{
+				input.position = position;
+				input.radius = radius;
+				UpdateQuery(this);
+			}
+		}
+
+		public void UpdatePosition(Vector3 position)
+		{
+			input.position = position;
+			UpdateQuery(this);
+		}
+
+		public void UpdateRadius(float radius)
+		{
+			input.radius = radius;
+			UpdateQuery(this);
+		}
+
+		public void Unregister()
+		{
+			UnregisterQuery(this);
+		}
+	}
+
+	public float depthBias = -0.1f;
+
+	private static List<Query> pool = new List<Query>(128);
+
+	private static List<Query> added = new List<Query>(32);
+
+	private static List<Query> reused = new List<Query>(32);
+
+	private static List<int> removed = new List<int>(128);
+
+	private static List<int> changed = new List<int>(128);
+
+	private static Queue<int> freed = new Queue<int>(16);
+
+	private static BufferSet buffer = new BufferSet();
+
+	private Camera camera;
+
+	private Material coverageMat;
+
+	private static CoverageQueries instance;
+
+	private static bool _debug = false;
+
+	public bool debug;
+
+	public static CoverageQueries Instance => instance;
+
+	public static bool Debug
+	{
+		get
+		{
+			return _debug;
+		}
+		set
+		{
+			_debug = value;
+		}
+	}
+
+	private void Awake()
+	{
+		instance = this;
+		camera = GetComponent<Camera>();
+	}
+
+	private void OnEnable()
+	{
+		coverageMat = new Material(Shader.Find("Hidden/CoverageQueries/Coverage"))
+		{
+			hideFlags = HideFlags.HideAndDontSave
+		};
+		buffer.Attach(coverageMat);
+	}
+
+	private void OnDisable()
+	{
+		if (coverageMat != null)
+		{
+			UnityEngine.Object.DestroyImmediate(coverageMat);
+			coverageMat = null;
+		}
+		buffer.Dispose();
+	}
+
+	private void Update()
+	{
+		FetchAndAnalyseResults();
+		UpdateCollection();
+	}
+
+	private void OnPostRender()
+	{
+		PrepareAndDispatch();
+		IssueRead();
+	}
+
+	private void UpdateCollection()
+	{
+		if (reused.Count > 0)
+		{
+			foreach (Query item in reused)
+			{
+				int id = item.intern.id;
+				UnityEngine.Debug.Assert(id >= 0 && id < pool.Count, "Reusing invalid query id ");
+				pool[id] = item;
+				changed.Add(id);
+			}
+			reused.Clear();
+		}
+		if (added.Count > 0)
+		{
+			foreach (Query item2 in added)
+			{
+				int id2 = item2.intern.id;
+				UnityEngine.Debug.Assert(id2 >= 0 && id2 <= pool.Count + added.Count, "Adding invalid query id");
+				pool.Add(item2);
+				changed.Add(id2);
+			}
+			added.Clear();
+		}
+		if (removed.Count > 0)
+		{
+			for (int i = 0; i < removed.Count; i++)
+			{
+				int num = removed[i];
+				UnityEngine.Debug.Assert(num >= 0 && num < pool.Count, "Removing invalid query id");
+				pool[num].intern.Reset();
+				pool[num].result.Reset();
+				pool[num] = null;
+				freed.Enqueue(num);
+			}
+			removed.Clear();
+		}
+		buffer.CheckResize(pool.Count);
+	}
+
+	private void PrepareAndDispatch()
+	{
+		if (pool.Count <= 0 || pool.Count > buffer.inputData.Length)
+		{
+			return;
+		}
+		Matrix4x4 worldToCameraMatrix = camera.worldToCameraMatrix;
+		Matrix4x4 gPUProjectionMatrix = GL.GetGPUProjectionMatrix(camera.projectionMatrix, renderIntoTexture: false);
+		Matrix4x4 value = gPUProjectionMatrix * worldToCameraMatrix;
+		coverageMat.SetMatrix("_ViewProjMatrix", value);
+		coverageMat.SetFloat("_DepthBias", depthBias);
+		if (changed.Count > 0)
+		{
+			for (int i = 0; i < changed.Count; i++)
+			{
+				int num = changed[i];
+				UnityEngine.Debug.Assert(changed[i] >= 0 && changed[i] < pool.Count);
+				Query query = pool[num];
+				if (query != null)
+				{
+					float x = query.input.position.x;
+					float y = query.input.position.y;
+					float z = query.input.position.z;
+					float w = (float)Mathf.RoundToInt(query.input.radius * 10000f) + (float)query.input.sampleCount / 255f;
+					ref Color reference = ref buffer.inputData[num];
+					reference = new Vector4(x, y, z, w);
+				}
+			}
+			changed.Clear();
+		}
+		buffer.UploadData();
+		buffer.Dispatch(pool.Count);
+	}
+
+	private void IssueRead()
+	{
+		if (pool.Count > 0)
+		{
+			buffer.IssueRead();
+			GL.IssuePluginEvent(RustNative.Graphics.GetRenderEventFunc(), 2);
+		}
+	}
+
+	private void FetchAndAnalyseResults()
+	{
+		if (pool.Count <= 0 || pool.Count > buffer.resultData.Length)
+		{
+			return;
+		}
+		buffer.GetResults();
+		for (int i = 0; i < pool.Count; i++)
+		{
+			Query query = pool[i];
+			if (query != null)
+			{
+				UnityEngine.Debug.Assert(query.intern.id == i);
+				query.result.passed = buffer.resultData[i].r;
+				query.result.coverage = (float)(int)buffer.resultData[i].g / 255f;
+				query.result.weightedCoverage = (float)(int)buffer.resultData[i].b / 255f;
+				query.result.originOccluded = buffer.resultData[i].a != 0;
+				query.result.originVisibility = 2f * Mathf.Clamp01(0.5f - query.result.coverage) * (float)((!query.result.originOccluded) ? 1 : 0);
+				if (query.result.frame < 0)
+				{
+					query.result.smoothCoverage = query.result.coverage;
+					query.result.weightedSmoothCoverage = query.result.weightedCoverage;
+					query.result.originSmoothVisibility = query.result.originVisibility;
+				}
+				else
+				{
+					float t = Time.deltaTime * query.input.smoothingSpeed;
+					query.result.smoothCoverage = Mathf.Lerp(query.result.smoothCoverage, query.result.coverage, t);
+					query.result.weightedSmoothCoverage = Mathf.Lerp(query.result.weightedSmoothCoverage, query.result.weightedCoverage, t);
+					query.result.originSmoothVisibility = Mathf.Lerp(query.result.originSmoothVisibility, query.result.originVisibility, t);
+				}
+				query.result.frame = Time.frameCount;
+			}
+		}
+	}
+
+	public static void RegisterQuery(Query query)
+	{
+		UnityEngine.Debug.Assert(query.input.sampleCount >= 1 && query.input.sampleCount <= 256, "RegisterQuery failed sample count check");
+		UnityEngine.Debug.Assert(query.input.radius >= 0f, "RegisterQuery failed with negative radius");
+		int id = query.intern.id;
+		if (id < 0)
+		{
+			if (freed.Count > 0)
+			{
+				id = freed.Dequeue();
+				reused.Add(query);
+			}
+			else
+			{
+				id = pool.Count + added.Count;
+				added.Add(query);
+			}
+			query.intern.id = id;
+		}
+	}
+
+	public static void UnregisterQuery(Query query)
+	{
+		int id = query.intern.id;
+		if (id >= 0 && id < pool.Count)
+		{
+			removed.Add(id);
+		}
+	}
+
+	public static void UpdateQuery(Query query)
+	{
+		int id = query.intern.id;
+		if (id >= 0 && id < pool.Count)
+		{
+			changed.Add(id);
+		}
+	}
+}

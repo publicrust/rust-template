@@ -1,0 +1,456 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using Facepunch;
+using Rust.Ai;
+using UnityEngine;
+using UnityEngine.AI;
+
+public class NavMeshGridCell : FacepunchBehaviour, IServerComponent
+{
+	public class NavMeshLinkInfo
+	{
+		public NavMeshGridCell Cell;
+
+		public Layer Layer;
+
+		public NavMeshLink Link;
+
+		public int References;
+	}
+
+	public class Layer
+	{
+		public int AgentTypeIndex;
+
+		public NavMeshSurface Surface;
+
+		public List<NavMeshLinkInfo> NavMeshLinkInfos;
+
+		public AsyncOperation BuildingOperation;
+
+		public NavMeshBuildSettings BuildSettings;
+
+		public bool IsAwaitingBake;
+
+		internal readonly List<NavMeshBuildSource> Sources = new List<NavMeshBuildSource>();
+
+		internal readonly List<NavMeshBuildMarkup> markups = new List<NavMeshBuildMarkup>();
+
+		internal NavMeshBuildSource terrainBuildSource;
+
+		public bool IsBuilding { get; internal set; }
+
+		public Layer(NavMeshGridCell cell, int agentTypeIndex, int areaMask)
+		{
+			IsBuilding = false;
+			AgentTypeIndex = agentTypeIndex;
+			BuildSettings = NavMesh.GetSettingsByIndex(agentTypeIndex);
+			terrainBuildSource.area = -1;
+			switch (agentTypeIndex)
+			{
+			case 0:
+				BuildSettings.overrideVoxelSize = true;
+				BuildSettings.voxelSize /= 2f;
+				break;
+			case 1:
+				BuildSettings.overrideVoxelSize = true;
+				BuildSettings.voxelSize *= 2f;
+				break;
+			}
+			int areaFromName = NavMesh.GetAreaFromName("Walkable");
+			if ((areaMask & (1 << NavMesh.GetAreaFromName("HumanNPC"))) != 0)
+			{
+				areaFromName = NavMesh.GetAreaFromName("HumanNPC");
+			}
+			else if ((areaMask & (1 << NavMesh.GetAreaFromName("Road"))) != 0)
+			{
+				areaFromName = NavMesh.GetAreaFromName("Road");
+			}
+			Surface = cell.gameObject.AddComponent<NavMeshSurface>();
+			Surface.layerMask = SingletonComponent<AiManager>.Instance.LayerMask;
+			Surface.agentTypeID = BuildSettings.agentTypeID;
+			Surface.defaultArea = areaFromName;
+			Surface.center = Vector3.zero;
+			Surface.size = cell.Bounds.size;
+			Surface.overrideVoxelSize = true;
+			Surface.voxelSize = BuildSettings.voxelSize;
+			Surface.overrideTileSize = true;
+			Surface.tileSize = BuildSettings.tileSize;
+			Surface.buildHeightMesh = false;
+			Surface.collectObjects = CollectObjects.Volume;
+			Surface.useGeometry = NavMeshCollectGeometry.PhysicsColliders;
+			Surface.UpdateOnTransformChanged = false;
+			NavMeshLinkInfos = new List<NavMeshLinkInfo>();
+			NavMeshBuilder.CollectSources(new Bounds(Quantize(cell.transform.position, cell.Bounds.size * 0.1f), cell.Bounds.size), SingletonComponent<AiManager>.Instance.LayerMask, SingletonComponent<AiManager>.Instance.NavMeshCollectGeometry, Surface.defaultArea, markups, Sources);
+		}
+
+		internal bool TryGenerateLinkInDirection(NavMeshSurface surface, Vector3 position, Vector3 direction, out NavMeshLink link)
+		{
+			link = null;
+			bool flag = false;
+			float multiplier = 0.5f;
+			if (Mathf.Abs(direction.x) < Mathf.Abs(direction.z))
+			{
+				if (direction.z > 0f)
+				{
+					Vector3 vector = Vector3.forward * surface.size.z / 2f;
+					Vector3 vector2 = ((!(direction.x > 0f)) ? Vector3.right : Vector3.left);
+					Vector3 cellCenterOffset = vector + vector2 * surface.size.x / 2f;
+					cellCenterOffset.x += direction.x - vector2.x * surface.size.x / 2f;
+					return TryGenerateLink(surface, cellCenterOffset, Vector3.back, Vector3.forward, multiplier, out link);
+				}
+				Vector3 vector3 = Vector3.back * surface.size.z / 2f;
+				Vector3 vector4 = ((!(direction.x > 0f)) ? Vector3.right : Vector3.left);
+				Vector3 cellCenterOffset2 = vector3 + vector4 * surface.size.x / 2f;
+				cellCenterOffset2.x += direction.x - vector4.x * surface.size.x / 2f;
+				return TryGenerateLink(surface, cellCenterOffset2, Vector3.forward, Vector3.back, multiplier, out link);
+			}
+			if (direction.x < 0f)
+			{
+				Vector3 vector5 = Vector3.left * surface.size.x / 2f;
+				Vector3 vector6 = ((!(direction.z > 0f)) ? Vector3.forward : Vector3.back);
+				Vector3 cellCenterOffset3 = vector5 + vector6 * surface.size.z / 2f;
+				cellCenterOffset3.z += direction.z - vector6.z * surface.size.z / 2f;
+				return TryGenerateLink(surface, cellCenterOffset3, Vector3.right, Vector3.left, multiplier, out link);
+			}
+			Vector3 vector7 = Vector3.right * (surface.size.x / 2f);
+			Vector3 vector8 = ((!(direction.z > 0f)) ? Vector3.forward : Vector3.back);
+			Vector3 cellCenterOffset4 = vector7 + vector8 * surface.size.z / 2f;
+			cellCenterOffset4.z += direction.z - vector8.z * surface.size.z / 2f;
+			return TryGenerateLink(surface, cellCenterOffset4, Vector3.left, Vector3.right, multiplier, out link);
+		}
+
+		public bool TryGenerateLink(NavMeshSurface surface, Vector3 cellCenterOffset, Vector3 start, Vector3 end, float multiplier, out NavMeshLink link)
+		{
+			end *= multiplier;
+			start *= multiplier;
+			int num = 0;
+			if (NavMesh.SamplePosition(surface.transform.position + cellCenterOffset + start, out var hit, 4f, 1 << surface.defaultArea))
+			{
+				start = hit.position + start * 0.1f;
+				num++;
+			}
+			if (NavMesh.SamplePosition(surface.transform.position + cellCenterOffset + end, out hit, 4f, 1 << surface.defaultArea))
+			{
+				end = hit.position + end * 0.5f;
+				num++;
+			}
+			if (num == 2 && !Physics.Linecast(start + Vector3.up * 0.5f, end + Vector3.up * 0.5f, out var _, surface.layerMask))
+			{
+				GameObject gameObject = SingletonComponent<AiManager>.Instance.LinkPool.Pop();
+				if (gameObject == null)
+				{
+					gameObject = SingletonComponent<AiManager>.Instance.NavMeshLinkPrefab.Instantiate();
+					PrefabInfoEx.EnablePooling(gameObject, SingletonComponent<AiManager>.Instance.NavMeshLinkPrefab.resourceID);
+				}
+				gameObject.transform.SetParent(surface.transform);
+				gameObject.transform.localPosition = default(Vector3);
+				link = gameObject.GetComponent<NavMeshLink>();
+				link.autoUpdate = false;
+				link.bidirectional = false;
+				link.agentTypeID = BuildSettings.agentTypeID;
+				link.area = surface.defaultArea;
+				link.UpdateOnTransformChanged = false;
+				link.startPoint = start - surface.transform.position;
+				link.endPoint = end - surface.transform.position;
+				link.width = 1f;
+				return true;
+			}
+			link = null;
+			return false;
+		}
+
+		internal IEnumerator GenerateNavmeshAsync(NavMeshGridCell cell, LayerMask layerMask, List<NavMeshBuildSource> sources)
+		{
+			if (!IsBuilding)
+			{
+				IsBuilding = true;
+				IsAwaitingBake = false;
+				Surface.layerMask = layerMask;
+				BuildingOperation = Surface.UpdateNavMesh(sources, calculateWorldBounds: false);
+				yield return BuildingOperation;
+				IsBuilding = false;
+			}
+		}
+
+		public void Kill()
+		{
+			if (Surface != null)
+			{
+				Surface.RemoveData();
+			}
+			if (Surface != null)
+			{
+				UnityEngine.Object.Destroy(Surface);
+			}
+		}
+	}
+
+	public readonly List<Layer> Layers = new List<Layer>(1);
+
+	public float TimeLastSeenByPlayer;
+
+	public Bounds Bounds;
+
+	private AsyncTerrainNavMeshBake terrainSource;
+
+	public float LastBakeTime;
+
+	public int LayerCount => Layers.Count;
+
+	public Vector2i Coord { get; internal set; }
+
+	public bool IsAwaitingBake
+	{
+		get
+		{
+			foreach (Layer layer in Layers)
+			{
+				if (layer.IsAwaitingBake)
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+		set
+		{
+			if (!value)
+			{
+				return;
+			}
+			foreach (Layer layer in Layers)
+			{
+				layer.IsAwaitingBake = true;
+			}
+		}
+	}
+
+	public void Setup(Vector2i coord, Vector3 position, Vector3 size, LayerMask layerMask, NavMeshCollectGeometry navMeshCollectGeometry)
+	{
+		Coord = coord;
+		base.transform.position = position;
+		TimeLastSeenByPlayer = Time.realtimeSinceStartup;
+		Bounds = new Bounds(Vector3.zero, size + new Vector3(1.75f, 0f, 0f));
+	}
+
+	public Layer GetLayer(int agentTypeIndex)
+	{
+		foreach (Layer layer in Layers)
+		{
+			if (layer.AgentTypeIndex == agentTypeIndex)
+			{
+				return layer;
+			}
+		}
+		return null;
+	}
+
+	public Layer CreateLayer(int agentTypeIndex, int area)
+	{
+		Layer layer = new Layer(this, agentTypeIndex, area);
+		Layers.Add(layer);
+		return layer;
+	}
+
+	public IEnumerator CreateNavMeshLayerAsync(Layer layer, LayerMask layerMask, Action<Layer> onAsyncDoneCallback)
+	{
+		LastBakeTime = Time.realtimeSinceStartup;
+		if (terrainSource == null)
+		{
+			terrainSource = new AsyncTerrainNavMeshBake(base.transform.position, (int)Bounds.size.x, (int)Bounds.size.y, normal: false, alpha: true);
+			yield return terrainSource;
+		}
+		if (terrainSource != null && layer.terrainBuildSource.area != layer.Surface.defaultArea)
+		{
+			layer.terrainBuildSource = terrainSource.navMeshBuildSource;
+			layer.terrainBuildSource.area = layer.Surface.defaultArea;
+			layer.Sources.Add(layer.terrainBuildSource);
+		}
+		List<NavMeshBuildSource> removeSources = null;
+		foreach (NavMeshBuildSource source in layer.Sources)
+		{
+			if (source.sourceObject == null)
+			{
+				if (removeSources == null)
+				{
+					removeSources = Pool.GetList<NavMeshBuildSource>();
+				}
+				removeSources.Add(source);
+			}
+		}
+		if (removeSources != null)
+		{
+			foreach (NavMeshBuildSource item in removeSources)
+			{
+				layer.Sources.Remove(item);
+			}
+			Pool.FreeList(ref removeSources);
+		}
+		yield return layer.GenerateNavmeshAsync(this, layerMask, layer.Sources);
+		onAsyncDoneCallback?.Invoke(layer);
+	}
+
+	public IEnumerator WaitForBuildToFinish(int agentTypeIndex, Action<Layer> onAsyncDoneCallback)
+	{
+		Layer layer = GetLayer(agentTypeIndex);
+		while (layer.BuildingOperation != null && !layer.BuildingOperation.isDone)
+		{
+			yield return null;
+		}
+		onAsyncDoneCallback?.Invoke(layer);
+	}
+
+	[ContextMenu("Rebake")]
+	public void RebakeCell()
+	{
+		StartCoroutine(RebakeCellAsync());
+	}
+
+	public IEnumerator RebakeCellAsync(Action onAsyncDoneCallback = null)
+	{
+		LastBakeTime = Time.realtimeSinceStartup;
+		int count = Layers.Count;
+		for (int i = 0; i < count; i++)
+		{
+			Layer layer = Layers[i];
+			if (layer.IsBuilding)
+			{
+				continue;
+			}
+			if (terrainSource == null)
+			{
+				terrainSource = new AsyncTerrainNavMeshBake(base.transform.position, (int)(Bounds.size.x + 0.5f), (int)(Bounds.size.y + 0.5f), normal: false, alpha: true);
+				yield return terrainSource;
+			}
+			if (terrainSource != null && layer.terrainBuildSource.area != layer.Surface.defaultArea)
+			{
+				layer.terrainBuildSource = terrainSource.navMeshBuildSource;
+				layer.terrainBuildSource.area = layer.Surface.defaultArea;
+				layer.Sources.Add(layer.terrainBuildSource);
+			}
+			List<NavMeshBuildSource> removeSources = null;
+			foreach (NavMeshBuildSource source in layer.Sources)
+			{
+				if (source.sourceObject == null)
+				{
+					if (removeSources == null)
+					{
+						removeSources = Pool.GetList<NavMeshBuildSource>();
+					}
+					removeSources.Add(source);
+				}
+			}
+			if (removeSources != null)
+			{
+				foreach (NavMeshBuildSource item in removeSources)
+				{
+					layer.Sources.Remove(item);
+				}
+				Pool.FreeList(ref removeSources);
+			}
+			yield return layer.GenerateNavmeshAsync(this, SingletonComponent<AiManager>.Instance.LayerMask, layer.Sources);
+		}
+		onAsyncDoneCallback?.Invoke();
+	}
+
+	private static Vector3 Quantize(Vector3 v, Vector3 quant)
+	{
+		float x = quant.x * Mathf.Floor(v.x / quant.x);
+		float y = quant.y * Mathf.Floor(v.y / quant.y);
+		float z = quant.z * Mathf.Floor(v.z / quant.z);
+		return new Vector3(x, y, z);
+	}
+
+	public void KeepAlive()
+	{
+		TimeLastSeenByPlayer = Time.realtimeSinceStartup;
+	}
+
+	public bool Timeout(float timeoutThreshold)
+	{
+		return Time.realtimeSinceStartup - TimeLastSeenByPlayer > timeoutThreshold;
+	}
+
+	public void Kill()
+	{
+		foreach (Layer layer in Layers)
+		{
+			layer.Kill();
+		}
+		UnityEngine.Object.Destroy(base.gameObject);
+	}
+
+	public bool IsAtBorder(Vector3 position, float threshold, bool mustHaveValidNeighbour)
+	{
+		Vector3 vector = position - base.transform.position;
+		if (Bounds.extents.x - vector.sqrMagnitude < threshold)
+		{
+			if (mustHaveValidNeighbour)
+			{
+				if (Mathf.Abs(vector.x) < Mathf.Abs(vector.z))
+				{
+					if (vector.z > 0f)
+					{
+						return SingletonComponent<AiManager>.Instance.HasReadyNeighbour(Coord, Vector2i.forward);
+					}
+					return SingletonComponent<AiManager>.Instance.HasReadyNeighbour(Coord, Vector2i.back);
+				}
+				if (vector.x < 0f)
+				{
+					return SingletonComponent<AiManager>.Instance.HasReadyNeighbour(Coord, Vector2i.left);
+				}
+				return SingletonComponent<AiManager>.Instance.HasReadyNeighbour(Coord, Vector2i.right);
+			}
+			return true;
+		}
+		return false;
+	}
+
+	public NavMeshLinkInfo GetOrCreateLink(int agentTypeIndex, Vector3 position, float threshold)
+	{
+		Layer layer = GetLayer(agentTypeIndex);
+		if (layer == null || layer.NavMeshLinkInfos == null || layer.IsBuilding || layer.IsAwaitingBake)
+		{
+			return null;
+		}
+		Vector3 direction = position - base.transform.position;
+		foreach (NavMeshLinkInfo navMeshLinkInfo2 in layer.NavMeshLinkInfos)
+		{
+			Vector3 vector = base.transform.position + navMeshLinkInfo2.Link.startPoint;
+			if ((position - vector).sqrMagnitude < threshold)
+			{
+				return navMeshLinkInfo2;
+			}
+		}
+		while (layer.NavMeshLinkInfos.Count > 0)
+		{
+			RemoveLink(layer.NavMeshLinkInfos[layer.NavMeshLinkInfos.Count - 1]);
+		}
+		if (layer.TryGenerateLinkInDirection(layer.Surface, position, direction, out var link))
+		{
+			NavMeshLinkInfo navMeshLinkInfo = Pool.Get<NavMeshLinkInfo>();
+			navMeshLinkInfo.Cell = this;
+			navMeshLinkInfo.Layer = layer;
+			navMeshLinkInfo.Link = link;
+			layer.NavMeshLinkInfos.Add(navMeshLinkInfo);
+			return navMeshLinkInfo;
+		}
+		return null;
+	}
+
+	public bool RemoveLink(NavMeshLinkInfo info)
+	{
+		if (info.Layer.NavMeshLinkInfos.Remove(info))
+		{
+			info.References = 0;
+			NavMeshLink link = info.Link;
+			link.transform.SetParent(null);
+			SingletonComponent<AiManager>.Instance.LinkPool.Push(link.gameObject);
+			Pool.Free(ref info);
+			return true;
+		}
+		return false;
+	}
+}

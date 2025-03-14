@@ -1,0 +1,179 @@
+using System;
+using System.Collections.Generic;
+using Oxide.Core;
+using Oxide.Core.Logging;
+using Oxide.Core.Plugins;
+
+public sealed class PluginManager
+{
+	private readonly IDictionary<string, Plugin> loadedPlugins;
+
+	private readonly IDictionary<string, IList<Plugin>> hookSubscriptions;
+
+	private readonly Dictionary<string, float> lastDeprecatedWarningAt = new Dictionary<string, float>();
+
+	private readonly List<string> hookConflicts = new List<string>();
+
+	public Logger Logger { get; private set; }
+
+	public string ConfigPath { get; set; }
+
+	public event PluginEvent OnPluginAdded;
+
+	public event PluginEvent OnPluginRemoved;
+
+	public PluginManager(Logger logger)
+	{
+		loadedPlugins = new Dictionary<string, Plugin>();
+		hookSubscriptions = new Dictionary<string, IList<Plugin>>();
+		Logger = logger;
+	}
+
+	public bool AddPlugin(Plugin plugin)
+	{
+		if (loadedPlugins.ContainsKey(plugin.Name))
+		{
+			return false;
+		}
+		loadedPlugins.Add(plugin.Name, plugin);
+		plugin.HandleAddedToManager(this);
+		this.OnPluginAdded?.Invoke(plugin);
+		return true;
+	}
+
+	public bool RemovePlugin(Plugin plugin)
+	{
+		if (!loadedPlugins.ContainsKey(plugin.Name))
+		{
+			return false;
+		}
+		loadedPlugins.Remove(plugin.Name);
+		foreach (IList<Plugin> value in hookSubscriptions.Values)
+		{
+			if (value.Contains(plugin))
+			{
+				value.Remove(plugin);
+			}
+		}
+		plugin.HandleRemovedFromManager(this);
+		this.OnPluginRemoved?.Invoke(plugin);
+		return true;
+	}
+
+	public Plugin GetPlugin(string name)
+	{
+		if (!loadedPlugins.TryGetValue(name, out var value))
+		{
+			return null;
+		}
+		return value;
+	}
+
+	public IEnumerable<Plugin> GetPlugins()
+	{
+		return loadedPlugins.Values;
+	}
+
+	internal void SubscribeToHook(string hook, Plugin plugin)
+	{
+		if (loadedPlugins.ContainsKey(plugin.Name) && (plugin.IsCorePlugin || !hook.StartsWith("I")))
+		{
+			if (!hookSubscriptions.TryGetValue(hook, out var value))
+			{
+				value = new List<Plugin>();
+				hookSubscriptions.Add(hook, value);
+			}
+			if (!value.Contains(plugin))
+			{
+				value.Add(plugin);
+			}
+		}
+	}
+
+	internal void UnsubscribeToHook(string hook, Plugin plugin)
+	{
+		if (loadedPlugins.ContainsKey(plugin.Name) && (plugin.IsCorePlugin || !hook.StartsWith("I")) && hookSubscriptions.TryGetValue(hook, out var value) && value.Contains(plugin))
+		{
+			value.Remove(plugin);
+		}
+	}
+
+	public object CallHook(string hook, params object[] args)
+	{
+		if (!hookSubscriptions.TryGetValue(hook, out var value))
+		{
+			return null;
+		}
+		if (value.Count == 0)
+		{
+			return null;
+		}
+		object[] array = new object[value.Count];
+		int num = 0;
+		object obj = null;
+		Plugin plugin = null;
+		for (int i = 0; i < value.Count; i++)
+		{
+			object obj2 = value[i].CallHook(hook, args);
+			if (obj2 != null)
+			{
+				array[i] = obj2;
+				obj = obj2;
+				plugin = value[i];
+				num++;
+			}
+		}
+		if (num == 0)
+		{
+			return null;
+		}
+		if (num > 1 && obj != null)
+		{
+			hookConflicts.Clear();
+			for (int j = 0; j < value.Count; j++)
+			{
+				object obj3 = array[j];
+				if (obj3 != null && obj3.GetType().IsValueType)
+				{
+					if (!array[j].Equals(obj))
+					{
+						hookConflicts.Add($"{value[j].Name} - {obj3} ({obj3.GetType().Name})");
+					}
+					else if (array[j] != obj)
+					{
+						hookConflicts.Add($"{value[j].Name} - {obj3} ({obj3.GetType().Name})");
+					}
+				}
+			}
+			if (hookConflicts.Count > 0)
+			{
+				hookConflicts.Add($"{plugin.Name} ({obj} ({obj.GetType().Name}))");
+				Logger.Write(LogType.Warning, "Calling hook {0} resulted in a conflict between the following plugins: {1}", hook, string.Join(", ", hookConflicts.ToArray()));
+			}
+		}
+		return obj;
+	}
+
+	public object CallDeprecatedHook(string oldHook, string newHook, DateTime expireDate, params object[] args)
+	{
+		if (!hookSubscriptions.TryGetValue(oldHook, out var value))
+		{
+			return null;
+		}
+		if (value.Count == 0)
+		{
+			return null;
+		}
+		if (expireDate < DateTime.Now)
+		{
+			return null;
+		}
+		float now = Interface.Oxide.Now;
+		if (!lastDeprecatedWarningAt.TryGetValue(oldHook, out var value2) || now - value2 > 300f)
+		{
+			lastDeprecatedWarningAt[oldHook] = now;
+			Interface.Oxide.LogWarning(string.Format("'{0} v{1}' is using deprecated hook '{2}', which will stop working on {3}. Please ask the author to update to '{4}'", value[0].Name, value[0].Version, oldHook, expireDate.ToString("D"), newHook));
+		}
+		return CallHook(oldHook, args);
+	}
+}

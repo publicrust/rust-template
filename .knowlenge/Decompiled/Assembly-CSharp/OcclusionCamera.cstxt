@@ -1,0 +1,267 @@
+using System;
+using UnityEngine;
+using UnityEngine.Rendering;
+
+[RequireComponent(typeof(Camera))]
+public class OcclusionCamera : MonoBehaviour
+{
+	private Camera camera;
+
+	private OcclusionCulling owner;
+
+	private Camera referenceCamera;
+
+	private Material downscaleMat;
+
+	private Material blitCopyMat;
+
+	private int width;
+
+	private int height;
+
+	private RenderTexture[] hiZLevels;
+
+	private RenderTexture hiZTexture;
+
+	private ShadowQuality savedShadows = ShadowQuality.All;
+
+	public Action OnPreCullCall;
+
+	public Action OnPostRenderCall;
+
+	public Camera Camera => camera;
+
+	public int Width => width;
+
+	public int Height => height;
+
+	public RenderTexture[] HiZLevels => hiZLevels;
+
+	public RenderTexture HiZTexture => hiZTexture;
+
+	public static OcclusionCamera Create(OcclusionCulling owner)
+	{
+		GameObject gameObject = new GameObject("Occlusion Camera", typeof(OcclusionCamera));
+		return gameObject.GetComponent<OcclusionCamera>();
+	}
+
+	private void AttachToOwner(OcclusionCulling owner)
+	{
+		this.owner = owner;
+		referenceCamera = owner.GetComponent<Camera>();
+		base.transform.parent = owner.transform;
+		base.transform.localPosition = Vector3.zero;
+		base.transform.localRotation = Quaternion.identity;
+		base.transform.localScale = Vector3.one;
+	}
+
+	private void CheckResizeHiZMap(int refWidth, int refHeight)
+	{
+		int num = Mathf.ClosestPowerOfTwo(refWidth / 3);
+		int num2 = Mathf.ClosestPowerOfTwo(refHeight / 3);
+		if (hiZLevels == null || width != num || height != num2)
+		{
+			InitializeHiZMap(num, num2);
+			width = num;
+			height = num2;
+			if (owner.debugSettings.log)
+			{
+				Debug.Log("[OcclusionCulling] Resized HiZ Map to " + width + " x " + height);
+			}
+		}
+	}
+
+	private void OnEnable()
+	{
+		AttachToOwner(OcclusionCulling.Instance);
+		Shader shader = Shader.Find("Hidden/OcclusionCulling/DepthRender");
+		Shader shader2 = Shader.Find("Hidden/OcclusionCulling/DepthDownscale");
+		Shader shader3 = Shader.Find("Hidden/OcclusionCulling/BlitCopy");
+		downscaleMat = new Material(shader2)
+		{
+			hideFlags = HideFlags.HideAndDontSave
+		};
+		blitCopyMat = new Material(shader3)
+		{
+			hideFlags = HideFlags.HideAndDontSave
+		};
+		camera = GetComponent<Camera>();
+		camera.useOcclusionCulling = false;
+		camera.renderingPath = RenderingPath.Forward;
+		camera.clearFlags = CameraClearFlags.Color;
+		camera.backgroundColor = Color.clear;
+		camera.opaqueSortMode = OpaqueSortMode.NoDistanceSort;
+		camera.allowMSAA = false;
+		camera.SetReplacementShader(shader, "RenderType");
+		CheckResizeHiZMap(Screen.width, Screen.height);
+	}
+
+	private void OnDisable()
+	{
+		DestroyHiZMap();
+		if (downscaleMat != null)
+		{
+			UnityEngine.Object.DestroyImmediate(downscaleMat);
+			downscaleMat = null;
+		}
+		if (blitCopyMat != null)
+		{
+			UnityEngine.Object.DestroyImmediate(blitCopyMat);
+			blitCopyMat = null;
+		}
+	}
+
+	private void Update()
+	{
+		int num = ((!(referenceCamera != null)) ? Screen.width : referenceCamera.pixelWidth);
+		int num2 = ((!(referenceCamera != null)) ? Screen.height : referenceCamera.pixelHeight);
+		CheckResizeHiZMap(num, num2);
+		camera.aspect = (float)num / (float)num2;
+		if (owner != null)
+		{
+			camera.cullingMask = owner.occluderMask;
+		}
+		if (referenceCamera != null)
+		{
+			camera.depth = referenceCamera.depth - 1f;
+			camera.fieldOfView = referenceCamera.fieldOfView;
+			camera.nearClipPlane = referenceCamera.nearClipPlane;
+			camera.farClipPlane = referenceCamera.farClipPlane;
+		}
+	}
+
+	private void OnPreCull()
+	{
+		if (OnPreCullCall != null)
+		{
+			OnPreCullCall();
+		}
+	}
+
+	private void OnPreRender()
+	{
+		DisableShadows();
+	}
+
+	private void OnPostRender()
+	{
+		RestoreShadows();
+		GenerateHiZMipChain();
+		if (OnPostRenderCall != null)
+		{
+			OnPostRenderCall();
+		}
+	}
+
+	private void OnDrawGizmos()
+	{
+		DebugDrawGizmos();
+	}
+
+	private void DisableShadows()
+	{
+		savedShadows = QualitySettings.shadows;
+		QualitySettings.shadows = ShadowQuality.Disable;
+	}
+
+	private void RestoreShadows()
+	{
+		QualitySettings.shadows = savedShadows;
+	}
+
+	private void InitializeHiZMap(int width, int height)
+	{
+		DestroyHiZMap();
+		int num = Mathf.Min(width, height);
+		int num2 = (int)(Mathf.Log(num, 2f) + 1f);
+		hiZLevels = new RenderTexture[num2];
+		hiZTexture = CreateHiZMipTexture("HiZMapTex", width, height);
+		for (int i = 0; i < num2; i++)
+		{
+			hiZLevels[i] = CreateHiZMipLevels("HiZMap" + i, width, height, i);
+		}
+		camera.targetTexture = hiZLevels[0];
+	}
+
+	private void DestroyHiZMap()
+	{
+		if (hiZTexture != null)
+		{
+			RenderTexture.active = null;
+			UnityEngine.Object.DestroyImmediate(hiZTexture);
+			hiZTexture = null;
+		}
+		if (hiZLevels != null)
+		{
+			camera.targetTexture = null;
+			RenderTexture.active = null;
+			for (int i = 0; i < hiZLevels.Length; i++)
+			{
+				UnityEngine.Object.DestroyImmediate(hiZLevels[i]);
+			}
+			hiZLevels = null;
+		}
+	}
+
+	private RenderTexture CreateHiZMipTexture(string name, int width, int height)
+	{
+		RenderTexture renderTexture = new RenderTexture(width, height, 0, RenderTextureFormat.RFloat, RenderTextureReadWrite.Linear);
+		renderTexture.name = name;
+		renderTexture.useMipMap = true;
+		renderTexture.autoGenerateMips = false;
+		renderTexture.wrapMode = TextureWrapMode.Clamp;
+		renderTexture.filterMode = FilterMode.Point;
+		renderTexture.Create();
+		return renderTexture;
+	}
+
+	private RenderTexture CreateHiZMipLevels(string name, int width, int height, int mip)
+	{
+		int num = width >> mip;
+		int num2 = height >> mip;
+		int depth = ((mip == 0) ? 24 : 0);
+		RenderTexture renderTexture = new RenderTexture(num, num2, depth, RenderTextureFormat.RFloat, RenderTextureReadWrite.Linear);
+		renderTexture.name = name;
+		renderTexture.useMipMap = false;
+		renderTexture.wrapMode = TextureWrapMode.Clamp;
+		renderTexture.filterMode = FilterMode.Point;
+		renderTexture.Create();
+		return renderTexture;
+	}
+
+	private void GenerateHiZMipChain()
+	{
+		for (int i = 1; i < hiZLevels.Length; i++)
+		{
+			downscaleMat.SetTexture("_MainTex", hiZLevels[i - 1]);
+			Graphics.Blit(hiZLevels[i - 1], hiZLevels[i], downscaleMat);
+		}
+		for (int j = 0; j < hiZLevels.Length; j++)
+		{
+			Graphics.SetRenderTarget(hiZTexture, j);
+			Graphics.Blit(hiZLevels[j], blitCopyMat);
+		}
+	}
+
+	private void DebugDrawGizmos()
+	{
+		Camera component = GetComponent<Camera>();
+		Gizmos.color = new Color(0.75f, 0.75f, 0f, 0.5f);
+		Gizmos.matrix = Matrix4x4.TRS(base.transform.position, base.transform.rotation, Vector3.one);
+		Gizmos.DrawFrustum(Vector3.zero, component.fieldOfView, component.farClipPlane, component.nearClipPlane, component.aspect);
+		Gizmos.color = Color.red;
+		Gizmos.matrix = Matrix4x4.identity;
+		Matrix4x4 worldToCameraMatrix = component.worldToCameraMatrix;
+		Matrix4x4 gPUProjectionMatrix = GL.GetGPUProjectionMatrix(component.projectionMatrix, renderIntoTexture: false);
+		Matrix4x4 viewProjMatrix = gPUProjectionMatrix * worldToCameraMatrix;
+		Vector4[] planes = new Vector4[6];
+		OcclusionCulling.ExtractFrustum(viewProjMatrix, ref planes);
+		for (int i = 0; i < planes.Length; i++)
+		{
+			Vector3 vector = new Vector3(planes[i].x, planes[i].y, planes[i].z);
+			float w = planes[i].w;
+			Vector3 vector2 = -vector * w;
+			Gizmos.DrawLine(vector2, vector2 * 2f);
+		}
+	}
+}

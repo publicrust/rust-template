@@ -1,0 +1,528 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Runtime.InteropServices;
+using Facepunch.Steamworks;
+using Facepunch.Steamworks.Interop;
+using SteamNative;
+
+public class ServerList : IDisposable
+{
+	public class Filter : List<KeyValuePair<string, string>>
+	{
+		internal IntPtr NativeArray;
+
+		private IntPtr m_pArrayEntries;
+
+		private int AppId = 0;
+
+		public void Add(string k, string v)
+		{
+			Add(new KeyValuePair<string, string>(k, v));
+		}
+
+		internal void Start()
+		{
+			MatchMakingKeyValuePair_t[] array = this.Select(delegate(KeyValuePair<string, string> x)
+			{
+				if (x.Key == "appid")
+				{
+					AppId = int.Parse(x.Value);
+				}
+				MatchMakingKeyValuePair_t result = default(MatchMakingKeyValuePair_t);
+				result.Key = x.Key;
+				result.Value = x.Value;
+				return result;
+			}).ToArray();
+			int num = Marshal.SizeOf(typeof(MatchMakingKeyValuePair_t));
+			NativeArray = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(IntPtr)) * array.Length);
+			m_pArrayEntries = Marshal.AllocHGlobal(num * array.Length);
+			for (int i = 0; i < array.Length; i++)
+			{
+				Marshal.StructureToPtr(array[i], new IntPtr(m_pArrayEntries.ToInt64() + i * num), fDeleteOld: false);
+			}
+			Marshal.WriteIntPtr(NativeArray, m_pArrayEntries);
+		}
+
+		internal void Free()
+		{
+			if (m_pArrayEntries != IntPtr.Zero)
+			{
+				Marshal.FreeHGlobal(m_pArrayEntries);
+			}
+			if (NativeArray != IntPtr.Zero)
+			{
+				Marshal.FreeHGlobal(NativeArray);
+			}
+		}
+
+		internal bool Test(gameserveritem_t info)
+		{
+			if (AppId != 0 && AppId != info.AppID)
+			{
+				return false;
+			}
+			return true;
+		}
+	}
+
+	private struct MatchPair
+	{
+		[MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+		public string key;
+
+		[MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+		public string value;
+	}
+
+	public class Request : IDisposable
+	{
+		internal class SubRequest
+		{
+			internal IntPtr Request;
+
+			internal int Pointer = 0;
+
+			internal List<int> WatchList = new List<int>();
+
+			internal Stopwatch Timer = Stopwatch.StartNew();
+
+			internal bool Update(SteamMatchmakingServers servers, Action<gameserveritem_t> OnServer, Action OnUpdate)
+			{
+				if (Request == IntPtr.Zero)
+				{
+					return true;
+				}
+				if (Timer.Elapsed.TotalSeconds < 0.5)
+				{
+					return false;
+				}
+				Timer.Reset();
+				Timer.Start();
+				bool changes = false;
+				int serverCount = servers.GetServerCount(Request);
+				if (serverCount != Pointer)
+				{
+					for (int i = Pointer; i < serverCount; i++)
+					{
+						WatchList.Add(i);
+					}
+				}
+				Pointer = serverCount;
+				WatchList.RemoveAll(delegate(int x)
+				{
+					gameserveritem_t serverDetails = servers.GetServerDetails(Request, x);
+					if (serverDetails.HadSuccessfulResponse)
+					{
+						OnServer(serverDetails);
+						changes = true;
+						return true;
+					}
+					return false;
+				});
+				if (!servers.IsRefreshing(Request))
+				{
+					WatchList.RemoveAll(delegate(int x)
+					{
+						gameserveritem_t serverDetails2 = servers.GetServerDetails(Request, x);
+						OnServer(serverDetails2);
+						return true;
+					});
+					servers.CancelQuery(Request);
+					Request = IntPtr.Zero;
+					changes = true;
+				}
+				if (changes)
+				{
+					OnUpdate?.Invoke();
+				}
+				return Request == IntPtr.Zero;
+			}
+		}
+
+		internal Client client;
+
+		internal List<SubRequest> Requests = new List<SubRequest>();
+
+		public Action OnUpdate;
+
+		public List<Server> Responded = new List<Server>();
+
+		public List<Server> Unresponsive = new List<Server>();
+
+		public bool Finished = false;
+
+		internal IEnumerable<string> ServerList { get; set; }
+
+		internal Filter Filter { get; set; }
+
+		internal Request(Client c)
+		{
+			client = c;
+			client.OnUpdate += Update;
+		}
+
+		~Request()
+		{
+			Dispose();
+		}
+
+		internal void StartCustomQuery()
+		{
+			if (ServerList == null)
+			{
+				return;
+			}
+			int count = 16;
+			int num = 0;
+			while (true)
+			{
+				IEnumerable<string> enumerable = ServerList.Skip(num).Take(count);
+				if (enumerable.Count() == 0)
+				{
+					break;
+				}
+				num += enumerable.Count();
+				Filter filter = new Filter();
+				filter.Add("or", enumerable.Count().ToString());
+				foreach (string item in enumerable)
+				{
+					filter.Add("gameaddr", item);
+				}
+				filter.Start();
+				HServerListRequest hServerListRequest = client.native.servers.RequestInternetServerList(client.AppId, filter.NativeArray, (uint)filter.Count, IntPtr.Zero);
+				filter.Free();
+				AddRequest(hServerListRequest);
+			}
+			ServerList = null;
+		}
+
+		internal void AddRequest(IntPtr id)
+		{
+			Requests.Add(new SubRequest
+			{
+				Request = id
+			});
+		}
+
+		private void Update()
+		{
+			if (Requests.Count == 0)
+			{
+				return;
+			}
+			for (int i = 0; i < Requests.Count(); i++)
+			{
+				if (Requests[i].Update(client.native.servers, OnServer, OnUpdate))
+				{
+					Requests.RemoveAt(i);
+					i--;
+				}
+			}
+			if (Requests.Count == 0)
+			{
+				Finished = true;
+				client.OnUpdate -= Update;
+			}
+		}
+
+		private void OnServer(gameserveritem_t info)
+		{
+			if (info.HadSuccessfulResponse)
+			{
+				if (Filter == null || Filter.Test(info))
+				{
+					Responded.Add(Server.FromSteam(client, info));
+				}
+			}
+			else
+			{
+				Unresponsive.Add(Server.FromSteam(client, info));
+			}
+		}
+
+		public void Dispose()
+		{
+			if (client.IsValid)
+			{
+				client.OnUpdate -= Update;
+			}
+			foreach (SubRequest request in Requests)
+			{
+				if (client.IsValid)
+				{
+					client.native.servers.CancelQuery(request.Request);
+				}
+			}
+			Requests.Clear();
+		}
+	}
+
+	public class Server
+	{
+		internal Client Client;
+
+		public Action<bool> OnReceivedRules;
+
+		public Dictionary<string, string> Rules;
+
+		internal ServerRules RulesRequest;
+
+		internal const uint k_unFavoriteFlagNone = 0u;
+
+		internal const uint k_unFavoriteFlagFavorite = 1u;
+
+		internal const uint k_unFavoriteFlagHistory = 2u;
+
+		public string Name { get; set; }
+
+		public int Ping { get; set; }
+
+		public string GameDir { get; set; }
+
+		public string Map { get; set; }
+
+		public string Description { get; set; }
+
+		public uint AppId { get; set; }
+
+		public int Players { get; set; }
+
+		public int MaxPlayers { get; set; }
+
+		public int BotPlayers { get; set; }
+
+		public bool Passworded { get; set; }
+
+		public bool Secure { get; set; }
+
+		public uint LastTimePlayed { get; set; }
+
+		public int Version { get; set; }
+
+		public string[] Tags { get; set; }
+
+		public ulong SteamId { get; set; }
+
+		public uint Address { get; set; }
+
+		public int ConnectionPort { get; set; }
+
+		public int QueryPort { get; set; }
+
+		public bool Favourite => Client.ServerList.IsFavourite(this);
+
+		public string AddressString => $"{(ulong)(Address >> 24) & 0xFFuL}.{(ulong)(Address >> 16) & 0xFFuL}.{(ulong)(Address >> 8) & 0xFFuL}.{(ulong)Address & 0xFFuL}";
+
+		public string ConnectionAddress => $"{(ulong)(Address >> 24) & 0xFFuL}.{(ulong)(Address >> 16) & 0xFFuL}.{(ulong)(Address >> 8) & 0xFFuL}.{(ulong)Address & 0xFFuL}:{ConnectionPort}";
+
+		public bool HasRules => Rules != null && Rules.Count > 0;
+
+		internal static Server FromSteam(Client client, gameserveritem_t item)
+		{
+			Server server = new Server();
+			server.Client = client;
+			server.Address = item.NetAdr.IP;
+			server.ConnectionPort = item.NetAdr.ConnectionPort;
+			server.QueryPort = item.NetAdr.QueryPort;
+			server.Name = item.ServerName;
+			server.Ping = item.Ping;
+			server.GameDir = item.GameDir;
+			server.Map = item.Map;
+			server.Description = item.GameDescription;
+			server.AppId = item.AppID;
+			server.Players = item.Players;
+			server.MaxPlayers = item.MaxPlayers;
+			server.BotPlayers = item.BotPlayers;
+			server.Passworded = item.Password;
+			server.Secure = item.Secure;
+			server.LastTimePlayed = item.TimeLastPlayed;
+			server.Version = item.ServerVersion;
+			server.Tags = ((item.GameTags == null) ? null : item.GameTags.Split(','));
+			server.SteamId = item.SteamID;
+			return server;
+		}
+
+		public void FetchRules()
+		{
+			if (RulesRequest == null)
+			{
+				Rules = new Dictionary<string, string>();
+				RulesRequest = new ServerRules(this, Address, QueryPort);
+			}
+		}
+
+		internal void OnServerRulesReceiveFinished(bool Success)
+		{
+			RulesRequest.Dispose();
+			RulesRequest = null;
+			if (OnReceivedRules != null)
+			{
+				OnReceivedRules(Success);
+			}
+		}
+
+		public void AddToHistory()
+		{
+			Client.native.matchmaking.AddFavoriteGame(AppId, Address, (ushort)ConnectionPort, (ushort)QueryPort, 2u, (uint)Utility.Epoch.Current);
+			Client.ServerList.UpdateFavouriteList();
+		}
+
+		public void RemoveFromHistory()
+		{
+			Client.native.matchmaking.RemoveFavoriteGame(AppId, Address, (ushort)ConnectionPort, (ushort)QueryPort, 2u);
+			Client.ServerList.UpdateFavouriteList();
+		}
+
+		public void AddToFavourites()
+		{
+			Client.native.matchmaking.AddFavoriteGame(AppId, Address, (ushort)ConnectionPort, (ushort)QueryPort, 1u, (uint)Utility.Epoch.Current);
+			Client.ServerList.UpdateFavouriteList();
+		}
+
+		public void RemoveFromFavourites()
+		{
+			Client.native.matchmaking.RemoveFavoriteGame(AppId, Address, (ushort)ConnectionPort, (ushort)QueryPort, 1u);
+			Client.ServerList.UpdateFavouriteList();
+		}
+	}
+
+	internal Client client;
+
+	private HashSet<ulong> FavouriteHash = new HashSet<ulong>();
+
+	private HashSet<ulong> HistoryHash = new HashSet<ulong>();
+
+	internal ServerList(Client client)
+	{
+		this.client = client;
+		UpdateFavouriteList();
+	}
+
+	internal void UpdateFavouriteList()
+	{
+		FavouriteHash.Clear();
+		HistoryHash.Clear();
+		for (int i = 0; i < client.native.matchmaking.GetFavoriteGameCount(); i++)
+		{
+			AppId_t pnAppID = 0u;
+			client.native.matchmaking.GetFavoriteGame(i, ref pnAppID, out var pnIP, out var pnConnPort, out var _, out var punFlags, out var _);
+			ulong num = pnIP;
+			num <<= 32;
+			num |= pnConnPort;
+			if ((punFlags & 1) == 1)
+			{
+				FavouriteHash.Add(num);
+			}
+			if ((punFlags & 1) == 1)
+			{
+				HistoryHash.Add(num);
+			}
+		}
+	}
+
+	public void Dispose()
+	{
+		client = null;
+	}
+
+	public Request Internet(Filter filter = null)
+	{
+		if (filter == null)
+		{
+			filter = new Filter();
+			filter.Add("appid", client.AppId.ToString());
+		}
+		filter.Start();
+		Request request = new Request(client);
+		request.Filter = filter;
+		request.AddRequest(client.native.servers.RequestInternetServerList(client.AppId, filter.NativeArray, (uint)filter.Count, IntPtr.Zero));
+		filter.Free();
+		return request;
+	}
+
+	public Request Custom(IEnumerable<string> serverList)
+	{
+		Request request = new Request(client);
+		request.ServerList = serverList;
+		request.StartCustomQuery();
+		return request;
+	}
+
+	public Request History(Filter filter = null)
+	{
+		if (filter == null)
+		{
+			filter = new Filter();
+			filter.Add("appid", client.AppId.ToString());
+		}
+		filter.Start();
+		Request request = new Request(client);
+		request.Filter = filter;
+		request.AddRequest(client.native.servers.RequestHistoryServerList(client.AppId, filter.NativeArray, (uint)filter.Count, IntPtr.Zero));
+		filter.Free();
+		return request;
+	}
+
+	public Request Favourites(Filter filter = null)
+	{
+		if (filter == null)
+		{
+			filter = new Filter();
+			filter.Add("appid", client.AppId.ToString());
+		}
+		filter.Start();
+		Request request = new Request(client);
+		request.Filter = filter;
+		request.AddRequest(client.native.servers.RequestFavoritesServerList(client.AppId, filter.NativeArray, (uint)filter.Count, IntPtr.Zero));
+		filter.Free();
+		return request;
+	}
+
+	public Request Friends(Filter filter = null)
+	{
+		if (filter == null)
+		{
+			filter = new Filter();
+			filter.Add("appid", client.AppId.ToString());
+		}
+		filter.Start();
+		Request request = new Request(client);
+		request.Filter = filter;
+		request.AddRequest(client.native.servers.RequestFriendsServerList(client.AppId, filter.NativeArray, (uint)filter.Count, IntPtr.Zero));
+		filter.Free();
+		return request;
+	}
+
+	public Request Local(Filter filter = null)
+	{
+		if (filter == null)
+		{
+			filter = new Filter();
+			filter.Add("appid", client.AppId.ToString());
+		}
+		filter.Start();
+		Request request = new Request(client);
+		request.Filter = filter;
+		request.AddRequest(client.native.servers.RequestLANServerList(client.AppId, IntPtr.Zero));
+		filter.Free();
+		return request;
+	}
+
+	internal bool IsFavourite(Server server)
+	{
+		ulong num = server.Address;
+		num <<= 32;
+		num |= (uint)server.ConnectionPort;
+		return FavouriteHash.Contains(num);
+	}
+
+	internal bool IsHistory(Server server)
+	{
+		ulong num = server.Address;
+		num <<= 32;
+		num |= (uint)server.ConnectionPort;
+		return HistoryHash.Contains(num);
+	}
+}

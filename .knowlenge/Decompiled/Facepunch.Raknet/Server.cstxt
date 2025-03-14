@@ -1,0 +1,221 @@
+using System;
+using System.Diagnostics;
+using Facepunch;
+using Facepunch.Network.Raknet;
+using Network;
+using UnityEngine;
+
+public class Server : Network.Server
+{
+	public static float MaxReceiveTime = 20f;
+
+	public static ulong MaxPacketsPerSecond = 1500uL;
+
+	private Peer peer;
+
+	public override bool IsConnected()
+	{
+		return peer != null;
+	}
+
+	public override bool Start()
+	{
+		peer = Peer.CreateServer(ip, port, 1024);
+		if (peer == null)
+		{
+			return false;
+		}
+		write = new StreamWrite(peer);
+		read = new StreamRead(peer);
+		return true;
+	}
+
+	public override void Stop(string shutdownMsg)
+	{
+		if (peer == null)
+		{
+			return;
+		}
+		Console.WriteLine("[Raknet] Server Shutting Down (" + shutdownMsg + ")");
+		(write as StreamWrite).Shutdown();
+		(read as StreamRead).Shutdown();
+		using (TimeWarning.New("ServerStop"))
+		{
+			peer.Close();
+			peer = null;
+			base.Stop(shutdownMsg);
+		}
+	}
+
+	public override void Kick(Connection cn, string message)
+	{
+		if (peer != null)
+		{
+			if (write.Start())
+			{
+				write.PacketID(Message.Type.DisconnectReason);
+				write.String(message);
+				write.Send(new SendInfo(cn)
+				{
+					method = SendMethod.ReliableUnordered,
+					priority = Priority.Immediate
+				});
+			}
+			Console.WriteLine(cn.ToString() + " kicked: " + message);
+			peer.Kick(cn);
+			OnDisconnected("Kicked: " + message, cn);
+		}
+	}
+
+	internal bool HandleRaknetPacket(byte type, Connection connection)
+	{
+		if (type >= 140)
+		{
+			return false;
+		}
+		switch (type)
+		{
+		case 19:
+			using (TimeWarning.New("OnNewConnection", 20L))
+			{
+				OnNewConnection();
+			}
+			return true;
+		case 21:
+			if (connection != null)
+			{
+				using (TimeWarning.New("OnDisconnected", 20L))
+				{
+					OnDisconnected("Disconnected", connection);
+				}
+			}
+			return true;
+		case 22:
+			if (connection != null)
+			{
+				using (TimeWarning.New("OnDisconnected (timed out)", 20L))
+				{
+					OnDisconnected("Timed Out", connection);
+				}
+			}
+			return true;
+		default:
+			return true;
+		}
+	}
+
+	internal void UnconnectedPacket()
+	{
+		byte b = peer.ReadUInt8();
+		if (onUnconnectedMessage == null || !onUnconnectedMessage(b, read, peer.incomingAddressInt, (int)peer.incomingPort))
+		{
+			HandleRaknetPacket(b, null);
+		}
+	}
+
+	internal void ConnectedPacket(Connection connection)
+	{
+		if (connection.GetPacketsPerSecond() >= MaxPacketsPerSecond)
+		{
+			Kick(connection, "Kicked: Packet Flooding");
+			UnityEngine.Debug.LogWarning(connection.ToString() + " was kicked for packet flooding");
+			return;
+		}
+		connection.AddPacketsPerSecond();
+		byte b = peer.ReadUInt8();
+		if (!HandleRaknetPacket(b, connection))
+		{
+			b -= 140;
+			Message obj = StartMessage((Message.Type)b, connection);
+			if (onMessage != null)
+			{
+				onMessage(obj);
+			}
+			obj.Clear();
+			Pool.Free(ref obj);
+		}
+	}
+
+	public override void Cycle()
+	{
+		base.Cycle();
+		if (!IsConnected())
+		{
+			return;
+		}
+		Stopwatch obj = Pool.Get<Stopwatch>();
+		obj.Reset();
+		obj.Start();
+		while (peer.Receive())
+		{
+			Connection connection = FindConnection(peer.incomingGUID);
+			if (connection == null)
+			{
+				using (TimeWarning.New("UnconnectedPacket", 20L))
+				{
+					UnconnectedPacket();
+				}
+			}
+			else
+			{
+				using (TimeWarning.New("ConnectedPacket", 20L))
+				{
+					ConnectedPacket(connection);
+				}
+			}
+			if (obj.Elapsed.TotalMilliseconds > (double)MaxReceiveTime)
+			{
+				break;
+			}
+		}
+		Pool.Free(ref obj);
+	}
+
+	protected override void OnNewConnection()
+	{
+		Connection connection = new Connection();
+		connection.guid = peer.incomingGUID;
+		connection.ipaddress = peer.incomingAddress;
+		connection.active = true;
+		OnNewConnection(connection);
+	}
+
+	public override string GetDebug(Connection connection)
+	{
+		if (peer == null)
+		{
+			return string.Empty;
+		}
+		if (connection == null)
+		{
+			return peer.GetStatisticsString(0uL);
+		}
+		return peer.GetStatisticsString(connection.guid);
+	}
+
+	public override int GetAveragePing(Connection connection)
+	{
+		if (peer == null)
+		{
+			return 0;
+		}
+		return peer.GetPingAverage(connection.guid);
+	}
+
+	public override ulong GetStat(Connection connection, StatTypeLong type)
+	{
+		if (peer == null)
+		{
+			return 0uL;
+		}
+		return peer.GetStat(connection, type);
+	}
+
+	public unsafe override void SendUnconnected(uint netAddr, ushort netPort, byte[] data, int size)
+	{
+		fixed (byte* data2 = data)
+		{
+			peer.SendUnconnectedMessage(data2, size, netAddr, netPort);
+		}
+	}
+}

@@ -1,0 +1,218 @@
+using System;
+using UnityEngine;
+using UnityEngine.AI;
+
+public class NPCPlayer : BasePlayer
+{
+	public Vector3 finalDestination;
+
+	[NonSerialized]
+	private float randomOffset;
+
+	[NonSerialized]
+	private Vector3 spawnPos;
+
+	public PlayerInventoryProperties[] loadouts;
+
+	public float stoppingDistance = 0.1f;
+
+	public LayerMask movementMask = 1403068673;
+
+	public NavMeshAgent NavAgent;
+
+	private float triggerEndTime;
+
+	private float nextTriggerTime;
+
+	private float lastThinkTime;
+
+	private Vector3 lastPos;
+
+	public override void ServerInit()
+	{
+		if (!base.isClient)
+		{
+			spawnPos = GetPosition();
+			randomOffset = UnityEngine.Random.Range(0f, 1f);
+			base.ServerInit();
+			UpdateNetworkGroup();
+			loadouts[UnityEngine.Random.Range(0, loadouts.Length)].GiveToPlayer(this);
+			InvokeRepeating(ServerThink_Internal, 0f, 0.2f);
+			lastThinkTime = Time.time;
+			Invoke(EquipTest, 1f);
+			finalDestination = base.transform.position;
+			if (NavAgent == null)
+			{
+				NavAgent = GetComponent<NavMeshAgent>();
+			}
+			if ((bool)NavAgent)
+			{
+				NavAgent.updateRotation = false;
+				NavAgent.updatePosition = false;
+			}
+		}
+	}
+
+	public void RandomMove()
+	{
+		float num = 8f;
+		Vector2 vector = UnityEngine.Random.insideUnitCircle * num;
+		SetDestination(spawnPos + new Vector3(vector.x, 0f, vector.y));
+	}
+
+	public virtual void SetDestination(Vector3 newDestination)
+	{
+		finalDestination = newDestination;
+	}
+
+	public AttackEntity GetAttackEntity()
+	{
+		HeldEntity heldEntity = GetHeldEntity();
+		return heldEntity as AttackEntity;
+	}
+
+	public void ShotTest()
+	{
+		HeldEntity heldEntity = GetHeldEntity();
+		AttackEntity attackEntity = heldEntity as AttackEntity;
+		if (attackEntity == null)
+		{
+			return;
+		}
+		BaseProjectile baseProjectile = attackEntity as BaseProjectile;
+		if ((bool)baseProjectile && baseProjectile.primaryMagazine.contents <= 0)
+		{
+			baseProjectile.ServerReload();
+		}
+		if (Mathf.Approximately(attackEntity.attackLengthMin, -1f))
+		{
+			if (!IsInvoking(TriggerDown) && !(Time.time < nextTriggerTime))
+			{
+				InvokeRepeating(TriggerDown, 0f, 0.01f);
+				triggerEndTime = Time.time + UnityEngine.Random.Range(attackEntity.attackLengthMin, attackEntity.attackLengthMax);
+				TriggerDown();
+			}
+		}
+		else if (attackEntity != null)
+		{
+			attackEntity.ServerUse();
+		}
+	}
+
+	public void TriggerDown()
+	{
+		HeldEntity heldEntity = GetHeldEntity();
+		AttackEntity attackEntity = heldEntity as AttackEntity;
+		if (attackEntity != null)
+		{
+			attackEntity.ServerUse();
+		}
+		if (Time.time > triggerEndTime)
+		{
+			CancelInvoke(TriggerDown);
+			nextTriggerTime = Time.time + attackEntity.attackSpacing;
+		}
+	}
+
+	public void EquipTest()
+	{
+		UpdateActiveItem(inventory.containerBelt.GetSlot(0).uid);
+	}
+
+	public void ServerThink_Internal()
+	{
+		float delta = Time.time - lastThinkTime;
+		ServerThink(delta);
+		lastThinkTime = Time.time;
+	}
+
+	public virtual void ServerThink(float delta)
+	{
+		MovementUpdate(delta);
+	}
+
+	public virtual void MovementUpdate(float delta)
+	{
+		if (base.isClient || !IsAlive() || IsWounded())
+		{
+			return;
+		}
+		Vector3 vector = base.transform.position;
+		if (NavAgent != null && NavAgent.enabled && NavAgent.isOnNavMesh)
+		{
+			if (NavAgent.isOnOffMeshLink)
+			{
+				Vector3 vector2 = NavAgent.currentOffMeshLinkData.endPos + Vector3.up * NavAgent.baseOffset;
+				if (NavMesh.SamplePosition(vector2, out var _, NavAgent.height * 2f, 1 << NavMesh.GetAreaFromName("HumanNPC")))
+				{
+					if (Vector3Ex.Distance2D(vector, vector2) < 0.15f)
+					{
+						NavAgent.CompleteOffMeshLink();
+					}
+					else
+					{
+						vector = Vector3.MoveTowards(vector, vector2, NavAgent.speed * Time.smoothDeltaTime);
+					}
+				}
+			}
+			else if (NavAgent.hasPath)
+			{
+				vector = NavAgent.nextPosition;
+			}
+		}
+		Vector3 vector3 = vector - GetPosition();
+		vector3 = new Vector3(vector3.x, 0f, vector3.z);
+		float range = 5f;
+		float b = DesiredMoveSpeed();
+		NavAgent.speed = Mathf.Lerp(NavAgent.speed, b, delta * 1f);
+		Vector3 vector4 = vector;
+		if (TransformUtil.GetGroundInfo(vector4, out var hitOut, range, movementMask, base.transform))
+		{
+			vector4 = hitOut.point;
+		}
+		ServerPosition = vector4;
+		SetAimDirection(GetAimDirection());
+	}
+
+	public Vector3 GetPosition()
+	{
+		return base.transform.position;
+	}
+
+	public virtual float DesiredMoveSpeed()
+	{
+		float running = Mathf.Sin(Time.time + randomOffset);
+		return GetSpeed(running, 0f);
+	}
+
+	public override bool EligibleForWounding(HitInfo info)
+	{
+		return false;
+	}
+
+	public virtual Vector3 GetAimDirection()
+	{
+		float num = Vector3Ex.Distance2D(finalDestination, GetPosition());
+		if (num >= 1f)
+		{
+			Vector3 vector = finalDestination - GetPosition();
+			return new Vector3(vector.x, 0f, vector.z);
+		}
+		return eyes.BodyForward();
+	}
+
+	public void SetAimDirection(Vector3 newAim)
+	{
+		if (!(newAim == Vector3.zero))
+		{
+			AttackEntity attackEntity = GetAttackEntity();
+			if ((bool)attackEntity)
+			{
+				newAim = attackEntity.ModifyAIAim(newAim);
+			}
+			eyes.rotation = Quaternion.LookRotation(newAim, Vector3.up);
+			viewAngles = eyes.rotation.eulerAngles;
+			ServerRotation = eyes.rotation;
+		}
+	}
+}

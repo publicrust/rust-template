@@ -1,0 +1,320 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+
+public class Construction : PrefabAttribute, IPrefabNeedsWarming
+{
+	public class Grade
+	{
+		public BuildingGrade grade;
+
+		public float maxHealth;
+
+		public List<ItemAmount> costToBuild;
+
+		public PhysicMaterial physicMaterial => grade.physicMaterial;
+
+		public ProtectionProperties damageProtecton => grade.damageProtecton;
+	}
+
+	public struct Target
+	{
+		public bool valid;
+
+		public Ray ray;
+
+		public BaseEntity transformParent;
+
+		public BuildingBlock construction;
+
+		public Socket_Base socket;
+
+		public bool onTerrain;
+
+		public Vector3 position;
+
+		public Vector3 normal;
+
+		public Vector3 rotation;
+
+		public BasePlayer player;
+
+		public bool inBuildingPrivilege;
+
+		public Quaternion GetWorldRotation(bool female)
+		{
+			Quaternion quaternion = socket.rotation;
+			if (socket.male && socket.female && female)
+			{
+				quaternion = socket.rotation * Quaternion.Euler(180f, 0f, 180f);
+			}
+			return construction.transform.rotation * quaternion;
+		}
+
+		public Vector3 GetWorldPosition()
+		{
+			return construction.transform.localToWorldMatrix.MultiplyPoint3x4(socket.position);
+		}
+	}
+
+	public class Placement
+	{
+		public Vector3 position;
+
+		public Quaternion rotation;
+	}
+
+	public BaseEntity.Menu.Option info;
+
+	public bool canBypassBuildingPermission;
+
+	public bool canRotate;
+
+	public bool checkVolumeOnRotate;
+
+	public bool checkVolumeOnUpgrade;
+
+	public bool canPlaceAtMaxDistance;
+
+	public Vector3 rotationAmount = new Vector3(0f, 90f, 0f);
+
+	[Range(0f, 10f)]
+	public float healthMultiplier = 1f;
+
+	[Range(0f, 10f)]
+	public float costMultiplier = 1f;
+
+	[Range(1f, 50f)]
+	public float maxplaceDistance = 4f;
+
+	[NonSerialized]
+	public Socket_Base[] allSockets;
+
+	[NonSerialized]
+	public ConstructionGrade defaultGrade;
+
+	[NonSerialized]
+	public SocketHandle socketHandle;
+
+	[NonSerialized]
+	public Bounds bounds;
+
+	[NonSerialized]
+	public ConstructionGrade[] grades;
+
+	[NonSerialized]
+	public Deployable deployable;
+
+	[NonSerialized]
+	public ConstructionPlaceholder placeholder;
+
+	public static string lastPlacementError;
+
+	public BaseEntity CreateConstruction(Target target, bool bNeedsValidPlacement = false)
+	{
+		GameObject gameObject = GameManager.server.CreatePrefab(fullName, Vector3.zero, Quaternion.identity, active: false);
+		bool flag = UpdatePlacement(gameObject.transform, this, ref target);
+		BaseEntity baseEntity = GameObjectEx.ToBaseEntity(gameObject);
+		if (bNeedsValidPlacement && !flag)
+		{
+			if (baseEntity.IsValid())
+			{
+				baseEntity.Kill();
+			}
+			else
+			{
+				GameManager.Destroy(gameObject);
+			}
+			return null;
+		}
+		BuildingBlock buildingBlock = baseEntity as BuildingBlock;
+		if ((bool)buildingBlock)
+		{
+			buildingBlock.AttachToBuilding(target.construction);
+		}
+		return baseEntity;
+	}
+
+	public Socket_Base[] FindMaleSockets(Target target)
+	{
+		List<Socket_Base> list = new List<Socket_Base>();
+		Socket_Base[] array = allSockets;
+		foreach (Socket_Base socket_Base in array)
+		{
+			if (socket_Base.male && !socket_Base.dummy && socket_Base.TestTarget(target))
+			{
+				list.Add(socket_Base);
+			}
+		}
+		if (list.Count == 0)
+		{
+			return null;
+		}
+		return list.ToArray();
+	}
+
+	protected override void AttributeSetup(GameObject rootObj, string name, bool serverside, bool clientside, bool bundling)
+	{
+		base.AttributeSetup(rootObj, name, serverside, clientside, bundling);
+		bounds = rootObj.GetComponent<BaseEntity>().bounds;
+		deployable = GetComponent<Deployable>();
+		placeholder = GetComponentInChildren<ConstructionPlaceholder>();
+		allSockets = GetComponentsInChildren<Socket_Base>(includeInactive: true);
+		socketHandle = GetComponentsInChildren<SocketHandle>(includeInactive: true).FirstOrDefault();
+		ConstructionGrade[] components = rootObj.GetComponents<ConstructionGrade>();
+		grades = new ConstructionGrade[5];
+		ConstructionGrade[] array = components;
+		foreach (ConstructionGrade constructionGrade in array)
+		{
+			constructionGrade.construction = this;
+			grades[(int)constructionGrade.gradeBase.type] = constructionGrade;
+		}
+		for (int j = 0; j < grades.Length; j++)
+		{
+			if (!(grades[j] == null))
+			{
+				defaultGrade = grades[j];
+				break;
+			}
+		}
+	}
+
+	protected override Type GetIndexedType()
+	{
+		return typeof(Construction);
+	}
+
+	public bool UpdatePlacement(Transform transform, Construction common, ref Target target)
+	{
+		if (!target.valid)
+		{
+			return false;
+		}
+		if (!common.canBypassBuildingPermission && !target.player.CanBuild())
+		{
+			lastPlacementError = "Player doesn't have permission";
+			return false;
+		}
+		Socket_Base[] array = common.FindMaleSockets(target);
+		if (array == null)
+		{
+			lastPlacementError = "Couldn't find male socket on " + common.fullName;
+			return false;
+		}
+		Socket_Base[] array2 = array;
+		foreach (Socket_Base socket_Base in array2)
+		{
+			Placement placement = null;
+			if (target.construction != null && target.socket != null && target.construction.IsOccupied(target.socket))
+			{
+				continue;
+			}
+			if (placement == null)
+			{
+				placement = socket_Base.DoPlacement(target);
+			}
+			if (placement == null)
+			{
+				continue;
+			}
+			if (!socket_Base.CheckSocketMods(placement))
+			{
+				transform.position = placement.position;
+				transform.rotation = placement.rotation;
+				continue;
+			}
+			if (!TestPlacingThroughRock(ref placement, target))
+			{
+				transform.position = placement.position;
+				transform.rotation = placement.rotation;
+				lastPlacementError = "Placing through rock";
+				continue;
+			}
+			if (!TestPlacingThroughWall(ref placement, transform, common, target))
+			{
+				transform.position = placement.position;
+				transform.rotation = placement.rotation;
+				lastPlacementError = "Placing through wall";
+				continue;
+			}
+			if (Vector3.Distance(placement.position, target.player.eyes.position) > common.maxplaceDistance + 1f)
+			{
+				transform.position = placement.position;
+				transform.rotation = placement.rotation;
+				lastPlacementError = "Too far away";
+				continue;
+			}
+			DeployVolume[] volumes = PrefabAttribute.server.FindAll<DeployVolume>(prefabID);
+			if (DeployVolume.Check(placement.position, placement.rotation, volumes))
+			{
+				transform.position = placement.position;
+				transform.rotation = placement.rotation;
+				lastPlacementError = "Not enough space";
+				continue;
+			}
+			BuildingProximity[] volumes2 = PrefabAttribute.server.FindAll<BuildingProximity>(prefabID);
+			if (BuildingProximity.Check(this, placement.position, placement.rotation, target.construction, volumes2))
+			{
+				transform.position = placement.position;
+				transform.rotation = placement.rotation;
+				lastPlacementError = "Building too close";
+				continue;
+			}
+			bool flag = BuildingPrivlidge.IsBlocked(target.player, placement.position, placement.rotation, common.bounds);
+			if (flag && !common.canBypassBuildingPermission)
+			{
+				transform.position = placement.position;
+				transform.rotation = placement.rotation;
+				lastPlacementError = "Building privilege";
+				continue;
+			}
+			target.inBuildingPrivilege = flag;
+			transform.position = placement.position;
+			transform.rotation = placement.rotation;
+			return true;
+		}
+		return false;
+	}
+
+	private bool TestPlacingThroughRock(ref Placement placement, Target target)
+	{
+		OBB oBB = new OBB(placement.position, Vector3.one, placement.rotation, bounds);
+		Vector3 center = target.player.GetCenter(ducked: true);
+		Vector3 origin = target.ray.origin;
+		if (Physics.Linecast(center, origin, 65536, QueryTriggerInteraction.Ignore))
+		{
+			return false;
+		}
+		RaycastHit hit;
+		Vector3 end = ((!oBB.Trace(target.ray, out hit)) ? oBB.ClosestPoint(origin) : hit.point);
+		if (Physics.Linecast(origin, end, 65536, QueryTriggerInteraction.Ignore))
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private static bool TestPlacingThroughWall(ref Placement placement, Transform transform, Construction common, Target target)
+	{
+		Vector3 vector = placement.position - target.ray.origin;
+		if (!Physics.Raycast(target.ray.origin, vector.normalized, out var hitInfo, vector.magnitude, 2097152))
+		{
+			return true;
+		}
+		BuildingBlock buildingBlock = RaycastHitEx.GetEntity(hitInfo) as BuildingBlock;
+		if (buildingBlock != null && target.construction == buildingBlock)
+		{
+			return true;
+		}
+		float num = vector.magnitude - hitInfo.distance;
+		if (num < 0.2f)
+		{
+			return true;
+		}
+		lastPlacementError = "object in placement path";
+		transform.position = hitInfo.point;
+		transform.rotation = placement.rotation;
+		return false;
+	}
+}

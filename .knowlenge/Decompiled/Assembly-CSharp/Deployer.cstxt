@@ -1,0 +1,220 @@
+#define UNITY_ASSERTIONS
+using System;
+using ConVar;
+using Network;
+using Oxide.Core;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class Deployer : HeldEntity
+{
+	[NonSerialized]
+	private string placementError;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("Deployer.OnRpcMessage"))
+		{
+			if (rpc == 875669810 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - DoDeploy "));
+				}
+				using (TimeWarning.New("DoDeploy"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsActiveItem.Test("DoDeploy", this, player))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							DoDeploy(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						player.Kick("RPC Error in DoDeploy");
+						Debug.LogException(exception);
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public ItemModDeployable GetModDeployable()
+	{
+		ItemDefinition ownerItemDefinition = GetOwnerItemDefinition();
+		if (ownerItemDefinition == null)
+		{
+			return null;
+		}
+		return ownerItemDefinition.GetComponent<ItemModDeployable>();
+	}
+
+	public Deployable GetDeployable()
+	{
+		ItemModDeployable modDeployable = GetModDeployable();
+		if (modDeployable == null)
+		{
+			return null;
+		}
+		return modDeployable.GetDeployable(this);
+	}
+
+	public Quaternion GetDeployedRotation(Vector3 normal, Vector3 placeDir)
+	{
+		return Quaternion.LookRotation(normal, placeDir) * Quaternion.Euler(90f, 0f, 0f);
+	}
+
+	public bool IsPlacementAngleAcceptable(Vector3 pos, Quaternion rot)
+	{
+		Vector3 lhs = rot * Vector3.up;
+		float f = Vector3.Dot(lhs, Vector3.up);
+		float num = Mathf.Acos(f);
+		if (num <= 0.61086524f)
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public bool CheckPlacement(Deployable deployable, Ray ray, float fDistance)
+	{
+		using (TimeWarning.New("Deploy.CheckPlacement"))
+		{
+			if (!UnityEngine.Physics.Raycast(ray, out var hitInfo, fDistance, 1101070337))
+			{
+				placementError = "Nothing to place on";
+				return false;
+			}
+			DeployVolume[] volumes = PrefabAttribute.server.FindAll<DeployVolume>(deployable.prefabID);
+			Vector3 point = hitInfo.point;
+			Quaternion deployedRotation = GetDeployedRotation(hitInfo.normal, ray.direction);
+			if (DeployVolume.Check(point, deployedRotation, volumes))
+			{
+				placementError = "Not enough space";
+				return false;
+			}
+			if (!IsPlacementAngleAcceptable(hitInfo.point, deployedRotation))
+			{
+				placementError = "Angle too steep";
+				return false;
+			}
+		}
+		return true;
+	}
+
+	[RPC_Server]
+	[RPC_Server.IsActiveItem]
+	private void DoDeploy(RPCMessage msg)
+	{
+		if (!msg.player.CanInteract())
+		{
+			return;
+		}
+		Deployable deployable = GetDeployable();
+		if (!(deployable == null))
+		{
+			Ray ray = msg.read.Ray();
+			uint entityID = msg.read.UInt32();
+			if (deployable.toSlot)
+			{
+				DoDeploy_Slot(deployable, ray, entityID);
+			}
+			else
+			{
+				DoDeploy_Regular(deployable, ray);
+			}
+		}
+	}
+
+	public void DoDeploy_Slot(Deployable deployable, Ray ray, uint entityID)
+	{
+		if (!HasItemAmount())
+		{
+			return;
+		}
+		BasePlayer ownerPlayer = GetOwnerPlayer();
+		if (!ownerPlayer || !ownerPlayer.CanBuild())
+		{
+			return;
+		}
+		BaseEntity baseEntity = BaseNetworkable.serverEntities.Find(entityID) as BaseEntity;
+		if (baseEntity == null || !baseEntity.HasSlot(deployable.slot) || baseEntity.GetSlot(deployable.slot) != null)
+		{
+			return;
+		}
+		ItemModDeployable modDeployable = GetModDeployable();
+		BaseEntity baseEntity2 = GameManager.server.CreateEntity(modDeployable.entityPrefab.resourcePath);
+		if (baseEntity2 != null)
+		{
+			TransformEx.Identity(baseEntity2.gameObject);
+			baseEntity2.SetParent(baseEntity, baseEntity.GetSlotAnchorName(deployable.slot));
+			baseEntity2.OnDeployed(baseEntity);
+			baseEntity2.Spawn();
+			baseEntity.SetSlot(deployable.slot, baseEntity2);
+			if (deployable.placeEffect.isValid)
+			{
+				Effect.server.Run(deployable.placeEffect.resourcePath, baseEntity.transform.position, Vector3.up);
+			}
+		}
+		modDeployable.OnDeployed(baseEntity2, ownerPlayer);
+		Interface.CallHook("OnItemDeployed", this, baseEntity);
+		UseItemAmount(1);
+	}
+
+	public void DoDeploy_Regular(Deployable deployable, Ray ray)
+	{
+		if (!HasItemAmount())
+		{
+			return;
+		}
+		BasePlayer ownerPlayer = GetOwnerPlayer();
+		if (!ownerPlayer)
+		{
+			return;
+		}
+		RaycastHit hitInfo;
+		if (!ownerPlayer.CanBuild())
+		{
+			ownerPlayer.ChatMessage("Building is blocked!");
+		}
+		else if (ConVar.AntiHack.objectplacement && ownerPlayer.TriggeredAntiHack())
+		{
+			ownerPlayer.ChatMessage("AntiHack!");
+		}
+		else if (CheckPlacement(deployable, ray, 8f) && UnityEngine.Physics.Raycast(ray, out hitInfo, 8f, 1101070337))
+		{
+			Quaternion deployedRotation = GetDeployedRotation(hitInfo.normal, ray.direction);
+			Item ownerItem = GetOwnerItem();
+			ItemModDeployable modDeployable = GetModDeployable();
+			BaseEntity baseEntity = GameManager.server.CreateEntity(modDeployable.entityPrefab.resourcePath, hitInfo.point, deployedRotation);
+			if (!baseEntity)
+			{
+				Debug.LogWarning("Couldn't create prefab:" + modDeployable.entityPrefab.resourcePath);
+				return;
+			}
+			baseEntity.skinID = ownerItem.skin;
+			baseEntity.SendMessage("SetDeployedBy", ownerPlayer, SendMessageOptions.DontRequireReceiver);
+			baseEntity.OwnerID = ownerPlayer.userID;
+			baseEntity.Spawn();
+			modDeployable.OnDeployed(baseEntity, ownerPlayer);
+			Interface.CallHook("OnItemDeployed", this, baseEntity);
+			UseItemAmount(1);
+		}
+	}
+}

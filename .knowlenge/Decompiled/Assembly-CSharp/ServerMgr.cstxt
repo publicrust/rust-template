@@ -1,0 +1,1010 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Reflection;
+using ConVar;
+using Facepunch;
+using Facepunch.Math;
+using Facepunch.Steamworks;
+using Ionic.Crc;
+using Network;
+using Network.Visibility;
+using Newtonsoft.Json;
+using Oxide.Core;
+using ProtoBuf;
+using Rust;
+using Rust.Workshop;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+public class ServerMgr : SingletonComponent<ServerMgr>
+{
+	private ConnectionAuth auth;
+
+	private bool runFrameUpdate;
+
+	public UserPersistance persistance;
+
+	private string _AssemblyHash;
+
+	private IEnumerator restartCoroutine;
+
+	private const string SchemaURL = "http://s3.amazonaws.com/s3.playrust.com/icons/inventory/rust/schema.json";
+
+	public ConnectionQueue connectionQueue = new ConnectionQueue();
+
+	private Stopwatch queryTimer = Stopwatch.StartNew();
+
+	private Dictionary<uint, int> unconnectedQueries = new Dictionary<uint, int>();
+
+	private Stopwatch queriesPerSeconTimer = Stopwatch.StartNew();
+
+	private int NumQueriesLastSecond;
+
+	private MemoryStream queryBuffer = new MemoryStream();
+
+	public static int AvailableSlots => ConVar.Server.maxplayers - BasePlayer.activePlayerList.Count();
+
+	private string AssemblyHash
+	{
+		get
+		{
+			if (_AssemblyHash == null)
+			{
+				Assembly assembly = typeof(ServerMgr).Assembly;
+				byte[] array = File.ReadAllBytes(assembly.Location);
+				CRC32 cRC = new CRC32();
+				cRC.SlurpBlock(array, 0, array.Length);
+				_AssemblyHash = cRC.Crc32Result.ToString("x");
+			}
+			return _AssemblyHash;
+		}
+	}
+
+	public bool Restarting => restartCoroutine != null;
+
+	public void Initialize(bool loadSave = true, string saveFile = "", bool allowOutOfDateSaves = false, bool skipInitialSpawn = false)
+	{
+		if (!ConVar.Server.official)
+		{
+			ExceptionReporter.Disabled = true;
+		}
+		StartCoroutine(UpdateInventoryFromSchema());
+		persistance = new UserPersistance(ConVar.Server.rootFolder);
+		SpawnMapEntities();
+		if ((bool)SingletonComponent<SpawnHandler>.Instance)
+		{
+			using (TimeWarning.New("SpawnHandler.UpdateDistributions"))
+			{
+				SingletonComponent<SpawnHandler>.Instance.UpdateDistributions();
+			}
+		}
+		if (loadSave)
+		{
+			skipInitialSpawn = SaveRestore.Load(saveFile, allowOutOfDateSaves);
+		}
+		if ((bool)SingletonComponent<SpawnHandler>.Instance)
+		{
+			if (!skipInitialSpawn)
+			{
+				using (TimeWarning.New("SpawnHandler.InitialSpawn", 200L))
+				{
+					SingletonComponent<SpawnHandler>.Instance.InitialSpawn();
+				}
+			}
+			using (TimeWarning.New("SpawnHandler.StartSpawnTick", 200L))
+			{
+				SingletonComponent<SpawnHandler>.Instance.StartSpawnTick();
+			}
+		}
+		CreateImportantEntities();
+		auth = GetComponent<ConnectionAuth>();
+	}
+
+	public void OpenConnection()
+	{
+		Network.Net.sv.ip = ConVar.Server.ip;
+		Network.Net.sv.port = ConVar.Server.port;
+		if (!Network.Net.sv.Start())
+		{
+			UnityEngine.Debug.LogWarning("Couldn't Start Server.");
+			return;
+		}
+		StartSteamServer();
+		Network.Net.sv.onMessage = OnNetworkMessage;
+		Network.Net.sv.onUnconnectedMessage = OnUnconnectedMessage;
+		Network.Net.sv.onDisconnected = OnDisconnected;
+		EACServer.DoStartup();
+		InvokeRepeating("EACUpdate", 1f, 1f);
+		InvokeRepeating("DoTick", 1f, 1f / (float)ConVar.Server.tickrate);
+		InvokeRepeating("DoHeartbeat", 1f, 1f);
+		runFrameUpdate = true;
+		Interface.CallHook("OnServerInitialized", null);
+	}
+
+	private void OnDisable()
+	{
+		if (persistance != null)
+		{
+			persistance.Dispose();
+			persistance = null;
+		}
+		EACServer.DoShutdown();
+		Network.Server sv = Network.Net.sv;
+		sv.onDisconnected = (Action<string, Connection>)Delegate.Remove(sv.onDisconnected, new Action<string, Connection>(OnDisconnected));
+		using (TimeWarning.New("sv.Stop"))
+		{
+			Network.Net.sv.Stop("Shutting Down");
+		}
+		using (TimeWarning.New("RCon.Shutdown"))
+		{
+			RCon.Shutdown();
+		}
+		using (TimeWarning.New("Steamworks.GameServer.Shutdown"))
+		{
+			if (Rust.Global.SteamServer != null)
+			{
+				UnityEngine.Debug.Log("Steamworks Shutting Down");
+				Rust.Global.SteamServer.Dispose();
+				Rust.Global.SteamServer = null;
+				UnityEngine.Debug.Log("Okay");
+			}
+		}
+	}
+
+	private void CreateImportantEntities()
+	{
+		CreateImportantEntity<EnvSync>("assets/bundled/prefabs/system/net_env.prefab");
+		CreateImportantEntity<CommunityEntity>("assets/bundled/prefabs/system/server/community.prefab");
+		CreateImportantEntity<ResourceDepositManager>("assets/bundled/prefabs/system/server/resourcedepositmanager.prefab");
+	}
+
+	private void CreateImportantEntity<T>(string prefabName) where T : BaseEntity
+	{
+		if (!BaseNetworkable.serverEntities.Any((BaseNetworkable x) => x is T))
+		{
+			UnityEngine.Debug.LogWarning("Missing " + typeof(T).Name + " - creating");
+			BaseEntity baseEntity = GameManager.server.CreateEntity(prefabName);
+			if (baseEntity == null)
+			{
+				UnityEngine.Debug.LogWarning("Couldn't create");
+			}
+			else
+			{
+				baseEntity.Spawn();
+			}
+		}
+	}
+
+	private void StartSteamServer()
+	{
+		if (Rust.Global.SteamServer == null)
+		{
+			uint num = 0u;
+			if (!string.IsNullOrEmpty(ConVar.Server.ip))
+			{
+				byte[] addressBytes = IPAddress.Parse(ConVar.Server.ip).GetAddressBytes();
+				num = (uint)(addressBytes[0] << 24);
+				num += (uint)(addressBytes[1] << 16);
+				num += (uint)(addressBytes[2] << 8);
+				num += addressBytes[3];
+			}
+			Config.ForUnity(UnityEngine.Application.platform.ToString());
+			ServerInit serverInit = new ServerInit("rust", "Rust");
+			serverInit.IpAddress = num;
+			serverInit.GamePort = (ushort)Network.Net.sv.port;
+			serverInit.Secure = ConVar.Server.secure;
+			serverInit.VersionString = 2013.ToString();
+			serverInit.QueryShareGamePort();
+			Rust.Global.SteamServer = new Facepunch.Steamworks.Server(Defines.appID, serverInit);
+			if (!Rust.Global.SteamServer.IsValid)
+			{
+				UnityEngine.Debug.LogWarning("Couldn't initialize Steam Server (" + num + ")");
+				Rust.Global.SteamServer.Dispose();
+				Rust.Global.SteamServer = null;
+				UnityEngine.Application.Quit();
+			}
+			else
+			{
+				Rust.Global.SteamServer.Auth.OnAuthChange = OnValidateAuthTicketResponse;
+				Rust.Global.SteamServer.LogOnAnonymous();
+				InvokeRepeating("UpdateServerInformation", 1f, 10f);
+				DebugEx.Log("Connected to Steam", StackTraceLogType.None);
+			}
+		}
+	}
+
+	private void OnValidateAuthTicketResponse(ulong SteamId, ulong OwnerId, ServerAuth.Status Status)
+	{
+		if (Auth_Steam.ValidateConnecting(SteamId, OwnerId, Status))
+		{
+			return;
+		}
+		Connection connection = Network.Net.sv.connections.FirstOrDefault((Connection x) => x.userid == SteamId);
+		if (connection == null)
+		{
+			UnityEngine.Debug.LogWarning(string.Concat("Steam gave us a ", Status, " ticket response for unconnected id ", SteamId));
+			return;
+		}
+		switch (Status)
+		{
+		case ServerAuth.Status.OK:
+			UnityEngine.Debug.LogWarning("Steam gave us a 'ok' ticket response for already connected id " + SteamId);
+			break;
+		case ServerAuth.Status.VACCheckTimedOut:
+			break;
+		default:
+			connection.authStatus = Status.ToString();
+			Network.Net.sv.Kick(connection, "Steam: " + Status);
+			break;
+		}
+	}
+
+	private void EACUpdate()
+	{
+		EACServer.DoUpdate();
+	}
+
+	private void Update()
+	{
+		if (!runFrameUpdate)
+		{
+			return;
+		}
+		using (TimeWarning.New("ServerMgr.Update", 500L))
+		{
+			try
+			{
+				using (TimeWarning.New("Net.sv.Cycle", 100L))
+				{
+					Network.Net.sv.Cycle();
+				}
+			}
+			catch (Exception exception)
+			{
+				UnityEngine.Debug.LogWarning("Server Network Exception");
+				UnityEngine.Debug.LogException(exception, this);
+			}
+			using (TimeWarning.New("BuildingManager.ServerCycle"))
+			{
+				BuildingManager.ServerCycle();
+			}
+			using (TimeWarning.New("BasePlayer.ServerCycle"))
+			{
+				BasePlayer.ServerCycle(UnityEngine.Time.deltaTime);
+			}
+			using (TimeWarning.New("SteamQueryResponse"))
+			{
+				SteamQueryResponse();
+			}
+			using (TimeWarning.New("connectionQueue.Cycle"))
+			{
+				connectionQueue.Cycle(AvailableSlots);
+			}
+		}
+	}
+
+	private void SteamQueryResponse()
+	{
+		if (Rust.Global.SteamServer == null)
+		{
+			return;
+		}
+		using (TimeWarning.New("SteamGameServer.GetNextOutgoingPacket"))
+		{
+			ServerQuery.Packet packet;
+			while (Rust.Global.SteamServer.Query.GetOutgoingPacket(out packet))
+			{
+				Network.Net.sv.SendUnconnected(packet.Address, packet.Port, packet.Data, packet.Size);
+			}
+		}
+	}
+
+	private void DoTick()
+	{
+		if (Rust.Global.SteamServer != null)
+		{
+			Interface.CallHook("OnTick", null);
+			Rust.Global.SteamServer.Update();
+		}
+		RCon.Update();
+		for (int i = 0; i < Network.Net.sv.connections.Count; i++)
+		{
+			Connection connection = Network.Net.sv.connections[i];
+			if (!connection.isAuthenticated && !(connection.GetSecondsConnected() < (float)ConVar.Server.authtimeout))
+			{
+				Network.Net.sv.Kick(connection, "Authentication Timed Out");
+			}
+		}
+	}
+
+	private void DoHeartbeat()
+	{
+		ItemManager.Heartbeat();
+	}
+
+	private void UpdateServerInformation()
+	{
+		if (Rust.Global.SteamServer == null)
+		{
+			return;
+		}
+		using (TimeWarning.New("UpdateServerInformation"))
+		{
+			Rust.Global.SteamServer.ServerName = ConVar.Server.hostname;
+			Rust.Global.SteamServer.MaxPlayers = ConVar.Server.maxplayers;
+			Rust.Global.SteamServer.Passworded = false;
+			Rust.Global.SteamServer.MapName = UnityEngine.Application.loadedLevelName;
+			string text = "stok";
+			if (Restarting)
+			{
+				text = "strst";
+			}
+			string text2 = $"born{Epoch.FromDateTime(SaveRestore.SaveCreatedTime)}";
+			string text3 = string.Format("mp{0},cp{1},qp{5},v{2}{3},h{4},{6},{7}", ConVar.Server.maxplayers, BasePlayer.activePlayerList.Count, 2013, (!ConVar.Server.pve) ? string.Empty : ",pve", AssemblyHash, SingletonComponent<ServerMgr>.Instance.connectionQueue.Queued, text, text2);
+			if (Interface.Oxide.Config.Options.Modded)
+			{
+				text3 = "oxide,modded," + text3;
+			}
+			Rust.Global.SteamServer.GameTags = text3;
+			if (ConVar.Server.description != null && ConVar.Server.description.Length > 100)
+			{
+				string[] array = StringEx.SplitToChunks(ConVar.Server.description, 100).ToArray();
+				for (int i = 0; i < 16; i++)
+				{
+					if (i < array.Length)
+					{
+						Rust.Global.SteamServer.SetKey($"description_{i:00}", array[i]);
+					}
+					else
+					{
+						Rust.Global.SteamServer.SetKey($"description_{i:00}", string.Empty);
+					}
+				}
+			}
+			else
+			{
+				Rust.Global.SteamServer.SetKey("description_0", ConVar.Server.description);
+				for (int j = 1; j < 16; j++)
+				{
+					Rust.Global.SteamServer.SetKey($"description_{j:00}", string.Empty);
+				}
+			}
+			Rust.Global.SteamServer.SetKey("hash", AssemblyHash);
+			Rust.Global.SteamServer.SetKey("world.seed", World.Seed.ToString());
+			Rust.Global.SteamServer.SetKey("world.size", World.Size.ToString());
+			Rust.Global.SteamServer.SetKey("pve", ConVar.Server.pve.ToString());
+			Rust.Global.SteamServer.SetKey("headerimage", ConVar.Server.headerimage);
+			Rust.Global.SteamServer.SetKey("url", ConVar.Server.url);
+			Rust.Global.SteamServer.SetKey("uptime", ((int)UnityEngine.Time.realtimeSinceStartup/*cast due to .constrained prefix*/).ToString());
+			Rust.Global.SteamServer.SetKey("gc_mb", Performance.report.memoryAllocations.ToString());
+			Rust.Global.SteamServer.SetKey("gc_cl", Performance.report.memoryCollections.ToString());
+			Rust.Global.SteamServer.SetKey("fps", Performance.report.frameRate.ToString());
+			Rust.Global.SteamServer.SetKey("fps_avg", Performance.report.frameRateAverage.ToString("0.00"));
+			Rust.Global.SteamServer.SetKey("ent_cnt", BaseNetworkable.serverEntities.Count.ToString());
+			Rust.Global.SteamServer.SetKey("build", BuildInfo.Current.Scm.ChangeId);
+		}
+	}
+
+	private void OnDisconnected(string strReason, Connection connection)
+	{
+		connectionQueue.RemoveConnection(connection);
+		ConnectionAuth.OnDisconnect(connection);
+		Rust.Global.SteamServer.Auth.EndSession(connection.userid);
+		EACServer.OnLeaveGame(connection);
+		BasePlayer basePlayer = connection.player as BasePlayer;
+		if ((bool)basePlayer)
+		{
+			Interface.CallHook("OnPlayerDisconnected", basePlayer, strReason);
+			basePlayer.OnDisconnected();
+		}
+	}
+
+	public static void OnEnterVisibility(Connection connection, Group group)
+	{
+		if (Network.Net.sv.IsConnected() && Network.Net.sv.write.Start())
+		{
+			Network.Net.sv.write.PacketID(Message.Type.GroupEnter);
+			Network.Net.sv.write.GroupID(group.ID);
+			Network.Net.sv.write.Send(new SendInfo(connection));
+		}
+	}
+
+	public static void OnLeaveVisibility(Connection connection, Group group)
+	{
+		if (Network.Net.sv.IsConnected())
+		{
+			if (Network.Net.sv.write.Start())
+			{
+				Network.Net.sv.write.PacketID(Message.Type.GroupLeave);
+				Network.Net.sv.write.GroupID(group.ID);
+				Network.Net.sv.write.Send(new SendInfo(connection));
+			}
+			if (Network.Net.sv.write.Start())
+			{
+				Network.Net.sv.write.PacketID(Message.Type.GroupDestroy);
+				Network.Net.sv.write.GroupID(group.ID);
+				Network.Net.sv.write.Send(new SendInfo(connection));
+			}
+		}
+	}
+
+	internal void SpawnMapEntities()
+	{
+		PrefabPreProcess prefabPreProcess = new PrefabPreProcess(clientside: false, serverside: true);
+		BaseEntity[] array = UnityEngine.Object.FindObjectsOfType<BaseEntity>();
+		BaseEntity[] array2 = array;
+		foreach (BaseEntity baseEntity in array2)
+		{
+			if (prefabPreProcess.NeedsProcessing(baseEntity.gameObject))
+			{
+				prefabPreProcess.ProcessObject(null, baseEntity.gameObject, isBundling: false, resetLocalTransform: false);
+			}
+			baseEntity.transform.parent = null;
+			SceneManager.MoveGameObjectToScene(baseEntity.gameObject, Rust.Server.EntityScene);
+			baseEntity.gameObject.SetActive(value: true);
+			baseEntity.SpawnAsMapEntity();
+		}
+		DebugEx.Log("Map Spawned " + array.Length + " entities", StackTraceLogType.None);
+	}
+
+	public static BasePlayer.SpawnPoint FindSpawnPoint()
+	{
+		if (SingletonComponent<SpawnHandler>.Instance != null)
+		{
+			BasePlayer.SpawnPoint spawnPoint = SpawnHandler.GetSpawnPoint();
+			if (spawnPoint != null)
+			{
+				return spawnPoint;
+			}
+		}
+		BasePlayer.SpawnPoint spawnPoint2 = new BasePlayer.SpawnPoint();
+		GameObject[] array = GameObject.FindGameObjectsWithTag("spawnpoint");
+		if (array.Length > 0)
+		{
+			GameObject gameObject = array[UnityEngine.Random.Range(0, array.Length)];
+			spawnPoint2.pos = gameObject.transform.position;
+			spawnPoint2.rot = gameObject.transform.rotation;
+		}
+		else
+		{
+			UnityEngine.Debug.Log("Couldn't find an appropriate spawnpoint for the player - so spawning at camera");
+			if (MainCamera.mainCamera != null)
+			{
+				spawnPoint2.pos = MainCamera.mainCamera.transform.position;
+				spawnPoint2.rot = MainCamera.mainCamera.transform.rotation;
+			}
+		}
+		if (UnityEngine.Physics.Raycast(new Ray(spawnPoint2.pos, Vector3.down), out var hitInfo, 32f, 1403068673))
+		{
+			spawnPoint2.pos = hitInfo.point;
+		}
+		return spawnPoint2;
+	}
+
+	public void JoinGame(Connection connection)
+	{
+		using (Approval approval = Facepunch.Pool.Get<Approval>())
+		{
+			approval.level = UnityEngine.Application.loadedLevelName;
+			approval.levelSeed = World.Seed;
+			approval.levelSize = World.Size;
+			approval.checksum = World.Checksum;
+			approval.hostname = ConVar.Server.hostname;
+			approval.official = ConVar.Server.official;
+			if (Network.Net.sv.write.Start())
+			{
+				Network.Net.sv.write.PacketID(Message.Type.Approved);
+				approval.WriteToStream(Network.Net.sv.write);
+				Network.Net.sv.write.Send(new SendInfo(connection));
+			}
+		}
+		connection.connected = true;
+	}
+
+	private void OnApplicationQuit()
+	{
+		Rust.Application.isQuitting = true;
+	}
+
+	internal void Shutdown()
+	{
+		Interface.CallHook("OnServerShutdown", null);
+		BasePlayer[] array = BasePlayer.activePlayerList.ToArray();
+		foreach (BasePlayer basePlayer in array)
+		{
+			basePlayer.Kick("Server Shutting Down");
+		}
+		ConsoleSystem.Run(ConsoleSystem.Option.Server, "server.save");
+		ConsoleSystem.Run(ConsoleSystem.Option.Server, "server.writecfg");
+	}
+
+	private IEnumerator ServerRestartWarning(string info, int iSeconds)
+	{
+		if (iSeconds < 0)
+		{
+			yield break;
+		}
+		if (!string.IsNullOrEmpty(info))
+		{
+			ConsoleNetwork.BroadcastToAllClients("chat.add", 0, "<color=#fff>SERVER</color> Restarting: " + info);
+		}
+		for (int i = iSeconds; i > 0; i--)
+		{
+			if (i == iSeconds || i % 60 == 0 || (i < 300 && i % 30 == 0) || (i < 60 && i % 10 == 0) || i < 10)
+			{
+				ConsoleNetwork.BroadcastToAllClients("chat.add", 0, "<color=#fff>SERVER</color> Restarting in " + i + " seconds!");
+				UnityEngine.Debug.Log("Restarting in " + i + " seconds");
+			}
+			yield return CoroutineEx.waitForSeconds(1f);
+		}
+		ConsoleNetwork.BroadcastToAllClients("chat.add", 0, "<color=#fff>SERVER</color> Restarting");
+		yield return CoroutineEx.waitForSeconds(2f);
+		BasePlayer[] array = BasePlayer.activePlayerList.ToArray();
+		foreach (BasePlayer basePlayer in array)
+		{
+			basePlayer.Kick("Server Restarting");
+		}
+		yield return CoroutineEx.waitForSeconds(1f);
+		ConsoleSystem.Run(ConsoleSystem.Option.Server, "quit");
+	}
+
+	public static void RestartServer(string strNotice, int iSeconds)
+	{
+		if (!(SingletonComponent<ServerMgr>.Instance == null))
+		{
+			if (SingletonComponent<ServerMgr>.Instance.restartCoroutine != null)
+			{
+				ConsoleNetwork.BroadcastToAllClients("chat.add", 0, "<color=#fff>SERVER</color> Restart interrupted!");
+				SingletonComponent<ServerMgr>.Instance.StopCoroutine(SingletonComponent<ServerMgr>.Instance.restartCoroutine);
+				SingletonComponent<ServerMgr>.Instance.restartCoroutine = null;
+			}
+			SingletonComponent<ServerMgr>.Instance.restartCoroutine = SingletonComponent<ServerMgr>.Instance.ServerRestartWarning(strNotice, iSeconds);
+			SingletonComponent<ServerMgr>.Instance.StartCoroutine(SingletonComponent<ServerMgr>.Instance.restartCoroutine);
+			SingletonComponent<ServerMgr>.Instance.UpdateServerInformation();
+		}
+	}
+
+	public IEnumerator UpdateInventoryFromSchema()
+	{
+		while (Rust.Global.SteamServer == null)
+		{
+			yield return CoroutineEx.waitForSecondsRealtime(1f);
+		}
+		while (true)
+		{
+			WWW www = new WWW("http://s3.amazonaws.com/s3.playrust.com/icons/inventory/rust/schema.json");
+			yield return www;
+			if (www.error != null || www.text.Trim().Length <= 8)
+			{
+				www.Dispose();
+				yield return CoroutineEx.waitForSecondsRealtime(10f);
+				continue;
+			}
+			try
+			{
+				ItemSchema itemSchema = JsonConvert.DeserializeObject<ItemSchema>(www.text);
+				if (itemSchema.items == null)
+				{
+					throw new Exception("No items in schema!");
+				}
+				ItemSchema.Item[] items = itemSchema.items;
+				foreach (ItemSchema.Item item in items)
+				{
+					Facepunch.Steamworks.Inventory.Definition definition = Rust.Global.SteamServer.Inventory.CreateDefinition((int)item.itemdefid);
+					definition.Name = item.name;
+					definition.SetProperty("itemshortname", item.itemshortname);
+					definition.SetProperty("workshopid", item.workshopid);
+					definition.SetProperty("workshopdownload", item.workshopdownload);
+				}
+			}
+			catch (Exception ex)
+			{
+				UnityEngine.Debug.LogWarning("Error parsing schema " + ex.Message);
+			}
+			www.Dispose();
+			yield return CoroutineEx.waitForSecondsRealtime(ConVar.Server.schematime);
+		}
+	}
+
+	private void Log(Exception e)
+	{
+		if (ConVar.Global.developer > 0)
+		{
+			UnityEngine.Debug.LogException(e);
+		}
+	}
+
+	private void OnNetworkMessage(Message packet)
+	{
+		switch (packet.type)
+		{
+		case Message.Type.GiveUserInformation:
+			if (packet.connection.GetPacketsPerSecond(packet.type) > 1)
+			{
+				Network.Net.sv.Kick(packet.connection, "Packet Flooding: User Information");
+				break;
+			}
+			using (TimeWarning.New("GiveUserInformation", 20L))
+			{
+				try
+				{
+					OnGiveUserInformation(packet);
+				}
+				catch (Exception e3)
+				{
+					Log(e3);
+					Network.Net.sv.Kick(packet.connection, "Invalid Packet: User Information");
+				}
+			}
+			packet.connection.AddPacketsPerSecond(packet.type);
+			break;
+		case Message.Type.Ready:
+			if (!packet.connection.isAuthenticated)
+			{
+				break;
+			}
+			if (packet.connection.GetPacketsPerSecond(packet.type) > 1)
+			{
+				Network.Net.sv.Kick(packet.connection, "Packet Flooding: Client Ready");
+				break;
+			}
+			using (TimeWarning.New("ClientReady", 20L))
+			{
+				try
+				{
+					ClientReady(packet);
+				}
+				catch (Exception e5)
+				{
+					Log(e5);
+					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Client Ready");
+				}
+			}
+			packet.connection.AddPacketsPerSecond(packet.type);
+			break;
+		case Message.Type.RPCMessage:
+			if (!packet.connection.isAuthenticated)
+			{
+				break;
+			}
+			if (packet.connection.GetPacketsPerSecond(packet.type) > (ulong)ConVar.Server.maxrpcspersecond)
+			{
+				Network.Net.sv.Kick(packet.connection, "Paket Flooding: RPC Message");
+				break;
+			}
+			using (TimeWarning.New("OnRPCMessage", 20L))
+			{
+				try
+				{
+					OnRPCMessage(packet);
+				}
+				catch (Exception e4)
+				{
+					Log(e4);
+					Network.Net.sv.Kick(packet.connection, "Invalid Packet: RPC Message");
+				}
+			}
+			packet.connection.AddPacketsPerSecond(packet.type);
+			break;
+		case Message.Type.ConsoleCommand:
+			if (!packet.connection.isAuthenticated)
+			{
+				break;
+			}
+			if (packet.connection.GetPacketsPerSecond(packet.type) > (ulong)ConVar.Server.maxcommandspersecond)
+			{
+				Network.Net.sv.Kick(packet.connection, "Packet Flooding: Client Command");
+				break;
+			}
+			using (TimeWarning.New("OnClientCommand", 20L))
+			{
+				try
+				{
+					ConsoleNetwork.OnClientCommand(packet);
+				}
+				catch (Exception e2)
+				{
+					Log(e2);
+					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Client Command");
+				}
+			}
+			packet.connection.AddPacketsPerSecond(packet.type);
+			break;
+		case Message.Type.DisconnectReason:
+			if (!packet.connection.isAuthenticated)
+			{
+				break;
+			}
+			if (packet.connection.GetPacketsPerSecond(packet.type) > 1)
+			{
+				Network.Net.sv.Kick(packet.connection, "Packet Flooding: Disconnect Reason");
+				break;
+			}
+			using (TimeWarning.New("ReadDisconnectReason", 20L))
+			{
+				try
+				{
+					ReadDisconnectReason(packet);
+				}
+				catch (Exception e6)
+				{
+					Log(e6);
+					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Disconnect Reason");
+				}
+			}
+			packet.connection.AddPacketsPerSecond(packet.type);
+			break;
+		case Message.Type.Tick:
+			if (!packet.connection.isAuthenticated)
+			{
+				break;
+			}
+			if (packet.connection.GetPacketsPerSecond(packet.type) > (ulong)ConVar.Server.maxtickspersecond)
+			{
+				Network.Net.sv.Kick(packet.connection, "Packet Flooding: Player Tick");
+				break;
+			}
+			using (TimeWarning.New("OnPlayerTick", 20L))
+			{
+				try
+				{
+					OnPlayerTick(packet);
+				}
+				catch (Exception e)
+				{
+					Log(e);
+					Network.Net.sv.Kick(packet.connection, "Invalid Packet: Player Tick");
+				}
+			}
+			packet.connection.AddPacketsPerSecond(packet.type);
+			break;
+		case Message.Type.EAC:
+			EACServer.OnMessageReceived(packet);
+			break;
+		default:
+			ProcessUnhandledPacket(packet);
+			break;
+		}
+	}
+
+	public void ProcessUnhandledPacket(Message packet)
+	{
+		UnityEngine.Debug.LogWarning("[SERVER][UNHANDLED] " + packet.type);
+		Network.Net.sv.Kick(packet.connection, "Sent Unhandled Message");
+	}
+
+	public void ReadDisconnectReason(Message packet)
+	{
+		string text = packet.read.String();
+		string text2 = packet.connection.ToString();
+		if (!string.IsNullOrEmpty(text) && !string.IsNullOrEmpty(text2))
+		{
+			UnityEngine.Debug.Log(text2 + " disconnecting: " + text);
+		}
+	}
+
+	private bool SpawnPlayerSleeping(Connection connection)
+	{
+		BasePlayer basePlayer = BasePlayer.FindSleeping(connection.userid);
+		if (basePlayer == null)
+		{
+			return false;
+		}
+		if (!basePlayer.IsSleeping())
+		{
+			UnityEngine.Debug.LogWarning("Player spawning into sleeper that isn't sleeping!");
+			basePlayer.Kill();
+			return false;
+		}
+		basePlayer.PlayerInit(connection);
+		basePlayer.inventory.SendSnapshot();
+		UnityEngine.Debug.Log(basePlayer.net.connection.ToString() + " joined [" + basePlayer.net.connection.os + "/" + basePlayer.net.connection.ownerid + "]");
+		return true;
+	}
+
+	private void SpawnNewPlayer(Connection connection)
+	{
+		BasePlayer.SpawnPoint spawnPoint = FindSpawnPoint();
+		BaseEntity baseEntity = GameManager.server.CreateEntity("assets/prefabs/player/player.prefab", spawnPoint.pos, spawnPoint.rot);
+		BasePlayer basePlayer = baseEntity.ToPlayer();
+		if (Interface.CallHook("OnPlayerSpawn", basePlayer) == null)
+		{
+			basePlayer.health = 0f;
+			basePlayer.lifestate = BaseCombatEntity.LifeState.Dead;
+			basePlayer.ResetLifeStateOnSpawn = false;
+			basePlayer.limitNetworking = true;
+			basePlayer.Spawn();
+			basePlayer.limitNetworking = false;
+			basePlayer.PlayerInit(connection);
+			if (SleepingBag.FindForPlayer(basePlayer.userID, ignoreTimers: true).Length == 0 && !basePlayer.hasPreviousLife)
+			{
+				basePlayer.Respawn();
+			}
+			else
+			{
+				basePlayer.SendRespawnOptions();
+			}
+			UnityEngine.Debug.Log(basePlayer.net.connection.ToString() + " joined [" + basePlayer.net.connection.os + "/" + basePlayer.net.connection.ownerid + "]");
+		}
+	}
+
+	private void ClientReady(Message packet)
+	{
+		using ClientReady clientReady = ProtoBuf.ClientReady.Deserialize(packet.read);
+		foreach (ClientReady.ClientInfo item in clientReady.clientInfo)
+		{
+			packet.connection.info.Set(item.name, item.value);
+		}
+		connectionQueue.JoinedGame(packet.connection);
+		Interface.CallHook("OnPlayerConnected", packet);
+		using (TimeWarning.New("ClientReady"))
+		{
+			using (TimeWarning.New("SpawnPlayerSleeping"))
+			{
+				if (SpawnPlayerSleeping(packet.connection))
+				{
+					return;
+				}
+			}
+			using (TimeWarning.New("SpawnNewPlayer"))
+			{
+				SpawnNewPlayer(packet.connection);
+			}
+		}
+	}
+
+	private void OnRPCMessage(Message packet)
+	{
+		uint uid = packet.read.UInt32();
+		uint nameID = packet.read.UInt32();
+		BaseEntity baseEntity = BaseNetworkable.serverEntities.Find(uid) as BaseEntity;
+		if (!(baseEntity == null))
+		{
+			baseEntity.SV_RPCMessage(nameID, packet);
+		}
+	}
+
+	private void OnPlayerTick(Message packet)
+	{
+		BasePlayer basePlayer = NetworkPacketEx.Player(packet);
+		if (!(basePlayer == null))
+		{
+			basePlayer.OnReceivedTick(packet.read);
+		}
+	}
+
+	private void OnGiveUserInformation(Message packet)
+	{
+		if (packet.connection.state != 0)
+		{
+			Network.Net.sv.Kick(packet.connection, "Invalid connection state");
+			return;
+		}
+		packet.connection.state = Connection.State.Connecting;
+		byte b = packet.read.UInt8();
+		if (b != 228)
+		{
+			Network.Net.sv.Kick(packet.connection, "Invalid Connection Protocol");
+			return;
+		}
+		packet.connection.userid = packet.read.UInt64();
+		packet.connection.protocol = packet.read.UInt32();
+		packet.connection.os = packet.read.String();
+		packet.connection.username = packet.read.String();
+		Interface.CallHook("OnClientAuth", packet.connection);
+		if (string.IsNullOrEmpty(packet.connection.os))
+		{
+			throw new Exception("Invalid OS");
+		}
+		if (string.IsNullOrEmpty(packet.connection.username))
+		{
+			Network.Net.sv.Kick(packet.connection, "Invalid Username");
+			return;
+		}
+		packet.connection.username = packet.connection.username.Replace('\n', ' ').Replace('\r', ' ').Replace('\t', ' ')
+			.Trim();
+		if (string.IsNullOrEmpty(packet.connection.username))
+		{
+			Network.Net.sv.Kick(packet.connection, "Invalid Username");
+			return;
+		}
+		string text = string.Empty;
+		string branch = ConVar.Server.branch;
+		if (packet.read.unread >= 4)
+		{
+			text = packet.read.String();
+		}
+		if (branch != string.Empty && branch != text)
+		{
+			UnityEngine.Debug.Log(string.Concat("Kicking ", packet.connection, " - their branch is '", text, "' not '", branch, "'"));
+			Network.Net.sv.Kick(packet.connection, "Wrong Steam Beta: Requires '" + branch + "' branch!");
+		}
+		else if (packet.connection.protocol > 2013)
+		{
+			UnityEngine.Debug.Log(string.Concat("Kicking ", packet.connection, " - their protocol is ", packet.connection.protocol, " not ", 2013));
+			Network.Net.sv.Kick(packet.connection, "Wrong Connection Protocol: Server update required!");
+		}
+		else if (packet.connection.protocol < 2013)
+		{
+			UnityEngine.Debug.Log(string.Concat("Kicking ", packet.connection, " - their protocol is ", packet.connection.protocol, " not ", 2013));
+			Network.Net.sv.Kick(packet.connection, "Wrong Connection Protocol: Client update required!");
+		}
+		else
+		{
+			packet.connection.token = packet.read.BytesWithSize();
+			if (packet.connection.token == null || packet.connection.token.Length < 1)
+			{
+				Network.Net.sv.Kick(packet.connection, "Invalid Token");
+			}
+			else
+			{
+				auth.OnNewConnection(packet.connection);
+			}
+		}
+	}
+
+	private bool OnUnconnectedMessage(int type, Read read, uint ip, int port)
+	{
+		if (queryTimer.Elapsed.TotalSeconds > 60.0)
+		{
+			queryTimer.Reset();
+			queryTimer.Start();
+			unconnectedQueries.Clear();
+		}
+		if (queriesPerSeconTimer.Elapsed.TotalSeconds > 1.0)
+		{
+			queriesPerSeconTimer.Reset();
+			queriesPerSeconTimer.Start();
+			NumQueriesLastSecond = 0;
+		}
+		if (type == 255)
+		{
+			if (NumQueriesLastSecond > ConVar.Server.queriesPerSecond)
+			{
+				return false;
+			}
+			if (read.UInt8() != byte.MaxValue)
+			{
+				return false;
+			}
+			if (read.UInt8() != byte.MaxValue)
+			{
+				return false;
+			}
+			if (read.UInt8() != byte.MaxValue)
+			{
+				return false;
+			}
+			if (!unconnectedQueries.ContainsKey(ip))
+			{
+				unconnectedQueries.Add(ip, 0);
+			}
+			int num = unconnectedQueries[ip] + 1;
+			unconnectedQueries[ip] = num;
+			if (num > ConVar.Server.ipQueriesPerMin)
+			{
+				return true;
+			}
+			NumQueriesLastSecond++;
+			read.Position = 0L;
+			int unread = read.unread;
+			if (unread > 4096)
+			{
+				return true;
+			}
+			if (queryBuffer.Capacity < unread)
+			{
+				queryBuffer.Capacity = unread;
+			}
+			int size = read.Read(queryBuffer.GetBuffer(), 0, unread);
+			Rust.Global.SteamServer.Query.Handle(queryBuffer.GetBuffer(), size, ip, (ushort)port);
+			return true;
+		}
+		return false;
+	}
+}

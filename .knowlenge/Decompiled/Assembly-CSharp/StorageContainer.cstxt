@@ -1,0 +1,367 @@
+#define UNITY_ASSERTIONS
+using System;
+using ConVar;
+using Facepunch;
+using Network;
+using Oxide.Core;
+using ProtoBuf;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class StorageContainer : DecayEntity
+{
+	public int inventorySlots = 6;
+
+	public float dropChance = 0.75f;
+
+	public bool isLootable = true;
+
+	public bool isLockable = true;
+
+	public string panelName = "generic";
+
+	public ItemContainer.ContentsType allowedContents;
+
+	public ItemDefinition allowedItem;
+
+	public int maxStackSize;
+
+	public bool displayHealth = true;
+
+	public bool needsBuildingPrivilegeToUse;
+
+	[Header("Item Dropping")]
+	public Vector3 dropPosition;
+
+	public Vector3 dropVelocity = Vector3.forward;
+
+	public ItemCategory onlyAcceptCategory = ItemCategory.All;
+
+	[NonSerialized]
+	public ItemContainer inventory;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("StorageContainer.OnRpcMessage"))
+		{
+			if (rpc == 4042031372u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RPC_OpenLoot "));
+				}
+				using (TimeWarning.New("RPC_OpenLoot"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test("RPC_OpenLoot", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage rpc2 = rPCMessage;
+							RPC_OpenLoot(rpc2);
+						}
+					}
+					catch (Exception exception)
+					{
+						player.Kick("RPC Error in RPC_OpenLoot");
+						Debug.LogException(exception);
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	private void OnDrawGizmos()
+	{
+		Gizmos.matrix = base.transform.localToWorldMatrix;
+		Gizmos.color = Color.yellow;
+		Gizmos.DrawCube(dropPosition, Vector3.one * 0.1f);
+		Gizmos.color = Color.white;
+		Gizmos.DrawRay(dropPosition, dropVelocity);
+	}
+
+	public void MoveAllInventoryItems(ItemContainer source, ItemContainer dest)
+	{
+		for (int i = 0; i < Mathf.Min(source.capacity, dest.capacity); i++)
+		{
+			source.GetSlot(i)?.MoveToContainer(dest);
+		}
+	}
+
+	public virtual void ReceiveInventoryFromItem(Item item)
+	{
+		if (item.contents != null)
+		{
+			MoveAllInventoryItems(item.contents, inventory);
+		}
+	}
+
+	public override void OnPickedUp(Item createdItem, BasePlayer player)
+	{
+		base.OnPickedUp(createdItem, player);
+		if (createdItem != null && createdItem.contents != null)
+		{
+			MoveAllInventoryItems(inventory, createdItem.contents);
+			return;
+		}
+		for (int i = 0; i < inventory.capacity; i++)
+		{
+			Item slot = inventory.GetSlot(i);
+			if (slot != null)
+			{
+				slot.RemoveFromContainer();
+				player.GiveItem(slot, GiveItemReason.PickedUp);
+			}
+		}
+	}
+
+	public override void ResetState()
+	{
+		base.ResetState();
+		if (inventory != null)
+		{
+			inventory.Clear();
+		}
+		inventory = null;
+	}
+
+	public override void ServerInit()
+	{
+		if (inventory == null)
+		{
+			inventory = new ItemContainer();
+			inventory.allowedContents = ((allowedContents == (ItemContainer.ContentsType)0) ? ItemContainer.ContentsType.Generic : allowedContents);
+			inventory.onlyAllowedItem = allowedItem;
+			inventory.entityOwner = this;
+			inventory.maxStackSize = maxStackSize;
+			inventory.ServerInitialize(null, inventorySlots);
+			inventory.GiveUID();
+			inventory.onDirty += OnInventoryDirty;
+			inventory.onItemAddedRemoved = OnItemAddedOrRemoved;
+			if (onlyAcceptCategory != ItemCategory.All)
+			{
+				inventory.canAcceptItem = ItemFilter;
+			}
+			OnInventoryFirstCreated(inventory);
+		}
+		base.ServerInit();
+	}
+
+	public virtual void OnInventoryFirstCreated(ItemContainer container)
+	{
+	}
+
+	public virtual void OnItemAddedOrRemoved(Item item, bool added)
+	{
+	}
+
+	public bool ItemFilter(Item item)
+	{
+		if (onlyAcceptCategory == ItemCategory.All)
+		{
+			return true;
+		}
+		return item.info.category == onlyAcceptCategory;
+	}
+
+	public override void PreServerLoad()
+	{
+		base.PreServerLoad();
+		inventory = new ItemContainer();
+		inventory.entityOwner = this;
+		inventory.allowedContents = ((allowedContents == (ItemContainer.ContentsType)0) ? ItemContainer.ContentsType.Generic : allowedContents);
+		inventory.ServerInitialize(null, inventorySlots);
+		inventory.onDirty += OnInventoryDirty;
+		inventory.onItemAddedRemoved = OnItemAddedOrRemoved;
+	}
+
+	protected virtual void OnInventoryDirty()
+	{
+		InvalidateNetworkCache();
+	}
+
+	public override void PostServerLoad()
+	{
+		base.PostServerLoad();
+		SetFlag(Flags.Open, b: false);
+	}
+
+	internal override void DoServerDestroy()
+	{
+		base.DoServerDestroy();
+		if (inventory != null)
+		{
+			inventory.Kill();
+			inventory = null;
+		}
+	}
+
+	public override bool HasSlot(Slot slot)
+	{
+		if (isLockable && slot == Slot.Lock)
+		{
+			return true;
+		}
+		return base.HasSlot(slot);
+	}
+
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
+	private void RPC_OpenLoot(RPCMessage rpc)
+	{
+		if (isLootable)
+		{
+			BasePlayer player = rpc.player;
+			PlayerOpenLoot(player);
+		}
+	}
+
+	public virtual string GetPanelName()
+	{
+		return panelName;
+	}
+
+	public virtual bool CanMoveFrom(BasePlayer player, Item item)
+	{
+		return !inventory.IsLocked();
+	}
+
+	public virtual bool CanOpenLootPanel(BasePlayer player, string panelName = "")
+	{
+		if (needsBuildingPrivilegeToUse && !player.CanBuild())
+		{
+			return false;
+		}
+		BaseLock baseLock = GetSlot(Slot.Lock) as BaseLock;
+		if (baseLock != null && !baseLock.OnTryToOpen(player))
+		{
+			player.ChatMessage("It is locked...");
+			return false;
+		}
+		return true;
+	}
+
+	public virtual bool PlayerOpenLoot(BasePlayer player)
+	{
+		return PlayerOpenLoot(player, panelName);
+	}
+
+	public virtual bool PlayerOpenLoot(BasePlayer player, string panelToOpen)
+	{
+		if (IsLocked())
+		{
+			player.ChatMessage("Can't loot right now");
+			return false;
+		}
+		if (!CanOpenLootPanel(player, panelToOpen))
+		{
+			return false;
+		}
+		using (TimeWarning.New("PlayerOpenLoot"))
+		{
+			player.inventory.loot.StartLootingEntity(this);
+			player.inventory.loot.AddContainer(inventory);
+			player.inventory.loot.SendImmediate();
+			player.ClientRPCPlayer(null, player, "RPC_OpenLootPanel", panelToOpen);
+			SendNetworkUpdate();
+		}
+		return true;
+	}
+
+	public virtual void PlayerStoppedLooting(BasePlayer player)
+	{
+		Interface.CallHook("OnLootEntityEnd", player, this);
+		SetFlag(Flags.Open, b: false);
+		SendNetworkUpdate();
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (info.msg.storageBox != null)
+		{
+			if (inventory != null)
+			{
+				inventory.Load(info.msg.storageBox.contents);
+				inventory.capacity = inventorySlots;
+			}
+			else
+			{
+				Debug.LogWarning("Storage container without inventory: " + ToString());
+			}
+		}
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		if (info.forDisk)
+		{
+			if (inventory != null)
+			{
+				info.msg.storageBox = Facepunch.Pool.Get<StorageBox>();
+				info.msg.storageBox.contents = inventory.Save();
+			}
+			else
+			{
+				Debug.LogWarning("Storage container without inventory: " + ToString());
+			}
+		}
+	}
+
+	private void PreDie()
+	{
+		DropItems();
+	}
+
+	public override void OnKilled(HitInfo info)
+	{
+		DropItems();
+		base.OnKilled(info);
+	}
+
+	public void DropItems()
+	{
+		if (inventory == null || inventory.itemList == null || inventory.itemList.Count == 0 || dropChance == 0f)
+		{
+			return;
+		}
+		if (ShouldDropItemsIndividually() || inventory.itemList.Count == 1)
+		{
+			DropUtil.DropItems(inventory, GetDropPosition());
+			return;
+		}
+		DroppedItemContainer droppedItemContainer = inventory.Drop("assets/prefabs/misc/item drop/item_drop.prefab", GetDropPosition(), base.transform.rotation);
+		if (!(droppedItemContainer != null))
+		{
+		}
+	}
+
+	public override Vector3 GetDropPosition()
+	{
+		return base.transform.localToWorldMatrix.MultiplyPoint(dropPosition);
+	}
+
+	public override Vector3 GetDropVelocity()
+	{
+		return base.transform.localToWorldMatrix.MultiplyVector(dropPosition);
+	}
+
+	public virtual bool ShouldDropItemsIndividually()
+	{
+		return false;
+	}
+}

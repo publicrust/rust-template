@@ -1,0 +1,244 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using Facepunch.Extend;
+using Facepunch.Steamworks;
+using Facepunch.Utility;
+using Newtonsoft.Json;
+using Rust;
+using Rust.Workshop;
+using UnityEngine;
+using UnityEngine.UI;
+
+internal class Publisher : MonoBehaviour
+{
+	public InputField ChangeLog;
+
+	public Button PublishButton;
+
+	public Texture2D IconBackground;
+
+	private Skinnable Skinnable;
+
+	private Skin Skin;
+
+	private ulong ItemId;
+
+	private string Title;
+
+	private GameObject Prefab;
+
+	protected WorkshopInterface Interface => GetComponentInParent<WorkshopInterface>();
+
+	protected WorkshopItemEditor Editor => Interface.Editor;
+
+	public void StartExport()
+	{
+		StartCoroutine(DoExport(publishToSteam: true, OpenFolder: false));
+	}
+
+	public void Update()
+	{
+		PublishButton.interactable = CanPublish();
+	}
+
+	public bool CanPublish()
+	{
+		if (Interface.Editor.ItemTitle.Length == 0)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private IEnumerator DoExport(bool publishToSteam, bool OpenFolder, string forceFolderName = null)
+	{
+		Skinnable = Editor.Skinnable;
+		Skin = Editor.Skin;
+		ItemId = Editor.ItemId;
+		Title = Editor.ItemTitle;
+		Prefab = Editor.Prefab;
+		Interface.LoadingBar.Active = true;
+		Interface.LoadingBar.Text = "Exporting";
+		Interface.LoadingBar.SubText = "";
+		string tempFolder = Path.GetTempFileName();
+		File.Delete(tempFolder);
+		Directory.CreateDirectory(tempFolder);
+		if (forceFolderName != null)
+		{
+			tempFolder = forceFolderName;
+		}
+		Debug.Log(tempFolder);
+		yield return StartCoroutine(ExportToFolder(tempFolder, OpenFolder));
+		if (publishToSteam)
+		{
+			yield return StartCoroutine(PublishToSteam(tempFolder));
+		}
+		if (forceFolderName != tempFolder)
+		{
+			Directory.Delete(tempFolder, recursive: true);
+		}
+		Interface.LoadingBar.Active = false;
+	}
+
+	private IEnumerator ExportToFolder(string folder, bool OpenFolder)
+	{
+		Skin.Manifest data = new Skin.Manifest
+		{
+			ItemType = Skinnable.Name,
+			Version = 3,
+			Groups = new Skin.Manifest.Group[Skin.Materials.Length],
+			PublishDate = DateTime.UtcNow,
+			AuthorId = Global.SteamClient.SteamId
+		};
+		for (int i = 0; i < Skin.Materials.Length; i++)
+		{
+			data.Groups[i] = new Skin.Manifest.Group();
+			yield return StartCoroutine(ExportTexture(data.Groups[i].Textures, folder, i, "_MainTex", Skin.Materials[i], Skin.DefaultMaterials[i]));
+			yield return StartCoroutine(ExportTexture(data.Groups[i].Textures, folder, i, "_OcclusionMap", Skin.Materials[i], Skin.DefaultMaterials[i]));
+			yield return StartCoroutine(ExportTexture(data.Groups[i].Textures, folder, i, "_SpecGlossMap", Skin.Materials[i], Skin.DefaultMaterials[i]));
+			yield return StartCoroutine(ExportTexture(data.Groups[i].Textures, folder, i, "_BumpMap", Skin.Materials[i], Skin.DefaultMaterials[i], isNormalMap: true));
+			yield return StartCoroutine(ExportTexture(data.Groups[i].Textures, folder, i, "_EmissionMap", Skin.Materials[i], Skin.DefaultMaterials[i]));
+			data.Groups[i].Floats.Add("_Cutoff", Skin.Materials[i].GetFloat("_Cutoff"));
+			data.Groups[i].Floats.Add("_BumpScale", Skin.Materials[i].GetFloat("_BumpScale"));
+			data.Groups[i].Floats.Add("_Glossiness", Skin.Materials[i].GetFloat("_Glossiness"));
+			data.Groups[i].Floats.Add("_OcclusionStrength", Skin.Materials[i].GetFloat("_OcclusionStrength"));
+			if (Skin.Materials[i].shader.name.Contains("Cloth"))
+			{
+				data.Groups[i].Floats.Add("_MicrofiberFuzzIntensity", Skin.Materials[i].GetFloat("_MicrofiberFuzzIntensity"));
+				data.Groups[i].Floats.Add("_MicrofiberFuzzScatter", Skin.Materials[i].GetFloat("_MicrofiberFuzzScatter"));
+				data.Groups[i].Floats.Add("_MicrofiberFuzzOcclusion", Skin.Materials[i].GetFloat("_MicrofiberFuzzOcclusion"));
+			}
+			data.Groups[i].Colors.Add("_Color", new Skin.Manifest.ColorEntry(Skin.Materials[i].GetColor("_Color")));
+			data.Groups[i].Colors.Add("_SpecColor", new Skin.Manifest.ColorEntry(Skin.Materials[i].GetColor("_SpecColor")));
+			data.Groups[i].Colors.Add("_EmissionColor", new Skin.Manifest.ColorEntry(Skin.Materials[i].GetColor("_EmissionColor")));
+			if (Skin.Materials[i].shader.name.Contains("Cloth"))
+			{
+				data.Groups[i].Colors.Add("_MicrofiberFuzzColor", new Skin.Manifest.ColorEntry(Skin.Materials[i].GetColor("_MicrofiberFuzzColor")));
+			}
+		}
+		PropRenderer.RenderScreenshot(Prefab, folder + "/icon.png", 512, 512, 4);
+		CreateWorkshopIcon(folder);
+		string contents = JsonConvert.SerializeObject(data, Formatting.Indented);
+		File.WriteAllText(folder + "/manifest.txt", contents);
+		if (OpenFolder)
+		{
+			Os.OpenFolder(folder);
+		}
+	}
+
+	private void CreateWorkshopIcon(string folder)
+	{
+		Texture2D texture2D = new Texture2D(512, 512, TextureFormat.ARGB32, mipmap: false);
+		texture2D.LoadImage(File.ReadAllBytes(folder + "/icon.png"));
+		RenderTexture renderTexture = new RenderTexture(512, 512, 0);
+		renderTexture.Blit(IconBackground);
+		renderTexture.BlitWithAlphaBlending(texture2D);
+		renderTexture.ToTexture(texture2D);
+		File.WriteAllBytes(bytes: texture2D.EncodeToPNG(), path: folder + "/icon_background.png");
+		UnityEngine.Object.DestroyImmediate(texture2D);
+		UnityEngine.Object.DestroyImmediate(renderTexture);
+	}
+
+	private IEnumerator PublishToSteam(string folder)
+	{
+		Workshop.Editor workshopEd = ((ItemId != 0L) ? Global.SteamClient.Workshop.EditItem(ItemId) : Global.SteamClient.Workshop.CreateItem(Workshop.ItemType.Microtransaction));
+		if (workshopEd == null)
+		{
+			throw new Exception("No Editor");
+		}
+		workshopEd.Folder = folder;
+		workshopEd.PreviewImage = folder + "/icon_background.png";
+		workshopEd.Title = Title;
+		workshopEd.Tags.Add("Version3");
+		workshopEd.Tags.Add(Skinnable.Name);
+		workshopEd.Tags.Add("Skin");
+		workshopEd.Visibility = Workshop.Editor.VisibilityType.Public;
+		if (!string.IsNullOrEmpty(ChangeLog.text))
+		{
+			workshopEd.ChangeNote = ChangeLog.text;
+		}
+		workshopEd.Publish();
+		Interface.LoadingBar.Text = "Publishing To Steam";
+		while (workshopEd.Publishing)
+		{
+			Interface.LoadingBar.Progress = (float)workshopEd.Progress;
+			Interface.LoadingBar.SubText = $"{workshopEd.BytesUploaded.FormatBytes()} / {workshopEd.BytesTotal.FormatBytes()}";
+			yield return null;
+		}
+		if (workshopEd.Error != null)
+		{
+			Debug.Log("Error: " + workshopEd.Error);
+		}
+		else
+		{
+			Debug.Log("Published File: " + workshopEd.Id);
+		}
+		Interface.LoadingBar.SubText = "";
+		Workshop.Query q = Global.SteamClient.Workshop.CreateQuery();
+		q.FileId.Add(workshopEd.Id);
+		Interface.LoadingBar.Text = "Fetching Item Information";
+		q.Run();
+		while (q.IsRunning)
+		{
+			yield return null;
+		}
+		if (q.Items.Length == 0)
+		{
+			Debug.Log("Error Retrieving item information!");
+			WorkshopItemList.RefreshAll();
+			yield break;
+		}
+		Workshop.Item item = q.Items[0];
+		Editor.ItemId = item.Id;
+		Editor.ItemTitle = item.Title;
+		ChangeLog.text = "";
+		UnityEngine.Application.OpenURL(q.Items[0].Url);
+		WorkshopItemList.RefreshAll();
+	}
+
+	private IEnumerator ExportTexture(Dictionary<string, string> data, string folder, int group, string paramname, Material mat, Material defaultMat, bool isNormalMap = false)
+	{
+		Interface.LoadingBar.SubText = "Exporting Texture " + paramname;
+		UnityEngine.Texture texture = mat.GetTexture(paramname);
+		UnityEngine.Texture texture2 = defaultMat.GetTexture(paramname);
+		if (texture == texture2)
+		{
+			yield break;
+		}
+		if (texture == null)
+		{
+			data.Add(paramname, "none");
+			yield break;
+		}
+		texture = Facepunch.Utility.Texture.LimitSize(texture as Texture2D, Skinnable.Groups[group].MaxTextureSize, Skinnable.Groups[group].MaxTextureSize);
+		if (isNormalMap)
+		{
+			texture = Facepunch.Utility.Texture.CreateReadableCopy(texture as Texture2D);
+			(texture as Texture2D).DecompressNormals();
+		}
+		string text = string.Format("{0}{1}{2}", paramname, group, ".png");
+		data.Add(paramname, text);
+		texture.SaveAsPng(folder + "/" + text);
+		yield return null;
+	}
+
+	public void Export()
+	{
+		StartCoroutine(DoExport());
+	}
+
+	public IEnumerator DoExport()
+	{
+		yield return StartCoroutine(Editor.FileDialog.Save());
+		if (Editor.FileDialog.result != null && !File.Exists(Editor.FileDialog.result))
+		{
+			if (!Directory.Exists(Editor.FileDialog.result))
+			{
+				Directory.CreateDirectory(Editor.FileDialog.result);
+			}
+			yield return StartCoroutine(DoExport(publishToSteam: false, OpenFolder: true, Editor.FileDialog.result));
+		}
+	}
+}

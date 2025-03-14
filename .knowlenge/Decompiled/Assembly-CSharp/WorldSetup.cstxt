@@ -1,0 +1,218 @@
+using System.Collections;
+using System.Collections.Generic;
+using ConVar;
+using UnityEngine;
+
+public class WorldSetup : SingletonComponent<WorldSetup>
+{
+	public bool AutomaticallySetup;
+
+	public GameObject terrain;
+
+	public GameObject decorPrefab;
+
+	public GameObject grassPrefab;
+
+	public GameObject spawnPrefab;
+
+	private TerrainMeta terrainMeta;
+
+	public uint EditorSeed;
+
+	public uint EditorSalt;
+
+	internal List<ProceduralObject> ProceduralObjects = new List<ProceduralObject>();
+
+	private void OnValidate()
+	{
+		if (this.terrain == null)
+		{
+			UnityEngine.Terrain terrain = Object.FindObjectOfType<UnityEngine.Terrain>();
+			if (terrain != null)
+			{
+				this.terrain = terrain.gameObject;
+			}
+		}
+	}
+
+	protected override void Awake()
+	{
+		base.Awake();
+		Prefab[] array = Prefab.Load("assets/bundled/prefabs/world");
+		foreach (Prefab prefab in array)
+		{
+			if (prefab.Object.GetComponent<BaseEntity>() != null)
+			{
+				BaseEntity baseEntity = prefab.SpawnEntity(Vector3.zero, Quaternion.identity);
+				baseEntity.Spawn();
+			}
+			else
+			{
+				prefab.Spawn(Vector3.zero, Quaternion.identity);
+			}
+		}
+		SingletonComponent[] array2 = Object.FindObjectsOfType<SingletonComponent>();
+		foreach (SingletonComponent singletonComponent in array2)
+		{
+			singletonComponent.Setup();
+		}
+		if ((bool)terrain)
+		{
+			TerrainGenerator component = terrain.GetComponent<TerrainGenerator>();
+			if ((bool)component)
+			{
+				World.Procedural = true;
+				terrain = component.CreateTerrain();
+			}
+			else
+			{
+				World.Procedural = false;
+			}
+			terrainMeta = terrain.GetComponent<TerrainMeta>();
+			terrainMeta.Init();
+			terrainMeta.SetupComponents();
+			World.InitSize(Mathf.RoundToInt(TerrainMeta.Size.x));
+		}
+		World.Serialization = new WorldSerialization();
+		World.Serialization.CleanupOldFiles();
+		CreateObject(decorPrefab);
+		CreateObject(grassPrefab);
+		CreateObject(spawnPrefab);
+		if (AutomaticallySetup)
+		{
+			StartCoroutine(InitCoroutine());
+		}
+	}
+
+	protected void CreateObject(GameObject prefab)
+	{
+		if (!(prefab == null))
+		{
+			GameObject gameObject = Object.Instantiate(prefab);
+			if (gameObject != null)
+			{
+				gameObject.SetActive(value: true);
+			}
+		}
+	}
+
+	public IEnumerator InitCoroutine()
+	{
+		ProceduralComponent[] components = GetComponentsInChildren<ProceduralComponent>(includeInactive: true);
+		Timing loadTimer = Timing.Start("Loading World");
+		if (ConVar.World.cache && World.Procedural && World.Serialization.CanLoadFromDisk())
+		{
+			LoadingScreen.Update("LOADING WORLD");
+			yield return CoroutineEx.waitForEndOfFrame;
+			yield return CoroutineEx.waitForEndOfFrame;
+			yield return CoroutineEx.waitForEndOfFrame;
+			World.Serialization.Load();
+		}
+		loadTimer.End();
+		if (World.Serialization.Cached && World.Serialization.Version != 1)
+		{
+			World.Serialization.Clear();
+		}
+		if (World.Serialization.Cached && string.IsNullOrEmpty(World.Checksum))
+		{
+			World.Checksum = World.Serialization.Checksum;
+		}
+		Timing applyTimer = Timing.Start("Applying World");
+		if (World.Serialization.Cached)
+		{
+			LoadingScreen.Update("APPLYING WORLD");
+			yield return CoroutineEx.waitForEndOfFrame;
+			yield return CoroutineEx.waitForEndOfFrame;
+			yield return CoroutineEx.waitForEndOfFrame;
+			TerrainMeta.HeightMap.FromByteArray(World.Serialization.GetMap("terrain"));
+			TerrainMeta.SplatMap.FromByteArray(World.Serialization.GetMap("splat"));
+			TerrainMeta.BiomeMap.FromByteArray(World.Serialization.GetMap("biome"));
+			TerrainMeta.TopologyMap.FromByteArray(World.Serialization.GetMap("topology"));
+			TerrainMeta.AlphaMap.FromByteArray(World.Serialization.GetMap("alpha"));
+			TerrainMeta.WaterMap.FromByteArray(World.Serialization.GetMap("water"));
+		}
+		applyTimer.End();
+		Timing spawnTimer = Timing.Start("Spawning World");
+		if (World.Serialization.Cached)
+		{
+			LoadingScreen.Update("SPAWNING WORLD");
+			yield return CoroutineEx.waitForEndOfFrame;
+			yield return CoroutineEx.waitForEndOfFrame;
+			yield return CoroutineEx.waitForEndOfFrame;
+			IEnumerator worldSpawn = World.Serialization.Spawn(0.2f, delegate(string str)
+			{
+				LoadingScreen.Update(str);
+			});
+			while (worldSpawn.MoveNext())
+			{
+				yield return worldSpawn.Current;
+			}
+			TerrainMeta.Path.Clear();
+			TerrainMeta.Path.Roads.AddRange(World.Serialization.GetPaths("Road"));
+			TerrainMeta.Path.Bridges.AddRange(World.Serialization.GetPaths("Bridge"));
+			TerrainMeta.Path.Rivers.AddRange(World.Serialization.GetPaths("River"));
+			TerrainMeta.Path.Powerlines.AddRange(World.Serialization.GetPaths("Powerline"));
+		}
+		spawnTimer.End();
+		Timing procgenTimer = Timing.Start("Procedural Generation");
+		if (components.Length > 0)
+		{
+			for (int i = 0; i < components.Length; i++)
+			{
+				ProceduralComponent component = components[i];
+				if ((bool)component && component.ShouldRun())
+				{
+					uint seed = (uint)(World.Seed + i);
+					LoadingScreen.Update(component.Description.ToUpper());
+					yield return CoroutineEx.waitForEndOfFrame;
+					yield return CoroutineEx.waitForEndOfFrame;
+					yield return CoroutineEx.waitForEndOfFrame;
+					Timing timing = Timing.Start(component.Description);
+					if ((bool)component)
+					{
+						component.Process(seed);
+					}
+					timing.End();
+				}
+			}
+		}
+		procgenTimer.End();
+		Timing saveTimer = Timing.Start("Saving World");
+		if (ConVar.World.cache && World.Procedural && !World.Serialization.Cached)
+		{
+			LoadingScreen.Update("SAVING WORLD");
+			yield return CoroutineEx.waitForEndOfFrame;
+			yield return CoroutineEx.waitForEndOfFrame;
+			yield return CoroutineEx.waitForEndOfFrame;
+			World.Serialization.AddPaths(TerrainMeta.Path.Roads);
+			World.Serialization.AddPaths(TerrainMeta.Path.Bridges);
+			World.Serialization.AddPaths(TerrainMeta.Path.Rivers);
+			World.Serialization.AddPaths(TerrainMeta.Path.Powerlines);
+			World.Serialization.Save();
+			if (string.IsNullOrEmpty(World.Checksum))
+			{
+				World.Checksum = World.Serialization.Checksum;
+			}
+		}
+		saveTimer.End();
+		Timing finalizeTimer = Timing.Start("Finalizing World");
+		LoadingScreen.Update("FINALIZING WORLD");
+		yield return CoroutineEx.waitForEndOfFrame;
+		yield return CoroutineEx.waitForEndOfFrame;
+		yield return CoroutineEx.waitForEndOfFrame;
+		if ((bool)terrainMeta)
+		{
+			terrainMeta.BindShaderProperties();
+			terrainMeta.PostSetupComponents();
+		}
+		finalizeTimer.End();
+		LoadingScreen.Update("DONE");
+		yield return CoroutineEx.waitForEndOfFrame;
+		yield return CoroutineEx.waitForEndOfFrame;
+		yield return CoroutineEx.waitForEndOfFrame;
+		if ((bool)this)
+		{
+			GameManager.Destroy(base.gameObject);
+		}
+	}
+}

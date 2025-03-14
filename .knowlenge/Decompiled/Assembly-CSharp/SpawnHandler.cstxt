@@ -1,0 +1,467 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using ConVar;
+using UnityEngine;
+
+public class SpawnHandler : SingletonComponent<SpawnHandler>
+{
+	public float TickInterval = 60f;
+
+	public int MinSpawnsPerTick = 100;
+
+	public int MaxSpawnsPerTick = 100;
+
+	public LayerMask PlacementMask = default(LayerMask);
+
+	public LayerMask PlacementCheckMask = default(LayerMask);
+
+	public float PlacementCheckHeight = 25f;
+
+	public LayerMask RadiusCheckMask = default(LayerMask);
+
+	public float RadiusCheckDistance = 5f;
+
+	public LayerMask BoundsCheckMask = default(LayerMask);
+
+	public SpawnFilter CharacterSpawn;
+
+	public SpawnPopulation[] SpawnPopulations;
+
+	internal SpawnDistribution[] SpawnDistributions;
+
+	internal SpawnDistribution CharDistribution;
+
+	internal List<SpawnGroup> SpawnGroups = new List<SpawnGroup>();
+
+	[ReadOnly]
+	public SpawnPopulation[] ConvarSpawnPopulations;
+
+	private Dictionary<SpawnPopulation, SpawnDistribution> population2distribution;
+
+	private bool spawnTick;
+
+	private SpawnPopulation[] AllSpawnPopulations;
+
+	protected void OnEnable()
+	{
+		AllSpawnPopulations = SpawnPopulations.Concat(ConvarSpawnPopulations).ToArray();
+		StartCoroutine(SpawnTick());
+		StartCoroutine(SpawnGroupTick());
+	}
+
+	public static BasePlayer.SpawnPoint GetSpawnPoint()
+	{
+		if (SingletonComponent<SpawnHandler>.Instance == null || SingletonComponent<SpawnHandler>.Instance.CharDistribution == null)
+		{
+			return null;
+		}
+		BasePlayer.SpawnPoint spawnPoint = new BasePlayer.SpawnPoint();
+		for (int i = 0; i < 60; i++)
+		{
+			if (SingletonComponent<SpawnHandler>.Instance.CharDistribution.Sample(out spawnPoint.pos, out spawnPoint.rot))
+			{
+				return spawnPoint;
+			}
+		}
+		return null;
+	}
+
+	public void UpdateDistributions()
+	{
+		if (World.Size == 0)
+		{
+			return;
+		}
+		SpawnDistributions = new SpawnDistribution[AllSpawnPopulations.Length];
+		population2distribution = new Dictionary<SpawnPopulation, SpawnDistribution>();
+		Vector3 size = TerrainMeta.Size;
+		Vector3 position = TerrainMeta.Position;
+		int pop_res = Mathf.NextPowerOfTwo((int)((float)World.Size * 0.25f));
+		float pop_normfac = 1f / ((float)pop_res - 1f);
+		for (int i = 0; i < AllSpawnPopulations.Length; i++)
+		{
+			SpawnPopulation spawnPopulation = AllSpawnPopulations[i];
+			if (spawnPopulation == null)
+			{
+				Debug.LogError("Spawn handler contains null spawn population.");
+				continue;
+			}
+			byte[] map = new byte[pop_res * pop_res];
+			SpawnFilter filter = spawnPopulation.Filter;
+			Parallel.For(0, pop_res, delegate(int z)
+			{
+				for (int j = 0; j < pop_res; j++)
+				{
+					float normX = (float)j * pop_normfac;
+					float normZ = (float)z * pop_normfac;
+					map[z * pop_res + j] = (byte)(255f * filter.GetFactor(normX, normZ));
+				}
+			});
+			SpawnDistribution value = (SpawnDistributions[i] = new SpawnDistribution(this, map, position, size));
+			population2distribution.Add(spawnPopulation, value);
+		}
+		int char_res = Mathf.NextPowerOfTwo((int)((float)World.Size * 0.5f));
+		float char_normfac = 1f / ((float)char_res - 1f);
+		byte[] map2 = new byte[char_res * char_res];
+		SpawnFilter filter2 = CharacterSpawn;
+		Parallel.For(0, char_res, delegate(int z)
+		{
+			for (int k = 0; k < char_res; k++)
+			{
+				float normX2 = (float)k * char_normfac;
+				float normZ2 = (float)z * char_normfac;
+				map2[z * char_res + k] = (byte)(255f * filter2.GetFactor(normX2, normZ2));
+			}
+		});
+		CharDistribution = new SpawnDistribution(this, map2, position, size);
+	}
+
+	public void FillPopulations()
+	{
+		if (SpawnDistributions == null)
+		{
+			return;
+		}
+		for (int i = 0; i < AllSpawnPopulations.Length; i++)
+		{
+			if (!(AllSpawnPopulations[i] == null))
+			{
+				SpawnInitial(AllSpawnPopulations[i], SpawnDistributions[i]);
+			}
+		}
+	}
+
+	public void FillGroups()
+	{
+		for (int i = 0; i < SpawnGroups.Count; i++)
+		{
+			SpawnGroups[i].Fill();
+		}
+	}
+
+	public void InitialSpawn()
+	{
+		if (ConVar.Spawn.respawn_populations && SpawnDistributions != null)
+		{
+			for (int i = 0; i < AllSpawnPopulations.Length; i++)
+			{
+				if (!(AllSpawnPopulations[i] == null))
+				{
+					SpawnInitial(AllSpawnPopulations[i], SpawnDistributions[i]);
+				}
+			}
+		}
+		if (ConVar.Spawn.respawn_groups)
+		{
+			for (int j = 0; j < SpawnGroups.Count; j++)
+			{
+				SpawnGroups[j].SpawnInitial();
+			}
+		}
+	}
+
+	public void StartSpawnTick()
+	{
+		spawnTick = true;
+	}
+
+	private IEnumerator SpawnTick()
+	{
+		while (true)
+		{
+			yield return CoroutineEx.waitForEndOfFrame;
+			if (!spawnTick || !ConVar.Spawn.respawn_populations)
+			{
+				continue;
+			}
+			yield return CoroutineEx.waitForSeconds(TickInterval);
+			for (int i = 0; i < AllSpawnPopulations.Length; i++)
+			{
+				SpawnPopulation spawnPopulation = AllSpawnPopulations[i];
+				if (spawnPopulation == null)
+				{
+					continue;
+				}
+				SpawnDistribution spawnDistribution = SpawnDistributions[i];
+				if (spawnDistribution == null)
+				{
+					continue;
+				}
+				try
+				{
+					if (SpawnDistributions != null)
+					{
+						SpawnRepeating(spawnPopulation, spawnDistribution);
+					}
+				}
+				catch (Exception message)
+				{
+					Debug.LogError(message);
+				}
+				yield return CoroutineEx.waitForEndOfFrame;
+			}
+		}
+	}
+
+	private IEnumerator SpawnGroupTick()
+	{
+		while (true)
+		{
+			yield return CoroutineEx.waitForEndOfFrame;
+			if (!spawnTick || !ConVar.Spawn.respawn_groups)
+			{
+				continue;
+			}
+			yield return CoroutineEx.waitForSeconds(1f);
+			for (int i = 0; i < SpawnGroups.Count; i++)
+			{
+				SpawnGroup spawnGroup = SpawnGroups[i];
+				if (!(spawnGroup == null))
+				{
+					try
+					{
+						spawnGroup.SpawnRepeating();
+					}
+					catch (Exception message)
+					{
+						Debug.LogError(message);
+					}
+					yield return CoroutineEx.waitForEndOfFrame;
+				}
+			}
+		}
+	}
+
+	public void SpawnInitial(SpawnPopulation population, SpawnDistribution distribution)
+	{
+		int num = GetTargetCount(population, distribution) - GetCurrentCount(population, distribution);
+		Spawn(population, distribution, num, num * population.SpawnAttemptsInitial);
+	}
+
+	public void SpawnRepeating(SpawnPopulation population, SpawnDistribution distribution)
+	{
+		int num = GetTargetCount(population, distribution) - GetCurrentCount(population, distribution);
+		num = Mathf.RoundToInt((float)num * population.GetCurrentSpawnRate());
+		num = UnityEngine.Random.Range(Mathf.Min(num, MinSpawnsPerTick), Mathf.Min(num, MaxSpawnsPerTick));
+		Spawn(population, distribution, num, num * population.SpawnAttemptsRepeating);
+	}
+
+	private void Spawn(SpawnPopulation population, SpawnDistribution distribution, int numToFill, int numToTry)
+	{
+		if (Global.developer > 1)
+		{
+			Debug.Log("[Spawn]".PadRight(10) + "Population " + population.ResourceFolder + " needs to spawn " + numToFill);
+		}
+		float num = Mathf.Max(population.ClusterSizeMax, distribution.Grid.CellArea * population.GetMaximumSpawnDensity());
+		while (numToFill >= population.ClusterSizeMin && numToTry > 0)
+		{
+			ByteQuadtree.Element node = distribution.SampleNode();
+			int f = UnityEngine.Random.Range(population.ClusterSizeMin, population.ClusterSizeMax + 1);
+			f = Mathx.Min(numToTry, numToFill, f);
+			for (int i = 0; i < f; i++)
+			{
+				if (distribution.Sample(out var spawnPos, out var spawnRot, node, population.AlignToNormal, population.ClusterDithering) && population.Filter.GetFactor(spawnPos) > 0f && (float)distribution.Grid[spawnPos] < num)
+				{
+					population.Spawn(spawnPos, spawnRot);
+					numToFill--;
+				}
+				numToTry--;
+			}
+		}
+	}
+
+	public void EnforceLimits(bool forceAll = false)
+	{
+		if (SpawnDistributions == null)
+		{
+			return;
+		}
+		for (int i = 0; i < AllSpawnPopulations.Length; i++)
+		{
+			if (!(AllSpawnPopulations[i] == null))
+			{
+				SpawnPopulation spawnPopulation = AllSpawnPopulations[i];
+				SpawnDistribution distribution = SpawnDistributions[i];
+				if (forceAll || spawnPopulation.EnforcePopulationLimits)
+				{
+					EnforceLimits(spawnPopulation, distribution);
+				}
+			}
+		}
+	}
+
+	private void EnforceLimits(SpawnPopulation population, SpawnDistribution distribution)
+	{
+		int targetCount = GetTargetCount(population, distribution);
+		Spawnable[] array = FindAll(population);
+		if (array.Length <= targetCount)
+		{
+			return;
+		}
+		Debug.Log(string.Concat(population, " has ", array.Length, " objects, but max allowed is ", targetCount));
+		int num = array.Length - targetCount;
+		Debug.Log(" - deleting " + num + " objects");
+		foreach (Spawnable item in array.Take(num))
+		{
+			BaseEntity baseEntity = GameObjectEx.ToBaseEntity(item.gameObject);
+			if (baseEntity.IsValid())
+			{
+				baseEntity.Kill();
+			}
+			else
+			{
+				GameManager.Destroy(item.gameObject);
+			}
+		}
+	}
+
+	public Spawnable[] FindAll(SpawnPopulation population)
+	{
+		return (from x in UnityEngine.Object.FindObjectsOfType<Spawnable>()
+			where x.gameObject.activeInHierarchy && x.Population == population
+			select x).ToArray();
+	}
+
+	public int GetTargetCount(SpawnPopulation population, SpawnDistribution distribution)
+	{
+		float num = TerrainMeta.Size.x * TerrainMeta.Size.z;
+		float num2 = population.GetCurrentSpawnDensity();
+		if (population.ScaleWithSpawnFilter)
+		{
+			num2 *= distribution.Density;
+		}
+		return Mathf.RoundToInt(num * num2);
+	}
+
+	public int GetCurrentCount(SpawnPopulation population, SpawnDistribution distribution)
+	{
+		return distribution.Count;
+	}
+
+	public void AddInstance(Spawnable spawnable)
+	{
+		if (!population2distribution.TryGetValue(spawnable.Population, out var value))
+		{
+			Debug.LogWarning("[SpawnHandler] trying to add instance to invalid population: " + spawnable.Population);
+			return;
+		}
+		value.Count++;
+		value.Grid[spawnable.SpawnPosition]++;
+	}
+
+	public void RemoveInstance(Spawnable spawnable)
+	{
+		if (!population2distribution.TryGetValue(spawnable.Population, out var value))
+		{
+			Debug.LogWarning("[SpawnHandler] trying to remove instance from invalid population: " + spawnable.Population);
+			return;
+		}
+		value.Count--;
+		value.Grid[spawnable.SpawnPosition]--;
+	}
+
+	public static float PlayerFraction()
+	{
+		float num = Mathf.Max(Server.maxplayers, 1);
+		float num2 = BasePlayer.activePlayerList.Count;
+		return Mathf.Clamp01(num2 / num);
+	}
+
+	public static float PlayerLerp(float min, float max)
+	{
+		return Mathf.Lerp(min, max, PlayerFraction());
+	}
+
+	public static float PlayerExcess()
+	{
+		float num = Mathf.Max(ConVar.Spawn.player_base, 1f);
+		float num2 = BasePlayer.activePlayerList.Count;
+		if (num2 <= num)
+		{
+			return 0f;
+		}
+		return (num2 - num) / num;
+	}
+
+	public static float PlayerScale(float scalar)
+	{
+		return Mathf.Max(1f, PlayerExcess() * scalar);
+	}
+
+	public void DumpReport(string filename)
+	{
+		File.AppendAllText(filename, "\r\n\r\nSpawnHandler Report:\r\n\r\n" + GetReport());
+	}
+
+	public string GetReport(bool detailed = true)
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+		if (AllSpawnPopulations == null)
+		{
+			stringBuilder.AppendLine("Spawn population array is null.");
+		}
+		if (SpawnDistributions == null)
+		{
+			stringBuilder.AppendLine("Spawn distribution array is null.");
+		}
+		if (AllSpawnPopulations != null && SpawnDistributions != null)
+		{
+			for (int i = 0; i < AllSpawnPopulations.Length; i++)
+			{
+				if (AllSpawnPopulations[i] == null)
+				{
+					continue;
+				}
+				SpawnPopulation spawnPopulation = AllSpawnPopulations[i];
+				SpawnDistribution spawnDistribution = SpawnDistributions[i];
+				if (spawnPopulation != null)
+				{
+					if (!string.IsNullOrEmpty(spawnPopulation.ResourceFolder))
+					{
+						stringBuilder.AppendLine(spawnPopulation.name + " (autospawn/" + spawnPopulation.ResourceFolder + ")");
+					}
+					else
+					{
+						stringBuilder.AppendLine(spawnPopulation.name);
+					}
+					if (detailed)
+					{
+						stringBuilder.AppendLine("\tPrefabs:");
+						if (spawnPopulation.Prefabs != null)
+						{
+							Prefab<Spawnable>[] prefabs = spawnPopulation.Prefabs;
+							foreach (Prefab<Spawnable> prefab in prefabs)
+							{
+								stringBuilder.AppendLine("\t\t" + prefab.Name + " - " + prefab.Object);
+							}
+						}
+						else
+						{
+							stringBuilder.AppendLine("\t\tN/A");
+						}
+					}
+					if (spawnDistribution != null)
+					{
+						int currentCount = GetCurrentCount(spawnPopulation, spawnDistribution);
+						int targetCount = GetTargetCount(spawnPopulation, spawnDistribution);
+						stringBuilder.AppendLine("\tPopulation: " + currentCount + "/" + targetCount);
+					}
+					else
+					{
+						stringBuilder.AppendLine("\tDistribution #" + i + " is not set.");
+					}
+				}
+				else
+				{
+					stringBuilder.AppendLine("Population #" + i + " is not set.");
+				}
+				stringBuilder.AppendLine();
+			}
+		}
+		return stringBuilder.ToString();
+	}
+}

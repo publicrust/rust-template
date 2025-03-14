@@ -1,0 +1,384 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Threading;
+using Oxide.Core;
+using Oxide.Core.Libraries;
+using Oxide.Core.Plugins;
+
+public class WebRequests : Library
+{
+	public class WebRequest
+	{
+		private HttpWebRequest request;
+
+		private WaitHandle waitHandle;
+
+		private RegisteredWaitHandle registeredWaitHandle;
+
+		private Event.Callback<Plugin, PluginManager> removedFromManager;
+
+		public Action<int, string> Callback { get; }
+
+		public float Timeout { get; set; }
+
+		public string Method { get; set; }
+
+		public string Url { get; }
+
+		public string Body { get; set; }
+
+		public int ResponseCode { get; protected set; }
+
+		public string ResponseText { get; protected set; }
+
+		public Plugin Owner { get; protected set; }
+
+		public Dictionary<string, string> RequestHeaders { get; set; }
+
+		public WebRequest(string url, Action<int, string> callback, Plugin owner)
+		{
+			Url = url;
+			Callback = callback;
+			Owner = owner;
+			removedFromManager = Owner?.OnRemovedFromManager.Add(owner_OnRemovedFromManager);
+		}
+
+		public void Start()
+		{
+			try
+			{
+				request = (HttpWebRequest)System.Net.WebRequest.Create(Url);
+				request.Method = Method;
+				request.Credentials = CredentialCache.DefaultCredentials;
+				request.Proxy = null;
+				request.KeepAlive = false;
+				request.Timeout = (int)Math.Round((Timeout.Equals(0f) ? WebRequests.Timeout : Timeout) * 1000f);
+				request.ServicePoint.MaxIdleTime = request.Timeout;
+				request.ServicePoint.Expect100Continue = ServicePointManager.Expect100Continue;
+				request.ServicePoint.ConnectionLimit = ServicePointManager.DefaultConnectionLimit;
+				byte[] data = new byte[0];
+				if (Body != null)
+				{
+					data = Encoding.UTF8.GetBytes(Body);
+					request.ContentLength = data.Length;
+					request.ContentType = "application/x-www-form-urlencoded";
+				}
+				if (RequestHeaders != null)
+				{
+					request.SetRawHeaders(RequestHeaders);
+				}
+				if (data.Length != 0)
+				{
+					request.BeginGetRequestStream(delegate(IAsyncResult result)
+					{
+						if (request != null)
+						{
+							try
+							{
+								using Stream stream = request.EndGetRequestStream(result);
+								stream.Write(data, 0, data.Length);
+							}
+							catch (Exception ex)
+							{
+								ResponseText = ex.Message.Trim('\r', '\n', ' ');
+								request?.Abort();
+								OnComplete();
+								return;
+							}
+							WaitForResponse();
+						}
+					}, null);
+				}
+				else
+				{
+					WaitForResponse();
+				}
+			}
+			catch (Exception ex2)
+			{
+				ResponseText = ex2.Message.Trim('\r', '\n', ' ');
+				string text = $"Web request produced exception (Url: {Url})";
+				if ((bool)Owner)
+				{
+					text += $" in '{Owner.Name} v{Owner.Version}' plugin";
+				}
+				Interface.Oxide.LogException(text, ex2);
+				request?.Abort();
+				OnComplete();
+			}
+		}
+
+		private void WaitForResponse()
+		{
+			IAsyncResult asyncResult = request.BeginGetResponse(delegate(IAsyncResult res)
+			{
+				try
+				{
+					using HttpWebResponse httpWebResponse = (HttpWebResponse)request.EndGetResponse(res);
+					using (Stream stream = httpWebResponse.GetResponseStream())
+					{
+						using StreamReader streamReader = new StreamReader(stream);
+						ResponseText = streamReader.ReadToEnd();
+					}
+					ResponseCode = (int)httpWebResponse.StatusCode;
+				}
+				catch (WebException ex)
+				{
+					ResponseText = ex.Message.Trim('\r', '\n', ' ');
+					if (ex.Response is HttpWebResponse httpWebResponse2)
+					{
+						try
+						{
+							using Stream stream2 = httpWebResponse2.GetResponseStream();
+							using StreamReader streamReader2 = new StreamReader(stream2);
+							ResponseText = streamReader2.ReadToEnd();
+						}
+						catch (Exception)
+						{
+						}
+						ResponseCode = (int)httpWebResponse2.StatusCode;
+					}
+				}
+				catch (Exception ex3)
+				{
+					ResponseText = ex3.Message.Trim('\r', '\n', ' ');
+					string text = $"Web request produced exception (Url: {Url})";
+					if ((bool)Owner)
+					{
+						text += $" in '{Owner.Name} v{Owner.Version}' plugin";
+					}
+					Interface.Oxide.LogException(text, ex3);
+				}
+				if (request != null)
+				{
+					request.Abort();
+					OnComplete();
+				}
+			}, null);
+			waitHandle = asyncResult.AsyncWaitHandle;
+			registeredWaitHandle = ThreadPool.RegisterWaitForSingleObject(waitHandle, OnTimeout, null, request.Timeout, executeOnlyOnce: true);
+		}
+
+		private void OnTimeout(object state, bool timedOut)
+		{
+			if (timedOut)
+			{
+				request?.Abort();
+			}
+			if (Owner != null)
+			{
+				Event.Remove(ref removedFromManager);
+				Owner = null;
+			}
+		}
+
+		private void OnComplete()
+		{
+			Event.Remove(ref removedFromManager);
+			registeredWaitHandle?.Unregister(waitHandle);
+			Interface.Oxide.NextTick(delegate
+			{
+				if (request != null)
+				{
+					request = null;
+					Owner?.TrackStart();
+					try
+					{
+						Callback(ResponseCode, ResponseText);
+					}
+					catch (Exception ex)
+					{
+						string text = "Web request callback raised an exception";
+						if ((bool)Owner && Owner != null)
+						{
+							text += $" in '{Owner.Name} v{Owner.Version}' plugin";
+						}
+						Interface.Oxide.LogException(text, ex);
+					}
+					Owner?.TrackEnd();
+					Owner = null;
+				}
+			});
+		}
+
+		private void owner_OnRemovedFromManager(Plugin sender, PluginManager manager)
+		{
+			if (request != null)
+			{
+				HttpWebRequest httpWebRequest = request;
+				request = null;
+				httpWebRequest.Abort();
+			}
+		}
+	}
+
+	public static float Timeout = 30f;
+
+	private readonly Queue<WebRequest> queue = new Queue<WebRequest>();
+
+	private readonly object syncroot = new object();
+
+	private readonly Thread workerthread;
+
+	private readonly AutoResetEvent workevent = new AutoResetEvent(initialState: false);
+
+	private bool shutdown;
+
+	private readonly int maxWorkerThreads;
+
+	private readonly int maxCompletionPortThreads;
+
+	public WebRequests()
+	{
+		ServicePointManager.Expect100Continue = false;
+		ServicePointManager.ServerCertificateValidationCallback = (object <sender>, X509Certificate <certificate>, X509Chain <chain>, SslPolicyErrors <sslPolicyErrors>) => true;
+		ServicePointManager.DefaultConnectionLimit = 200;
+		ThreadPool.GetMaxThreads(out maxWorkerThreads, out maxCompletionPortThreads);
+		maxCompletionPortThreads = (int)((double)maxCompletionPortThreads * 0.6);
+		maxWorkerThreads = (int)((double)maxWorkerThreads * 0.75);
+		workerthread = new Thread(Worker);
+		workerthread.Start();
+	}
+
+	public override void Shutdown()
+	{
+		if (!shutdown)
+		{
+			shutdown = true;
+			workevent.Set();
+			Thread.Sleep(250);
+			workerthread.Abort();
+		}
+	}
+
+	private void Worker()
+	{
+		try
+		{
+			while (!shutdown)
+			{
+				ThreadPool.GetAvailableThreads(out var workerThreads, out var completionPortThreads);
+				if (workerThreads <= maxWorkerThreads || completionPortThreads <= maxCompletionPortThreads)
+				{
+					Thread.Sleep(100);
+					continue;
+				}
+				WebRequest webRequest = null;
+				lock (syncroot)
+				{
+					if (queue.Count > 0)
+					{
+						webRequest = queue.Dequeue();
+					}
+				}
+				if (webRequest != null)
+				{
+					webRequest.Start();
+				}
+				else
+				{
+					workevent.WaitOne();
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			Interface.Oxide.LogException("WebRequests worker: ", ex);
+		}
+	}
+
+	[LibraryFunction("EnqueueGet")]
+	public void EnqueueGet(string url, Action<int, string> callback, Plugin owner, Dictionary<string, string> headers = null, float timeout = 0f)
+	{
+		WebRequest item = new WebRequest(url, callback, owner)
+		{
+			Method = "GET",
+			RequestHeaders = headers,
+			Timeout = timeout
+		};
+		lock (syncroot)
+		{
+			queue.Enqueue(item);
+		}
+		workevent.Set();
+	}
+
+	[LibraryFunction("EnqueueDelete")]
+	public void EnqueueDelete(string url, string body, Action<int, string> callback, Plugin owner, Dictionary<string, string> headers = null, float timeout = 0f)
+	{
+		WebRequest item = new WebRequest(url, callback, owner)
+		{
+			Method = "DELETE",
+			RequestHeaders = headers,
+			Timeout = timeout,
+			Body = body
+		};
+		lock (syncroot)
+		{
+			queue.Enqueue(item);
+		}
+		workevent.Set();
+	}
+
+	[LibraryFunction("EnqueuePatch")]
+	public void EnqueuePatch(string url, string body, Action<int, string> callback, Plugin owner, Dictionary<string, string> headers = null, float timeout = 0f)
+	{
+		WebRequest item = new WebRequest(url, callback, owner)
+		{
+			Method = "PATCH",
+			RequestHeaders = headers,
+			Timeout = timeout,
+			Body = body
+		};
+		lock (syncroot)
+		{
+			queue.Enqueue(item);
+		}
+		workevent.Set();
+	}
+
+	[LibraryFunction("EnqueuePost")]
+	public void EnqueuePost(string url, string body, Action<int, string> callback, Plugin owner, Dictionary<string, string> headers = null, float timeout = 0f)
+	{
+		WebRequest item = new WebRequest(url, callback, owner)
+		{
+			Method = "POST",
+			RequestHeaders = headers,
+			Timeout = timeout,
+			Body = body
+		};
+		lock (syncroot)
+		{
+			queue.Enqueue(item);
+		}
+		workevent.Set();
+	}
+
+	[LibraryFunction("EnqueuePut")]
+	public void EnqueuePut(string url, string body, Action<int, string> callback, Plugin owner, Dictionary<string, string> headers = null, float timeout = 0f)
+	{
+		WebRequest item = new WebRequest(url, callback, owner)
+		{
+			Method = "PUT",
+			RequestHeaders = headers,
+			Timeout = timeout,
+			Body = body
+		};
+		lock (syncroot)
+		{
+			queue.Enqueue(item);
+		}
+		workevent.Set();
+	}
+
+	[LibraryFunction("GetQueueLength")]
+	public int GetQueueLength()
+	{
+		return queue.Count;
+	}
+}

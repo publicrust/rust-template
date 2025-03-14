@@ -1,0 +1,284 @@
+#define UNITY_ASSERTIONS
+using System;
+using ConVar;
+using Facepunch;
+using Network;
+using Oxide.Core;
+using ProtoBuf;
+using Rust;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class ResearchTable : StorageContainer
+{
+	[NonSerialized]
+	public float researchFinishedTime;
+
+	public float researchCostFraction = 1f;
+
+	public float researchDuration = 10f;
+
+	public int requiredPaper = 10;
+
+	public GameObjectRef researchStartEffect;
+
+	public GameObjectRef researchFailEffect;
+
+	public GameObjectRef researchSuccessEffect;
+
+	private BasePlayer user;
+
+	public static ItemDefinition blueprintBaseDef;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("ResearchTable.OnRpcMessage"))
+		{
+			if (rpc == 2708607782u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - DoResearch "));
+				}
+				using (TimeWarning.New("DoResearch"))
+				{
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							DoResearch(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						player.Kick("RPC Error in DoResearch");
+						Debug.LogException(exception);
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public override void ResetState()
+	{
+		base.ResetState();
+		researchFinishedTime = 0f;
+	}
+
+	public bool IsResearching()
+	{
+		return HasFlag(Flags.On);
+	}
+
+	public int RarityMultiplier(Rarity rarity)
+	{
+		return rarity switch
+		{
+			Rarity.Common => 20, 
+			Rarity.Uncommon => 15, 
+			Rarity.Rare => 10, 
+			_ => 5, 
+		};
+	}
+
+	public int GetBlueprintStacksize(Item sourceItem)
+	{
+		int result = RarityMultiplier(sourceItem.info.rarity);
+		if (sourceItem.info.category == ItemCategory.Ammunition)
+		{
+			result = Mathf.FloorToInt((float)sourceItem.info.stackable / (float)sourceItem.info.Blueprint.amountToCreate) * 2;
+		}
+		return result;
+	}
+
+	public int ScrapForFullChance(Item item)
+	{
+		return item.info.Blueprint.scrapRequired;
+	}
+
+	public float GetSuccessChance(Item item, Item scrap)
+	{
+		float result = 0f;
+		if (item.info.Blueprint != null && item.info.Blueprint.scrapRequired > 0 && scrap != null && scrap.info.shortname == "scrap" && scrap.amount > 0)
+		{
+			int num = ScrapForFullChance(item);
+			float num2 = Mathf.Clamp01((float)scrap.amount / (float)num);
+			result = num2;
+		}
+		return result;
+	}
+
+	public bool IsItemResearchable(Item item)
+	{
+		ItemBlueprint itemBlueprint = ItemManager.FindBlueprint(item.info);
+		if (itemBlueprint == null || itemBlueprint.scrapRequired == 0)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public Item GetTargetItem()
+	{
+		return inventory.GetSlot(0);
+	}
+
+	public Item GetScrapItem()
+	{
+		return inventory.GetSlot(1);
+	}
+
+	public override void PostServerLoad()
+	{
+		base.PostServerLoad();
+		if (HasFlag(Flags.On) && researchFinishedTime != 0f)
+		{
+			Invoke(ResearchAttemptFinished, researchFinishedTime - UnityEngine.Time.realtimeSinceStartup);
+		}
+		inventory.SetLocked(isLocked: false);
+	}
+
+	public override bool PlayerOpenLoot(BasePlayer player)
+	{
+		user = player;
+		return base.PlayerOpenLoot(player);
+	}
+
+	public override void PlayerStoppedLooting(BasePlayer player)
+	{
+		user = null;
+		base.PlayerStoppedLooting(player);
+	}
+
+	[RPC_Server]
+	public void DoResearch(RPCMessage msg)
+	{
+		if (IsResearching())
+		{
+			return;
+		}
+		BasePlayer player = msg.player;
+		Item targetItem = GetTargetItem();
+		if (targetItem != null && Interface.CallHook("OnItemResearch", targetItem, player) == null && targetItem.amount <= 1 && IsItemResearchable(targetItem))
+		{
+			Interface.CallHook("OnItemResearchStart", this);
+			targetItem.CollectedForCrafting(player);
+			researchFinishedTime = UnityEngine.Time.realtimeSinceStartup + researchDuration;
+			Invoke(ResearchAttemptFinished, researchDuration);
+			inventory.SetLocked(isLocked: true);
+			SetFlag(Flags.On, b: true);
+			SendNetworkUpdate();
+			player.inventory.loot.SendImmediate();
+			if (researchStartEffect.isValid)
+			{
+				Effect.server.Run(researchStartEffect.resourcePath, this, 0u, Vector3.zero, Vector3.zero);
+			}
+		}
+	}
+
+	public static ItemDefinition GetBlueprintTemplate()
+	{
+		if (blueprintBaseDef == null)
+		{
+			blueprintBaseDef = ItemManager.FindItemDefinition("blueprintbase");
+		}
+		return blueprintBaseDef;
+	}
+
+	public void ResearchAttemptFinished()
+	{
+		Item targetItem = GetTargetItem();
+		Item scrapItem = GetScrapItem();
+		if (targetItem != null)
+		{
+			float num = UnityEngine.Random.Range(0f, 1f);
+			object obj = Interface.CallHook("OnItemResearchEnd", this, num);
+			if (obj is float)
+			{
+				num = (float)obj;
+			}
+			int num2 = ScrapForFullChance(targetItem);
+			if (num <= GetSuccessChance(targetItem, inventory.GetSlot(1)))
+			{
+				int iAmount = 1;
+				Item item = ItemManager.Create(targetItem.info, iAmount, 0uL);
+				if (!item.MoveToContainer(inventory, 0))
+				{
+					item.Drop(GetDropPosition(), GetDropVelocity());
+				}
+				if (researchSuccessEffect.isValid)
+				{
+					Effect.server.Run(researchSuccessEffect.resourcePath, this, 0u, Vector3.zero, Vector3.zero);
+				}
+			}
+			else if (researchFailEffect.isValid)
+			{
+				Effect.server.Run(researchFailEffect.resourcePath, this, 0u, Vector3.zero, Vector3.zero);
+			}
+			if (scrapItem != null)
+			{
+				if (scrapItem.amount <= num2)
+				{
+					inventory.Remove(scrapItem);
+					scrapItem.RemoveFromContainer();
+					scrapItem.Remove();
+				}
+				else
+				{
+					scrapItem.UseItem(num2);
+				}
+			}
+		}
+		SendNetworkUpdateImmediate();
+		if (user != null)
+		{
+			user.inventory.loot.SendImmediate();
+		}
+		EndResearch();
+	}
+
+	public void CancelResearch()
+	{
+	}
+
+	public void EndResearch()
+	{
+		inventory.SetLocked(isLocked: false);
+		SetFlag(Flags.On, b: false);
+		researchFinishedTime = 0f;
+		SendNetworkUpdate();
+		if (user != null)
+		{
+			user.inventory.loot.SendImmediate();
+		}
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		info.msg.researchTable = Facepunch.Pool.Get<ProtoBuf.ResearchTable>();
+		info.msg.researchTable.researchTimeLeft = researchFinishedTime - UnityEngine.Time.realtimeSinceStartup;
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (info.msg.researchTable != null)
+		{
+			researchFinishedTime = UnityEngine.Time.realtimeSinceStartup + info.msg.researchTable.researchTimeLeft;
+		}
+	}
+
+	public override bool SupportsPooling()
+	{
+		return true;
+	}
+}

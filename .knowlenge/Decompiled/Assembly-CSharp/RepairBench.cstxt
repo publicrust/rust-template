@@ -1,0 +1,253 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using ConVar;
+using Facepunch;
+using Facepunch.Steamworks;
+using Network;
+using Oxide.Core;
+using Rust;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class RepairBench : StorageContainer
+{
+	public float maxConditionLostOnRepair = 0.2f;
+
+	public GameObjectRef skinchangeEffect;
+
+	private float nextSkinChangeTime;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("RepairBench.OnRpcMessage"))
+		{
+			if (rpc == 2163974445u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - ChangeSkin "));
+				}
+				using (TimeWarning.New("ChangeSkin"))
+				{
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							ChangeSkin(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						player.Kick("RPC Error in ChangeSkin");
+						Debug.LogException(exception);
+					}
+				}
+				return true;
+			}
+			if (rpc == 2132347936 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - RepairItem "));
+				}
+				using (TimeWarning.New("RepairItem"))
+				{
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg3 = rPCMessage;
+							RepairItem(msg3);
+						}
+					}
+					catch (Exception exception2)
+					{
+						player.Kick("RPC Error in RepairItem");
+						Debug.LogException(exception2);
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public float GetRepairFraction(Item itemToRepair)
+	{
+		return 1f - itemToRepair.condition / itemToRepair.maxCondition;
+	}
+
+	public float RepairCostFraction(Item itemToRepair)
+	{
+		return GetRepairFraction(itemToRepair) * 0.5f;
+	}
+
+	public List<ItemAmount> GetRepairCostList(ItemBlueprint bp)
+	{
+		List<ItemAmount> list = Facepunch.Pool.GetList<ItemAmount>();
+		list.Clear();
+		foreach (ItemAmount ingredient in bp.ingredients)
+		{
+			list.Add(new ItemAmount(ingredient.itemDef, ingredient.amount));
+		}
+		foreach (ItemAmount ingredient2 in bp.ingredients)
+		{
+			if (ingredient2.itemDef.category != ItemCategory.Component || !(ingredient2.itemDef.Blueprint != null))
+			{
+				continue;
+			}
+			bool flag = false;
+			ItemAmount itemAmount = ingredient2.itemDef.Blueprint.ingredients[0];
+			foreach (ItemAmount item in list)
+			{
+				if (item.itemDef == itemAmount.itemDef)
+				{
+					item.amount += itemAmount.amount * ingredient2.amount;
+					flag = true;
+					break;
+				}
+			}
+			if (!flag)
+			{
+				list.Add(new ItemAmount(itemAmount.itemDef, itemAmount.amount * ingredient2.amount));
+			}
+		}
+		return list;
+	}
+
+	public void debugprint(string toPrint)
+	{
+		if (ConVar.Global.developer > 0)
+		{
+			Debug.LogWarning(toPrint);
+		}
+	}
+
+	[RPC_Server]
+	public void ChangeSkin(RPCMessage msg)
+	{
+		if (UnityEngine.Time.realtimeSinceStartup < nextSkinChangeTime)
+		{
+			return;
+		}
+		BasePlayer player = msg.player;
+		int num = msg.read.Int32();
+		Item slot = inventory.GetSlot(0);
+		if (slot == null)
+		{
+			return;
+		}
+		if (num != 0 && !player.blueprints.steamInventory.HasItem(num))
+		{
+			debugprint("RepairBench.ChangeSkin player does not have item :" + num + ":");
+			return;
+		}
+		ulong num2 = 0uL;
+		Facepunch.Steamworks.Inventory.Definition definition = Rust.Global.SteamServer.Inventory.FindDefinition(num);
+		if (definition != null)
+		{
+			num2 = definition.GetProperty<ulong>("workshopdownload");
+			string property = definition.GetProperty<string>("itemshortname");
+			if (num != 0 && property != slot.info.shortname)
+			{
+				return;
+			}
+		}
+		if (num2 == 0)
+		{
+			num2 = (ulong)num;
+		}
+		if (num2 == slot.skin)
+		{
+			debugprint("RepairBench.ChangeSkin cannot apply same skin twice : " + num2 + ": " + slot.skin);
+			return;
+		}
+		nextSkinChangeTime = UnityEngine.Time.realtimeSinceStartup + 0.75f;
+		slot.skin = num2;
+		slot.MarkDirty();
+		BaseEntity heldEntity = slot.GetHeldEntity();
+		if (heldEntity != null)
+		{
+			heldEntity.skinID = num2;
+			heldEntity.SendNetworkUpdate();
+		}
+		if (skinchangeEffect.isValid)
+		{
+			Effect.server.Run(skinchangeEffect.resourcePath, this, 0u, new Vector3(0f, 1.5f, 0f), Vector3.zero);
+		}
+	}
+
+	[RPC_Server]
+	public void RepairItem(RPCMessage msg)
+	{
+		Item slot = inventory.GetSlot(0);
+		if (slot == null)
+		{
+			return;
+		}
+		ItemDefinition info = slot.info;
+		ItemBlueprint component = info.GetComponent<ItemBlueprint>();
+		if (!component || !info.condition.repairable || slot.condition == slot.maxCondition)
+		{
+			return;
+		}
+		BasePlayer player = msg.player;
+		if (Interface.CallHook("OnItemRepair", player, slot) != null)
+		{
+			return;
+		}
+		float num = RepairCostFraction(slot);
+		bool flag = false;
+		List<ItemAmount> obj = GetRepairCostList(component);
+		foreach (ItemAmount item in obj)
+		{
+			if (item.itemDef.category != ItemCategory.Component)
+			{
+				int amount = player.inventory.GetAmount(item.itemDef.itemid);
+				int num2 = Mathf.CeilToInt(item.amount * num);
+				if (num2 > amount)
+				{
+					flag = true;
+					break;
+				}
+			}
+		}
+		if (flag)
+		{
+			Facepunch.Pool.Free(ref obj);
+			return;
+		}
+		foreach (ItemAmount item2 in obj)
+		{
+			if (item2.itemDef.category != ItemCategory.Component)
+			{
+				int amount2 = Mathf.CeilToInt(item2.amount * num);
+				player.inventory.Take(null, item2.itemid, amount2);
+			}
+		}
+		Facepunch.Pool.Free(ref obj);
+		slot.DoRepair(maxConditionLostOnRepair);
+		if (ConVar.Global.developer > 0)
+		{
+			Debug.Log("Item repaired! condition : " + slot.condition + "/" + slot.maxCondition);
+		}
+		Effect.server.Run("assets/bundled/prefabs/fx/repairbench/itemrepair.prefab", this, 0u, Vector3.zero, Vector3.zero);
+	}
+
+	public override bool SupportsPooling()
+	{
+		return true;
+	}
+}

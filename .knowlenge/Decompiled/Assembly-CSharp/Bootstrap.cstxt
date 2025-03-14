@@ -1,0 +1,258 @@
+using System;
+using System.Collections;
+using System.Linq;
+using ConVar;
+using Facepunch;
+using Facepunch.Network.Raknet;
+using Network;
+using Oxide.Core;
+using Rust;
+using Rust.Ai;
+using UnityEngine;
+using UnityEngine.UI;
+
+public class Bootstrap : SingletonComponent<Bootstrap>
+{
+	internal static bool bootstrapInitRun;
+
+	public static bool isErrored;
+
+	public string messageString = "Loading...";
+
+	public GameObject errorPanel;
+
+	public Text errorText;
+
+	public Text statusText;
+
+	public static bool isGameInitRun;
+
+	public static bool needsSetup => !bootstrapInitRun;
+
+	public static bool isPresent
+	{
+		get
+		{
+			if (bootstrapInitRun)
+			{
+				return true;
+			}
+			if (UnityEngine.Object.FindObjectsOfType<GameSetup>().Count() > 0)
+			{
+				return true;
+			}
+			return false;
+		}
+	}
+
+	public static void RunDefaults()
+	{
+		UnityEngine.Application.targetFrameRate = 256;
+		UnityEngine.Time.fixedDeltaTime = 0.0625f;
+		UnityEngine.Time.maximumDeltaTime = 0.5f;
+	}
+
+	public static void Init_Tier0()
+	{
+		RunDefaults();
+		GameSetup.RunOnce = true;
+		bootstrapInitRun = true;
+		ConsoleSystem.Index.Initialize(ConsoleGen.All);
+		UnityButtons.Register();
+		Output.Install();
+		Facepunch.Pool.ResizeBuffer<Networkable>(65536);
+		Facepunch.Pool.ResizeBuffer<ConstructionLink>(262144);
+		Facepunch.Pool.ResizeBuffer<StabilityLink>(32768);
+		Facepunch.Pool.ResizeBuffer<NeighbourLink>(16384);
+		Facepunch.Pool.FillBuffer<Networkable>();
+		Facepunch.Pool.FillBuffer<ConstructionLink>();
+		Facepunch.Pool.FillBuffer<StabilityLink>();
+		Facepunch.Pool.FillBuffer<NeighbourLink>();
+		NetworkInit();
+		Noise.ConnectToNativeBackend();
+		string text = Facepunch.CommandLine.Full.Replace(Facepunch.CommandLine.GetSwitch("-rcon.password", Facepunch.CommandLine.GetSwitch("+rcon.password", "RCONPASSWORD")), "******");
+		DebugEx.Log("Command Line: " + text, StackTraceLogType.None);
+		Interface.Initialize();
+	}
+
+	public static void Init_Systems()
+	{
+		Facepunch.Application.Initialize(new Integration());
+	}
+
+	public static void Init_Config()
+	{
+		ConsoleNetwork.Init();
+		ConsoleSystem.UpdateValuesFromCommandLine();
+		ConsoleSystem.Run(ConsoleSystem.Option.Server, "server.backup");
+		ConsoleSystem.Run(ConsoleSystem.Option.Server, "server.readcfg");
+		ServerUsers.Load();
+	}
+
+	public static void NetworkInit()
+	{
+		Network.Net.sv = new Facepunch.Network.Raknet.Server();
+	}
+
+	private IEnumerator Start()
+	{
+		DebugEx.Log("Bootstrap Startup", StackTraceLogType.None);
+		DebugEx.Log(SystemInfoGeneralText.currentInfo, StackTraceLogType.None);
+		Texture.SetGlobalAnisotropicFilteringLimits(1, 16);
+		yield return StartCoroutine(LoadingUpdate("Loading Bundles"));
+		FileSystem.iface = new FileSystem_AssetBundles("Bundles/Bundles");
+		if (FileSystem_AssetBundles.isError)
+		{
+			ThrowError(FileSystem_AssetBundles.loadingError);
+		}
+		if (isErrored)
+		{
+			yield break;
+		}
+		yield return StartCoroutine(LoadingUpdate("Loading Game Manifest"));
+		GameManifest.Load();
+		yield return StartCoroutine(LoadingUpdate("DONE!"));
+		yield return StartCoroutine(LoadingUpdate("Running Self Check"));
+		SelfCheck.Run();
+		if (isErrored)
+		{
+			yield break;
+		}
+		yield return StartCoroutine(LoadingUpdate("Bootstrap Tier0"));
+		Init_Tier0();
+		ConsoleSystem.UpdateValuesFromCommandLine();
+		yield return StartCoroutine(LoadingUpdate("Bootstrap Systems"));
+		Init_Systems();
+		yield return StartCoroutine(LoadingUpdate("Bootstrap Config"));
+		Init_Config();
+		if (!isErrored)
+		{
+			yield return StartCoroutine(LoadingUpdate("Cleaning Storage (this might take a while)"));
+			ConsoleSystem.Run(ConsoleSystem.Option.Unrestricted, "global.cleanup");
+			yield return StartCoroutine(LoadingUpdate("Loading Items"));
+			ItemManager.Initialize();
+			if (!isErrored)
+			{
+				yield return StartCoroutine(DedicatedServerStartup());
+				GameManager.Destroy(base.gameObject);
+			}
+		}
+	}
+
+	private IEnumerator DedicatedServerStartup()
+	{
+		Rust.Application.isLoading = true;
+		yield return StartCoroutine(GameInit_Warmup());
+		UnityEngine.Physics.solverIterationCount = 3;
+		QualitySettings.SetQualityLevel(0);
+		UnityEngine.Object.DontDestroyOnLoad(base.gameObject);
+		UnityEngine.Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/server_console.prefab"));
+		StartupShared();
+		World.InitSize(ConVar.Server.worldsize);
+		World.InitSeed(ConVar.Server.seed);
+		World.InitSalt(ConVar.Server.salt);
+		LevelManager.LoadLevel(ConVar.Server.level);
+		yield return CoroutineEx.waitForEndOfFrame;
+		yield return CoroutineEx.waitForEndOfFrame;
+		yield return StartCoroutine(StartServer(!Facepunch.CommandLine.HasSwitch("-skipload"), string.Empty, allowOutOfDateSaves: false));
+		if (!UnityEngine.Object.FindObjectOfType<Performance>())
+		{
+			UnityEngine.Object.DontDestroyOnLoad(GameManager.server.CreatePrefab("assets/bundled/prefabs/system/performance.prefab"));
+		}
+		Facepunch.Pool.Clear();
+		System.GC.Collect();
+		Rust.Application.isLoading = false;
+	}
+
+	public static IEnumerator StartServer(bool doLoad, string saveFileOverride, bool allowOutOfDateSaves)
+	{
+		float timeScale = UnityEngine.Time.timeScale;
+		if (ConVar.Time.pausewhileloading)
+		{
+			UnityEngine.Time.timeScale = 0f;
+		}
+		RCon.Initialize();
+		BaseEntity.Query.Server = new BaseEntity.Query.EntityTree(8096f);
+		if ((bool)SingletonComponent<WorldSetup>.Instance)
+		{
+			yield return SingletonComponent<WorldSetup>.Instance.StartCoroutine(SingletonComponent<WorldSetup>.Instance.InitCoroutine());
+		}
+		if ((bool)SingletonComponent<DynamicNavMesh>.Instance && SingletonComponent<DynamicNavMesh>.Instance.enabled && !AiManager.nav_disable && !AiManager.nav_grid)
+		{
+			yield return SingletonComponent<DynamicNavMesh>.Instance.StartCoroutine(SingletonComponent<DynamicNavMesh>.Instance.UpdateNavMeshAndWait());
+		}
+		if ((bool)SingletonComponent<AiManager>.Instance && SingletonComponent<AiManager>.Instance.enabled)
+		{
+			SingletonComponent<AiManager>.Instance.Initialize();
+		}
+		GameObject server = GameManager.server.CreatePrefab("assets/bundled/prefabs/system/server.prefab");
+		UnityEngine.Object.DontDestroyOnLoad(server);
+		ServerMgr serverMgr = server.GetComponent<ServerMgr>();
+		serverMgr.Initialize(doLoad, saveFileOverride, allowOutOfDateSaves);
+		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		ColliderGrid.RefreshAll();
+		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		SaveRestore.InitializeEntityLinks();
+		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		SaveRestore.InitializeEntitySupports();
+		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		SaveRestore.InitializeEntityConditionals();
+		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		ColliderGrid.RefreshAll();
+		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		SaveRestore.GetSaveCache();
+		yield return CoroutineEx.waitForSecondsRealtime(0.1f);
+		serverMgr.OpenConnection();
+		if (ConVar.Time.pausewhileloading)
+		{
+			UnityEngine.Time.timeScale = timeScale;
+		}
+		DebugEx.Log("Server startup complete", StackTraceLogType.None);
+	}
+
+	private void StartupShared()
+	{
+		Interface.CallHook("InitLogging", null);
+		ItemManager.Initialize();
+	}
+
+	public void ThrowError(string error)
+	{
+		Debug.Log("ThrowError: " + error);
+		errorPanel.SetActive(value: true);
+		errorText.text = error;
+		isErrored = true;
+	}
+
+	public void ExitGame()
+	{
+		Debug.Log("Exiting due to Exit Game button on bootstrap error panel");
+		UnityEngine.Application.Quit();
+	}
+
+	public static IEnumerator LoadingUpdate(string str)
+	{
+		if ((bool)SingletonComponent<Bootstrap>.Instance)
+		{
+			SingletonComponent<Bootstrap>.Instance.messageString = str;
+			yield return CoroutineEx.waitForEndOfFrame;
+			yield return CoroutineEx.waitForEndOfFrame;
+		}
+	}
+
+	public static IEnumerator GameInit_Warmup(Action<string> statusFunction = null)
+	{
+		if (!isGameInitRun)
+		{
+			statusFunction?.Invoke("GameManager Warmup");
+			yield return CoroutineEx.waitForEndOfFrame;
+			yield return CoroutineEx.waitForEndOfFrame;
+			GameManager.Warmup();
+			statusFunction?.Invoke("Skinnable Warmup");
+			yield return CoroutineEx.waitForEndOfFrame;
+			yield return CoroutineEx.waitForEndOfFrame;
+			GameManifest.LoadAssets();
+			isGameInitRun = true;
+		}
+	}
+}

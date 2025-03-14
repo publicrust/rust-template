@@ -1,0 +1,416 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using ConVar;
+using Network;
+using Oxide.Core;
+using ProtoBuf;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class Planner : HeldEntity
+{
+	public BaseEntity[] buildableList;
+
+	private Vector3 rotationOffset = Vector3.zero;
+
+	public bool isTypeDeployable => GetModDeployable() != null;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("Planner.OnRpcMessage"))
+		{
+			if (rpc == 1840638812 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log(string.Concat("SV_RPCMessage: ", player, " - DoPlace "));
+				}
+				using (TimeWarning.New("DoPlace"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsActiveItem.Test("DoPlace", this, player))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							DoPlace(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						player.Kick("RPC Error in DoPlace");
+						Debug.LogException(exception);
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public ItemModDeployable GetModDeployable()
+	{
+		ItemDefinition ownerItemDefinition = GetOwnerItemDefinition();
+		if (ownerItemDefinition == null)
+		{
+			return null;
+		}
+		return ownerItemDefinition.GetComponent<ItemModDeployable>();
+	}
+
+	public Deployable GetDeployable()
+	{
+		ItemModDeployable modDeployable = GetModDeployable();
+		if (modDeployable == null)
+		{
+			return null;
+		}
+		return modDeployable.GetDeployable(this);
+	}
+
+	internal void FillPlacement(ref Construction.Target target, Construction component)
+	{
+		if ((bool)component.socketHandle)
+		{
+			component.socketHandle.AdjustTarget(ref target, component.maxplaceDistance);
+		}
+		FindAppropriateHandle(ref target, component);
+		if (!target.valid)
+		{
+			FindTerrainPlacement(ref target, component);
+			if (!target.valid)
+			{
+			}
+		}
+	}
+
+	internal void FindTerrainPlacement(ref Construction.Target target, Construction component)
+	{
+		if (GamePhysics.Trace(target.ray, 0f, out var hitInfo, component.maxplaceDistance, 27328768, QueryTriggerInteraction.Ignore))
+		{
+			target.position = target.ray.origin + target.ray.direction * hitInfo.distance;
+			target.normal = hitInfo.normal;
+			target.rotation = rotationOffset;
+			target.onTerrain = true;
+			target.valid = true;
+		}
+		else
+		{
+			target.position = target.ray.origin + target.ray.direction * component.maxplaceDistance;
+			target.normal = Vector3.up;
+			target.rotation = rotationOffset;
+			target.onTerrain = component.canPlaceAtMaxDistance;
+			target.valid = component.canPlaceAtMaxDistance;
+		}
+	}
+
+	internal bool FindAppropriateHandle(ref Construction.Target target, Construction component)
+	{
+		BasePlayer player = target.player;
+		Ray ray = target.ray;
+		IOrderedEnumerable<RaycastHit> orderedEnumerable = from h in UnityEngine.Physics.SphereCastAll(ray, 0.33f, component.maxplaceDistance * 2f, 4194304)
+			orderby h.distance descending
+			select h;
+		BuildSocketMenuProvider buildSocketMenuProvider = null;
+		foreach (RaycastHit item in orderedEnumerable)
+		{
+			if (item.distance < 1f || Vector3.Dot(ray.direction, item.normal) > -0.2f)
+			{
+				continue;
+			}
+			BuildSocketMenuProvider component2 = item.collider.gameObject.GetComponent<BuildSocketMenuProvider>();
+			if (!(component2 == null))
+			{
+				Socket_Base[] array = component.FindMaleSockets(component2.target);
+				if (array != null)
+				{
+					buildSocketMenuProvider = component2;
+				}
+			}
+		}
+		if (buildSocketMenuProvider == null)
+		{
+			target.valid = false;
+			return false;
+		}
+		target = buildSocketMenuProvider.target;
+		target.ray = ray;
+		target.valid = true;
+		target.player = player;
+		target.rotation = rotationOffset;
+		return true;
+	}
+
+	[RPC_Server]
+	[RPC_Server.IsActiveItem]
+	private void DoPlace(RPCMessage msg)
+	{
+		if (!msg.player.CanInteract())
+		{
+			return;
+		}
+		using CreateBuilding msg2 = CreateBuilding.Deserialize(msg.read);
+		DoBuild(msg2);
+	}
+
+	public Socket_Base FindSocket(string name, uint prefabIDToFind)
+	{
+		Socket_Base[] source = PrefabAttribute.server.FindAll<Socket_Base>(prefabIDToFind);
+		return source.FirstOrDefault((Socket_Base s) => s.socketName == name);
+	}
+
+	public void DoBuild(CreateBuilding msg)
+	{
+		BasePlayer ownerPlayer = GetOwnerPlayer();
+		if (!ownerPlayer)
+		{
+			return;
+		}
+		if (ConVar.AntiHack.objectplacement && ownerPlayer.TriggeredAntiHack())
+		{
+			ownerPlayer.ChatMessage("AntiHack!");
+			return;
+		}
+		Construction construction = PrefabAttribute.server.Find<Construction>(msg.blockID);
+		if (construction == null)
+		{
+			ownerPlayer.ChatMessage("Couldn't find Construction " + msg.blockID);
+		}
+		else if (!CanAffordToPlace(construction))
+		{
+			ownerPlayer.ChatMessage("Can't afford to place!");
+		}
+		else if (!ownerPlayer.CanBuild() && !construction.canBypassBuildingPermission)
+		{
+			ownerPlayer.ChatMessage("Building is blocked!");
+		}
+		else
+		{
+			if (Interface.CallHook("CanBuild", this, construction, msg.position) != null)
+			{
+				return;
+			}
+			Construction.Target target = default(Construction.Target);
+			BaseNetworkable baseNetworkable = null;
+			if (msg.entity != 0)
+			{
+				baseNetworkable = BaseNetworkable.serverEntities.Find(msg.entity);
+				if (!baseNetworkable)
+				{
+					ownerPlayer.ChatMessage("Couldn't find entity " + msg.entity);
+					return;
+				}
+				target.construction = baseNetworkable.GetComponent<BuildingBlock>();
+				target.transformParent = baseNetworkable.GetComponent<BaseEntity>();
+				if (msg.socket != 0)
+				{
+					string text = StringPool.Get(msg.socket);
+					if (text != string.Empty && target.transformParent != null)
+					{
+						target.socket = FindSocket(text, target.transformParent.prefabID);
+					}
+					else
+					{
+						ownerPlayer.ChatMessage("Invalid Socket!");
+					}
+				}
+				else
+				{
+					Debug.Log("socket was 0");
+				}
+			}
+			target.ray = msg.ray;
+			target.onTerrain = msg.onterrain;
+			target.position = msg.position;
+			target.normal = msg.normal;
+			target.rotation = msg.rotation;
+			target.player = ownerPlayer;
+			target.valid = true;
+			Deployable deployable = GetDeployable();
+			if ((bool)deployable && deployable.placeEffect.isValid)
+			{
+				if ((bool)baseNetworkable && msg.socket != 0)
+				{
+					Effect.server.Run(deployable.placeEffect.resourcePath, baseNetworkable.transform.TransformPoint(target.socket.worldPosition), baseNetworkable.transform.up);
+				}
+				else
+				{
+					Effect.server.Run(deployable.placeEffect.resourcePath, msg.position, msg.normal);
+				}
+			}
+			DoBuild(target, construction);
+		}
+	}
+
+	public void DoBuild(Construction.Target target, Construction component)
+	{
+		BasePlayer ownerPlayer = GetOwnerPlayer();
+		if (!ownerPlayer || RayEx.IsNaNOrInfinity(target.ray) || target.position.IsNaNOrInfinity() || target.normal.IsNaNOrInfinity())
+		{
+			return;
+		}
+		if (target.socket != null)
+		{
+			if (!target.socket.female)
+			{
+				ownerPlayer.ChatMessage("Target socket is not female. (" + target.socket.socketName + ")");
+				return;
+			}
+			if (target.construction != null && target.construction.IsOccupied(target.socket))
+			{
+				ownerPlayer.ChatMessage("Target socket is occupied. (" + target.socket.socketName + ")");
+				return;
+			}
+		}
+		Construction.lastPlacementError = "No Error";
+		GameObject gameObject = DoPlacement(target, component);
+		if (gameObject == null)
+		{
+			ownerPlayer.ChatMessage("Can't place: " + Construction.lastPlacementError);
+		}
+		if (!(gameObject != null))
+		{
+			return;
+		}
+		Interface.CallHook("OnEntityBuilt", this, gameObject);
+		Deployable deployable = GetDeployable();
+		if (deployable != null)
+		{
+			BaseEntity baseEntity = GameObjectEx.ToBaseEntity(gameObject);
+			if (deployable.setSocketParent && target.transformParent != null && (bool)baseEntity)
+			{
+				baseEntity.SetParent(target.transformParent);
+				baseEntity.transform.position = target.transformParent.transform.InverseTransformPoint(baseEntity.transform.position);
+			}
+			if (deployable.wantsInstanceData && GetOwnerItem().instanceData != null)
+			{
+				(baseEntity as IInstanceDataReceiver).ReceiveInstanceData(GetOwnerItem().instanceData);
+			}
+			if (deployable.copyInventoryFromItem)
+			{
+				StorageContainer component2 = baseEntity.GetComponent<StorageContainer>();
+				if ((bool)component2)
+				{
+					component2.ReceiveInventoryFromItem(GetOwnerItem());
+				}
+			}
+			ItemModDeployable modDeployable = GetModDeployable();
+			if (modDeployable != null)
+			{
+				modDeployable.OnDeployed(baseEntity, ownerPlayer);
+			}
+		}
+		PayForPlacement(ownerPlayer, component);
+	}
+
+	public GameObject DoPlacement(Construction.Target placement, Construction component)
+	{
+		BasePlayer ownerPlayer = GetOwnerPlayer();
+		if (!ownerPlayer)
+		{
+			return null;
+		}
+		BaseEntity baseEntity = component.CreateConstruction(placement, bNeedsValidPlacement: true);
+		if (!baseEntity)
+		{
+			return null;
+		}
+		float num = 1f;
+		float num2 = 0f;
+		Item ownerItem = GetOwnerItem();
+		if (ownerItem != null)
+		{
+			baseEntity.skinID = ownerItem.skin;
+			if (ownerItem.hasCondition)
+			{
+				num = ownerItem.conditionNormalized;
+			}
+		}
+		PrefabInfoEx.AwakeFromInstantiate(baseEntity.gameObject);
+		BuildingBlock buildingBlock = baseEntity as BuildingBlock;
+		if ((bool)buildingBlock)
+		{
+			buildingBlock.blockDefinition = PrefabAttribute.server.Find<Construction>(buildingBlock.prefabID);
+			if (!buildingBlock.blockDefinition)
+			{
+				Debug.LogError("Placing a building block that has no block definition!");
+				return null;
+			}
+			buildingBlock.SetGrade(buildingBlock.blockDefinition.defaultGrade.gradeBase.type);
+			num2 = buildingBlock.currentGrade.maxHealth;
+		}
+		BaseCombatEntity baseCombatEntity = baseEntity as BaseCombatEntity;
+		if ((bool)baseCombatEntity)
+		{
+			num2 = ((!(buildingBlock != null)) ? baseCombatEntity.startHealth : buildingBlock.currentGrade.maxHealth);
+			baseCombatEntity.ResetLifeStateOnSpawn = false;
+			baseCombatEntity.InitializeHealth(num2 * num, num2);
+		}
+		baseEntity.gameObject.SendMessage("SetDeployedBy", ownerPlayer, SendMessageOptions.DontRequireReceiver);
+		baseEntity.OwnerID = ownerPlayer.userID;
+		baseEntity.Spawn();
+		if ((bool)buildingBlock)
+		{
+			Effect.server.Run("assets/bundled/prefabs/fx/build/frame_place.prefab", baseEntity, 0u, Vector3.zero, Vector3.zero);
+		}
+		StabilityEntity stabilityEntity = baseEntity as StabilityEntity;
+		if ((bool)stabilityEntity)
+		{
+			stabilityEntity.UpdateSurroundingEntities();
+		}
+		return baseEntity.gameObject;
+	}
+
+	public void PayForPlacement(BasePlayer player, Construction component)
+	{
+		if (isTypeDeployable)
+		{
+			GetItem().UseItem();
+			return;
+		}
+		List<Item> list = new List<Item>();
+		foreach (ItemAmount item in component.defaultGrade.costToBuild)
+		{
+			player.inventory.Take(list, item.itemDef.itemid, (int)item.amount);
+			player.Command("note.inv", item.itemDef.itemid, item.amount * -1f);
+		}
+		foreach (Item item2 in list)
+		{
+			item2.Remove();
+		}
+	}
+
+	public bool CanAffordToPlace(Construction component)
+	{
+		if (isTypeDeployable)
+		{
+			return true;
+		}
+		BasePlayer ownerPlayer = GetOwnerPlayer();
+		if (!ownerPlayer)
+		{
+			return false;
+		}
+		foreach (ItemAmount item in component.defaultGrade.costToBuild)
+		{
+			if ((float)ownerPlayer.inventory.GetAmount(item.itemDef.itemid) < item.amount)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+}

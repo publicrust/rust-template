@@ -1,0 +1,298 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using Newtonsoft.Json;
+using Rust;
+using Rust.UI;
+using Rust.Workshop;
+using UnityEngine;
+
+public class Skin
+{
+	public class Manifest
+	{
+		public class Group
+		{
+			public Dictionary<string, string> Textures { get; set; } = new Dictionary<string, string>();
+
+			public Dictionary<string, float> Floats { get; set; } = new Dictionary<string, float>();
+
+			public Dictionary<string, ColorEntry> Colors { get; set; } = new Dictionary<string, ColorEntry>();
+		}
+
+		public class ColorEntry
+		{
+			public float r { get; set; }
+
+			public float g { get; set; }
+
+			public float b { get; set; }
+
+			public ColorEntry(Color c)
+			{
+				r = c.r;
+				g = c.g;
+				b = c.b;
+			}
+		}
+
+		public int Version { get; set; }
+
+		public string ItemType { get; set; }
+
+		public ulong AuthorId { get; set; }
+
+		public DateTime PublishDate { get; set; }
+
+		public Group[] Groups { get; set; }
+	}
+
+	public static bool Cache = true;
+
+	private string manifestName;
+
+	private Manifest manifest;
+
+	public Skinnable Skinnable;
+
+	public Material[] Materials;
+
+	public Material[] DefaultMaterials;
+
+	public bool IsLoading { get; internal set; }
+
+	private void LoadManifestFromFile()
+	{
+		string value = File.ReadAllText(manifestName);
+		manifest = JsonConvert.DeserializeObject<Manifest>(value);
+	}
+
+	public IEnumerator FromFolder(DirectoryInfo directory, LoadingBar loadingBar)
+	{
+		TimeWarning.BeginSample("Skin.FromFolder");
+		if (directory == null)
+		{
+			TimeWarning.EndSample();
+			throw new ArgumentNullException("directory");
+		}
+		IsLoading = true;
+		manifestName = directory.FullName + "/manifest.txt";
+		if (!File.Exists(manifestName))
+		{
+			IsLoading = false;
+			TimeWarning.EndSample();
+			yield break;
+		}
+		TimeWarning.EndSample();
+		yield return Global.Runner.StartCoroutine(Parallel.Coroutine(LoadManifestFromFile));
+		TimeWarning.BeginSample("Skin.FromFolder");
+		if (manifest == null)
+		{
+			TimeWarning.EndSample();
+			throw new Exception("invalid manifest");
+		}
+		TimeWarning.BeginSample("Skinnable.Find");
+		Skinnable = Skinnable.Find(manifest.ItemType);
+		TimeWarning.EndSample();
+		ReadDefaults();
+		for (int i = 0; i < Skinnable.Groups.Length && i < manifest.Groups.Length; i++)
+		{
+			if (Materials[i] == null)
+			{
+				continue;
+			}
+			Manifest.Group group = manifest.Groups[i];
+			TimeWarning.BeginSample("Floats");
+			if (group.Floats != null)
+			{
+				foreach (KeyValuePair<string, float> @float in group.Floats)
+				{
+					Materials[i].SetFloat(@float.Key, @float.Value);
+					if (@float.Key == "_Cutoff")
+					{
+						if (@float.Value > 0.1f)
+						{
+							Materials[i].SetOverrideTag("RenderType", "TransparentCutout");
+							Materials[i].EnableKeyword("_ALPHATEST_ON");
+							Materials[i].renderQueue = 2450;
+						}
+						else
+						{
+							Materials[i].SetOverrideTag("RenderType", "");
+							Materials[i].DisableKeyword("_ALPHATEST_ON");
+							Materials[i].renderQueue = -1;
+						}
+					}
+					if (@float.Key == "_MicrofiberFuzzIntensity")
+					{
+						if (@float.Value > 0.1f)
+						{
+							Materials[i].EnableKeyword("_MICROFIBERFUZZLAYER_ON");
+						}
+						else
+						{
+							Materials[i].DisableKeyword("_MICROFIBERFUZZLAYER_ON");
+						}
+					}
+				}
+			}
+			TimeWarning.EndSample();
+			TimeWarning.BeginSample("Colors");
+			if (group.Colors != null)
+			{
+				foreach (KeyValuePair<string, Manifest.ColorEntry> color in group.Colors)
+				{
+					Materials[i].SetColor(color.Key, new Color(color.Value.r, color.Value.g, color.Value.b));
+				}
+			}
+			TimeWarning.EndSample();
+			foreach (KeyValuePair<string, string> mat in group.Textures)
+			{
+				if (mat.Value == "none")
+				{
+					Materials[i].SetTexture(mat.Key, null);
+					continue;
+				}
+				if (mat.Key == "_EmissionMap")
+				{
+					Materials[i].EnableKeyword("_EMISSION");
+				}
+				bool isDiffuseMap = mat.Key == "_MainTex";
+				bool isNormalMap = mat.Key == "_BumpMap";
+				bool isOcclusionMap = mat.Key == "_OcclusionMap";
+				string textureName = Path.Combine(directory.FullName, mat.Value);
+				if (loadingBar != null)
+				{
+					loadingBar.SubText = "Reading Texture";
+				}
+				TimeWarning.BeginSample("AsyncTextureLoad.Invoke");
+				AsyncTextureLoad request = new AsyncTextureLoad(textureName, isNormalMap, !isNormalMap, hqmode: true, Cache);
+				TimeWarning.EndSample();
+				TimeWarning.EndSample();
+				yield return request;
+				TimeWarning.BeginSample("Skin.FromFolder");
+				TimeWarning.BeginSample("AsyncTextureLoad.Texture");
+				Texture2D texture = request.texture;
+				TimeWarning.EndSample();
+				TimeWarning.EndSample();
+				yield return null;
+				TimeWarning.BeginSample("Skin.FromFolder");
+				if (texture != null)
+				{
+					TimeWarning.BeginSample("UpdateTextureMetadata");
+					UpdateTextureMetadata(texture, textureName, isDiffuseMap || isNormalMap, !isOcclusionMap);
+					TimeWarning.EndSample();
+					TimeWarning.BeginSample("Texture2D.Apply");
+					texture.Apply(updateMipmaps: true);
+					TimeWarning.EndSample();
+					TimeWarning.EndSample();
+					yield return null;
+					TimeWarning.BeginSample("Skin.FromFolder");
+					Materials[i].SetTexture(mat.Key, texture);
+				}
+			}
+		}
+		IsLoading = false;
+		TimeWarning.EndSample();
+	}
+
+	private void UpdateTextureMetadata(Texture2D texture, string textureName, bool anisoFiltering, bool trilinearFiltering)
+	{
+		texture.name = textureName;
+		texture.anisoLevel = ((!anisoFiltering) ? 1 : 16);
+		texture.filterMode = ((!trilinearFiltering) ? FilterMode.Bilinear : FilterMode.Trilinear);
+	}
+
+	internal void Apply(GameObject gameObject)
+	{
+		Apply(gameObject, Skinnable, Materials);
+	}
+
+	public static void Apply(GameObject obj, Skinnable skinnable, Material[] Materials)
+	{
+		TimeWarning.BeginSample("Skin.Apply");
+		if (Materials == null)
+		{
+			TimeWarning.EndSample();
+			return;
+		}
+		if (obj == null)
+		{
+			TimeWarning.EndSample();
+			return;
+		}
+		MaterialReplacement.ReplaceRecursive(obj, skinnable.SourceMaterials, Materials);
+		TimeWarning.EndSample();
+	}
+
+	private bool IsSkinnable(string name)
+	{
+		if (name.Contains("PlayerSkin"))
+		{
+			return false;
+		}
+		if (name.StartsWith("Female."))
+		{
+			return false;
+		}
+		if (name.StartsWith("Male."))
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private bool CompareMaterials(Material a, Material b)
+	{
+		if (a == b)
+		{
+			return true;
+		}
+		if (a.GetTexture("_MainTex") != b.GetTexture("_MainTex"))
+		{
+			return false;
+		}
+		return true;
+	}
+
+	internal void ReadDefaults()
+	{
+		TimeWarning.BeginSample("Skin.ReadDefaults");
+		if (DefaultMaterials != null && Materials != null)
+		{
+			for (int i = 0; i < Materials.Length; i++)
+			{
+				if (CompareMaterials(Materials[i], DefaultMaterials[i]))
+				{
+					Materials[i] = null;
+				}
+			}
+		}
+		_ = DefaultMaterials;
+		DefaultMaterials = new Material[Skinnable.Groups.Length];
+		for (int j = 0; j < Skinnable.Groups.Length; j++)
+		{
+			DefaultMaterials[j] = Skinnable.Groups[j].Material;
+		}
+		if (Materials == null || Materials.Length != Skinnable.Groups.Length)
+		{
+			Materials = new Material[Skinnable.Groups.Length];
+		}
+		for (int k = 0; k < Materials.Length; k++)
+		{
+			if (DefaultMaterials[k] == null)
+			{
+				Debug.LogWarning("Missing skin for " + Skinnable.ItemName);
+				continue;
+			}
+			Material obj = Materials[k];
+			Materials[k] = new Material(DefaultMaterials[k]);
+			Materials[k].DisableKeyword("_COLORIZELAYER_ON");
+			Materials[k].SetInt("_COLORIZELAYER_ON", 0);
+			Materials[k].name = DefaultMaterials[k].name + " (Editing)";
+			_ = obj != null;
+		}
+		TimeWarning.EndSample();
+	}
+}

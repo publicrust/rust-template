@@ -1,0 +1,1173 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using Apex.DataStructures;
+using Apex.LoadBalancing;
+using Facepunch;
+using Rust.Ai;
+using UnityEngine;
+using UnityEngine.AI;
+
+[DefaultExecutionOrder(-103)]
+public class AiManager : SingletonComponent<AiManager>, IServerComponent, ILoadBalanced
+{
+	private class EngagementInfo : Pool.IPooled
+	{
+		internal Vector2i Coord;
+
+		internal float LastEngagementTime;
+
+		internal float Intensity;
+
+		internal float TimeLastSeenByPlayer;
+
+		public void EnterPool()
+		{
+			LastEngagementTime = 0f;
+			Intensity = 0f;
+		}
+
+		public void LeavePool()
+		{
+		}
+
+		public void KeepAlive()
+		{
+			TimeLastSeenByPlayer = Time.realtimeSinceStartup;
+		}
+
+		public bool Timeout(float timeoutThreshold)
+		{
+			return Time.realtimeSinceStartup - TimeLastSeenByPlayer > timeoutThreshold;
+		}
+	}
+
+	private struct BakeInfo
+	{
+		public class Comparer : IComparer<BakeInfo>
+		{
+			public int Compare(BakeInfo a, BakeInfo b)
+			{
+				if (a.Cell == null && b.Cell == null)
+				{
+					return 0;
+				}
+				if (a.Cell == null)
+				{
+					return -1;
+				}
+				if (b.Cell == null)
+				{
+					return 1;
+				}
+				int distanceToNearestPlayer = GetDistanceToNearestPlayer(a.Cell.Coord);
+				if (distanceToNearestPlayer == 0)
+				{
+					return 1;
+				}
+				int distanceToNearestPlayer2 = GetDistanceToNearestPlayer(b.Cell.Coord);
+				if (distanceToNearestPlayer2 == 0)
+				{
+					return -1;
+				}
+				if (distanceToNearestPlayer < distanceToNearestPlayer2)
+				{
+					return 1;
+				}
+				if (distanceToNearestPlayer > distanceToNearestPlayer2)
+				{
+					return -1;
+				}
+				return 0;
+			}
+
+			private int GetDistanceToNearestPlayer(Vector2i coord)
+			{
+				int num = int.MaxValue;
+				foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+				{
+					if (activePlayer == null || !activePlayer.IsConnected)
+					{
+						continue;
+					}
+					Vector2i coord2 = SingletonComponent<AiManager>.Instance.GetCoord(activePlayer.ServerPosition);
+					Vector2i[] directions = Directions;
+					foreach (Vector2i vector2i in directions)
+					{
+						if (coord == coord2 + vector2i)
+						{
+							return 0;
+						}
+					}
+					Vector2i a = coord - coord2;
+					int num2 = MagnitudeSquared(a);
+					if (num2 < num)
+					{
+						num = num2;
+					}
+				}
+				return num;
+			}
+
+			private int MagnitudeSquared(Vector2i a)
+			{
+				return Dot(a, a);
+			}
+
+			private int Dot(Vector2i a, Vector2i b)
+			{
+				return a.x * b.x + a.y * b.y;
+			}
+		}
+
+		public IEnumerator BakeFunc;
+
+		public NavMeshGridCell Cell;
+	}
+
+	private struct LinkInfo
+	{
+		public IEnumerator LinkGenAction;
+
+		public IAIAgent Agent;
+
+		public NavMeshGridCell Cell;
+	}
+
+	internal enum NavMeshAddResult
+	{
+		Async,
+		True,
+		False
+	}
+
+	private readonly HashSet<IAIAgent> activeAgents = new HashSet<IAIAgent>();
+
+	private readonly HashSet<IAIAgent> dormantAgents = new HashSet<IAIAgent>();
+
+	private readonly HashSet<IAIAgent> pendingAddToActive = new HashSet<IAIAgent>();
+
+	private readonly HashSet<IAIAgent> pendingAddToDormant = new HashSet<IAIAgent>();
+
+	private readonly HashSet<IAIAgent> pendingRemoveFromActive = new HashSet<IAIAgent>();
+
+	private readonly HashSet<IAIAgent> pendingRemoveFromDormant = new HashSet<IAIAgent>();
+
+	[Header("Cover System")]
+	[SerializeField]
+	public bool UseCover = true;
+
+	public float CoverPointVolumeCellSize = 20f;
+
+	public float CoverPointVolumeCellHeight = 8f;
+
+	public CoverPointVolume cpvPrefab;
+
+	[SerializeField]
+	public LayerMask DynamicCoverPointVolumeLayerMask;
+
+	private WorldSpaceGrid<CoverPointVolume> coverPointVolumeGrid;
+
+	[ServerVar(Help = "If true we'll wait for the navmesh to generate before completely starting the server. This might cause your server to hitch and lag as it generates in the background.")]
+	public static bool nav_wait = false;
+
+	[ServerVar(Help = "If set to true the navmesh won't generate.. which means Ai that uses the navmesh won't be able to move")]
+	public static bool nav_disable = false;
+
+	[ServerVar(Help = "If set to true the ai manager will control a navmesh grid, only building navmesh patches in those areas where it's needed and for those agent types. If this is false, we bake a single huge navmesh for the entire island, and can only support a single agent type.")]
+	public static bool nav_grid = true;
+
+	[ServerVar(Help = "If ai_dormant is true, any npc outside the range of players will render itself dormant and take up less resources, but wildlife won't simulate as well.")]
+	public static bool ai_dormant = true;
+
+	[ServerVar(Help = "If nav_grid_kill_dormant_cells is true, when a navigation grid cell is out of range from active players for a certain time, we unload it to save memory (but comes with extra performance hit since we have to regenerate that navmesh then next time it's activated again).")]
+	public static bool nav_grid_kill_dormant_cells = false;
+
+	[ServerVar(Help = "nav_grid_max_bakes_per_frame adjust how many rebakes of navmesh grid cells we will start each frame. The higher the number, the heavier performance impact.")]
+	public static int nav_grid_max_bakes_per_frame = 1;
+
+	[ServerVar(Help = "nav_grid_max_links_generated_per_frame adjust how many navmesh links can generate within a frame. The higher the number, the heavier performance impact.")]
+	public static int nav_grid_max_links_generated_per_frame = 4;
+
+	[ServerVar(Help = "If nav_grid_links_enabled is true, agents can walk between navmesh grid cells, otherwise they can only walk on the navmesh grid cell they spawn (faster pathfiding).")]
+	public static bool nav_grid_links_enabled = true;
+
+	[ServerVar(Help = "If nav_grid_rebake_cells_enabled is true, we rebake cells in player areas to adapt to construction and destruction.")]
+	public static bool nav_grid_rebake_cells_enabled = true;
+
+	[ServerVar(Help = "nav_grid_rebake_cooldown defines how long a navmesh grid cell must wait between rebakes. Higher number means a cell will rebake less often.")]
+	public static float nav_grid_rebake_cooldown = 30f;
+
+	[ServerVar(Help = "nav_grid_cell_width adjust how large each cell in the navmesh grid is. Larger cells take longer to bake, but we need fewever of them to cover the map.")]
+	public static int nav_grid_cell_width = 80;
+
+	[ServerVar(Help = "nav_grid_cell_height adjust how much vertical difference within a cell we can cope with when generating navmesh.")]
+	public static int nav_grid_cell_height = 80;
+
+	[SerializeField]
+	[Header("Intensity System")]
+	public bool UseIntensity;
+
+	public float IntensityCellSize = 80f;
+
+	public AnimationCurve HitResponse = AnimationCurve.EaseInOut(0f, 1f, 1f, 0f);
+
+	public float hitResponseOutputMultiplier = 1f;
+
+	public AnimationCurve HurtResponse = AnimationCurve.EaseInOut(0f, 0f, 1f, 1f);
+
+	public float maxHurtResponseInput = 5.5f;
+
+	public float hurtResponseOutputMultiplier = 1f;
+
+	public float OnDeathIntensityBonus = 1f;
+
+	public float IntensityDecayRate = 0.1f;
+
+	public float NoEngagementToDecayTime = 5f;
+
+	private WorldSpaceGrid<EngagementInfo> intensityGrid;
+
+	public WorldSpaceGrid<NavMeshGridCell> NavMeshGrid;
+
+	private int lastUpdateCellIndex;
+
+	[Header("NavMesh Grid")]
+	[SerializeField]
+	public bool UseNavMesh = true;
+
+	public LayerMask LayerMask;
+
+	public NavMeshCollectGeometry NavMeshCollectGeometry;
+
+	public float CellTimeoutThreshold = 30f;
+
+	private Dictionary<int, NavMeshGridCell.NavMeshLinkInfo> AgentLinks;
+
+	public PrefabPool LinkPool;
+
+	public GameObjectRef NavMeshLinkPrefab;
+
+	private int lastPlayerIndexForRebake;
+
+	private int lastDirectionIndexForRebake;
+
+	public int NumCellsCurrentlyBaking;
+
+	public int NumLinksCurrentlyGenerating;
+
+	private BinaryHeap<BakeInfo> bakeHeap;
+
+	private Queue<LinkInfo> linkGenQueue;
+
+	public static Vector2i[] Directions = new Vector2i[9]
+	{
+		Vector2i.zero,
+		Vector2i.forward,
+		Vector2i.right,
+		Vector2i.back,
+		Vector2i.left,
+		Vector2i.forward + Vector2i.right,
+		Vector2i.back + Vector2i.right,
+		Vector2i.forward + Vector2i.left,
+		Vector2i.back + Vector2i.left
+	};
+
+	public bool repeat => true;
+
+	internal void OnEnableAgency()
+	{
+	}
+
+	internal void OnDisableAgency()
+	{
+	}
+
+	public void Add(IAIAgent agent)
+	{
+		if (!UseNavMesh)
+		{
+			AddActiveAgency(agent);
+		}
+		else if (ai_dormant)
+		{
+			if (IsAgentCloseToPlayers(agent))
+			{
+				InternalAdd(agent);
+			}
+			else
+			{
+				AddDormantAgency(agent);
+			}
+		}
+		else
+		{
+			InternalAdd(agent);
+		}
+	}
+
+	internal void InternalAdd(IAIAgent agent)
+	{
+		if (NavMeshAddAgent(agent, delegate(IAIAgent a)
+		{
+			if (a != null)
+			{
+				InternalAddPlusAdjacents(agent);
+			}
+		}) != 0)
+		{
+			InternalAddPlusAdjacents(agent);
+		}
+	}
+
+	internal void InternalAddPlusAdjacents(IAIAgent agent)
+	{
+		AddActiveAgency(agent);
+		Vector2i vector2i = NavMeshGrid.WorldToGridCoords(agent.Entity.ServerPosition);
+		for (int i = 1; i < Directions.Length; i++)
+		{
+			Vector2i vector2i2 = Directions[i];
+			NavMeshAddAtCoord(agent, vector2i + vector2i2, agent.Entity.ServerPosition.y, agent.AgentTypeIndex);
+		}
+	}
+
+	public void Remove(IAIAgent agent)
+	{
+		RemoveActiveAgency(agent);
+		if (ai_dormant)
+		{
+			RemoveDormantAgency(agent);
+		}
+	}
+
+	internal void AddActiveAgency(IAIAgent agent)
+	{
+		pendingAddToActive.Add(agent);
+	}
+
+	internal void AddDormantAgency(IAIAgent agent)
+	{
+		pendingAddToDormant.Add(agent);
+	}
+
+	internal void RemoveActiveAgency(IAIAgent agent)
+	{
+		pendingRemoveFromActive.Add(agent);
+	}
+
+	internal void RemoveDormantAgency(IAIAgent agent)
+	{
+		pendingRemoveFromDormant.Add(agent);
+	}
+
+	internal void UpdateAgency()
+	{
+		AgencyCleanup();
+		AgencyAddPending();
+		if (ai_dormant)
+		{
+			TryWakeUpDormantAgents();
+			TryMakeAgentsDormant();
+		}
+	}
+
+	private void AgencyCleanup()
+	{
+		if (ai_dormant)
+		{
+			foreach (IAIAgent item in pendingRemoveFromDormant)
+			{
+				if (item != null)
+				{
+					dormantAgents.Remove(item);
+				}
+			}
+			pendingRemoveFromDormant.Clear();
+		}
+		foreach (IAIAgent item2 in pendingRemoveFromActive)
+		{
+			if (item2 != null)
+			{
+				activeAgents.Remove(item2);
+				RemoveAgentLinkReference(item2, removeAgentFromCache: true);
+			}
+		}
+		pendingRemoveFromActive.Clear();
+	}
+
+	private void AgencyAddPending()
+	{
+		if (ai_dormant)
+		{
+			foreach (IAIAgent item in pendingAddToDormant)
+			{
+				if (item != null && !(item.Entity == null) && !item.Entity.IsDestroyed && dormantAgents.Add(item))
+				{
+					item.Pause();
+				}
+			}
+			pendingAddToDormant.Clear();
+		}
+		foreach (IAIAgent item2 in pendingAddToActive)
+		{
+			if (item2 != null && !(item2.Entity == null) && !item2.Entity.IsDestroyed && activeAgents.Add(item2))
+			{
+				item2.Resume();
+			}
+		}
+		pendingAddToActive.Clear();
+	}
+
+	private void TryWakeUpDormantAgents()
+	{
+		if (!ai_dormant)
+		{
+			return;
+		}
+		foreach (IAIAgent dormantAgent in dormantAgents)
+		{
+			if (dormantAgent.Entity.IsDestroyed)
+			{
+				RemoveDormantAgency(dormantAgent);
+			}
+			else if (IsAgentCloseToPlayers(dormantAgent))
+			{
+				InternalAdd(dormantAgent);
+			}
+		}
+	}
+
+	private void TryMakeAgentsDormant()
+	{
+		if (!ai_dormant)
+		{
+			return;
+		}
+		foreach (IAIAgent activeAgent in activeAgents)
+		{
+			if (activeAgent.Entity.IsDestroyed)
+			{
+				RemoveActiveAgency(activeAgent);
+			}
+			else if (UseNavMesh && !IsAgentCloseToPlayers(activeAgent))
+			{
+				AddDormantAgency(activeAgent);
+				RemoveActiveAgency(activeAgent);
+			}
+		}
+	}
+
+	internal void ForceAgentsDormant(Vector2i coord)
+	{
+		if (!UseNavMesh || !ai_dormant)
+		{
+			return;
+		}
+		foreach (IAIAgent activeAgent in activeAgents)
+		{
+			Vector2i coord2 = GetCoord(activeAgent.Entity.ServerPosition);
+			if (coord2 == coord)
+			{
+				AddDormantAgency(activeAgent);
+				RemoveActiveAgency(activeAgent);
+			}
+		}
+	}
+
+	internal void OnEnableCover()
+	{
+		if (coverPointVolumeGrid == null)
+		{
+			coverPointVolumeGrid = new WorldSpaceGrid<CoverPointVolume>(TerrainMeta.Size.x, CoverPointVolumeCellSize);
+		}
+	}
+
+	internal void OnDisableCover()
+	{
+		for (int i = 0; i < coverPointVolumeGrid.Cells.Length; i++)
+		{
+			UnityEngine.Object.Destroy(coverPointVolumeGrid.Cells[i]);
+		}
+	}
+
+	public static CoverPointVolume CreateNewCoverVolume(BaseEntity sampleCharacterSizePrefab, Vector3 point)
+	{
+		if (SingletonComponent<AiManager>.Instance != null && SingletonComponent<AiManager>.Instance.enabled && SingletonComponent<AiManager>.Instance.UseCover)
+		{
+			CoverPointVolume coverPointVolume = SingletonComponent<AiManager>.Instance.GetCoverVolumeContaining(point);
+			if (coverPointVolume == null)
+			{
+				Vector2i vector2i = SingletonComponent<AiManager>.Instance.coverPointVolumeGrid.WorldToGridCoords(point);
+				coverPointVolume = ((!(SingletonComponent<AiManager>.Instance.cpvPrefab != null)) ? new GameObject("CoverPointVolume").AddComponent<CoverPointVolume>() : UnityEngine.Object.Instantiate(SingletonComponent<AiManager>.Instance.cpvPrefab));
+				coverPointVolume.transform.localPosition = default(Vector3);
+				coverPointVolume.transform.position = SingletonComponent<AiManager>.Instance.coverPointVolumeGrid.GridToWorldCoords(vector2i) + Vector3.up * point.y;
+				coverPointVolume.transform.localScale = new Vector3(SingletonComponent<AiManager>.Instance.CoverPointVolumeCellSize, SingletonComponent<AiManager>.Instance.CoverPointVolumeCellHeight, SingletonComponent<AiManager>.Instance.CoverPointVolumeCellSize);
+				coverPointVolume.SampleCharacterSizePrefab = sampleCharacterSizePrefab;
+				coverPointVolume.CoverLayerMask = SingletonComponent<AiManager>.Instance.DynamicCoverPointVolumeLayerMask;
+				coverPointVolume.CoverPointRayLength = 1.75f;
+				SingletonComponent<AiManager>.Instance.coverPointVolumeGrid[vector2i] = coverPointVolume;
+				coverPointVolume.GenerateCoverPoints();
+			}
+			return coverPointVolume;
+		}
+		return null;
+	}
+
+	public CoverPointVolume GetCoverVolumeContaining(Vector3 point)
+	{
+		Vector2i cellCoords = coverPointVolumeGrid.WorldToGridCoords(point);
+		return coverPointVolumeGrid[cellCoords];
+	}
+
+	public void Initialize()
+	{
+		if (nav_grid && !nav_disable)
+		{
+			UseNavMesh = true;
+		}
+		else
+		{
+			UseNavMesh = false;
+		}
+		OnEnableAgency();
+		if (UseNavMesh)
+		{
+			OnEnableNavMeshGrid();
+		}
+		if (UseCover)
+		{
+			OnEnableCover();
+		}
+		if (UseIntensity)
+		{
+			OnEnableIntensity();
+		}
+		Apex.LoadBalancing.LoadBalancer.defaultBalancer.Add(this);
+	}
+
+	private void OnDisable()
+	{
+		OnDisableAgency();
+		if (UseNavMesh)
+		{
+			OnDisableNavMeshGrid();
+		}
+		if (UseCover)
+		{
+			OnDisableCover();
+		}
+		if (UseIntensity)
+		{
+			OnDisableIntensity();
+		}
+		Apex.LoadBalancing.LoadBalancer.defaultBalancer.Remove(this);
+	}
+
+	public float? ExecuteUpdate(float deltaTime, float nextInterval)
+	{
+		UpdateAgency();
+		if (UseNavMesh)
+		{
+			UpdateNavMeshGridCell();
+		}
+		if (UseIntensity)
+		{
+			UpdateIntensityGridCellLifetimes();
+		}
+		return UnityEngine.Random.value + 1f;
+	}
+
+	private bool IsAgentCloseToPlayers(IAIAgent agent)
+	{
+		if (UseNavMesh)
+		{
+			Vector2i coord = GetCoord(agent.Entity.ServerPosition);
+			return IsCoordCloseToPlayers(coord);
+		}
+		return false;
+	}
+
+	private bool IsCoordCloseToPlayers(Vector2i coord)
+	{
+		if (UseNavMesh)
+		{
+			foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+			{
+				Vector2i coord2 = GetCoord(activePlayer.ServerPosition);
+				if (IsCoordEqualOrAdjacentToOther(coord2, coord))
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	internal void OnEnableIntensity()
+	{
+		if (intensityGrid == null)
+		{
+			intensityGrid = new WorldSpaceGrid<EngagementInfo>(TerrainMeta.Size.x, IntensityCellSize);
+		}
+	}
+
+	internal void OnDisableIntensity()
+	{
+	}
+
+	public void UpdateIntensityGridCellLifetimes()
+	{
+		for (int i = 0; i < intensityGrid.Cells.Length; i++)
+		{
+			EngagementInfo obj = intensityGrid.Cells[i];
+			if (obj != null && Time.realtimeSinceStartup - obj.LastEngagementTime > NoEngagementToDecayTime)
+			{
+				obj.Intensity = Mathf.Max(obj.Intensity - IntensityDecayRate, 0f);
+				if (Mathf.Approximately(obj.Intensity, 0f) && obj.Timeout(CellTimeoutThreshold))
+				{
+					Pool.Free(ref obj);
+				}
+			}
+		}
+		foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+		{
+			if (activePlayer is IAIAgent)
+			{
+				continue;
+			}
+			Vector2i vector2i = intensityGrid.WorldToGridCoords(activePlayer.ServerPosition);
+			Vector2i[] directions = Directions;
+			foreach (Vector2i vector2i2 in directions)
+			{
+				Vector2i cellCoords = vector2i + vector2i2;
+				if (cellCoords.x >= 0 && cellCoords.y >= 0 && cellCoords.x < intensityGrid.CellCount && cellCoords.y < intensityGrid.CellCount)
+				{
+					intensityGrid[cellCoords]?.KeepAlive();
+				}
+			}
+		}
+	}
+
+	public void OnHit(HitInfo info)
+	{
+		BasePlayer basePlayer = info.HitEntity as BasePlayer;
+		if (basePlayer != null && !(basePlayer is IAIAgent))
+		{
+			Vector2i vector2i = intensityGrid.WorldToGridCoords(basePlayer.ServerPosition);
+			EngagementInfo engagementInfo = intensityGrid[vector2i];
+			if (engagementInfo == null)
+			{
+				engagementInfo = Pool.Get<EngagementInfo>();
+				engagementInfo.Coord = vector2i;
+				intensityGrid[vector2i] = engagementInfo;
+			}
+			engagementInfo.Intensity += HitResponse.Evaluate(basePlayer.healthFraction) * hitResponseOutputMultiplier;
+			if (basePlayer.IsDead())
+			{
+				engagementInfo.Intensity += OnDeathIntensityBonus;
+			}
+			engagementInfo.LastEngagementTime = Time.realtimeSinceStartup;
+		}
+		BasePlayer basePlayer2 = info.Initiator as BasePlayer;
+		if (basePlayer2 != null && !(basePlayer2 is IAIAgent))
+		{
+			Vector2i vector2i2 = intensityGrid.WorldToGridCoords(basePlayer2.ServerPosition);
+			EngagementInfo engagementInfo2 = intensityGrid[vector2i2];
+			if (engagementInfo2 == null)
+			{
+				engagementInfo2 = Pool.Get<EngagementInfo>();
+				engagementInfo2.Coord = vector2i2;
+				intensityGrid[vector2i2] = engagementInfo2;
+			}
+			BaseCombatEntity baseCombatEntity = ((!(basePlayer != null)) ? (info.HitEntity as BaseCombatEntity) : basePlayer);
+			float time = Mathf.Clamp(fearEstimate(basePlayer2, baseCombatEntity), 0f, maxHurtResponseInput);
+			engagementInfo2.Intensity += HurtResponse.Evaluate(time) * hurtResponseOutputMultiplier;
+			if (baseCombatEntity != null && baseCombatEntity.IsDead())
+			{
+				engagementInfo2.Intensity += OnDeathIntensityBonus;
+			}
+			engagementInfo2.LastEngagementTime = Time.realtimeSinceStartup;
+		}
+	}
+
+	private float fearEstimate(BasePlayer initiator, BaseCombatEntity victim)
+	{
+		float num = 0f;
+		if (victim == null)
+		{
+			return num;
+		}
+		BaseNpc baseNpc = victim as BaseNpc;
+		if (baseNpc != null)
+		{
+			if (baseNpc.Stats.Size > 0.5f)
+			{
+				if (baseNpc.WantsToAttack(initiator) > 0.25f)
+				{
+					num += 0.3f;
+				}
+				if (baseNpc.AttackTarget == initiator)
+				{
+					num += 0.5f;
+				}
+				if (baseNpc.CurrentBehaviour == BaseNpc.Behaviour.Attack)
+				{
+					num *= 1.5f;
+				}
+				if (baseNpc.CurrentBehaviour == BaseNpc.Behaviour.Sleep)
+				{
+					num *= 0.1f;
+				}
+			}
+		}
+		else
+		{
+			NPCPlayerApex nPCPlayerApex = victim as NPCPlayerApex;
+			if (nPCPlayerApex != null)
+			{
+				if (nPCPlayerApex.AttackTarget == initiator)
+				{
+					num += 1f;
+				}
+				if (nPCPlayerApex.CurrentBehaviour == BaseNpc.Behaviour.Attack)
+				{
+					num *= 1.5f;
+				}
+				if (nPCPlayerApex.CurrentBehaviour == BaseNpc.Behaviour.Sleep)
+				{
+					num *= 0.1f;
+				}
+			}
+		}
+		num += HitResponse.Evaluate(initiator.healthFraction);
+		num += 1f - HitResponse.Evaluate(victim.healthFraction);
+		BasePlayer basePlayer = victim as BasePlayer;
+		if (basePlayer != null)
+		{
+			num += ((!(basePlayer is IAIAgent)) ? 2f : 1f);
+		}
+		return num;
+	}
+
+	internal void OnEnableNavMeshGrid()
+	{
+		if (NavMeshGrid == null)
+		{
+			NavMeshGrid = new WorldSpaceGrid<NavMeshGridCell>(TerrainMeta.Size.x, nav_grid_cell_width);
+		}
+		AgentLinks = new Dictionary<int, NavMeshGridCell.NavMeshLinkInfo>();
+		LinkPool = new PrefabPool();
+		bakeHeap = new BinaryHeap<BakeInfo>(256, new BakeInfo.Comparer());
+		linkGenQueue = new Queue<LinkInfo>();
+	}
+
+	internal void OnDisableNavMeshGrid()
+	{
+	}
+
+	internal NavMeshAddResult NavMeshAddAgent(IAIAgent agent, Action<IAIAgent> onAsyncDoneCallback)
+	{
+		if (NavMeshGrid == null)
+		{
+			NavMeshGrid = new WorldSpaceGrid<NavMeshGridCell>(TerrainMeta.Size.x, nav_grid_cell_width);
+		}
+		Vector2i vector2i = NavMeshGrid.WorldToGridCoords(agent.Entity.ServerPosition);
+		NavMeshGridCell cell = NavMeshGrid[vector2i];
+		if (cell == null)
+		{
+			string text = "cell";
+			cell = new GameObject(text).AddComponent<NavMeshGridCell>();
+			cell.Setup(vector2i, NavMeshGrid.GridToWorldCoords(vector2i) + Vector3.up * agent.Entity.ServerPosition.y, new Vector3(nav_grid_cell_width, nav_grid_cell_height, nav_grid_cell_width), LayerMask, NavMeshCollectGeometry);
+			cell.transform.SetParent(base.transform);
+			NavMeshGrid[vector2i] = cell;
+		}
+		NavMeshGridCell.Layer layer = cell.GetLayer(agent.AgentTypeIndex);
+		if (layer == null)
+		{
+			layer = cell.CreateLayer(agent.AgentTypeIndex, agent.GetNavAgent.areaMask);
+			layer.IsAwaitingBake = true;
+			bakeHeap.Add(new BakeInfo
+			{
+				Cell = cell,
+				BakeFunc = cell.CreateNavMeshLayerAsync(layer, LayerMask, delegate(NavMeshGridCell.Layer l)
+				{
+					DecreaseNumCellsCurrentlyBaking();
+					OnNavMeshBuildDoneCallback(l, agent, cell, onAsyncDoneCallback);
+				})
+			});
+			return NavMeshAddResult.Async;
+		}
+		if (IsNavmeshBuilding(layer))
+		{
+			StartCoroutine(cell.WaitForBuildToFinish(agent.AgentTypeIndex, delegate(NavMeshGridCell.Layer l)
+			{
+				OnNavMeshBuildDoneCallback(l, agent, cell, onAsyncDoneCallback);
+			}));
+			return NavMeshAddResult.Async;
+		}
+		return NavMeshAddResult.True;
+	}
+
+	internal NavMeshAddResult NavMeshAddAtCoord(IAIAgent agent, Vector2i coord, float y, int agentTypeIndex)
+	{
+		if (NavMeshGrid == null || NavMeshGrid.Cells == null || NavMeshGrid.Cells.Length == 0 || coord.x < 0 || coord.y < 0 || coord.x >= NavMeshGrid.CellCount || coord.y >= NavMeshGrid.CellCount)
+		{
+			return NavMeshAddResult.False;
+		}
+		NavMeshGridCell navMeshGridCell = NavMeshGrid[coord];
+		if (navMeshGridCell == null)
+		{
+			navMeshGridCell = new GameObject("Cell").AddComponent<NavMeshGridCell>();
+			navMeshGridCell.Setup(coord, NavMeshGrid.GridToWorldCoords(coord) + Vector3.up * y, new Vector3(nav_grid_cell_width, nav_grid_cell_height, nav_grid_cell_width), LayerMask, NavMeshCollectGeometry);
+			navMeshGridCell.transform.SetParent(base.transform);
+			NavMeshGrid[coord] = navMeshGridCell;
+		}
+		NavMeshGridCell.Layer layer = navMeshGridCell.GetLayer(agentTypeIndex);
+		if (layer == null)
+		{
+			layer = navMeshGridCell.CreateLayer(agentTypeIndex, agent.GetNavAgent.areaMask);
+			layer.IsAwaitingBake = true;
+			bakeHeap.Add(new BakeInfo
+			{
+				Cell = navMeshGridCell,
+				BakeFunc = navMeshGridCell.CreateNavMeshLayerAsync(layer, LayerMask, DecreaseNumCellsCurrentlyBaking)
+			});
+			return NavMeshAddResult.Async;
+		}
+		if (IsNavmeshBuilding(layer))
+		{
+			return NavMeshAddResult.Async;
+		}
+		return NavMeshAddResult.True;
+	}
+
+	private void OnNavMeshBuildDoneCallback(NavMeshGridCell.Layer layer, IAIAgent agent, NavMeshGridCell cell, Action<IAIAgent> onAsyncDoneCallback)
+	{
+		if (agent.Entity == null || agent.Entity.IsDestroyed)
+		{
+			onAsyncDoneCallback?.Invoke(null);
+		}
+		else
+		{
+			onAsyncDoneCallback?.Invoke(agent);
+		}
+	}
+
+	internal void UpdateNavMeshGridCell()
+	{
+		TryBake();
+		TryGenerateLinks();
+		UpdateCellTimeouts();
+		UpdateCellPlayerTimestamps();
+		TryQueueCellRebakes();
+		TryQueueLinkGeneration();
+	}
+
+	private void TryBake()
+	{
+		while (bakeHeap.count > 0 && NumCellsCurrentlyBaking < nav_grid_max_bakes_per_frame)
+		{
+			BakeInfo bakeInfo = bakeHeap.Remove();
+			NumCellsCurrentlyBaking++;
+			StartCoroutine(bakeInfo.BakeFunc);
+		}
+	}
+
+	private void TryGenerateLinks()
+	{
+		while (linkGenQueue.Count > 0 && NumLinksCurrentlyGenerating < nav_grid_max_links_generated_per_frame)
+		{
+			LinkInfo linkInfo = linkGenQueue.Dequeue();
+			NumLinksCurrentlyGenerating++;
+			StartCoroutine(linkInfo.LinkGenAction);
+		}
+	}
+
+	private void UpdateCellTimeouts()
+	{
+		if (!ai_dormant)
+		{
+			return;
+		}
+		for (int i = 0; i < NavMeshGrid.Cells.Length; i++)
+		{
+			NavMeshGridCell navMeshGridCell = NavMeshGrid.Cells[i];
+			if (navMeshGridCell != null && navMeshGridCell.Timeout(CellTimeoutThreshold))
+			{
+				Vector2i coord = NavMeshGrid.WorldToGridCoords(navMeshGridCell.Bounds.center);
+				ForceAgentsDormant(coord);
+				if (nav_grid_kill_dormant_cells)
+				{
+					navMeshGridCell.Kill();
+					NavMeshGrid.Cells[i] = null;
+				}
+			}
+		}
+	}
+
+	private void UpdateCellPlayerTimestamps()
+	{
+		foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+		{
+			if (activePlayer is IAIAgent)
+			{
+				continue;
+			}
+			Vector2i vector2i = NavMeshGrid.WorldToGridCoords(activePlayer.ServerPosition);
+			Vector2i[] directions = Directions;
+			foreach (Vector2i vector2i2 in directions)
+			{
+				Vector2i cellCoords = vector2i + vector2i2;
+				if (cellCoords.x >= 0 && cellCoords.y >= 0 && cellCoords.x < NavMeshGrid.CellCount && cellCoords.y < NavMeshGrid.CellCount)
+				{
+					NavMeshGridCell navMeshGridCell = NavMeshGrid[cellCoords];
+					if (navMeshGridCell != null)
+					{
+						navMeshGridCell.KeepAlive();
+					}
+				}
+			}
+		}
+	}
+
+	private void TryQueueCellRebakes()
+	{
+		if (bakeHeap.count != 0 || !nav_grid_rebake_cells_enabled)
+		{
+			return;
+		}
+		HashSet<Vector2i> obj = Pool.Get<HashSet<Vector2i>>();
+		foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+		{
+			if (activePlayer == null || !activePlayer.IsConnected || activePlayer is IAIAgent)
+			{
+				continue;
+			}
+			Vector2i vector2i = NavMeshGrid.WorldToGridCoords(activePlayer.ServerPosition);
+			Vector2i[] directions = Directions;
+			foreach (Vector2i vector2i2 in directions)
+			{
+				Vector2i vector2i3 = vector2i + vector2i2;
+				if (vector2i3.x >= 0 && vector2i3.y >= 0 && vector2i3.x < NavMeshGrid.CellCount && vector2i3.y < NavMeshGrid.CellCount && !obj.Contains(vector2i3))
+				{
+					NavMeshGridCell navMeshGridCell = NavMeshGrid[vector2i3];
+					if (navMeshGridCell != null && navMeshGridCell.Layers.Count > 0 && !IsAnyNavmeshBuilding(vector2i3) && Time.realtimeSinceStartup - navMeshGridCell.LastBakeTime >= nav_grid_rebake_cooldown)
+					{
+						obj.Add(vector2i3);
+						navMeshGridCell.IsAwaitingBake = true;
+						bakeHeap.Add(new BakeInfo
+						{
+							Cell = navMeshGridCell,
+							BakeFunc = navMeshGridCell.RebakeCellAsync(DecreaseNumCellsCurrentlyBaking)
+						});
+					}
+				}
+			}
+		}
+		obj.Clear();
+		Pool.Free(ref obj);
+	}
+
+	private void TryQueueLinkGeneration()
+	{
+		if (!nav_grid_links_enabled)
+		{
+			return;
+		}
+		foreach (IAIAgent activeAgent in activeAgents)
+		{
+			if (activeAgent.Entity == null)
+			{
+				RemoveActiveAgency(activeAgent);
+				continue;
+			}
+			Vector2i coord = GetCoord(activeAgent.Entity.ServerPosition);
+			NavMeshGridCell navMeshGridCell = NavMeshGrid[coord];
+			if (navMeshGridCell != null && !navMeshGridCell.Timeout(CellTimeoutThreshold) && navMeshGridCell.IsAtBorder(activeAgent.Entity.ServerPosition, (float)nav_grid_cell_width * 0.1f, mustHaveValidNeighbour: true))
+			{
+				linkGenQueue.Enqueue(new LinkInfo
+				{
+					Agent = activeAgent,
+					Cell = navMeshGridCell,
+					LinkGenAction = LinkGeneration(activeAgent, navMeshGridCell)
+				});
+			}
+			else
+			{
+				RemoveAgentLinkReference(activeAgent);
+			}
+		}
+	}
+
+	private void DecreaseNumCellsCurrentlyBaking(NavMeshGridCell.Layer layer)
+	{
+		DecreaseNumCellsCurrentlyBaking();
+	}
+
+	private void DecreaseNumCellsCurrentlyBaking()
+	{
+		NumCellsCurrentlyBaking--;
+		if (NumCellsCurrentlyBaking < 0)
+		{
+			NumCellsCurrentlyBaking = 0;
+		}
+	}
+
+	private IEnumerator LinkGeneration(IAIAgent agent, NavMeshGridCell cell)
+	{
+		if (agent != null && agent.Entity != null && cell != null && cell.IsAtBorder(agent.Entity.ServerPosition, (float)nav_grid_cell_width * 0.1f, mustHaveValidNeighbour: false))
+		{
+			NavMeshGridCell.NavMeshLinkInfo link = cell.GetOrCreateLink(agent.AgentTypeIndex, agent.Entity.ServerPosition, (float)nav_grid_cell_width * 0.1f);
+			if (link != null)
+			{
+				if (AgentLinks.TryGetValue(agent.Entity.GetInstanceID(), out var value) && value != null && value.Link.GetInstanceID() != link.Link.GetInstanceID())
+				{
+					RemoveAgentLinkReference(agent, value);
+				}
+				link.References++;
+				AgentLinks[agent.Entity.GetInstanceID()] = link;
+			}
+			else
+			{
+				RemoveAgentLinkReference(agent);
+			}
+			yield return null;
+		}
+		NumLinksCurrentlyGenerating--;
+		if (NumLinksCurrentlyGenerating < 0)
+		{
+			NumLinksCurrentlyGenerating = 0;
+		}
+	}
+
+	public bool HasReadyNeighbour(Vector2i coord, Vector2i direction)
+	{
+		Vector2i vector2i = coord + direction;
+		if (vector2i.x < 0 || vector2i.y < 0 || vector2i.x >= SingletonComponent<AiManager>.Instance.NavMeshGrid.CellCount || vector2i.y >= SingletonComponent<AiManager>.Instance.NavMeshGrid.CellCount)
+		{
+			return false;
+		}
+		NavMeshGridCell navMeshGridCell = NavMeshGrid[vector2i];
+		if (navMeshGridCell == null)
+		{
+			return false;
+		}
+		if (IsAnyNavmeshBuilding(vector2i))
+		{
+			return false;
+		}
+		return navMeshGridCell.Layers.Count > 0;
+	}
+
+	private void RemoveAgentLinkReference(IAIAgent agent, bool removeAgentFromCache = false)
+	{
+		if (AgentLinks != null && !(agent.Entity == null) && AgentLinks.TryGetValue(agent.Entity.GetInstanceID(), out var value))
+		{
+			RemoveAgentLinkReference(agent, value, removeAgentFromCache);
+		}
+	}
+
+	private void RemoveAgentLinkReference(IAIAgent agent, NavMeshGridCell.NavMeshLinkInfo info, bool removeAgentFromCache = false)
+	{
+		if (info != null)
+		{
+			info.References--;
+			if (info.References == 0 && (info.Cell == null || !info.Cell.RemoveLink(info)))
+			{
+				info.Link.transform.SetParent(null);
+				LinkPool.Push(info.Link.gameObject);
+			}
+		}
+		if (AgentLinks != null && agent.Entity != null)
+		{
+			if (removeAgentFromCache)
+			{
+				AgentLinks.Remove(agent.Entity.GetInstanceID());
+			}
+			else
+			{
+				AgentLinks[agent.Entity.GetInstanceID()] = null;
+			}
+		}
+	}
+
+	internal bool HasActiveAgents(NavMeshGridCell cell)
+	{
+		if (cell.LayerCount == 0)
+		{
+			return false;
+		}
+		foreach (IAIAgent activeAgent in activeAgents)
+		{
+			if (activeAgent.Entity == null || !cell.Bounds.Contains(activeAgent.Entity.ServerPosition))
+			{
+				continue;
+			}
+			return true;
+		}
+		return false;
+	}
+
+	public Vector2i GetCoord(Vector3 position)
+	{
+		return NavMeshGrid.WorldToGridCoords(position);
+	}
+
+	public bool IsAnyNavmeshBuilding(Vector3 position)
+	{
+		return IsAnyNavmeshBuilding(GetCoord(position));
+	}
+
+	public bool IsAnyNavmeshBuilding(Vector2i coord)
+	{
+		NavMeshGridCell navMeshGridCell = NavMeshGrid[coord];
+		if (navMeshGridCell != null)
+		{
+			foreach (NavMeshGridCell.Layer layer in navMeshGridCell.Layers)
+			{
+				if (layer != null)
+				{
+					return layer.IsAwaitingBake || layer.IsBuilding || (layer.BuildingOperation != null && !layer.BuildingOperation.isDone);
+				}
+			}
+		}
+		return false;
+	}
+
+	public bool IsNavmeshBuilding(int agentTypeIndex, Vector3 position)
+	{
+		return IsNavmeshBuilding(agentTypeIndex, GetCoord(position));
+	}
+
+	public bool IsNavmeshBuilding(int agentTypeIndex, Vector2i coord)
+	{
+		NavMeshGridCell navMeshGridCell = NavMeshGrid[coord];
+		if (navMeshGridCell != null)
+		{
+			NavMeshGridCell.Layer layer = navMeshGridCell.GetLayer(agentTypeIndex);
+			if (layer != null)
+			{
+				return layer.IsAwaitingBake || layer.IsBuilding || (layer.BuildingOperation != null && !layer.BuildingOperation.isDone);
+			}
+		}
+		return false;
+	}
+
+	public bool IsNavmeshBuilding(NavMeshGridCell.Layer layer)
+	{
+		return layer.IsAwaitingBake || layer.IsBuilding || (layer.BuildingOperation != null && !layer.BuildingOperation.isDone);
+	}
+
+	public bool IsCoordEqualOrAdjacentToOther(Vector2i coord, Vector2i other)
+	{
+		Vector2i[] directions = Directions;
+		foreach (Vector2i vector2i in directions)
+		{
+			if (coord + vector2i == other)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+}

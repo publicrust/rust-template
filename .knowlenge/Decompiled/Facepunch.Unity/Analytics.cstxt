@@ -1,0 +1,170 @@
+using System;
+using System.Collections;
+using System.Collections.Specialized;
+using System.Net;
+using System.Text;
+using Facepunch;
+using Facepunch.Models.Analytics;
+using Newtonsoft.Json;
+using UnityEngine;
+
+public class Analytics
+{
+	protected class AnalyticWebClient : WebClient
+	{
+		public int TimeoutSeconds = 30;
+
+		protected override WebRequest GetWebRequest(Uri uri)
+		{
+			WebRequest webRequest = base.GetWebRequest(uri);
+			webRequest.Timeout = TimeoutSeconds * 1000;
+			return webRequest;
+		}
+	}
+
+	private AnalyticWebClient webClient = new AnalyticWebClient();
+
+	private static Stat Stats = new Stat();
+
+	internal string Uid { get; set; }
+
+	internal string SessionId { get; private set; }
+
+	internal string ReportUrl { get; private set; }
+
+	public static DateTime LastSend { get; internal set; }
+
+	public static string LastMessage { get; internal set; } = string.Empty;
+
+	public static string LastResponse { get; internal set; } = string.Empty;
+
+	internal Analytics(string reportUrl)
+	{
+		Uid = Facepunch.Application.Integration.UserId;
+		ReportUrl = reportUrl;
+		SessionId = Guid.NewGuid().ToString();
+		SessionStart obj = new SessionStart
+		{
+			Uid = Uid,
+			Sid = SessionId,
+			ChangeSet = BuildInfo.Current.Scm.ChangeId,
+			Branch = BuildInfo.Current.Scm.Branch,
+			Os = SystemInfo.operatingSystem,
+			Bucket = Facepunch.Application.Integration.Bucket,
+			Gpu = SystemInfo.graphicsDeviceName,
+			Cpu = SystemInfo.processorType,
+			CpuFrq = SystemInfo.processorFrequency,
+			CpuCnt = SystemInfo.processorCount,
+			Mem = SystemInfo.systemMemorySize,
+			GpuMem = SystemInfo.graphicsMemorySize,
+			Arch = ((IntPtr.Size != 4) ? "x64" : "x86"),
+			Width = Screen.width,
+			Height = Screen.height,
+			Fullscreen = Screen.fullScreen,
+			RR = Screen.currentResolution.refreshRate
+		};
+		Send("start", obj);
+		Facepunch.Application.Controller.StartCoroutine(KeepAlive());
+		webClient.UploadValuesCompleted += delegate(object s, UploadValuesCompletedEventArgs e)
+		{
+			LastResponse = "";
+			string[] allKeys = webClient.ResponseHeaders.AllKeys;
+			foreach (string text in allKeys)
+			{
+				LastResponse += $"{text}: {webClient.ResponseHeaders[text]}\n";
+			}
+			LastResponse += "\n";
+			LastResponse += Encoding.UTF8.GetString(e.Result);
+		};
+	}
+
+	internal void OnQuit()
+	{
+		SendSessionUpdate();
+		SessionClose sessionClose = new SessionClose();
+		sessionClose.Uid = Uid;
+		sessionClose.Sid = SessionId;
+		sessionClose.FinalUpdate = new SessionUpdate
+		{
+			Frames = Performance.CategorizedFrameCount,
+			Mem = Performance.MemoryUsage,
+			Gc = Performance.GarbageCollections
+		};
+		SessionClose obj = sessionClose;
+		Send("close", obj, andWait: true);
+	}
+
+	private void Send(string action, object obj, bool andWait = false)
+	{
+		string text = JsonConvert.SerializeObject(obj, Formatting.Indented);
+		NameValueCollection nameValueCollection = new NameValueCollection();
+		nameValueCollection.Add("data", text);
+		LastMessage = text;
+		LastResponse = "";
+		Uri address = new Uri(ReportUrl.Replace("{action}", action));
+		try
+		{
+			if (andWait)
+			{
+				webClient.TimeoutSeconds = 5;
+				webClient.UploadValues(address, "POST", nameValueCollection);
+			}
+			else
+			{
+				webClient.TimeoutSeconds = 30;
+				webClient.UploadValuesAsync(address, "POST", nameValueCollection);
+			}
+		}
+		catch (Exception ex)
+		{
+			Debug.LogWarning("Analytic Exception: " + ex.Message);
+			Debug.LogWarning(ex.StackTrace);
+		}
+		LastSend = DateTime.UtcNow;
+	}
+
+	public IEnumerator KeepAlive()
+	{
+		float minutesToWait = 4f;
+		while (true)
+		{
+			yield return new WaitForSeconds(60f * minutesToWait);
+			SendSessionUpdate();
+			if (minutesToWait < 32f)
+			{
+				minutesToWait *= 2f;
+			}
+		}
+	}
+
+	private void SendSessionUpdate(bool andWait = false)
+	{
+		SessionUpdate sessionUpdate = new SessionUpdate();
+		sessionUpdate.Uid = Uid;
+		sessionUpdate.Sid = SessionId;
+		sessionUpdate.Frames = Performance.CategorizedFrameCount;
+		sessionUpdate.Mem = Performance.MemoryUsage;
+		sessionUpdate.Gc = Performance.GarbageCollections;
+		sessionUpdate.Stats = Stats;
+		SessionUpdate obj = sessionUpdate;
+		Send("update", obj, andWait);
+	}
+
+	public static void ForceSendSessionUpdateDebug()
+	{
+		if (Facepunch.Application.Analytics != null)
+		{
+			Facepunch.Application.Analytics.SendSessionUpdate();
+		}
+	}
+
+	public static void RecordAdd(string category, string name, double val)
+	{
+		Stats.GetCategory(category).AddSum(name, val);
+	}
+
+	public static void RecordReplace(string category, string name, double val)
+	{
+		Stats.GetCategory(category).AddReplace(name, val);
+	}
+}

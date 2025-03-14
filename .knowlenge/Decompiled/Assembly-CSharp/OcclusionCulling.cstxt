@@ -1,0 +1,1152 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using RustNative;
+using UnityEngine;
+using UnityEngine.Rendering;
+
+[RequireComponent(typeof(Camera))]
+[RequireComponent(typeof(Camera))]
+public class OcclusionCulling : MonoBehaviour
+{
+	public class BufferSet
+	{
+		public ComputeBuffer inputBuffer;
+
+		public ComputeBuffer resultBuffer;
+
+		public int width;
+
+		public int height;
+
+		public int capacity;
+
+		public int count;
+
+		public Texture2D inputTexture;
+
+		public RenderTexture resultTexture;
+
+		public Texture2D resultReadTexture;
+
+		public IntPtr readbackInst = IntPtr.Zero;
+
+		public Color[] inputData = new Color[0];
+
+		public Color32[] resultData = new Color32[0];
+
+		private bool usingFallback = true;
+
+		private Material fallbackMat;
+
+		private ComputeShader compute;
+
+		public void Attach(Material fallbackMat)
+		{
+			this.fallbackMat = fallbackMat;
+			usingFallback = true;
+		}
+
+		public void Attach(ComputeShader computeShader)
+		{
+			compute = computeShader;
+			usingFallback = false;
+		}
+
+		public void Dispose(bool data = true)
+		{
+			if (inputBuffer != null)
+			{
+				inputBuffer.Dispose();
+				inputBuffer = null;
+			}
+			if (resultBuffer != null)
+			{
+				resultBuffer.Dispose();
+				resultBuffer = null;
+			}
+			if (inputTexture != null)
+			{
+				UnityEngine.Object.DestroyImmediate(inputTexture);
+				inputTexture = null;
+			}
+			if (resultTexture != null)
+			{
+				RenderTexture.active = null;
+				UnityEngine.Object.DestroyImmediate(resultTexture);
+				resultTexture = null;
+			}
+			if (resultReadTexture != null)
+			{
+				UnityEngine.Object.DestroyImmediate(resultReadTexture);
+				resultReadTexture = null;
+			}
+			if (readbackInst != IntPtr.Zero)
+			{
+				RustNative.Graphics.BufferReadback.Destroy(readbackInst);
+				readbackInst = IntPtr.Zero;
+			}
+			if (data)
+			{
+				inputData = new Color[0];
+				resultData = new Color32[0];
+				capacity = 0;
+				count = 0;
+			}
+		}
+
+		public bool CheckResize(int count, int granularity)
+		{
+			if (count > capacity || (usingFallback && resultTexture != null && !resultTexture.IsCreated()))
+			{
+				Dispose(data: false);
+				int num = count / granularity * granularity + granularity;
+				if (usingFallback)
+				{
+					width = Mathf.CeilToInt(Mathf.Sqrt(num));
+					height = Mathf.CeilToInt((float)num / (float)width);
+					inputTexture = new Texture2D(width, height, TextureFormat.RGBAFloat, mipmap: false, linear: true);
+					inputTexture.name = "_Input";
+					inputTexture.filterMode = FilterMode.Point;
+					inputTexture.wrapMode = TextureWrapMode.Clamp;
+					resultTexture = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear);
+					resultTexture.name = "_Result";
+					resultTexture.filterMode = FilterMode.Point;
+					resultTexture.wrapMode = TextureWrapMode.Clamp;
+					resultTexture.useMipMap = false;
+					resultTexture.Create();
+					resultReadTexture = new Texture2D(width, height, TextureFormat.ARGB32, mipmap: false, linear: true);
+					resultReadTexture.name = "_ResultRead";
+					resultReadTexture.filterMode = FilterMode.Point;
+					resultReadTexture.wrapMode = TextureWrapMode.Clamp;
+					readbackInst = RustNative.Graphics.BufferReadback.CreateForTexture(resultTexture.GetNativeTexturePtr(), (uint)width, (uint)height, (uint)resultTexture.format);
+					capacity = width * height;
+				}
+				else
+				{
+					inputBuffer = new ComputeBuffer(num, 16);
+					resultBuffer = new ComputeBuffer(num, 4);
+					uint size = (uint)(num * 4);
+					readbackInst = RustNative.Graphics.BufferReadback.CreateForBuffer(resultBuffer.GetNativeBufferPtr(), size);
+					capacity = num;
+				}
+				Array.Resize(ref inputData, capacity);
+				Array.Resize(ref resultData, capacity);
+				this.count = count;
+				return true;
+			}
+			return false;
+		}
+
+		public void UploadData()
+		{
+			if (usingFallback)
+			{
+				inputTexture.SetPixels(inputData);
+				inputTexture.Apply();
+			}
+			else
+			{
+				inputBuffer.SetData(inputData);
+			}
+		}
+
+		private int AlignDispatchSize(int dispatchSize)
+		{
+			return (dispatchSize + 63) / 64;
+		}
+
+		public void Dispatch(int count)
+		{
+			if (usingFallback)
+			{
+				RenderBuffer activeColorBuffer = UnityEngine.Graphics.activeColorBuffer;
+				RenderBuffer activeDepthBuffer = UnityEngine.Graphics.activeDepthBuffer;
+				fallbackMat.SetTexture("_Input", inputTexture);
+				UnityEngine.Graphics.Blit(inputTexture, resultTexture, fallbackMat, 0);
+				UnityEngine.Graphics.SetRenderTarget(activeColorBuffer, activeDepthBuffer);
+			}
+			else
+			{
+				compute.SetBuffer(0, "_Input", inputBuffer);
+				compute.SetBuffer(0, "_Result", resultBuffer);
+				compute.Dispatch(0, AlignDispatchSize(count), 1, 1);
+			}
+		}
+
+		public void IssueRead()
+		{
+			if (!SafeMode)
+			{
+				RustNative.Graphics.BufferReadback.IssueRead(readbackInst);
+			}
+		}
+
+		public void GetResults()
+		{
+			if (!SafeMode)
+			{
+				RustNative.Graphics.BufferReadback.GetData(readbackInst, ref resultData[0]);
+			}
+			else if (usingFallback)
+			{
+				RenderTexture.active = resultTexture;
+				resultReadTexture.ReadPixels(new Rect(0f, 0f, width, height), 0, 0);
+				resultReadTexture.Apply();
+				Color32[] pixels = resultReadTexture.GetPixels32();
+				Array.Copy(pixels, resultData, resultData.Length);
+			}
+			else
+			{
+				resultBuffer.GetData(resultData);
+			}
+		}
+	}
+
+	public delegate void OnVisibilityChanged(bool visible);
+
+	[Serializable]
+	public class DebugSettings
+	{
+		public bool forceFallback;
+
+		public bool log;
+
+		public bool showMipChain;
+
+		public bool showMain;
+
+		public bool showGrid;
+
+		public bool showFallback;
+
+		public bool showStats;
+
+		public int showMainLod;
+	}
+
+	public class HashedPoolValue
+	{
+		public ulong hashedPoolKey = ulong.MaxValue;
+
+		public int hashedPoolIndex = -1;
+	}
+
+	public class HashedPool<ValueType> where ValueType : HashedPoolValue, new()
+	{
+		private int granularity;
+
+		private Dictionary<ulong, ValueType> dict;
+
+		private List<ValueType> pool;
+
+		private List<ValueType> list;
+
+		private Queue<ValueType> recycled;
+
+		public int Size => list.Count;
+
+		public int Count => dict.Count;
+
+		public ValueType this[int i]
+		{
+			get
+			{
+				return list[i];
+			}
+			set
+			{
+				list[i] = value;
+			}
+		}
+
+		public HashedPool(int capacity, int granularity)
+		{
+			this.granularity = granularity;
+			dict = new Dictionary<ulong, ValueType>(capacity);
+			pool = new List<ValueType>(capacity);
+			list = new List<ValueType>(capacity);
+			recycled = new Queue<ValueType>();
+		}
+
+		public ValueType Add(ulong key, int capacityGranularity = 16)
+		{
+			ValueType val;
+			if (recycled.Count > 0)
+			{
+				val = recycled.Dequeue();
+				list[val.hashedPoolIndex] = val;
+			}
+			else
+			{
+				int count = pool.Count;
+				if (count == pool.Capacity)
+				{
+					pool.Capacity += granularity;
+				}
+				val = new ValueType
+				{
+					hashedPoolIndex = count
+				};
+				pool.Add(val);
+				list.Add(val);
+			}
+			val.hashedPoolKey = key;
+			dict.Add(key, val);
+			return val;
+		}
+
+		public void Remove(ValueType value)
+		{
+			dict.Remove(value.hashedPoolKey);
+			list[value.hashedPoolIndex] = (ValueType)null;
+			recycled.Enqueue(value);
+			value.hashedPoolKey = ulong.MaxValue;
+		}
+
+		public bool TryGetValue(ulong key, out ValueType value)
+		{
+			return dict.TryGetValue(key, out value);
+		}
+
+		public bool ContainsKey(ulong key)
+		{
+			return dict.ContainsKey(key);
+		}
+	}
+
+	public class SmartListValue
+	{
+		public int hashedListIndex = -1;
+	}
+
+	public class SmartList<ValueType> where ValueType : SmartListValue
+	{
+		private List<ValueType> list;
+
+		private Queue<int> recycled;
+
+		public int Size => list.Count;
+
+		public int Count => list.Count - recycled.Count;
+
+		public ValueType this[int i]
+		{
+			get
+			{
+				return list[i];
+			}
+			set
+			{
+				list[i] = value;
+			}
+		}
+
+		public SmartList(int capacity)
+		{
+			list = new List<ValueType>(capacity);
+			recycled = new Queue<int>();
+		}
+
+		public void Add(ValueType value, int capacityGranularity = 16)
+		{
+			int num;
+			if (recycled.Count > 0)
+			{
+				num = recycled.Dequeue();
+				list[num] = value;
+			}
+			else
+			{
+				num = list.Count;
+				if (num == list.Capacity)
+				{
+					list.Capacity += capacityGranularity;
+				}
+				list.Add(value);
+			}
+			value.hashedListIndex = num;
+		}
+
+		public void Remove(ValueType value)
+		{
+			int hashedListIndex = value.hashedListIndex;
+			list[hashedListIndex] = (ValueType)null;
+			recycled.Enqueue(hashedListIndex);
+			value.hashedListIndex = -1;
+		}
+
+		public bool Contains(ValueType value)
+		{
+			int hashedListIndex = value.hashedListIndex;
+			return hashedListIndex >= 0 && list[hashedListIndex] != null;
+		}
+	}
+
+	[Serializable]
+	public class Cell : HashedPoolValue
+	{
+		public int x;
+
+		public int y;
+
+		public int z;
+
+		public Bounds bounds;
+
+		public Vector4 sphereBounds;
+
+		public bool isVisible;
+
+		public SmartList<OccludeeState> bucket;
+
+		public void Reset()
+		{
+			x = (y = (z = 0));
+			bounds = default(Bounds);
+			sphereBounds = Vector4.zero;
+			isVisible = true;
+			bucket = null;
+		}
+
+		public Cell Initialize(int x, int y, int z, Bounds bounds)
+		{
+			this.x = x;
+			this.y = y;
+			this.z = z;
+			this.bounds = bounds;
+			sphereBounds = new Vector4(bounds.center.x, bounds.center.y, bounds.center.z, bounds.extents.magnitude);
+			isVisible = true;
+			bucket = new SmartList<OccludeeState>(32);
+			return this;
+		}
+	}
+
+	public struct Sphere
+	{
+		public Vector3 position;
+
+		public float radius;
+
+		public Sphere(Vector3 position, float radius)
+		{
+			this.position = position;
+			this.radius = radius;
+		}
+	}
+
+	public LayerMask occluderMask = 0;
+
+	public ComputeShader computeShader;
+
+	private OcclusionCamera occlusionCamera;
+
+	private const int ComputeThreadsPerGroup = 64;
+
+	private const int InputBufferStride = 16;
+
+	private const int ResultBufferStride = 4;
+
+	private const int OccludeeMaxSlotsPerPool = 1048576;
+
+	private const int OccludeePoolGranularity = 2048;
+
+	private const int StateBufferGranularity = 2048;
+
+	private const int GridBufferGranularity = 256;
+
+	private static Queue<OccludeeState> statePool = new Queue<OccludeeState>();
+
+	private static List<OccludeeState> staticOccludees = new List<OccludeeState>(2048);
+
+	private static List<OccludeeState> dynamicOccludees = new List<OccludeeState>(2048);
+
+	private static List<OccludeeState> visibilityChanged = new List<OccludeeState>(1024);
+
+	private static List<int> staticChanged = new List<int>(256);
+
+	private static Queue<int> staticRecycled = new Queue<int>();
+
+	private static List<int> dynamicChanged = new List<int>(1024);
+
+	private static Queue<int> dynamicRecycled = new Queue<int>();
+
+	private static BufferSet staticSet = new BufferSet();
+
+	private static BufferSet dynamicSet = new BufferSet();
+
+	private static BufferSet gridSet = new BufferSet();
+
+	private Vector4[] frustumPlanes = new Vector4[6];
+
+	private string[] frustumPropNames = new string[6];
+
+	private float[] matrixToFloatTemp = new float[16];
+
+	private bool usingFallback = true;
+
+	private Material fallbackMat;
+
+	private static OcclusionCulling instance;
+
+	private static GraphicsDeviceType[] supportedDeviceTypes = new GraphicsDeviceType[2]
+	{
+		GraphicsDeviceType.Direct3D11,
+		GraphicsDeviceType.OpenGLCore
+	};
+
+	private static bool _enabled = false;
+
+	private static bool _safeMode = false;
+
+	private static bool _debug = false;
+
+	public DebugSettings debugSettings = new DebugSettings();
+
+	private const int GridCellsPerAxis = 2097152;
+
+	private const int GridHalfCellsPerAxis = 1048576;
+
+	private const int GridMinHalfCellsPerAxis = -1048575;
+
+	private const int GridMaxHalfCellsPerAxis = 1048575;
+
+	private const float GridCellSize = 200f;
+
+	private const float GridHalfCellSize = 100f;
+
+	private const float GridRcpCellSize = 0.005f;
+
+	private const int GridPoolCapacity = 16384;
+
+	private const int GridPoolGranularity = 4096;
+
+	private static HashedPool<Cell> grid = new HashedPool<Cell>(16384, 4096);
+
+	private static Queue<Cell> gridChanged = new Queue<Cell>();
+
+	public static OcclusionCulling Instance => instance;
+
+	public static bool Supported => supportedDeviceTypes.Contains(SystemInfo.graphicsDeviceType);
+
+	public static bool Enabled
+	{
+		get
+		{
+			return _enabled;
+		}
+		set
+		{
+			_enabled = value;
+			if (instance != null)
+			{
+				instance.enabled = value;
+			}
+		}
+	}
+
+	public static bool SafeMode
+	{
+		get
+		{
+			return _safeMode;
+		}
+		set
+		{
+			_safeMode = value;
+		}
+	}
+
+	public static bool Debug
+	{
+		get
+		{
+			return _debug;
+		}
+		set
+		{
+			_debug = value;
+		}
+	}
+
+	private static void GrowStatePool()
+	{
+		for (int i = 0; i < 2048; i++)
+		{
+			statePool.Enqueue(new OccludeeState());
+		}
+	}
+
+	private static OccludeeState AllocateState()
+	{
+		if (statePool.Count == 0)
+		{
+			GrowStatePool();
+		}
+		return statePool.Dequeue();
+	}
+
+	private static void ReleaseState(OccludeeState state)
+	{
+		statePool.Enqueue(state);
+	}
+
+	private void Awake()
+	{
+		instance = this;
+		for (int i = 0; i < 6; i++)
+		{
+			frustumPropNames[i] = "_FrustumPlane" + i;
+		}
+	}
+
+	private void OnEnable()
+	{
+		if (!Enabled)
+		{
+			Enabled = false;
+			return;
+		}
+		if (!Supported)
+		{
+			UnityEngine.Debug.LogWarning(string.Concat("[OcclusionCulling] HiZ culling disabled due to graphics device type ", SystemInfo.graphicsDeviceType, " not supported."));
+			Enabled = false;
+			return;
+		}
+		usingFallback = debugSettings.forceFallback || !SystemInfo.supportsComputeShaders || computeShader == null || !computeShader.HasKernel("compute_cull");
+		if (occlusionCamera == null)
+		{
+			occlusionCamera = OcclusionCamera.Create(this);
+		}
+		OcclusionCamera obj = occlusionCamera;
+		obj.OnPostRenderCall = (Action)Delegate.Remove(obj.OnPostRenderCall, new Action(OnOcclusionPostRender));
+		OcclusionCamera obj2 = occlusionCamera;
+		obj2.OnPostRenderCall = (Action)Delegate.Combine(obj2.OnPostRenderCall, new Action(OnOcclusionPostRender));
+		for (int i = 0; i < staticOccludees.Count; i++)
+		{
+			staticChanged.Add(i);
+		}
+		for (int j = 0; j < dynamicOccludees.Count; j++)
+		{
+			dynamicChanged.Add(j);
+		}
+		if (usingFallback)
+		{
+			fallbackMat = new Material(Shader.Find("Hidden/OcclusionCulling/Culling"))
+			{
+				hideFlags = HideFlags.HideAndDontSave
+			};
+			staticSet.Attach(fallbackMat);
+			dynamicSet.Attach(fallbackMat);
+			gridSet.Attach(fallbackMat);
+		}
+		else
+		{
+			staticSet.Attach(computeShader);
+			dynamicSet.Attach(computeShader);
+			gridSet.Attach(computeShader);
+		}
+	}
+
+	private void OnDisable()
+	{
+		if (fallbackMat != null)
+		{
+			UnityEngine.Object.DestroyImmediate(fallbackMat);
+			fallbackMat = null;
+		}
+		if (occlusionCamera != null)
+		{
+			OcclusionCamera obj = occlusionCamera;
+			obj.OnPostRenderCall = (Action)Delegate.Remove(obj.OnPostRenderCall, new Action(OnOcclusionPostRender));
+			if (occlusionCamera != null)
+			{
+				UnityEngine.Object.Destroy(occlusionCamera.gameObject);
+				occlusionCamera = null;
+			}
+		}
+		staticSet.Dispose();
+		dynamicSet.Dispose();
+		gridSet.Dispose();
+	}
+
+	public static void MakeAllVisible()
+	{
+		for (int i = 0; i < staticOccludees.Count; i++)
+		{
+			if (staticOccludees[i] != null)
+			{
+				staticOccludees[i].MakeVisible();
+			}
+		}
+		for (int j = 0; j < dynamicOccludees.Count; j++)
+		{
+			if (dynamicOccludees[j] != null)
+			{
+				dynamicOccludees[j].MakeVisible();
+			}
+		}
+	}
+
+	private void Update()
+	{
+		if (!Enabled)
+		{
+			base.enabled = false;
+		}
+	}
+
+	private void OnPreCull()
+	{
+		RetrieveAndApplyVisibility();
+	}
+
+	private void OnOcclusionPostRender()
+	{
+		PrepareAndDispatch();
+		IssueRead();
+	}
+
+	public static void RecursiveAddOccludees<T>(Transform transform, float minTimeVisible = 0.1f, bool isStatic = true, bool stickyGizmos = false) where T : Occludee
+	{
+		Renderer component = transform.GetComponent<Renderer>();
+		Collider component2 = transform.GetComponent<Collider>();
+		if (component != null && component2 != null)
+		{
+			T component3 = component.gameObject.GetComponent<T>();
+			component3 = ((!(component3 == null)) ? component3 : component.gameObject.AddComponent<T>());
+			component3.minTimeVisible = minTimeVisible;
+			component3.isStatic = isStatic;
+			component3.stickyGizmos = stickyGizmos;
+			component3.Register();
+		}
+		foreach (Transform item in transform)
+		{
+			RecursiveAddOccludees<T>(item, minTimeVisible, isStatic, stickyGizmos);
+		}
+	}
+
+	private static int FindFreeSlot(List<OccludeeState> occludees, Queue<int> recycled)
+	{
+		int result;
+		if (recycled.Count > 0)
+		{
+			result = recycled.Dequeue();
+		}
+		else
+		{
+			if (occludees.Count == occludees.Capacity)
+			{
+				int num = Mathf.Min(occludees.Capacity + 2048, 1048576);
+				if (num > 0)
+				{
+					occludees.Capacity = num;
+				}
+			}
+			if (occludees.Count < occludees.Capacity)
+			{
+				result = occludees.Count;
+				occludees.Add(null);
+			}
+			else
+			{
+				result = -1;
+			}
+		}
+		return result;
+	}
+
+	public static OccludeeState GetStateById(int id)
+	{
+		if (id >= 0 && id < 2097152)
+		{
+			bool flag = id < 1048576;
+			int index = ((!flag) ? (id - 1048576) : id);
+			if (flag)
+			{
+				return staticOccludees[index];
+			}
+			return dynamicOccludees[index];
+		}
+		return null;
+	}
+
+	public static int RegisterOccludee(Vector3 center, float radius, bool isVisible, float minTimeVisible, bool isStatic, OnVisibilityChanged onVisibilityChanged = null)
+	{
+		int num = -1;
+		num = ((!isStatic) ? RegisterOccludee(center, radius, isVisible, minTimeVisible, onVisibilityChanged, dynamicOccludees, dynamicRecycled, dynamicChanged, dynamicSet) : RegisterOccludee(center, radius, isVisible, minTimeVisible, onVisibilityChanged, staticOccludees, staticRecycled, staticChanged, staticSet));
+		return (num >= 0 && !isStatic) ? (num + 1048576) : num;
+	}
+
+	private static int RegisterOccludee(Vector3 center, float radius, bool isVisible, float minTimeVisible, OnVisibilityChanged onVisibilityChanged, List<OccludeeState> occludees, Queue<int> recycled, List<int> changed, BufferSet set)
+	{
+		int num = FindFreeSlot(occludees, recycled);
+		if (num >= 0)
+		{
+			Vector4 sphereBounds = new Vector4(center.x, center.y, center.z, radius);
+			occludees[num] = AllocateState().Initialize(set, num, sphereBounds, isVisible, minTimeVisible, onVisibilityChanged);
+			occludees[num].cell = RegisterToGrid(occludees[num]);
+			changed.Add(num);
+			if (occludees[num].isVisible != occludees[num].cell.isVisible)
+			{
+				visibilityChanged.Add(occludees[num]);
+			}
+		}
+		return num;
+	}
+
+	public static void UnregisterOccludee(int id)
+	{
+		if (id >= 0 && id < 2097152)
+		{
+			bool flag = id < 1048576;
+			int slot = ((!flag) ? (id - 1048576) : id);
+			if (flag)
+			{
+				UnregisterOccludee(slot, staticOccludees, staticRecycled, staticChanged);
+			}
+			else
+			{
+				UnregisterOccludee(slot, dynamicOccludees, dynamicRecycled, dynamicChanged);
+			}
+		}
+	}
+
+	private static void UnregisterOccludee(int slot, List<OccludeeState> occludees, Queue<int> recycled, List<int> changed)
+	{
+		UnregisterFromGrid(occludees[slot]);
+		recycled.Enqueue(slot);
+		changed.Add(slot);
+		ReleaseState(occludees[slot]);
+		occludees[slot] = null;
+	}
+
+	public static void UpdateDynamicOccludee(int id, Vector3 center, float radius)
+	{
+		int num = id - 1048576;
+		if (num >= 0 && num < 1048576)
+		{
+			dynamicOccludees[num].sphereBounds = new Vector4(center.x, center.y, center.z, radius);
+			dynamicChanged.Add(num);
+		}
+	}
+
+	private void UpdateBuffers(List<OccludeeState> occludees, BufferSet set, List<int> changed, bool isStatic)
+	{
+		int count = occludees.Count;
+		bool flag = changed.Count > 0;
+		set.CheckResize(count, 2048);
+		for (int i = 0; i < changed.Count; i++)
+		{
+			int num = changed[i];
+			OccludeeState occludeeState = occludees[num];
+			if (occludeeState != null)
+			{
+				if (!isStatic)
+				{
+					UpdateInGrid(occludeeState);
+				}
+				ref Color reference = ref set.inputData[num];
+				reference = occludeeState.sphereBounds;
+			}
+			else
+			{
+				ref Color reference2 = ref set.inputData[num];
+				reference2 = Vector4.zero;
+			}
+		}
+		changed.Clear();
+		if (flag)
+		{
+			set.UploadData();
+		}
+	}
+
+	private float[] MatrixToFloatArray(Matrix4x4 m)
+	{
+		int i = 0;
+		int num = 0;
+		for (; i < 4; i++)
+		{
+			for (int j = 0; j < 4; j++)
+			{
+				matrixToFloatTemp[num++] = m[j, i];
+			}
+		}
+		return matrixToFloatTemp;
+	}
+
+	private void PrepareAndDispatch()
+	{
+		if (staticOccludees.Count <= 0 && dynamicOccludees.Count <= 0)
+		{
+			return;
+		}
+		Matrix4x4 worldToCameraMatrix = occlusionCamera.Camera.worldToCameraMatrix;
+		Matrix4x4 gPUProjectionMatrix = GL.GetGPUProjectionMatrix(occlusionCamera.Camera.projectionMatrix, renderIntoTexture: false);
+		Matrix4x4 matrix4x = gPUProjectionMatrix * worldToCameraMatrix;
+		Vector2 vector = new Vector2(occlusionCamera.Width, occlusionCamera.Height);
+		ExtractFrustum(matrix4x, ref frustumPlanes);
+		if (usingFallback)
+		{
+			fallbackMat.SetTexture("_HiZMap", occlusionCamera.HiZTexture);
+			fallbackMat.SetMatrix("_ViewMatrix", worldToCameraMatrix);
+			fallbackMat.SetMatrix("_ProjMatrix", gPUProjectionMatrix);
+			fallbackMat.SetMatrix("_ViewProjMatrix", matrix4x);
+			fallbackMat.SetVector("_CameraWorldPos", occlusionCamera.transform.position);
+			fallbackMat.SetVector("_ViewportSize", vector);
+			for (int i = 0; i < 6; i++)
+			{
+				fallbackMat.SetVector(frustumPropNames[i], frustumPlanes[i]);
+			}
+		}
+		else
+		{
+			computeShader.SetTexture(0, "_HiZMap", occlusionCamera.HiZLevels[0]);
+			computeShader.SetFloats("_ViewMatrix", MatrixToFloatArray(worldToCameraMatrix));
+			computeShader.SetFloats("_ProjMatrix", MatrixToFloatArray(gPUProjectionMatrix));
+			computeShader.SetFloats("_ViewProjMatrix", MatrixToFloatArray(matrix4x));
+			computeShader.SetVector("_CameraWorldPos", occlusionCamera.transform.position);
+			computeShader.SetVector("_ViewportSize", vector);
+			for (int j = 0; j < 6; j++)
+			{
+				computeShader.SetVector(frustumPropNames[j], frustumPlanes[j]);
+			}
+		}
+		if (staticOccludees.Count > 0)
+		{
+			UpdateBuffers(staticOccludees, staticSet, staticChanged, isStatic: true);
+			staticSet.Dispatch(staticOccludees.Count);
+		}
+		if (dynamicOccludees.Count > 0)
+		{
+			UpdateBuffers(dynamicOccludees, dynamicSet, dynamicChanged, isStatic: false);
+			dynamicSet.Dispatch(dynamicOccludees.Count);
+		}
+		UpdateGridBuffers();
+		gridSet.Dispatch(grid.Size);
+	}
+
+	private void IssueRead()
+	{
+		if (staticOccludees.Count > 0)
+		{
+			staticSet.IssueRead();
+		}
+		if (dynamicOccludees.Count > 0)
+		{
+			dynamicSet.IssueRead();
+		}
+		if (grid.Count > 0)
+		{
+			gridSet.IssueRead();
+		}
+		GL.IssuePluginEvent(RustNative.Graphics.GetRenderEventFunc(), 2);
+	}
+
+	public void RetrieveAndApplyVisibility()
+	{
+		float deltaTime = Time.deltaTime;
+		if (staticOccludees.Count > 0)
+		{
+			staticSet.GetResults();
+		}
+		if (dynamicOccludees.Count > 0)
+		{
+			dynamicSet.GetResults();
+		}
+		if (grid.Count > 0)
+		{
+			gridSet.GetResults();
+		}
+		for (int i = 0; i < grid.Size; i++)
+		{
+			Cell cell = grid[i];
+			if (cell == null)
+			{
+				continue;
+			}
+			bool flag = gridSet.resultData[i].r > 0;
+			if (!cell.isVisible && !flag)
+			{
+				continue;
+			}
+			int num = 0;
+			for (int j = 0; j < cell.bucket.Size; j++)
+			{
+				OccludeeState occludeeState = cell.bucket[j];
+				if (occludeeState != null)
+				{
+					bool flag2 = occludeeState.set.resultData[occludeeState.slot].r > 0;
+					occludeeState.timeVisible -= deltaTime;
+					if (flag2)
+					{
+						occludeeState.timeVisible = occludeeState.minTimeVisible;
+					}
+					else
+					{
+						flag2 = occludeeState.timeVisible > 0f;
+					}
+					if (flag2 != occludeeState.isVisible)
+					{
+						visibilityChanged.Add(occludeeState);
+					}
+					num += ((!occludeeState.isVisible) ? 1 : 0);
+				}
+			}
+			cell.isVisible = flag || num < cell.bucket.Count;
+		}
+		for (int k = 0; k < visibilityChanged.Count; k++)
+		{
+			OccludeeState occludeeState2 = visibilityChanged[k];
+			bool flag3 = !occludeeState2.isVisible;
+			OnVisibilityChanged onVisibilityChanged = occludeeState2.onVisibilityChanged;
+			if (onVisibilityChanged != null && (UnityEngine.Object)onVisibilityChanged.Target != null)
+			{
+				onVisibilityChanged(flag3);
+			}
+			occludeeState2.isVisible = flag3;
+		}
+		visibilityChanged.Clear();
+	}
+
+	public static void NormalizePlane(ref Vector4 plane)
+	{
+		float num = Mathf.Sqrt(plane.x * plane.x + plane.y * plane.y + plane.z * plane.z);
+		plane.x /= num;
+		plane.y /= num;
+		plane.z /= num;
+		plane.w /= num;
+	}
+
+	public static void ExtractFrustum(Matrix4x4 viewProjMatrix, ref Vector4[] planes)
+	{
+		planes[0].x = viewProjMatrix.m30 + viewProjMatrix.m00;
+		planes[0].y = viewProjMatrix.m31 + viewProjMatrix.m01;
+		planes[0].z = viewProjMatrix.m32 + viewProjMatrix.m02;
+		planes[0].w = viewProjMatrix.m33 + viewProjMatrix.m03;
+		NormalizePlane(ref planes[0]);
+		planes[1].x = viewProjMatrix.m30 - viewProjMatrix.m00;
+		planes[1].y = viewProjMatrix.m31 - viewProjMatrix.m01;
+		planes[1].z = viewProjMatrix.m32 - viewProjMatrix.m02;
+		planes[1].w = viewProjMatrix.m33 - viewProjMatrix.m03;
+		NormalizePlane(ref planes[1]);
+		planes[2].x = viewProjMatrix.m30 - viewProjMatrix.m10;
+		planes[2].y = viewProjMatrix.m31 - viewProjMatrix.m11;
+		planes[2].z = viewProjMatrix.m32 - viewProjMatrix.m12;
+		planes[2].w = viewProjMatrix.m33 - viewProjMatrix.m13;
+		NormalizePlane(ref planes[2]);
+		planes[3].x = viewProjMatrix.m30 + viewProjMatrix.m10;
+		planes[3].y = viewProjMatrix.m31 + viewProjMatrix.m11;
+		planes[3].z = viewProjMatrix.m32 + viewProjMatrix.m12;
+		planes[3].w = viewProjMatrix.m33 + viewProjMatrix.m13;
+		NormalizePlane(ref planes[3]);
+		planes[4].x = viewProjMatrix.m20;
+		planes[4].y = viewProjMatrix.m21;
+		planes[4].z = viewProjMatrix.m22;
+		planes[4].w = viewProjMatrix.m23;
+		NormalizePlane(ref planes[4]);
+		planes[5].x = viewProjMatrix.m30 - viewProjMatrix.m20;
+		planes[5].y = viewProjMatrix.m31 - viewProjMatrix.m21;
+		planes[5].z = viewProjMatrix.m32 - viewProjMatrix.m22;
+		planes[5].w = viewProjMatrix.m33 - viewProjMatrix.m23;
+		NormalizePlane(ref planes[5]);
+	}
+
+	private static int floor(float x)
+	{
+		int num = (int)x;
+		return (!(x < (float)num)) ? num : (num - 1);
+	}
+
+	public static Cell RegisterToGrid(OccludeeState occludee)
+	{
+		int num = floor(occludee.sphereBounds.x * 0.005f);
+		int num2 = floor(occludee.sphereBounds.y * 0.005f);
+		int num3 = floor(occludee.sphereBounds.z * 0.005f);
+		int num4 = Mathf.Clamp(num, -1048575, 1048575);
+		int num5 = Mathf.Clamp(num2, -1048575, 1048575);
+		int num6 = Mathf.Clamp(num3, -1048575, 1048575);
+		ulong num7 = (ulong)((num4 < 0) ? (num4 + 1048575) : num4);
+		ulong num8 = (ulong)((num5 < 0) ? (num5 + 1048575) : num5);
+		ulong num9 = (ulong)((num6 < 0) ? (num6 + 1048575) : num6);
+		ulong key = (num7 << 42) | (num8 << 21) | num9;
+		Cell value;
+		bool flag = grid.TryGetValue(key, out value);
+		if (!flag)
+		{
+			Vector3 center = default(Vector3);
+			center.x = (float)num * 200f + 100f;
+			center.y = (float)num2 * 200f + 100f;
+			center.z = (float)num3 * 200f + 100f;
+			Vector3 size = new Vector3(200f, 200f, 200f);
+			value = grid.Add(key).Initialize(num, num2, num3, new Bounds(center, size));
+		}
+		if (!flag || !value.bucket.Contains(occludee))
+		{
+			Vector4 sphereBounds = occludee.sphereBounds;
+			float num10 = sphereBounds.w * 2f;
+			Vector3 center2 = new Vector3(sphereBounds.x, sphereBounds.y, sphereBounds.z);
+			Vector3 size2 = new Vector3(num10, num10, num10);
+			occludee.cell = value;
+			value.bucket.Add(occludee);
+			value.bounds.Encapsulate(new Bounds(center2, size2));
+			gridChanged.Enqueue(value);
+		}
+		return value;
+	}
+
+	public static void UpdateInGrid(OccludeeState occludee)
+	{
+		int num = floor(occludee.sphereBounds.x * 0.005f);
+		int num2 = floor(occludee.sphereBounds.y * 0.005f);
+		int num3 = floor(occludee.sphereBounds.z * 0.005f);
+		if (num != occludee.cell.x || num2 != occludee.cell.y || num3 != occludee.cell.z)
+		{
+			UnregisterFromGrid(occludee);
+			RegisterToGrid(occludee);
+		}
+	}
+
+	public static void UnregisterFromGrid(OccludeeState occludee)
+	{
+		Cell cell = occludee.cell;
+		cell.bucket.Remove(occludee);
+		gridChanged.Enqueue(cell);
+		if (cell.bucket.Count == 0)
+		{
+			grid.Remove(cell);
+			cell.Reset();
+		}
+		occludee.cell = null;
+	}
+
+	public void UpdateGridBuffers()
+	{
+		if (gridSet.CheckResize(grid.Size, 256))
+		{
+			if (debugSettings.log)
+			{
+				UnityEngine.Debug.Log("[OcclusionCulling] Resized grid to " + grid.Size);
+			}
+			for (int i = 0; i < grid.Size; i++)
+			{
+				if (grid[i] != null)
+				{
+					gridChanged.Enqueue(grid[i]);
+				}
+			}
+		}
+		bool flag = gridChanged.Count > 0;
+		while (gridChanged.Count > 0)
+		{
+			Cell cell = gridChanged.Dequeue();
+			ref Color reference = ref gridSet.inputData[cell.hashedPoolIndex];
+			reference = cell.sphereBounds;
+		}
+		if (flag)
+		{
+			gridSet.UploadData();
+		}
+	}
+}
