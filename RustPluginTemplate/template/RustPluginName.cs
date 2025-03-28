@@ -1,8 +1,8 @@
 namespace Oxide.Plugins
 {
-    [Info("HelloWorld", "PublicRust", "1.0.0")]
-    [Description("Simple Hello World plugin for Rust")]
-    public class HelloWorld : RustPlugin
+    [Info("RustPluginName", "PluginAuthor", "1.0.0")]
+    [Description("PluginDescription")]
+    public class RustPluginName : RustPlugin
     {
         private void Init()
         {
@@ -12,7 +12,7 @@ namespace Oxide.Plugins
         [ChatCommand("hello")]
         private void HelloCommand(BasePlayer player, string command, string[] args)
         {
-            command.Init();
+            player.ChatMessage("Hello, " + player.displayName + "! Welcome to this Rust server.");
         }
     }
 }

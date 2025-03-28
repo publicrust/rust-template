@@ -13,14 +13,14 @@ namespace Oxide.Plugins
 {
     [Info("Admin Monitor", "Braga", "1.3.0")]
     [Description("Monitors admin activity and tracks their time spent in-game")]
-    public class AdminMonitor : RustPlugin
+    public class AdminMonitor1 : RustPlugin
     {
         #region Fields
         private const string PermissionAdmin = "adminmonitor.admin";
         private const string PermissionView = "adminmonitor.view";
         private const string PermissionTracked = "adminmonitor.tracked";
         private const string PermissionReports = "adminmonitor.reports";
-        private StoredData? storedData;
+        private readonly StoredData? storedData;
         private readonly Dictionary<ulong, AdminActivity> activeAdmins = new();
         private readonly Dictionary<ulong, Timer> activityTimers = new();
         private readonly Dictionary<ulong, Timer> uiUpdateTimers = new();
@@ -1134,8 +1134,7 @@ namespace Oxide.Plugins
             // Добавляем статистику сервера
             int totalAdmins = storedData.AdminStatistics.Count;
             int onlineAdmins = storedData.AdminStatistics.Count(x =>
-                BasePlayer.FindByID(x.Key)?.IsConnected == true
-            );
+                BasePlayer.FindByID(x.Key)?.IsConnected);
             int afkAdmins = activeAdmins.Count(x => x.Value.IsAfk);
 
             _ = container.Add(
@@ -1559,7 +1558,7 @@ namespace Oxide.Plugins
                 // Разбиваем сложное тернарное выражение на простые условия
                 return "⭕";
             }
-            else if (activity?.IsAfk == true)
+            else if (activity?.IsAfk)
             {
                 // Разбиваем сложное тернарное выражение на простые условия
                 return "💤";
