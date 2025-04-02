@@ -1,0 +1,224 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using ProtoBuf;
+using Rust.Demo;
+using UnityEngine;
+
+public class Indexer
+{
+	public class Entity
+	{
+		public ProtoBuf.Entity Init;
+
+		public ProtoBuf.Entity Data;
+
+		public Vector3 Position;
+
+		public Vector3 Rotation;
+
+		public NetworkableId UId => Init.baseNetworkable.uid;
+
+		public Entity Copy()
+		{
+			return new Entity
+			{
+				Init = Init,
+				Data = Data,
+				Position = Position,
+				Rotation = Rotation
+			};
+		}
+	}
+
+	public class Keyframe
+	{
+		public long Position;
+
+		public Entity[] Entities;
+
+		public NetworkableId[] Updated;
+
+		public Dictionary<NetworkableId, Entity> EntityDict;
+
+		public void Init()
+		{
+			EntityDict = Entities.ToDictionary((Entity x) => x.UId, (Entity x) => x);
+		}
+
+		public bool HasEntity(NetworkableId iD)
+		{
+			return EntityDict.ContainsKey(iD);
+		}
+	}
+
+	private List<Keyframe> keyframes = new List<Keyframe>();
+
+	private long LastPacketTime;
+
+	private long PacketCount;
+
+	private Dictionary<NetworkableId, Entity> currentEnts = new Dictionary<NetworkableId, Entity>();
+
+	private long NextKeyframe;
+
+	private List<NetworkableId> Updated = new List<NetworkableId>();
+
+	public TimeSpan TotalLength => TimeSpan.FromMilliseconds(LastPacketTime);
+
+	public long Interval => 1000L;
+
+	internal Indexer(Reader reader)
+	{
+		reader.Progress(long.MaxValue);
+		while (!reader.IsFinished)
+		{
+			Packet packet = reader.ReadPacket();
+			if (!packet.isValid)
+			{
+				break;
+			}
+			try
+			{
+				TryCreateKeyframe(packet);
+				ProcessPacket(packet);
+			}
+			catch (Exception exception)
+			{
+				Debug.LogException(exception);
+			}
+		}
+		reader.ResetToStart();
+		if (keyframes.Count > 1)
+		{
+			keyframes[0].Entities = keyframes[1].Entities;
+			keyframes[0].EntityDict = keyframes[1].EntityDict;
+			keyframes[0].Updated = keyframes[1].Updated;
+		}
+		Debug.Log($"Index created {keyframes.Count} keyframes");
+	}
+
+	private void ProcessPacket(Packet packet)
+	{
+		PacketCount++;
+		LastPacketTime = Math.Max(LastPacketTime, packet.Time);
+		using BinaryReader binaryReader = new BinaryReader(new MemoryStream(packet.Data));
+		byte b = binaryReader.ReadByte();
+		if (b > 140)
+		{
+			switch ((byte)(b - 140))
+			{
+			case 5:
+				Entities(binaryReader);
+				break;
+			case 9:
+				RpcMessage(binaryReader);
+				break;
+			case 10:
+				EntityPosition(binaryReader);
+				break;
+			case 6:
+				EntityDestroy(binaryReader);
+				break;
+			}
+		}
+	}
+
+	private void EntityUpdated(NetworkableId ent)
+	{
+		if (!Updated.Contains(ent))
+		{
+			Updated.Add(ent);
+		}
+	}
+
+	private void EntityPosition(BinaryReader reader)
+	{
+		NetworkableId networkableId = new NetworkableId(reader.ReadUInt64());
+		Vector3 position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+		Vector3 rotation = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+		EntityUpdated(networkableId);
+		if (currentEnts.TryGetValue(networkableId, out var value))
+		{
+			value.Position = position;
+			value.Rotation = rotation;
+		}
+	}
+
+	private void RpcMessage(BinaryReader reader)
+	{
+	}
+
+	internal Keyframe LookupKeyframeForTime(long time)
+	{
+		int index = Mathf.FloorToInt(time / Interval);
+		return GetKeyframe(index);
+	}
+
+	internal Keyframe GetKeyframe(int index)
+	{
+		index = Mathf.Clamp(index, 0, keyframes.Count - 1);
+		return keyframes[index];
+	}
+
+	internal HashSet<NetworkableId> GetChangedEntities(long from, long to)
+	{
+		using (TimeWarning.New("GetChangedEntities"))
+		{
+			int num = Mathf.Min((int)from, (int)to) / (int)Interval - 1;
+			int num2 = Mathf.Max((int)from, (int)to) / (int)Interval + 1;
+			HashSet<NetworkableId> hashSet = new HashSet<NetworkableId>();
+			for (int i = num; i <= num2; i++)
+			{
+				Keyframe keyframe = GetKeyframe(i);
+				for (int j = 0; j < keyframe.Updated.Length; j++)
+				{
+					if (!hashSet.Contains(keyframe.Updated[j]))
+					{
+						hashSet.Add(keyframe.Updated[j]);
+					}
+				}
+			}
+			return hashSet;
+		}
+	}
+
+	private void EntityDestroy(BinaryReader reader)
+	{
+		NetworkableId networkableId = new NetworkableId(reader.ReadUInt32());
+		currentEnts.Remove(networkableId);
+		EntityUpdated(networkableId);
+	}
+
+	private void Entities(BinaryReader reader)
+	{
+		reader.ReadUInt32();
+		ProtoBuf.Entity entity = ProtoBuf.Entity.Deserialize(reader.BaseStream);
+		EntityUpdated(entity.baseNetworkable.uid);
+		if (!currentEnts.TryGetValue(entity.baseNetworkable.uid, out var value))
+		{
+			value = new Entity();
+			value.Init = entity;
+			currentEnts[value.UId] = value;
+		}
+		value.Data = entity;
+	}
+
+	private void TryCreateKeyframe(Packet packet)
+	{
+		if (packet.Time >= NextKeyframe)
+		{
+			NextKeyframe += Interval;
+			Keyframe keyframe = new Keyframe
+			{
+				Position = packet.Position,
+				Entities = currentEnts.Select((KeyValuePair<NetworkableId, Entity> x) => x.Value.Copy()).ToArray(),
+				Updated = Updated.ToArray()
+			};
+			keyframe.Init();
+			keyframes.Add(keyframe);
+			Updated.Clear();
+		}
+	}
+}

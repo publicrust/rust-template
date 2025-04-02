@@ -1,0 +1,1152 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using ConVar;
+using Facepunch;
+using Network;
+using Oxide.Core;
+using ProtoBuf;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class BallistaGun : BaseVehicleSeat
+{
+	[Serializable]
+	private struct Ammo
+	{
+		public ItemDefinition item;
+
+		public GameObject go;
+	}
+
+	[Serializable]
+	private struct FiringEffect
+	{
+		public ItemDefinition item;
+
+		public GameObjectRef effectPrefab;
+	}
+
+	private enum AimDirection
+	{
+		Left,
+		Right,
+		Up,
+		Down
+	}
+
+	[Header("Ballista")]
+	[SerializeField]
+	private bool isMountedOnVehicle = true;
+
+	[SerializeField]
+	private float turnSensivity = 2f;
+
+	[SerializeField]
+	private float reloadTime = 3f;
+
+	[SerializeField]
+	private float fovMultiplier = 1f;
+
+	[SerializeField]
+	private bool noHeadshots = true;
+
+	[SerializeField]
+	private CapsuleCollider playerServerCollider;
+
+	[SerializeField]
+	private BaseProjectile.Magazine magazine;
+
+	[Space]
+	[SerializeField]
+	private Transform muzzle;
+
+	[SerializeField]
+	private Transform pitchTransform;
+
+	[SerializeField]
+	public Transform yawTransform;
+
+	[SerializeField]
+	public Transform mountTransform;
+
+	[SerializeField]
+	private Animator animator;
+
+	[SerializeField]
+	private GameObject ammoParent;
+
+	public DamageRenderer damageRenderer;
+
+	private Vector3 aimDir;
+
+	[SerializeField]
+	private Ammo[] ammoPrefabs;
+
+	[SerializeField]
+	[Header("IK")]
+	public Transform leftHandTarget;
+
+	[SerializeField]
+	public Transform rightHandTarget;
+
+	[SerializeField]
+	[Header("Effects")]
+	private FiringEffect[] muzzleFireEffects;
+
+	[SerializeField]
+	private SoundDefinition reloadedSound;
+
+	[SerializeField]
+	private SoundDefinition aimMovementSoundDef;
+
+	[SerializeField]
+	private AnimationCurve aimMovementGainCurve;
+
+	private Sound aimMovementSound;
+
+	private SoundModulation.Modulator aimMovementGainMod;
+
+	[Space]
+	[SerializeField]
+	private bool runSideChecks;
+
+	[SerializeField]
+	private Transform leftGroundCheckTransform;
+
+	[SerializeField]
+	private Transform rightGroundCheckTransform;
+
+	[SerializeField]
+	private Transform[] leftSideCheckPositions;
+
+	[SerializeField]
+	private Transform[] rightSideCheckPositions;
+
+	[SerializeField]
+	private Vector3 originalLocalMountPos;
+
+	[SerializeField]
+	private bool runBoundsChecks;
+
+	[SerializeField]
+	private Bounds[] areaChecks;
+
+	[NonSerialized]
+	public Ballista ballistaOwner;
+
+	[HideInInspector]
+	public float reloadProgress;
+
+	private bool justReloaded;
+
+	private BasePlayer reloadingPlayer;
+
+	private float steerInput;
+
+	private float verticalRatio;
+
+	private bool wasShowingLegs;
+
+	private TimeSince lastReloadStartTime;
+
+	private float fixedMountYRotation;
+
+	[ClientVar(ClientAdmin = true)]
+	public static bool debug;
+
+	public const Flags Flag_Reloading = Flags.Reserved4;
+
+	public const Flags Flag_Loaded = Flags.Reserved5;
+
+	private readonly float progressTickRate = 0.1f;
+
+	private RealTimeSinceEx timeSinceLastServerTick;
+
+	private Vector3 lastSentAimDir = Vector3.zero;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("BallistaGun.OnRpcMessage"))
+		{
+			if (rpc == 1188838966 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_CancelReload ");
+				}
+				using (TimeWarning.New("SERVER_CancelReload"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.CallsPerSecond.Test(1188838966u, "SERVER_CancelReload", this, player, 3uL))
+						{
+							return true;
+						}
+						if (!RPC_Server.FromOwner.Test(1188838966u, "SERVER_CancelReload", this, player, includeMounted: true))
+						{
+							return true;
+						}
+						if (!RPC_Server.IsVisible.Test(1188838966u, "SERVER_CancelReload", this, player, 3f))
+						{
+							return true;
+						}
+						if (!RPC_Server.MaxDistance.Test(1188838966u, "SERVER_CancelReload", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							SERVER_CancelReload(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						Debug.LogException(exception);
+						player.Kick("RPC Error in SERVER_CancelReload");
+					}
+				}
+				return true;
+			}
+			if (rpc == 296086248 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_FireClientProjectile ");
+				}
+				using (TimeWarning.New("SERVER_FireClientProjectile"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.CallsPerSecond.Test(296086248u, "SERVER_FireClientProjectile", this, player, 1uL))
+						{
+							return true;
+						}
+						if (!RPC_Server.FromOwner.Test(296086248u, "SERVER_FireClientProjectile", this, player, includeMounted: true))
+						{
+							return true;
+						}
+						if (!RPC_Server.IsVisible.Test(296086248u, "SERVER_FireClientProjectile", this, player, 3f))
+						{
+							return true;
+						}
+						if (!RPC_Server.MaxDistance.Test(296086248u, "SERVER_FireClientProjectile", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg3 = rPCMessage;
+							SERVER_FireClientProjectile(msg3);
+						}
+					}
+					catch (Exception exception2)
+					{
+						Debug.LogException(exception2);
+						player.Kick("RPC Error in SERVER_FireClientProjectile");
+					}
+				}
+				return true;
+			}
+			if (rpc == 2817383917u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_ReloadStart ");
+				}
+				using (TimeWarning.New("SERVER_ReloadStart"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.CallsPerSecond.Test(2817383917u, "SERVER_ReloadStart", this, player, 3uL))
+						{
+							return true;
+						}
+						if (!RPC_Server.FromOwner.Test(2817383917u, "SERVER_ReloadStart", this, player, includeMounted: true))
+						{
+							return true;
+						}
+						if (!RPC_Server.IsVisible.Test(2817383917u, "SERVER_ReloadStart", this, player, 3f))
+						{
+							return true;
+						}
+						if (!RPC_Server.MaxDistance.Test(2817383917u, "SERVER_ReloadStart", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg4 = rPCMessage;
+							SERVER_ReloadStart(msg4);
+						}
+					}
+					catch (Exception exception3)
+					{
+						Debug.LogException(exception3);
+						player.Kick("RPC Error in SERVER_ReloadStart");
+					}
+				}
+				return true;
+			}
+			if (rpc == 4118009042u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_SwitchAmmoTo ");
+				}
+				using (TimeWarning.New("SERVER_SwitchAmmoTo"))
+				{
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg5 = rPCMessage;
+							SERVER_SwitchAmmoTo(msg5);
+						}
+					}
+					catch (Exception exception4)
+					{
+						Debug.LogException(exception4);
+						player.Kick("RPC Error in SERVER_SwitchAmmoTo");
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	private bool HasOwner()
+	{
+		return ballistaOwner != null;
+	}
+
+	private bool IsLoaded()
+	{
+		if (HasFlag(Flags.Reserved5) && magazine.contents == magazine.capacity)
+		{
+			return reloadProgress >= 0.94f;
+		}
+		return false;
+	}
+
+	private bool CanFire()
+	{
+		if (IsLoaded() && !HasFlag(Flags.Reserved4))
+		{
+			return !OwnerIsWaterlogged();
+		}
+		return false;
+	}
+
+	private bool CanReload()
+	{
+		if (!IsLoaded() && (float)lastReloadStartTime > 1f)
+		{
+			return !OwnerIsWaterlogged();
+		}
+		return false;
+	}
+
+	public bool OwnerIsWaterlogged()
+	{
+		if (HasOwner())
+		{
+			return ballistaOwner.IsWaterlogged();
+		}
+		return false;
+	}
+
+	public override void InitShared()
+	{
+		base.InitShared();
+		originalLocalMountPos = mountAnchor.localPosition;
+	}
+
+	private bool UpdateManualAim(InputState inputState)
+	{
+		float y = mountAnchor.position.y;
+		MoveMountAnchor();
+		float num = y - mountAnchor.position.y;
+		float num2 = 0f;
+		if (Mathf.Abs(num) > 0.0001f)
+		{
+			num2 = (0f - num) * 50f;
+		}
+		float num3 = (0f - inputState.current.mouseDelta.y) * turnSensivity;
+		float num4 = inputState.current.mouseDelta.x * turnSensivity;
+		float num5 = turnSensivity * 2.5f;
+		if (inputState.IsDown(BUTTON.LEFT))
+		{
+			num4 -= num5;
+		}
+		if (inputState.IsDown(BUTTON.RIGHT))
+		{
+			num4 += num5;
+		}
+		if (inputState.IsDown(BUTTON.BACKWARD))
+		{
+			num3 += num5;
+		}
+		if (inputState.IsDown(BUTTON.FORWARD))
+		{
+			num3 += 0f - num5;
+		}
+		num3 += num2;
+		if (!CanRotateInDirection(num4 > 0f))
+		{
+			num4 = 0f;
+		}
+		if (runBoundsChecks)
+		{
+			if (num4 != 0f && !CheckBallistaBounds((!(num4 < 0f)) ? AimDirection.Right : AimDirection.Left))
+			{
+				num4 = 0f;
+			}
+			if (num3 != 0f && !CheckBallistaBounds((num3 < 0f) ? AimDirection.Up : AimDirection.Down))
+			{
+				num3 = 0f;
+			}
+		}
+		Vector3 euler = Quaternion.LookRotation(aimDir, base.transform.up).eulerAngles + new Vector3(num3, num4, 0f);
+		euler.x = ClampPitch(euler.x);
+		Transform transform = (HasOwner() ? base.transform.parent : yawTransform);
+		euler.y = ClampYaw(euler.y, Quaternion.LookRotation(transform.forward, base.transform.up).eulerAngles.y);
+		Vector3 vector = Quaternion.Euler(euler) * Vector3.forward;
+		bool result = !Mathf.Approximately(aimDir.x, vector.x) || !Mathf.Approximately(aimDir.y, vector.y) || !Mathf.Approximately(aimDir.z, vector.z);
+		aimDir = vector;
+		return result;
+	}
+
+	private bool CanRotateInDirection(bool rotatingLeft)
+	{
+		Transform checkTransform = (rotatingLeft ? leftGroundCheckTransform : rightGroundCheckTransform);
+		Transform[] array = (rotatingLeft ? leftSideCheckPositions : rightSideCheckPositions);
+		if (!HasGround(checkTransform))
+		{
+			return false;
+		}
+		if (runSideChecks)
+		{
+			Transform[] array2 = array;
+			foreach (Transform transform in array2)
+			{
+				if (HasColliderBlockingRotation(transform.position, transform.forward))
+				{
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	public void RotateBallista(float dt)
+	{
+		if ((isMountedOnVehicle && base.transform.parent == null) || aimDir == Vector3.zero)
+		{
+			return;
+		}
+		float speed = 50f;
+		Transform transform = (isMountedOnVehicle ? base.transform.parent : base.transform);
+		Vector3 vector = transform.InverseTransformDirection(aimDir);
+		if (!(vector == Vector3.zero))
+		{
+			Quaternion quaternion = Quaternion.LookRotation(vector, Vector3.up);
+			float y = ClampYaw(quaternion.eulerAngles.y, 0f);
+			float x = ClampPitch(quaternion.eulerAngles.x);
+			Quaternion quaternion2 = Quaternion.Euler(0f, y, 0f);
+			Quaternion quaternion3 = Quaternion.Euler(x, 0f, 0f);
+			Quaternion quaternion4 = transform.rotation * quaternion2;
+			if (yawTransform.rotation != quaternion4)
+			{
+				yawTransform.rotation = Mathx.Lerp(yawTransform.rotation, quaternion4, speed, dt);
+			}
+			if (pitchTransform.localRotation != quaternion3)
+			{
+				pitchTransform.localRotation = Mathx.Lerp(pitchTransform.localRotation, quaternion3, speed, dt);
+			}
+		}
+	}
+
+	private void UpdatePlayerModelPose()
+	{
+		Quaternion quaternion = Quaternion.LookRotation(muzzle.forward, Vector3.up);
+		float t = Mathf.InverseLerp(pitchClamp.y, pitchClamp.x, Mathf.DeltaAngle(0f, quaternion.eulerAngles.x));
+		verticalRatio = Mathf.Lerp(-1f, 1f, t);
+	}
+
+	private float ClampPitch(float pitch)
+	{
+		float num = Mathf.Clamp(Mathf.DeltaAngle(0f, pitch), pitchClamp.x, pitchClamp.y);
+		if (num < 0f)
+		{
+			num += 360f;
+		}
+		return num;
+	}
+
+	private float ClampYaw(float targetYaw, float parentYaw)
+	{
+		float value = Mathf.DeltaAngle(parentYaw, targetYaw);
+		value = Mathf.Clamp(value, yawClamp.x, yawClamp.y);
+		return parentYaw + value;
+	}
+
+	private Item GetAmmoFromPlayerInventory(BasePlayer player)
+	{
+		Item item = player.inventory.FindItemByItemID(magazine.ammoType.itemid);
+		if (item == null && !magazine.allowAmmoSwitching)
+		{
+			return null;
+		}
+		if (item == null)
+		{
+			Item item2 = player.inventory.FindAmmo(magazine.definition.ammoTypes);
+			if (item2 == null)
+			{
+				return null;
+			}
+			item = player.inventory.FindItemByItemID(item2.info.itemid);
+			if (item == null)
+			{
+				return null;
+			}
+		}
+		return item;
+	}
+
+	public override void OnFlagsChanged(Flags old, Flags next)
+	{
+		base.OnFlagsChanged(old, next);
+	}
+
+	private bool HasGround(Transform checkTransform)
+	{
+		float maxDistance = 1f;
+		RaycastHit hitInfo;
+		return UnityEngine.Physics.SphereCast(checkTransform.position + Vector3.up * 0.6f, 0.1f, Vector3.down, out hitInfo, maxDistance, 1503731969);
+	}
+
+	private bool HasColliderBlockingRotation(Vector3 origin, Vector3 direction)
+	{
+		float maxDistance = 0.2f;
+		RaycastHit hitInfo;
+		return UnityEngine.Physics.SphereCast(origin, 0.05f, direction, out hitInfo, maxDistance, 1503731969);
+	}
+
+	private void MoveMountAnchor()
+	{
+		float maxDistance = 2f;
+		Vector3 origin = mountAnchor.parent.TransformPoint(originalLocalMountPos) + Vector3.up * 0.8f;
+		Vector3 down = Vector3.down;
+		if (UnityEngine.Physics.SphereCast(origin, 0.05f, down, out var hitInfo, maxDistance, 1503731969))
+		{
+			float y = hitInfo.point.y;
+			float y2 = mountAnchor.parent.TransformPoint(originalLocalMountPos).y;
+			if (Mathf.Abs(y - y2) < 0.5f)
+			{
+				mountAnchor.position = hitInfo.point;
+			}
+		}
+	}
+
+	private bool CanRotate()
+	{
+		if (HasOwner())
+		{
+			return !ballistaOwner.IsStationary();
+		}
+		return AnyMounted();
+	}
+
+	private bool CanSeeFirePoint(BasePlayer player, float radius)
+	{
+		Vector3 center = player.eyes.center;
+		Vector3 position = player.eyes.position;
+		Vector3 position2 = muzzle.position;
+		int layerMask = 2162688;
+		if (GamePhysics.LineOfSightRadius(center, position, layerMask, radius, this))
+		{
+			return GamePhysics.LineOfSightRadius(position, position2, layerMask, radius, this);
+		}
+		return false;
+	}
+
+	private bool CheckBallistaBounds(AimDirection direction)
+	{
+		List<Bounds> obj = Facepunch.Pool.Get<List<Bounds>>();
+		bool num = direction == AimDirection.Up || direction == AimDirection.Down;
+		Vector3 position = pitchTransform.position;
+		if (num)
+		{
+			position += ((direction == AimDirection.Up) ? pitchTransform.up : (-pitchTransform.up)).normalized * 0.05f;
+			obj.Add(areaChecks[areaChecks.Length - 1]);
+		}
+		else
+		{
+			int num2 = ((direction != 0) ? 1 : 0);
+			obj.Add(areaChecks[num2]);
+			obj.Add(areaChecks[areaChecks.Length - 1]);
+		}
+		bool result = true;
+		foreach (Bounds item in obj)
+		{
+			if (SocketMod_AreaCheck.IsInArea(position, pitchTransform.rotation, item, 1503731969, this))
+			{
+				result = false;
+				break;
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+		return result;
+	}
+
+	public override void ServerInit()
+	{
+		base.ServerInit();
+		InvokeRepeating(ServerTick, UnityEngine.Random.Range(0f, 1f), 0.015f);
+		InvokeRandomized(SendAimDir, UnityEngine.Random.Range(0f, 1f), 0.2f, 0.05f);
+	}
+
+	private void ServerTick()
+	{
+		if (base.isServer)
+		{
+			float dt = (float)(double)timeSinceLastServerTick;
+			timeSinceLastServerTick = 0.0;
+			if (CanRotate())
+			{
+				RotateBallista(dt);
+			}
+			if (!HasOwner() && AnyMounted() && IsSeatClipping(this))
+			{
+				DismountAllPlayers();
+			}
+		}
+	}
+
+	public override void PlayerServerInput(InputState inputState, BasePlayer player)
+	{
+		base.PlayerServerInput(inputState, player);
+		UpdateManualAim(inputState);
+	}
+
+	public override void OnParentChanging(BaseEntity oldParent, BaseEntity newParent)
+	{
+		base.OnParentChanging(oldParent, newParent);
+		if (newParent != null && aimDir == Vector3.zero)
+		{
+			aimDir = newParent.transform.forward;
+		}
+	}
+
+	public override void OnPlayerMounted()
+	{
+		base.OnPlayerMounted();
+		TogglePlayerServerCollider(active: true);
+		aimDir = pitchTransform.forward;
+		SendAimDirImmediate();
+	}
+
+	public override void OnPlayerDismounted(BasePlayer player)
+	{
+		base.OnPlayerDismounted(player);
+		TogglePlayerServerCollider(active: false);
+		if (HasFlag(Flags.Reserved4))
+		{
+			StopReload();
+		}
+	}
+
+	private void LoadAmmo(BasePlayer player)
+	{
+		if (!(player != GetMounted()) && !IsLoaded())
+		{
+			Item ammoFromPlayerInventory = GetAmmoFromPlayerInventory(player);
+			if (ammoFromPlayerInventory != null)
+			{
+				SetFlag(Flags.Reserved5, b: true);
+				magazine.ammoType = ammoFromPlayerInventory.info;
+				magazine.contents = 1;
+				ammoFromPlayerInventory.UseItem();
+			}
+		}
+	}
+
+	public void SendAimDir()
+	{
+		if (lastSentAimDir == Vector3.zero || Vector3.Angle(lastSentAimDir, aimDir) > 0.03f)
+		{
+			SendAimDirImmediate();
+		}
+	}
+
+	public void SendAimDirImmediate(bool force = false)
+	{
+		lastSentAimDir = aimDir;
+		ClientRPC(RpcTarget.NetworkGroup("CLIENT_ReceiveAimDir"), aimDir, force);
+	}
+
+	private void ReloadProgress()
+	{
+		if (reloadingPlayer == null || reloadingPlayer != GetMounted() || reloadingPlayer.IsDead() || reloadingPlayer.IsSleeping() || Vector3Ex.Distance2D(reloadingPlayer.transform.position, base.transform.position) > 3f)
+		{
+			StopReload();
+			return;
+		}
+		reloadProgress += progressTickRate / reloadTime;
+		if (reloadProgress >= 1f)
+		{
+			reloadProgress = 1f;
+			LoadAmmo(reloadingPlayer);
+			Invoke(delegate
+			{
+				SendAimDirImmediate(force: true);
+			}, 0.5f);
+			StopReload();
+		}
+		else
+		{
+			SendNetworkUpdateImmediate();
+		}
+	}
+
+	public void StopReload()
+	{
+		CancelInvoke(ReloadProgress);
+		reloadingPlayer = null;
+		SetFlag(Flags.Reserved4, b: false);
+	}
+
+	public void TogglePlayerServerCollider(bool active)
+	{
+		playerServerCollider.enabled = active;
+	}
+
+	[RPC_Server]
+	private void SERVER_SwitchAmmoTo(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		BasePlayer mounted = GetMounted();
+		if (mounted == null || player == null || player != mounted)
+		{
+			return;
+		}
+		int num = msg.read.Int32();
+		if (num == magazine.ammoType.itemid)
+		{
+			return;
+		}
+		ItemDefinition itemDefinition = ItemManager.FindItemDefinition(num);
+		if (itemDefinition == null)
+		{
+			return;
+		}
+		ItemModProjectile component = itemDefinition.GetComponent<ItemModProjectile>();
+		if ((bool)component && component.IsAmmo(magazine.definition.ammoTypes))
+		{
+			if (magazine.contents > 0)
+			{
+				mounted.GiveItem(ItemManager.CreateByItemID(magazine.ammoType.itemid, magazine.contents, 0uL));
+				magazine.contents = 0;
+				SetFlag(Flags.Reserved5, b: false);
+			}
+			magazine.ammoType = itemDefinition;
+			SendNetworkUpdateImmediate();
+			ItemManager.DoRemoves();
+			mounted.inventory.ServerUpdate(0f);
+		}
+	}
+
+	[RPC_Server.MaxDistance(3f)]
+	[RPC_Server]
+	[RPC_Server.FromOwner(true)]
+	[RPC_Server.CallsPerSecond(1uL)]
+	[RPC_Server.IsVisible(3f)]
+	private void SERVER_FireClientProjectile(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (player == null)
+		{
+			return;
+		}
+		if (!VerifyClientRPC(player))
+		{
+			SendNetworkUpdate();
+		}
+		else
+		{
+			if (!IsLoaded() || magazine.contents != 1 || player != GetMounted() || !CanFire() || player.InSafeZone() || Interface.CallHook("OnSiegeWeaponFire", ballistaOwner, player) != null)
+			{
+				return;
+			}
+			ItemDefinition ammoType = magazine.ammoType;
+			if (ammoType == null)
+			{
+				AntiHack.Log(player, AntiHackType.ProjectileHack, "Item not found (" + base.ShortPrefabName + ")");
+				player.stats.combat.LogInvalid(player, null, "item_missing");
+				return;
+			}
+			ItemModProjectile component = ammoType.GetComponent<ItemModProjectile>();
+			if (component == null)
+			{
+				AntiHack.Log(player, AntiHackType.ProjectileHack, "Item mod not found (" + base.ShortPrefabName + ")");
+				player.stats.combat.LogInvalid(player, null, "mod_missing");
+				return;
+			}
+			ProjectileShoot projectileShoot = ProjectileShoot.Deserialize(msg.read);
+			if (projectileShoot.projectiles.Count != 1)
+			{
+				AntiHack.Log(player, AntiHackType.ProjectileHack, "Projectile count mismatch (" + base.ShortPrefabName + ")");
+				player.stats.combat.LogInvalid(player, null, "count_mismatch");
+				return;
+			}
+			player.CleanupExpiredProjectiles();
+			Guid projectileGroupId = Guid.NewGuid();
+			foreach (ProjectileShoot.Projectile projectile in projectileShoot.projectiles)
+			{
+				if (player.HasFiredProjectile(projectile.projectileID))
+				{
+					AntiHack.Log(player, AntiHackType.ProjectileHack, "Duplicate ID (" + projectile.projectileID + ")");
+					player.stats.combat.LogInvalid(player, null, "duplicate_id");
+				}
+				else if (ValidateFirePos(player, projectile.startPos))
+				{
+					player.NoteFiredProjectile(projectile.projectileID, projectile.startPos, projectile.startVel, null, ammoType, projectileGroupId, Vector3.zero);
+					Effect effect = new Effect();
+					effect.Init(Effect.Type.Projectile, projectile.startPos, projectile.startVel, msg.connection);
+					effect.scale = 1f;
+					effect.pooledString = component.projectileObject.resourcePath;
+					effect.number = projectile.seed;
+					EffectNetwork.Send(effect);
+				}
+			}
+			projectileShoot?.Dispose();
+			SendAimDirImmediate(force: true);
+			player.MarkHostileFor();
+			SignalBroadcast(Signal.Attack, string.Empty, msg.connection);
+			magazine.contents = 0;
+			reloadProgress = 0f;
+			SetFlag(Flags.Reserved5, b: false);
+			if (HasOwner())
+			{
+				ballistaOwner.RefreshLastUseTime();
+				ballistaOwner.OnFired();
+			}
+			SingletonComponent<NpcNoiseManager>.Instance.OnWeaponShot(player, null);
+		}
+	}
+
+	protected bool VerifyClientRPC(BasePlayer player)
+	{
+		if (player == null)
+		{
+			Debug.LogWarning("Received RPC from null player");
+			return false;
+		}
+		BasePlayer mounted = GetMounted();
+		if (mounted == null)
+		{
+			AntiHack.Log(player, AntiHackType.AttackHack, "Owner not found (" + base.ShortPrefabName + ")");
+			player.stats.combat.LogInvalid(player, null, "owner_missing");
+			return false;
+		}
+		if (mounted != player)
+		{
+			AntiHack.Log(player, AntiHackType.AttackHack, "Player mismatch (" + base.ShortPrefabName + ")");
+			player.stats.combat.LogInvalid(player, null, "player_mismatch");
+			return false;
+		}
+		if (player.IsDead())
+		{
+			AntiHack.Log(player, AntiHackType.AttackHack, "Player dead (" + base.ShortPrefabName + ")");
+			player.stats.combat.LogInvalid(player, null, "player_dead");
+			return false;
+		}
+		if (player.IsWounded())
+		{
+			AntiHack.Log(player, AntiHackType.AttackHack, "Player down (" + base.ShortPrefabName + ")");
+			player.stats.combat.LogInvalid(player, null, "player_down");
+			return false;
+		}
+		if (player.IsSleeping())
+		{
+			AntiHack.Log(player, AntiHackType.AttackHack, "Player sleeping (" + base.ShortPrefabName + ")");
+			player.stats.combat.LogInvalid(player, null, "player_sleeping");
+			return false;
+		}
+		if (player.desyncTimeRaw > ConVar.AntiHack.maxdesync)
+		{
+			AntiHack.Log(player, AntiHackType.AttackHack, "Player stalled (" + base.ShortPrefabName + " with " + player.desyncTimeRaw + "s)");
+			player.stats.combat.LogInvalid(player, null, "player_stalled");
+			return false;
+		}
+		if (magazine.ammoType == null)
+		{
+			AntiHack.Log(player, AntiHackType.AttackHack, "Item not found (" + base.ShortPrefabName + ")");
+			player.stats.combat.LogInvalid(player, null, "item_missing");
+			return false;
+		}
+		return true;
+	}
+
+	protected bool ValidateFirePos(BasePlayer player, Vector3 firePos)
+	{
+		bool flag = true;
+		if (firePos.IsNaNOrInfinity())
+		{
+			string shortPrefabName = base.ShortPrefabName;
+			AntiHack.Log(player, AntiHackType.EyeHack, "Contains NaN (" + shortPrefabName + ")");
+			player.stats.combat.LogInvalid(player, null, "eye_nan");
+			flag = false;
+		}
+		if (ConVar.AntiHack.eye_protection > 0)
+		{
+			if (ConVar.AntiHack.eye_protection >= 1)
+			{
+				float num = player.GetParentVelocity().magnitude + player.GetMountVelocity().magnitude + ConVar.AntiHack.eye_forgiveness;
+				float num2 = Vector3.Distance(muzzle.transform.position, firePos);
+				if (num2 > num)
+				{
+					string shortPrefabName2 = base.ShortPrefabName;
+					AntiHack.Log(player, AntiHackType.EyeHack, "Distance (" + shortPrefabName2 + " on attack with " + num2 + "m > " + num + "m)");
+					player.stats.combat.LogInvalid(player, null, "eye_distance");
+					flag = false;
+				}
+			}
+			int num3 = 2162688;
+			if (ConVar.AntiHack.eye_terraincheck)
+			{
+				num3 |= 0x800000;
+			}
+			if (ConVar.AntiHack.eye_vehiclecheck)
+			{
+				num3 |= 0x8000000;
+			}
+			if (ConVar.AntiHack.eye_protection >= 2 && !CanSeeFirePoint(player, 0.05f))
+			{
+				string shortPrefabName3 = base.ShortPrefabName;
+				string[] obj = new string[8]
+				{
+					"Line of sight (",
+					shortPrefabName3,
+					" on attack) ",
+					player.eyes.center.ToString(),
+					" ",
+					player.eyes.position.ToString(),
+					" ",
+					null
+				};
+				Vector3 vector = firePos;
+				obj[7] = vector.ToString();
+				AntiHack.Log(player, AntiHackType.EyeHack, string.Concat(obj));
+				player.stats.combat.LogInvalid(player, null, "eye_los");
+				flag = false;
+			}
+		}
+		if (!flag)
+		{
+			AntiHack.AddViolation(player, AntiHackType.EyeHack, ConVar.AntiHack.eye_penalty);
+		}
+		return flag;
+	}
+
+	protected override bool BroadcastSignalFromClientFilter(Signal signal)
+	{
+		return signal == Signal.Attack;
+	}
+
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server.FromOwner(true)]
+	[RPC_Server.CallsPerSecond(3uL)]
+	[RPC_Server]
+	[RPC_Server.MaxDistance(3f)]
+	private void SERVER_ReloadStart(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		BasePlayer mounted = GetMounted();
+		if (!(mounted == null) && !(player == null) && !(player != mounted))
+		{
+			reloadingPlayer = player;
+			SetFlag(Flags.Reserved4, b: true);
+			ClientRPC(RpcTarget.NetworkGroup("CLIENT_StartReloading"), reloadingPlayer.net.ID);
+			InvokeRepeating(ReloadProgress, 0f, progressTickRate);
+			if (HasOwner())
+			{
+				ballistaOwner.RefreshLastUseTime();
+			}
+		}
+	}
+
+	[RPC_Server]
+	[RPC_Server.MaxDistance(3f)]
+	[RPC_Server.FromOwner(true)]
+	[RPC_Server.CallsPerSecond(3uL)]
+	[RPC_Server.IsVisible(3f)]
+	public void SERVER_CancelReload(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (!(player == null) && !(player != reloadingPlayer))
+		{
+			StopReload();
+		}
+	}
+
+	public override void PostServerLoad()
+	{
+		base.PostServerLoad();
+		if (CanRotate())
+		{
+			RotateBallista(1000f);
+		}
+	}
+
+	public override void DoRepair(BasePlayer player)
+	{
+		if (HasParent() && HasOwner())
+		{
+			ballistaOwner.DoRepair(player);
+		}
+		else
+		{
+			base.DoRepair(player);
+		}
+	}
+
+	public override void Hurt(HitInfo info)
+	{
+		if (HasParent() && HasOwner())
+		{
+			ballistaOwner.Hurt(info);
+		}
+		else
+		{
+			base.Hurt(info);
+		}
+	}
+
+	public override void OnDied(HitInfo info)
+	{
+		base.OnDied(info);
+		if (HasParent() && HasOwner() && !ballistaOwner.IsDead())
+		{
+			ballistaOwner.Die();
+		}
+	}
+
+	public void AdminReload(int ammo)
+	{
+		reloadProgress = 1f;
+		StopReload();
+		ItemDefinition ammoType = null;
+		switch (ammo)
+		{
+		case 1:
+			ammoType = ItemManager.FindItemDefinition("ballista.bolt.hammerhead");
+			break;
+		case 2:
+			ammoType = ItemManager.FindItemDefinition("ballista.bolt.incendiary");
+			break;
+		case 3:
+			ammoType = ItemManager.FindItemDefinition("ballista.bolt.piercer");
+			break;
+		case 4:
+			ammoType = ItemManager.FindItemDefinition("ballista.bolt.pitchfork");
+			break;
+		}
+		SetFlag(Flags.Reserved5, b: true);
+		magazine.ammoType = ammoType;
+		magazine.contents = 1;
+		SendNetworkUpdateImmediate();
+	}
+
+	[ServerVar]
+	public static void reload(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer == null)
+		{
+			arg.ReplyWith("Null player.");
+		}
+		else
+		{
+			if (!basePlayer.IsAdmin)
+			{
+				return;
+			}
+			int @int = arg.GetInt(0, 1);
+			@int = Mathf.Clamp(@int, 1, 4);
+			BallistaGun[] array = Util.FindAll<BallistaGun>();
+			int num = 0;
+			BallistaGun[] array2 = array;
+			foreach (BallistaGun ballistaGun in array2)
+			{
+				if (ballistaGun.isServer && Vector3.Distance(ballistaGun.transform.position, basePlayer.transform.position) <= 10f)
+				{
+					ballistaGun.AdminReload(@int);
+					num++;
+				}
+			}
+			arg.ReplyWith($"Reloaded {num} ballistas.");
+		}
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		if (!isMountedOnVehicle || HasOwner())
+		{
+			info.msg.ballistaGun = Facepunch.Pool.Get<ProtoBuf.BallistaGun>();
+			info.msg.ballistaGun.magazine = magazine.Save();
+			info.msg.ballistaGun.reloadProgress = reloadProgress;
+			info.msg.ballistaGun.aimDir = aimDir;
+		}
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		if (info.msg.ballistaGun != null)
+		{
+			if (info.msg.ballistaGun.magazine != null)
+			{
+				magazine.Load(info.msg.ballistaGun.magazine);
+			}
+			if (base.isServer)
+			{
+				reloadProgress = info.msg.ballistaGun.reloadProgress;
+				aimDir = info.msg.ballistaGun.aimDir;
+			}
+		}
+		base.Load(info);
+	}
+}

@@ -1,0 +1,621 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using ConVar;
+using Facepunch;
+using Network;
+using Oxide.Core;
+using ProtoBuf;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class IndustrialCrafter : IndustrialEntity, IItemContainerEntity, IIdealSlotEntity, ILootableEntity, IInventoryProvider, LootPanel.IHasLootPanel, IContainerSounds, IIndustrialStorage
+{
+	public string LootPanelName = "generic";
+
+	public bool NeedsBuildingPrivilegeToUse;
+
+	public bool OnlyOneUser;
+
+	public SoundDefinition ContainerOpenSound;
+
+	public SoundDefinition ContainerCloseSound;
+
+	public AnimationCurve MaterialOffsetCurve = AnimationCurve.Linear(0f, 0f, 1f, 1f);
+
+	public const Flags Crafting = Flags.Reserved1;
+
+	public const Flags FullOutput = Flags.Reserved2;
+
+	public Renderer MeshRenderer;
+
+	public ParticleSystemContainer JobCompleteFx;
+
+	public SoundDefinition JobCompleteSoundDef;
+
+	public const int BlueprintSlotStart = 0;
+
+	public const int BlueprintSlotEnd = 3;
+
+	public ItemContainer _inventory;
+
+	private ItemDefinition currentlyCrafting;
+
+	private int currentlyCraftingAmount;
+
+	private const int StorageSize = 12;
+
+	private const int InputSlotStart = 4;
+
+	private const int InputSlotEnd = 7;
+
+	private const int OutputSlotStart = 8;
+
+	private const int OutputSlotEnd = 11;
+
+	private Translate.Phrase _lootPanelTitle = new Translate.Phrase("industrial.crafter.loot", "Industrial Crafter");
+
+	public TimeUntilWithDuration jobFinishes { get; private set; }
+
+	ItemContainer IItemContainerEntity.inventory => _inventory;
+
+	Transform IItemContainerEntity.Transform => base.transform;
+
+	bool IItemContainerEntity.DropsLoot => true;
+
+	float IItemContainerEntity.DestroyLootPercent => 0f;
+
+	bool IItemContainerEntity.DropFloats { get; }
+
+	ulong ILootableEntity.LastLootedBy { get; set; }
+
+	BasePlayer ILootableEntity.LastLootedByPlayer { get; set; }
+
+	ItemContainer IIndustrialStorage.Container => _inventory;
+
+	BaseEntity IIndustrialStorage.IndustrialEntity => this;
+
+	Translate.Phrase LootPanel.IHasLootPanel.LootPanelTitle => _lootPanelTitle;
+
+	public SoundDefinition OpenSound => ContainerOpenSound;
+
+	public SoundDefinition CloseSound => ContainerCloseSound;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("IndustrialCrafter.OnRpcMessage"))
+		{
+			if (rpc == 331989034 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - RPC_OpenLoot ");
+				}
+				using (TimeWarning.New("RPC_OpenLoot"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(331989034u, "RPC_OpenLoot", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage rpc2 = rPCMessage;
+							RPC_OpenLoot(rpc2);
+						}
+					}
+					catch (Exception exception)
+					{
+						Debug.LogException(exception);
+						player.Kick("RPC Error in RPC_OpenLoot");
+					}
+				}
+				return true;
+			}
+			if (rpc == 4167839872u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SvSwitch ");
+				}
+				using (TimeWarning.New("SvSwitch"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.CallsPerSecond.Test(4167839872u, "SvSwitch", this, player, 2uL))
+						{
+							return true;
+						}
+						if (!RPC_Server.IsVisible.Test(4167839872u, "SvSwitch", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							SvSwitch(msg2);
+						}
+					}
+					catch (Exception exception2)
+					{
+						Debug.LogException(exception2);
+						player.Kick("RPC Error in SvSwitch");
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public override void OnFlagsChanged(Flags old, Flags next)
+	{
+		base.OnFlagsChanged(old, next);
+		bool flag = next.HasFlag(Flags.On);
+		if (old.HasFlag(Flags.On) != flag && base.isServer)
+		{
+			float industrialCrafterFrequency = ConVar.Server.industrialCrafterFrequency;
+			if (flag && industrialCrafterFrequency > 0f)
+			{
+				InvokeRandomized(CheckCraft, industrialCrafterFrequency, industrialCrafterFrequency, industrialCrafterFrequency * 0.5f);
+			}
+			else
+			{
+				CancelInvoke(CheckCraft);
+			}
+		}
+	}
+
+	public override void OnDied(HitInfo info)
+	{
+		base.OnDied(info);
+		DropItems(info?.Initiator);
+	}
+
+	public void DropItems(BaseEntity initiator = null)
+	{
+		StorageContainer.DropItems(this, initiator);
+	}
+
+	public bool ShouldDropItemsIndividually()
+	{
+		return false;
+	}
+
+	public void DropBonusItems(BaseEntity initiator, ItemContainer container)
+	{
+	}
+
+	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
+	private void RPC_OpenLoot(RPCMessage rpc)
+	{
+		if (_inventory != null)
+		{
+			BasePlayer player = rpc.player;
+			if ((bool)player && player.CanInteract())
+			{
+				PlayerOpenLoot(player);
+			}
+		}
+	}
+
+	public virtual bool PlayerOpenLoot(BasePlayer player, string panelToOpen = "", bool doPositionChecks = true)
+	{
+		if (Interface.CallHook("CanLootEntity", player, this) != null)
+		{
+			return false;
+		}
+		if (NeedsBuildingPrivilegeToUse && !player.CanBuild())
+		{
+			return false;
+		}
+		if (OnlyOneUser && IsOpen())
+		{
+			player.ChatMessage("Already in use");
+			return false;
+		}
+		if (player.inventory.loot.StartLootingEntity(this, doPositionChecks))
+		{
+			SetFlag(Flags.Open, b: true);
+			player.inventory.loot.AddContainer(_inventory);
+			player.inventory.loot.SendImmediate();
+			player.ClientRPC(RpcTarget.Player("RPC_OpenLootPanel", player), LootPanelName);
+			SendNetworkUpdate();
+			return true;
+		}
+		return false;
+	}
+
+	public virtual void PlayerStoppedLooting(BasePlayer player)
+	{
+		SetFlag(Flags.Open, b: false);
+		SendNetworkUpdate();
+	}
+
+	public override void ServerInit()
+	{
+		base.ServerInit();
+		CreateInventory(giveUID: true);
+	}
+
+	internal override void DoServerDestroy()
+	{
+		base.DoServerDestroy();
+		Facepunch.Pool.Free(ref _inventory);
+	}
+
+	public void CreateInventory(bool giveUID)
+	{
+		Debug.Assert(_inventory == null, "Double init of inventory!");
+		_inventory = Facepunch.Pool.Get<ItemContainer>();
+		_inventory.entityOwner = this;
+		_inventory.canAcceptItem = CanAcceptItem;
+		_inventory.ServerInitialize(null, 12);
+		if (giveUID)
+		{
+			_inventory.GiveUID();
+		}
+	}
+
+	private bool CanAcceptItem(Item item, int index)
+	{
+		if (index >= 0 && index <= 3 && !item.IsBlueprint())
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private void CheckCraft()
+	{
+		IndustrialEntity.Queue.Add(this);
+	}
+
+	private Item GetTargetBlueprint(int index)
+	{
+		if (_inventory == null)
+		{
+			return null;
+		}
+		if (index < 0 || index > 3)
+		{
+			return null;
+		}
+		Item slot = _inventory.GetSlot(index);
+		if (slot == null || !slot.IsBlueprint())
+		{
+			return null;
+		}
+		return slot;
+	}
+
+	protected override void RunJob()
+	{
+		base.RunJob();
+		if (ConVar.Server.industrialCrafterFrequency <= 0f || HasFlag(Flags.Reserved1) || currentlyCrafting != null)
+		{
+			return;
+		}
+		for (int i = 0; i <= 3; i++)
+		{
+			Item targetBlueprint = GetTargetBlueprint(i);
+			if (targetBlueprint == null || GetWorkbench() == null || GetWorkbench().Workbenchlevel < targetBlueprint.blueprintTargetDef.Blueprint.GetWorkbenchLevel())
+			{
+				continue;
+			}
+			ItemBlueprint blueprint = targetBlueprint.blueprintTargetDef.Blueprint;
+			if (Interface.CallHook("OnItemCraft", this, blueprint) != null)
+			{
+				break;
+			}
+			bool flag = true;
+			foreach (ItemAmount ingredient in blueprint.GetIngredients())
+			{
+				if ((float)GetInputAmount(ingredient.itemDef) < ingredient.amount)
+				{
+					flag = false;
+					break;
+				}
+			}
+			if (!flag)
+			{
+				continue;
+			}
+			flag = false;
+			for (int j = 8; j <= 11; j++)
+			{
+				Item slot = _inventory.GetSlot(j);
+				if (slot == null || (slot.info == targetBlueprint.blueprintTargetDef && slot.amount + blueprint.amountToCreate <= slot.MaxStackable()))
+				{
+					flag = true;
+					break;
+				}
+			}
+			if (!flag)
+			{
+				SetFlag(Flags.Reserved2, b: true);
+				continue;
+			}
+			SetFlag(Flags.Reserved2, b: false);
+			foreach (ItemAmount ingredient2 in blueprint.GetIngredients())
+			{
+				ConsumeInputIngredient(ingredient2);
+			}
+			currentlyCrafting = targetBlueprint.blueprintTargetDef;
+			currentlyCraftingAmount = blueprint.amountToCreate;
+			float craftTime = blueprint.GetCraftTime();
+			Invoke(CompleteCraft, craftTime);
+			jobFinishes = craftTime;
+			SetFlag(Flags.Reserved1, b: true);
+			ClientRPC(RpcTarget.NetworkGroup("ClientUpdateCraftTimeRemaining"), (float)jobFinishes, jobFinishes.Duration);
+			break;
+		}
+	}
+
+	private void CompleteCraft()
+	{
+		bool flag = false;
+		for (int i = 8; i <= 11; i++)
+		{
+			Item slot = _inventory.GetSlot(i);
+			if (slot == null)
+			{
+				Item item = ItemManager.Create(currentlyCrafting, currentlyCraftingAmount, 0uL);
+				item.SetItemOwnership(ItemOwnership.username, ItemOwnershipPhrases.IndustrialCrafter);
+				item.position = i;
+				_inventory.Insert(item);
+				flag = true;
+				break;
+			}
+			if (slot.info == currentlyCrafting && slot.amount + currentlyCraftingAmount <= slot.MaxStackable())
+			{
+				slot.amount += currentlyCraftingAmount;
+				slot.MarkDirty();
+				flag = true;
+				break;
+			}
+		}
+		if (!flag)
+		{
+			Item item2 = ItemManager.Create(currentlyCrafting, currentlyCraftingAmount, 0uL);
+			item2.SetItemOwnership(ItemOwnership.username, ItemOwnershipPhrases.IndustrialCrafter);
+			item2.Drop(base.transform.position + base.transform.forward * 0.5f, Vector3.zero);
+		}
+		currentlyCrafting = null;
+		currentlyCraftingAmount = 0;
+		SetFlag(Flags.Reserved1, b: false);
+	}
+
+	private int GetInputAmount(ItemDefinition def)
+	{
+		if (def == null)
+		{
+			return 0;
+		}
+		int num = 0;
+		for (int i = 4; i <= 7; i++)
+		{
+			Item slot = _inventory.GetSlot(i);
+			if (slot != null && def == slot.info)
+			{
+				num += slot.amount;
+			}
+		}
+		return num;
+	}
+
+	private bool ConsumeInputIngredient(ItemAmount am)
+	{
+		if (am.itemDef == null)
+		{
+			return false;
+		}
+		float num = am.amount;
+		for (int i = 4; i <= 7; i++)
+		{
+			Item slot = _inventory.GetSlot(i);
+			if (slot != null && am.itemDef == slot.info)
+			{
+				float num2 = Mathf.Min(num, slot.amount);
+				slot.UseItem((int)num2);
+				num -= num2;
+				if (num2 <= 0f)
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		if (info.forDisk)
+		{
+			if (currentlyCrafting != null)
+			{
+				info.msg.industrialCrafter = Facepunch.Pool.Get<ProtoBuf.IndustrialCrafter>();
+				info.msg.industrialCrafter.currentlyCrafting = currentlyCrafting.itemid;
+				info.msg.industrialCrafter.currentlyCraftingAmount = currentlyCraftingAmount;
+			}
+			if (_inventory != null)
+			{
+				info.msg.storageBox = Facepunch.Pool.Get<StorageBox>();
+				info.msg.storageBox.contents = _inventory.Save();
+			}
+		}
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (info.msg.storageBox != null && _inventory != null)
+		{
+			_inventory.Load(info.msg.storageBox.contents);
+			_inventory.capacity = 12;
+		}
+		if (base.isServer && info.fromDisk && info.msg.industrialCrafter != null)
+		{
+			currentlyCrafting = ItemManager.FindItemDefinition(info.msg.industrialCrafter.currentlyCrafting);
+			currentlyCraftingAmount = info.msg.industrialCrafter.currentlyCraftingAmount;
+			CompleteCraft();
+		}
+	}
+
+	public Vector2i InputSlotRange(int slotIndex)
+	{
+		if (slotIndex == 3)
+		{
+			return new Vector2i(0, 3);
+		}
+		return new Vector2i(4, 7);
+	}
+
+	public Vector2i OutputSlotRange(int slotIndex)
+	{
+		if (slotIndex == 1)
+		{
+			return new Vector2i(0, 3);
+		}
+		return new Vector2i(8, 11);
+	}
+
+	public void OnStorageItemTransferBegin()
+	{
+	}
+
+	public void OnStorageItemTransferEnd()
+	{
+	}
+
+	public override void UpdateHasPower(int inputAmount, int inputSlot)
+	{
+	}
+
+	public override void IOStateChanged(int inputAmount, int inputSlot)
+	{
+		base.IOStateChanged(inputAmount, inputSlot);
+		if (inputSlot == 1)
+		{
+			SetFlag(Flags.Reserved8, inputAmount >= ConsumptionAmount() && inputAmount > 0);
+			currentEnergy = inputAmount;
+			ensureOutputsUpdated = true;
+			MarkDirty();
+		}
+		if (inputSlot == 1 && inputAmount <= 0 && IsOn())
+		{
+			SetSwitch(wantsOn: false);
+		}
+		if (inputSlot == 2)
+		{
+			if (IsOn() && inputAmount == 0)
+			{
+				SetSwitch(wantsOn: false);
+			}
+			else if (!IsOn() && inputAmount > 0 && HasFlag(Flags.Reserved8))
+			{
+				SetSwitch(wantsOn: true);
+			}
+		}
+		if (inputSlot == 4 && inputAmount > 0 && HasFlag(Flags.Reserved8))
+		{
+			SetSwitch(wantsOn: true);
+		}
+		if (inputSlot == 5 && inputAmount > 0 && HasFlag(Flags.Reserved8))
+		{
+			SetSwitch(wantsOn: false);
+		}
+	}
+
+	public override bool ShouldDrainBattery(IOEntity battery)
+	{
+		return IsOn();
+	}
+
+	public override bool WantsPassthroughPower()
+	{
+		return false;
+	}
+
+	public override bool WantsPower(int inputIndex)
+	{
+		return inputIndex == 1;
+	}
+
+	public virtual void SetSwitch(bool wantsOn)
+	{
+		if (wantsOn != IsOn())
+		{
+			SetFlag(Flags.On, wantsOn, recursive: false, networkupdate: false);
+			SetFlag(Flags.Busy, b: true, recursive: false, networkupdate: false);
+			if (!wantsOn)
+			{
+				SetFlag(Flags.Reserved2, b: false, recursive: false, networkupdate: false);
+			}
+			Invoke(Unbusy, 0.5f);
+			SendNetworkUpdateImmediate();
+			MarkDirty();
+		}
+	}
+
+	public void Unbusy()
+	{
+		SetFlag(Flags.Busy, b: false);
+	}
+
+	[RPC_Server.CallsPerSecond(2uL)]
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
+	private void SvSwitch(RPCMessage msg)
+	{
+		SetSwitch(!IsOn());
+	}
+
+	public override bool CanPickup(BasePlayer player)
+	{
+		if (_inventory != null && _inventory.IsEmpty())
+		{
+			return base.CanPickup(player);
+		}
+		return false;
+	}
+
+	public void GetAllInventories(List<ItemContainer> list)
+	{
+		list.Add(_inventory);
+	}
+
+	public int GetIdealSlot(BasePlayer player, ItemContainer container, Item item)
+	{
+		return -1;
+	}
+
+	public ItemContainerId GetIdealContainer(BasePlayer player, Item item, ItemMoveModifier modifier)
+	{
+		return default(ItemContainerId);
+	}
+
+	public Workbench GetWorkbench()
+	{
+		return GetParentEntity() as Workbench;
+	}
+}

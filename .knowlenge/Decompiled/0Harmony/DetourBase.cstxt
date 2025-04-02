@@ -1,0 +1,165 @@
+using System;
+using System.Runtime.CompilerServices;
+using System.Threading;
+
+private abstract class DetourBase : ICoreDetourBase, IDisposable
+{
+	protected abstract class DetourBoxBase
+	{
+		public SimpleNativeDetour? Detour;
+
+		protected readonly PlatformTriple Triple;
+
+		protected readonly object Sync = new object();
+
+		private bool applyDetours;
+
+		private bool isApplying;
+
+		public bool IsApplied
+		{
+			get
+			{
+				return Volatile.Read(ref applyDetours);
+			}
+			set
+			{
+				Volatile.Write(ref applyDetours, value);
+				Thread.MemoryBarrier();
+			}
+		}
+
+		public bool IsApplying
+		{
+			get
+			{
+				return Volatile.Read(ref isApplying);
+			}
+			set
+			{
+				Volatile.Write(ref isApplying, value);
+				Thread.MemoryBarrier();
+			}
+		}
+
+		protected DetourBoxBase(PlatformTriple triple)
+		{
+			Triple = triple;
+			applyDetours = false;
+			isApplying = false;
+		}
+	}
+
+	protected readonly PlatformTriple Triple;
+
+	protected DetourBoxBase DetourBox;
+
+	private bool disposedValue;
+
+	public bool IsApplied => DetourBox.IsApplied;
+
+	protected DetourBase(PlatformTriple triple)
+	{
+		Triple = triple;
+		DetourBox = null;
+	}
+
+	protected TBox GetDetourBox<TBox>() where TBox : DetourBoxBase
+	{
+		return System.Runtime.CompilerServices.Unsafe.As<TBox>(DetourBox);
+	}
+
+	protected static void ReplaceDetourInLock(DetourBoxBase nativeDetour, SimpleNativeDetour? newDetour, out SimpleNativeDetour? oldDetour)
+	{
+		Thread.MemoryBarrier();
+		oldDetour = Interlocked.Exchange(ref nativeDetour.Detour, newDetour);
+	}
+
+	protected abstract SimpleNativeDetour CreateDetour();
+
+	public void Apply()
+	{
+		lock (DetourBox)
+		{
+			if (IsApplied)
+			{
+				throw new InvalidOperationException("Cannot apply a detour which is already applied");
+			}
+			try
+			{
+				DetourBox.IsApplying = true;
+				DetourBox.IsApplied = true;
+				ReplaceDetourInLock(DetourBox, CreateDetour(), out SimpleNativeDetour _);
+			}
+			catch
+			{
+				DetourBox.IsApplied = false;
+				throw;
+			}
+			finally
+			{
+				DetourBox.IsApplying = false;
+			}
+		}
+	}
+
+	protected abstract void BeforeUndo();
+
+	protected abstract void AfterUndo();
+
+	public void Undo()
+	{
+		lock (DetourBox)
+		{
+			if (!IsApplied)
+			{
+				throw new InvalidOperationException("Cannot undo a detour which is not applied");
+			}
+			try
+			{
+				DetourBox.IsApplying = true;
+				UndoCore(out SimpleNativeDetour oldDetour);
+				oldDetour?.Dispose();
+			}
+			finally
+			{
+				DetourBox.IsApplying = false;
+			}
+		}
+	}
+
+	private void UndoCore(out SimpleNativeDetour? oldDetour)
+	{
+		BeforeUndo();
+		DetourBox.IsApplied = false;
+		ReplaceDetourInLock(DetourBox, null, out oldDetour);
+		AfterUndo();
+	}
+
+	protected abstract void BeforeDispose();
+
+	private void Dispose(bool disposing)
+	{
+		if (!disposedValue)
+		{
+			BeforeDispose();
+			lock (DetourBox)
+			{
+				UndoCore(out SimpleNativeDetour oldDetour);
+				oldDetour?.Dispose();
+			}
+			disposedValue = true;
+		}
+	}
+
+	~DetourBase()
+	{
+		Dispose(disposing: false);
+	}
+
+	public void Dispose()
+	{
+		Dispose(disposing: true);
+		GC.SuppressFinalize(this);
+	}
+}

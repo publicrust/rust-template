@@ -1,0 +1,312 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using Newtonsoft.Json;
+using Oxide.Core;
+using Oxide.Core.Extensions;
+using Oxide.Core.Libraries;
+using Oxide.Core.Plugins;
+
+public static class RemoteLogger
+{
+	private class QueuedReport
+	{
+		public readonly Dictionary<string, string> Headers;
+
+		public readonly string Body;
+
+		public QueuedReport(Report report)
+		{
+			Headers = BuildHeaders();
+			Body = JsonConvert.SerializeObject(report);
+		}
+	}
+
+	public class Report
+	{
+		public string message;
+
+		public string level;
+
+		public string culprit;
+
+		public string platform = "csharp";
+
+		public string release = OxideMod.Version.ToString();
+
+		public Dictionary<string, string> tags = Tags;
+
+		public Dictionary<string, string> modules;
+
+		public Dictionary<string, string> extra;
+
+		private Dictionary<string, string> headers;
+
+		public Report(string level, string culprit, string message, string exception = null)
+		{
+			headers = BuildHeaders();
+			this.level = level;
+			this.message = ((message.Length > 1000) ? message.Substring(0, 1000) : message);
+			this.culprit = culprit;
+			modules = new Dictionary<string, string>();
+			foreach (Extension allExtension in Interface.Oxide.GetAllExtensions())
+			{
+				modules[allExtension.GetType().Assembly.GetName().Name] = allExtension.Version.ToString();
+			}
+			if (exception == null)
+			{
+				return;
+			}
+			extra = new Dictionary<string, string>();
+			string[] array = exception.Split(new char[1] { '\n' }).Take(31).ToArray();
+			for (int i = 0; i < array.Length; i++)
+			{
+				string text = array[i].Trim(' ', '\r', '\n').Replace('\t', ' ');
+				if (text.Length > 0)
+				{
+					extra["line_" + i.ToString("00")] = text;
+				}
+			}
+		}
+
+		public void DetectModules(Assembly assembly)
+		{
+			if (!(assembly.GetTypes().FirstOrDefault((Type t) => t.BaseType == typeof(Extension)) == null))
+			{
+				return;
+			}
+			Type type = assembly.GetTypes().FirstOrDefault((Type t) => IsTypeDerivedFrom(t, typeof(Plugin)));
+			if (type != null)
+			{
+				Plugin plugin = Interface.Oxide.RootPluginManager.GetPlugin(type.Name);
+				if (plugin != null)
+				{
+					modules["Plugins." + plugin.Name] = plugin.Version.ToString();
+				}
+			}
+		}
+
+		public void DetectModules(string[] stackTrace)
+		{
+			foreach (string text in stackTrace)
+			{
+				if (text.StartsWith("Oxide.Plugins.PluginCompiler") && text.Contains("+"))
+				{
+					string name = text.Split(new char[1] { '+' })[0];
+					Plugin plugin = Interface.Oxide.RootPluginManager.GetPlugin(name);
+					if (plugin != null)
+					{
+						modules["Plugins." + plugin.Name] = plugin.Version.ToString();
+					}
+					break;
+				}
+			}
+		}
+
+		private static bool IsTypeDerivedFrom(Type type, Type baseType)
+		{
+			while (type != null && type != baseType)
+			{
+				if ((type = type.BaseType) == baseType)
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+	}
+
+	private const int projectId = 141692;
+
+	private const string host = "sentry.io";
+
+	private const string publicKey = "2d0162c790be4036a94d2d8326d7f900";
+
+	private const string secretKey = "8a6249aad4b84e368f900b32396e8b04";
+
+	private static readonly string Url = "https://sentry.io/api/" + 141692 + "/store/";
+
+	private static readonly string[][] sentryAuth = new string[4][]
+	{
+		new string[2] { "sentry_version", "7" },
+		new string[2] { "sentry_client", "MiniRaven/1.0" },
+		new string[2] { "sentry_key", "2d0162c790be4036a94d2d8326d7f900" },
+		new string[2] { "sentry_secret", "8a6249aad4b84e368f900b32396e8b04" }
+	};
+
+	public static string Filename = Utility.GetFileNameWithoutExtension(Process.GetCurrentProcess().MainModule.FileName);
+
+	private static readonly Dictionary<string, string> Tags = new Dictionary<string, string>
+	{
+		{
+			"arch",
+			(IntPtr.Size == 8) ? "x64" : "x86"
+		},
+		{
+			"platform",
+			Environment.OSVersion.Platform.ToString().ToLower()
+		},
+		{
+			"os version",
+			Environment.OSVersion.Version.ToString().ToLower()
+		},
+		{
+			"game",
+			Filename.ToLower().Replace("dedicated", "").Replace("server", "")
+				.Replace("-", "")
+				.Replace("_", "")
+		}
+	};
+
+	private static readonly Timer Timers = Interface.Oxide.GetLibrary<Timer>();
+
+	private static readonly WebRequests Webrequests = Interface.Oxide.GetLibrary<WebRequests>();
+
+	private static readonly List<QueuedReport> QueuedReports = new List<QueuedReport>();
+
+	private static bool submittingReports;
+
+	public static string[] ExceptionFilter = new string[12]
+	{
+		"BadImageFormatException", "DllNotFoundException", "FileNotFoundException", "IOException", "KeyNotFoundException", "Oxide.Core.Configuration", "Oxide.Ext.", "Oxide.Plugins.<", "ReflectionTypeLoadException", "Sharing violation",
+		"UnauthorizedAccessException", "WebException"
+	};
+
+	private static Dictionary<string, string> BuildHeaders()
+	{
+		string text = string.Join(", ", sentryAuth.Select((string[] x) => string.Join("=", x)).ToArray());
+		text = text + ", sentry_timestamp=" + (int)DateTime.UtcNow.Subtract(new DateTime(1970, 1, 1)).TotalSeconds;
+		return new Dictionary<string, string> { 
+		{
+			"X-Sentry-Auth",
+			"Sentry " + text
+		} };
+	}
+
+	public static void SetTag(string name, string value)
+	{
+		Tags[name] = value;
+	}
+
+	public static string GetTag(string name)
+	{
+		if (!Tags.TryGetValue(name, out var value))
+		{
+			return "unknown";
+		}
+		return value;
+	}
+
+	public static void Debug(string message)
+	{
+		EnqueueReport("debug", Assembly.GetCallingAssembly(), GetCurrentMethod(), message);
+	}
+
+	public static void Error(string message)
+	{
+		EnqueueReport("error", Assembly.GetCallingAssembly(), GetCurrentMethod(), message);
+	}
+
+	public static void Info(string message)
+	{
+		EnqueueReport("info", Assembly.GetCallingAssembly(), GetCurrentMethod(), message);
+	}
+
+	public static void Warning(string message)
+	{
+		EnqueueReport("warning", Assembly.GetCallingAssembly(), GetCurrentMethod(), message);
+	}
+
+	public static void Exception(string message, Exception exception)
+	{
+		if (!exception.StackTrace.Contains("Oxide.Core") && !exception.StackTrace.Contains("Oxide.Plugins.Compiler"))
+		{
+			return;
+		}
+		string[] exceptionFilter = ExceptionFilter;
+		foreach (string value in exceptionFilter)
+		{
+			if (exception.StackTrace.Contains(value) || message.Contains(value))
+			{
+				return;
+			}
+		}
+		EnqueueReport("fatal", Assembly.GetCallingAssembly(), GetCurrentMethod(), message, exception.ToString());
+	}
+
+	public static void Exception(string message, string rawStackTrace)
+	{
+		string[] array = rawStackTrace.Split('\r', '\n');
+		string culprit = array[0].Split(new char[1] { '(' })[0].Trim();
+		EnqueueReport("fatal", array, culprit, message, rawStackTrace);
+	}
+
+	private static void EnqueueReport(string level, Assembly assembly, string culprit, string message, string exception = null)
+	{
+		Report report = new Report(level, culprit, message, exception);
+		report.DetectModules(assembly);
+		EnqueueReport(report);
+	}
+
+	private static void EnqueueReport(string level, string[] stackTrace, string culprit, string message, string exception = null)
+	{
+		Report report = new Report(level, culprit, message, exception);
+		report.DetectModules(stackTrace);
+		EnqueueReport(report);
+	}
+
+	private static void EnqueueReport(Report report)
+	{
+		Dictionary<string, string>.ValueCollection values = report.extra.Values;
+		if (!values.Contains("Oxide.Core") && !values.Contains("Oxide.Plugins.Compiler"))
+		{
+			return;
+		}
+		string[] exceptionFilter = ExceptionFilter;
+		foreach (string value in exceptionFilter)
+		{
+			if (values.Contains(value) || values.Contains(value))
+			{
+				return;
+			}
+		}
+		QueuedReports.Add(new QueuedReport(report));
+		if (!submittingReports)
+		{
+			SubmitNextReport();
+		}
+	}
+
+	private static void SubmitNextReport()
+	{
+		if (QueuedReports.Count < 1)
+		{
+			return;
+		}
+		QueuedReport queuedReport = QueuedReports[0];
+		submittingReports = true;
+		Webrequests.Enqueue(Url, queuedReport.Body, delegate(int code, string response)
+		{
+			if (code == 200)
+			{
+				QueuedReports.RemoveAt(0);
+				submittingReports = false;
+				SubmitNextReport();
+			}
+			else
+			{
+				Timers.Once(5f, SubmitNextReport);
+			}
+		}, null, RequestMethod.POST, queuedReport.Headers);
+	}
+
+	[MethodImpl(MethodImplOptions.NoInlining)]
+	private static string GetCurrentMethod()
+	{
+		MethodBase method = new StackTrace().GetFrame(2).GetMethod();
+		return method.DeclaringType?.FullName + "." + method.Name;
+	}
+}

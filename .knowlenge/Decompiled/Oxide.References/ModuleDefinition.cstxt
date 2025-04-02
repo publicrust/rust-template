@@ -1,0 +1,942 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Threading;
+using Mono;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+using Mono.Cecil.Metadata;
+using Mono.Cecil.PE;
+using Mono.Collections.Generic;
+
+public sealed class ModuleDefinition : ModuleReference, Mono.Cecil.ICustomAttributeProvider, IMetadataTokenProvider
+{
+	internal Image Image;
+
+	internal MetadataSystem MetadataSystem;
+
+	internal ReadingMode ReadingMode;
+
+	internal ISymbolReaderProvider SymbolReaderProvider;
+
+	internal ISymbolReader symbol_reader;
+
+	internal IAssemblyResolver assembly_resolver;
+
+	internal IMetadataResolver metadata_resolver;
+
+	internal TypeSystem type_system;
+
+	private readonly MetadataReader reader;
+
+	private readonly string fq_name;
+
+	internal string runtime_version;
+
+	internal ModuleKind kind;
+
+	private TargetRuntime runtime;
+
+	private TargetArchitecture architecture;
+
+	private ModuleAttributes attributes;
+
+	private ModuleCharacteristics characteristics;
+
+	private Guid mvid;
+
+	internal AssemblyDefinition assembly;
+
+	private MethodDefinition entry_point;
+
+	private MetadataImporter importer;
+
+	private Collection<CustomAttribute> custom_attributes;
+
+	private Collection<AssemblyNameReference> references;
+
+	private Collection<ModuleReference> modules;
+
+	private Collection<Resource> resources;
+
+	private Collection<ExportedType> exported_types;
+
+	private TypeDefinitionCollection types;
+
+	private readonly object module_lock = new object();
+
+	public bool IsMain => kind != ModuleKind.NetModule;
+
+	public ModuleKind Kind
+	{
+		get
+		{
+			return kind;
+		}
+		set
+		{
+			kind = value;
+		}
+	}
+
+	public TargetRuntime Runtime
+	{
+		get
+		{
+			return runtime;
+		}
+		set
+		{
+			runtime = value;
+			runtime_version = runtime.RuntimeVersionString();
+		}
+	}
+
+	public string RuntimeVersion
+	{
+		get
+		{
+			return runtime_version;
+		}
+		set
+		{
+			runtime_version = value;
+			runtime = runtime_version.ParseRuntime();
+		}
+	}
+
+	public TargetArchitecture Architecture
+	{
+		get
+		{
+			return architecture;
+		}
+		set
+		{
+			architecture = value;
+		}
+	}
+
+	public ModuleAttributes Attributes
+	{
+		get
+		{
+			return attributes;
+		}
+		set
+		{
+			attributes = value;
+		}
+	}
+
+	public ModuleCharacteristics Characteristics
+	{
+		get
+		{
+			return characteristics;
+		}
+		set
+		{
+			characteristics = value;
+		}
+	}
+
+	public string FullyQualifiedName => fq_name;
+
+	public Guid Mvid
+	{
+		get
+		{
+			return mvid;
+		}
+		set
+		{
+			mvid = value;
+		}
+	}
+
+	internal bool HasImage => Image != null;
+
+	public bool HasSymbols => symbol_reader != null;
+
+	public ISymbolReader SymbolReader => symbol_reader;
+
+	public override MetadataScopeType MetadataScopeType => MetadataScopeType.ModuleDefinition;
+
+	public AssemblyDefinition Assembly => assembly;
+
+	internal MetadataImporter MetadataImporter
+	{
+		get
+		{
+			if (importer == null)
+			{
+				Interlocked.CompareExchange(ref importer, new MetadataImporter(this), null);
+			}
+			return importer;
+		}
+	}
+
+	public IAssemblyResolver AssemblyResolver
+	{
+		get
+		{
+			if (assembly_resolver == null)
+			{
+				Interlocked.CompareExchange(ref assembly_resolver, new DefaultAssemblyResolver(), null);
+			}
+			return assembly_resolver;
+		}
+	}
+
+	public IMetadataResolver MetadataResolver
+	{
+		get
+		{
+			if (metadata_resolver == null)
+			{
+				Interlocked.CompareExchange(ref metadata_resolver, new MetadataResolver(AssemblyResolver), null);
+			}
+			return metadata_resolver;
+		}
+	}
+
+	public TypeSystem TypeSystem
+	{
+		get
+		{
+			if (type_system == null)
+			{
+				Interlocked.CompareExchange(ref type_system, TypeSystem.CreateTypeSystem(this), null);
+			}
+			return type_system;
+		}
+	}
+
+	public bool HasAssemblyReferences
+	{
+		get
+		{
+			if (references != null)
+			{
+				return references.Count > 0;
+			}
+			if (HasImage)
+			{
+				return Image.HasTable(Table.AssemblyRef);
+			}
+			return false;
+		}
+	}
+
+	public Collection<AssemblyNameReference> AssemblyReferences
+	{
+		get
+		{
+			if (references != null)
+			{
+				return references;
+			}
+			if (HasImage)
+			{
+				return Read(ref references, this, (ModuleDefinition _, MetadataReader reader) => reader.ReadAssemblyReferences());
+			}
+			return references = new Collection<AssemblyNameReference>();
+		}
+	}
+
+	public bool HasModuleReferences
+	{
+		get
+		{
+			if (modules != null)
+			{
+				return modules.Count > 0;
+			}
+			if (HasImage)
+			{
+				return Image.HasTable(Table.ModuleRef);
+			}
+			return false;
+		}
+	}
+
+	public Collection<ModuleReference> ModuleReferences
+	{
+		get
+		{
+			if (modules != null)
+			{
+				return modules;
+			}
+			if (HasImage)
+			{
+				return Read(ref modules, this, (ModuleDefinition _, MetadataReader reader) => reader.ReadModuleReferences());
+			}
+			return modules = new Collection<ModuleReference>();
+		}
+	}
+
+	public bool HasResources
+	{
+		get
+		{
+			if (resources != null)
+			{
+				return resources.Count > 0;
+			}
+			if (HasImage)
+			{
+				if (!Image.HasTable(Table.ManifestResource))
+				{
+					return Read(this, (ModuleDefinition _, MetadataReader reader) => reader.HasFileResource());
+				}
+				return true;
+			}
+			return false;
+		}
+	}
+
+	public Collection<Resource> Resources
+	{
+		get
+		{
+			if (resources != null)
+			{
+				return resources;
+			}
+			if (HasImage)
+			{
+				return Read(ref resources, this, (ModuleDefinition _, MetadataReader reader) => reader.ReadResources());
+			}
+			return resources = new Collection<Resource>();
+		}
+	}
+
+	public bool HasCustomAttributes
+	{
+		get
+		{
+			if (custom_attributes != null)
+			{
+				return custom_attributes.Count > 0;
+			}
+			return this.GetHasCustomAttributes(this);
+		}
+	}
+
+	public Collection<CustomAttribute> CustomAttributes => custom_attributes ?? this.GetCustomAttributes(ref custom_attributes, this);
+
+	public bool HasTypes
+	{
+		get
+		{
+			if (types != null)
+			{
+				return types.Count > 0;
+			}
+			if (HasImage)
+			{
+				return Image.HasTable(Table.TypeDef);
+			}
+			return false;
+		}
+	}
+
+	public Collection<TypeDefinition> Types
+	{
+		get
+		{
+			if (types != null)
+			{
+				return types;
+			}
+			if (HasImage)
+			{
+				return Read(ref types, this, (ModuleDefinition _, MetadataReader reader) => reader.ReadTypes());
+			}
+			return types = new TypeDefinitionCollection(this);
+		}
+	}
+
+	public bool HasExportedTypes
+	{
+		get
+		{
+			if (exported_types != null)
+			{
+				return exported_types.Count > 0;
+			}
+			if (HasImage)
+			{
+				return Image.HasTable(Table.ExportedType);
+			}
+			return false;
+		}
+	}
+
+	public Collection<ExportedType> ExportedTypes
+	{
+		get
+		{
+			if (exported_types != null)
+			{
+				return exported_types;
+			}
+			if (HasImage)
+			{
+				return Read(ref exported_types, this, (ModuleDefinition _, MetadataReader reader) => reader.ReadExportedTypes());
+			}
+			return exported_types = new Collection<ExportedType>();
+		}
+	}
+
+	public MethodDefinition EntryPoint
+	{
+		get
+		{
+			if (entry_point != null)
+			{
+				return entry_point;
+			}
+			if (HasImage)
+			{
+				return Read(ref entry_point, this, (ModuleDefinition _, MetadataReader reader) => reader.ReadEntryPoint());
+			}
+			return entry_point = null;
+		}
+		set
+		{
+			entry_point = value;
+		}
+	}
+
+	internal object SyncRoot => module_lock;
+
+	public bool HasDebugHeader
+	{
+		get
+		{
+			if (Image != null)
+			{
+				return !Image.Debug.IsZero;
+			}
+			return false;
+		}
+	}
+
+	internal ModuleDefinition()
+	{
+		MetadataSystem = new MetadataSystem();
+		token = new MetadataToken(TokenType.Module, 1);
+	}
+
+	internal ModuleDefinition(Image image)
+		: this()
+	{
+		Image = image;
+		kind = image.Kind;
+		RuntimeVersion = image.RuntimeVersion;
+		architecture = image.Architecture;
+		attributes = image.Attributes;
+		characteristics = image.Characteristics;
+		fq_name = image.FileName;
+		reader = new MetadataReader(this);
+	}
+
+	public bool HasTypeReference(string fullName)
+	{
+		return HasTypeReference(string.Empty, fullName);
+	}
+
+	public bool HasTypeReference(string scope, string fullName)
+	{
+		CheckFullName(fullName);
+		if (!HasImage)
+		{
+			return false;
+		}
+		return GetTypeReference(scope, fullName) != null;
+	}
+
+	public bool TryGetTypeReference(string fullName, out TypeReference type)
+	{
+		return TryGetTypeReference(string.Empty, fullName, out type);
+	}
+
+	public bool TryGetTypeReference(string scope, string fullName, out TypeReference type)
+	{
+		CheckFullName(fullName);
+		if (!HasImage)
+		{
+			type = null;
+			return false;
+		}
+		return (type = GetTypeReference(scope, fullName)) != null;
+	}
+
+	private TypeReference GetTypeReference(string scope, string fullname)
+	{
+		return Read(new Row<string, string>(scope, fullname), (Row<string, string> row, MetadataReader reader) => reader.GetTypeReference(row.Col1, row.Col2));
+	}
+
+	public IEnumerable<TypeReference> GetTypeReferences()
+	{
+		if (!HasImage)
+		{
+			return Empty<TypeReference>.Array;
+		}
+		return Read(this, (ModuleDefinition _, MetadataReader reader) => reader.GetTypeReferences());
+	}
+
+	public IEnumerable<MemberReference> GetMemberReferences()
+	{
+		if (!HasImage)
+		{
+			return Empty<MemberReference>.Array;
+		}
+		return Read(this, (ModuleDefinition _, MetadataReader reader) => reader.GetMemberReferences());
+	}
+
+	public TypeReference GetType(string fullName, bool runtimeName)
+	{
+		if (!runtimeName)
+		{
+			return GetType(fullName);
+		}
+		return TypeParser.ParseType(this, fullName);
+	}
+
+	public TypeDefinition GetType(string fullName)
+	{
+		CheckFullName(fullName);
+		if (fullName.IndexOf('/') > 0)
+		{
+			return GetNestedType(fullName);
+		}
+		return ((TypeDefinitionCollection)Types).GetType(fullName);
+	}
+
+	public TypeDefinition GetType(string @namespace, string name)
+	{
+		Mixin.CheckName(name);
+		return ((TypeDefinitionCollection)Types).GetType(@namespace ?? string.Empty, name);
+	}
+
+	public IEnumerable<TypeDefinition> GetTypes()
+	{
+		return GetTypes(Types);
+	}
+
+	private static IEnumerable<TypeDefinition> GetTypes(Collection<TypeDefinition> types)
+	{
+		for (int i = 0; i < types.Count; i++)
+		{
+			TypeDefinition type = types[i];
+			yield return type;
+			if (!type.HasNestedTypes)
+			{
+				continue;
+			}
+			foreach (TypeDefinition type2 in GetTypes(type.NestedTypes))
+			{
+				yield return type2;
+			}
+		}
+	}
+
+	private static void CheckFullName(string fullName)
+	{
+		if (fullName == null)
+		{
+			throw new ArgumentNullException("fullName");
+		}
+		if (fullName.Length == 0)
+		{
+			throw new ArgumentException();
+		}
+	}
+
+	private TypeDefinition GetNestedType(string fullname)
+	{
+		string[] array = fullname.Split(new char[1] { '/' });
+		TypeDefinition typeDefinition = GetType(array[0]);
+		if (typeDefinition == null)
+		{
+			return null;
+		}
+		for (int i = 1; i < array.Length; i++)
+		{
+			TypeDefinition nestedType = typeDefinition.GetNestedType(array[i]);
+			if (nestedType == null)
+			{
+				return null;
+			}
+			typeDefinition = nestedType;
+		}
+		return typeDefinition;
+	}
+
+	internal FieldDefinition Resolve(FieldReference field)
+	{
+		return MetadataResolver.Resolve(field);
+	}
+
+	internal MethodDefinition Resolve(MethodReference method)
+	{
+		return MetadataResolver.Resolve(method);
+	}
+
+	internal TypeDefinition Resolve(TypeReference type)
+	{
+		return MetadataResolver.Resolve(type);
+	}
+
+	private static void CheckType(object type)
+	{
+		if (type == null)
+		{
+			throw new ArgumentNullException("type");
+		}
+	}
+
+	private static void CheckField(object field)
+	{
+		if (field == null)
+		{
+			throw new ArgumentNullException("field");
+		}
+	}
+
+	private static void CheckMethod(object method)
+	{
+		if (method == null)
+		{
+			throw new ArgumentNullException("method");
+		}
+	}
+
+	private static void CheckContext(IGenericParameterProvider context, ModuleDefinition module)
+	{
+		if (context == null || context.Module == module)
+		{
+			return;
+		}
+		throw new ArgumentException();
+	}
+
+	private static ImportGenericContext GenericContextFor(IGenericParameterProvider context)
+	{
+		if (context == null)
+		{
+			return default(ImportGenericContext);
+		}
+		return new ImportGenericContext(context);
+	}
+
+	public TypeReference Import(Type type)
+	{
+		return Import(type, null);
+	}
+
+	public TypeReference Import(Type type, IGenericParameterProvider context)
+	{
+		CheckType(type);
+		CheckContext(context, this);
+		return MetadataImporter.ImportType(type, GenericContextFor(context), (context != null) ? ImportGenericKind.Open : ImportGenericKind.Definition);
+	}
+
+	public FieldReference Import(FieldInfo field)
+	{
+		return Import(field, null);
+	}
+
+	public FieldReference Import(FieldInfo field, IGenericParameterProvider context)
+	{
+		CheckField(field);
+		CheckContext(context, this);
+		return MetadataImporter.ImportField(field, GenericContextFor(context));
+	}
+
+	public MethodReference Import(MethodBase method)
+	{
+		CheckMethod(method);
+		return MetadataImporter.ImportMethod(method, default(ImportGenericContext), ImportGenericKind.Definition);
+	}
+
+	public MethodReference Import(MethodBase method, IGenericParameterProvider context)
+	{
+		CheckMethod(method);
+		CheckContext(context, this);
+		return MetadataImporter.ImportMethod(method, GenericContextFor(context), (context != null) ? ImportGenericKind.Open : ImportGenericKind.Definition);
+	}
+
+	public TypeReference Import(TypeReference type)
+	{
+		CheckType(type);
+		if (type.Module == this)
+		{
+			return type;
+		}
+		return MetadataImporter.ImportType(type, default(ImportGenericContext));
+	}
+
+	public TypeReference Import(TypeReference type, IGenericParameterProvider context)
+	{
+		CheckType(type);
+		if (type.Module == this)
+		{
+			return type;
+		}
+		CheckContext(context, this);
+		return MetadataImporter.ImportType(type, GenericContextFor(context));
+	}
+
+	public FieldReference Import(FieldReference field)
+	{
+		CheckField(field);
+		if (field.Module == this)
+		{
+			return field;
+		}
+		return MetadataImporter.ImportField(field, default(ImportGenericContext));
+	}
+
+	public FieldReference Import(FieldReference field, IGenericParameterProvider context)
+	{
+		CheckField(field);
+		if (field.Module == this)
+		{
+			return field;
+		}
+		CheckContext(context, this);
+		return MetadataImporter.ImportField(field, GenericContextFor(context));
+	}
+
+	public MethodReference Import(MethodReference method)
+	{
+		return Import(method, null);
+	}
+
+	public MethodReference Import(MethodReference method, IGenericParameterProvider context)
+	{
+		CheckMethod(method);
+		if (method.Module == this)
+		{
+			return method;
+		}
+		CheckContext(context, this);
+		return MetadataImporter.ImportMethod(method, GenericContextFor(context));
+	}
+
+	public IMetadataTokenProvider LookupToken(int token)
+	{
+		return LookupToken(new MetadataToken((uint)token));
+	}
+
+	public IMetadataTokenProvider LookupToken(MetadataToken token)
+	{
+		return Read(token, (MetadataToken t, MetadataReader reader) => reader.LookupToken(t));
+	}
+
+	internal TRet Read<TItem, TRet>(TItem item, Func<TItem, MetadataReader, TRet> read)
+	{
+		lock (module_lock)
+		{
+			int position = reader.position;
+			IGenericContext context = reader.context;
+			TRet result = read(item, reader);
+			reader.position = position;
+			reader.context = context;
+			return result;
+		}
+	}
+
+	internal TRet Read<TItem, TRet>(ref TRet variable, TItem item, Func<TItem, MetadataReader, TRet> read) where TRet : class
+	{
+		lock (module_lock)
+		{
+			if (variable != null)
+			{
+				return variable;
+			}
+			int position = reader.position;
+			IGenericContext context = reader.context;
+			TRet val = read(item, reader);
+			reader.position = position;
+			reader.context = context;
+			return variable = val;
+		}
+	}
+
+	public ImageDebugDirectory GetDebugHeader(out byte[] header)
+	{
+		if (!HasDebugHeader)
+		{
+			throw new InvalidOperationException();
+		}
+		return Image.GetDebugHeader(out header);
+	}
+
+	private void ProcessDebugHeader()
+	{
+		if (HasDebugHeader)
+		{
+			byte[] header;
+			ImageDebugDirectory debugHeader = GetDebugHeader(out header);
+			if (!symbol_reader.ProcessDebugHeader(debugHeader, header))
+			{
+				throw new InvalidOperationException();
+			}
+		}
+	}
+
+	public static ModuleDefinition CreateModule(string name, ModuleKind kind)
+	{
+		return CreateModule(name, new ModuleParameters
+		{
+			Kind = kind
+		});
+	}
+
+	public static ModuleDefinition CreateModule(string name, ModuleParameters parameters)
+	{
+		Mixin.CheckName(name);
+		Mixin.CheckParameters(parameters);
+		ModuleDefinition moduleDefinition = new ModuleDefinition
+		{
+			Name = name,
+			kind = parameters.Kind,
+			Runtime = parameters.Runtime,
+			architecture = parameters.Architecture,
+			mvid = Guid.NewGuid(),
+			Attributes = ModuleAttributes.ILOnly,
+			Characteristics = (ModuleCharacteristics.DynamicBase | ModuleCharacteristics.NoSEH | ModuleCharacteristics.NXCompat | ModuleCharacteristics.TerminalServerAware)
+		};
+		if (parameters.AssemblyResolver != null)
+		{
+			moduleDefinition.assembly_resolver = parameters.AssemblyResolver;
+		}
+		if (parameters.MetadataResolver != null)
+		{
+			moduleDefinition.metadata_resolver = parameters.MetadataResolver;
+		}
+		if (parameters.Kind != ModuleKind.NetModule)
+		{
+			AssemblyDefinition assemblyDefinition = (moduleDefinition.assembly = new AssemblyDefinition());
+			moduleDefinition.assembly.Name = CreateAssemblyName(name);
+			assemblyDefinition.main_module = moduleDefinition;
+		}
+		moduleDefinition.Types.Add(new TypeDefinition(string.Empty, "<Module>", Mono.Cecil.TypeAttributes.NotPublic));
+		return moduleDefinition;
+	}
+
+	private static AssemblyNameDefinition CreateAssemblyName(string name)
+	{
+		if (name.EndsWith(".dll") || name.EndsWith(".exe"))
+		{
+			name = name.Substring(0, name.Length - 4);
+		}
+		return new AssemblyNameDefinition(name, new Version(0, 0, 0, 0));
+	}
+
+	public void ReadSymbols()
+	{
+		if (string.IsNullOrEmpty(fq_name))
+		{
+			throw new InvalidOperationException();
+		}
+		ISymbolReaderProvider platformReaderProvider = SymbolProvider.GetPlatformReaderProvider();
+		if (platformReaderProvider == null)
+		{
+			throw new InvalidOperationException();
+		}
+		ReadSymbols(platformReaderProvider.GetSymbolReader(this, fq_name));
+	}
+
+	public void ReadSymbols(ISymbolReader reader)
+	{
+		if (reader == null)
+		{
+			throw new ArgumentNullException("reader");
+		}
+		symbol_reader = reader;
+		ProcessDebugHeader();
+	}
+
+	public static ModuleDefinition ReadModule(string fileName)
+	{
+		return ReadModule(fileName, new ReaderParameters(ReadingMode.Deferred));
+	}
+
+	public static ModuleDefinition ReadModule(Stream stream)
+	{
+		return ReadModule(stream, new ReaderParameters(ReadingMode.Deferred));
+	}
+
+	public static ModuleDefinition ReadModule(string fileName, ReaderParameters parameters)
+	{
+		using Stream stream = GetFileStream(fileName, FileMode.Open, FileAccess.Read, FileShare.Read);
+		return ReadModule(stream, parameters);
+	}
+
+	private static void CheckStream(object stream)
+	{
+		if (stream == null)
+		{
+			throw new ArgumentNullException("stream");
+		}
+	}
+
+	public static ModuleDefinition ReadModule(Stream stream, ReaderParameters parameters)
+	{
+		CheckStream(stream);
+		if (!stream.CanRead || !stream.CanSeek)
+		{
+			throw new ArgumentException();
+		}
+		Mixin.CheckParameters(parameters);
+		return ModuleReader.CreateModuleFrom(ImageReader.ReadImageFrom(stream), parameters);
+	}
+
+	private static Stream GetFileStream(string fileName, FileMode mode, FileAccess access, FileShare share)
+	{
+		if (fileName == null)
+		{
+			throw new ArgumentNullException("fileName");
+		}
+		if (fileName.Length == 0)
+		{
+			throw new ArgumentException();
+		}
+		return new FileStream(fileName, mode, access, share);
+	}
+
+	public void Write(string fileName)
+	{
+		Write(fileName, new WriterParameters());
+	}
+
+	public void Write(Stream stream)
+	{
+		Write(stream, new WriterParameters());
+	}
+
+	public void Write(string fileName, WriterParameters parameters)
+	{
+		using Stream stream = GetFileStream(fileName, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+		Write(stream, parameters);
+	}
+
+	public void Write(Stream stream, WriterParameters parameters)
+	{
+		CheckStream(stream);
+		if (!stream.CanWrite || !stream.CanSeek)
+		{
+			throw new ArgumentException();
+		}
+		Mixin.CheckParameters(parameters);
+		ModuleWriter.WriteModuleTo(this, stream, parameters);
+	}
+}

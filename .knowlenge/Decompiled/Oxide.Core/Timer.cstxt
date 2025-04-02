@@ -1,0 +1,404 @@
+using System;
+using System.Collections.Generic;
+using Oxide.Core;
+using Oxide.Core.Libraries;
+using Oxide.Core.Plugins;
+
+public class Timer : Library
+{
+	public class TimeSlot
+	{
+		public int Count;
+
+		public TimerInstance FirstInstance;
+
+		public TimerInstance LastInstance;
+
+		public void GetExpired(double now, Queue<TimerInstance> queue)
+		{
+			TimerInstance timerInstance = FirstInstance;
+			while (timerInstance != null && !((double)timerInstance.ExpiresAt > now))
+			{
+				queue.Enqueue(timerInstance);
+				timerInstance = timerInstance.NextInstance;
+			}
+		}
+
+		public void InsertTimer(TimerInstance timer)
+		{
+			float expiresAt = timer.ExpiresAt;
+			TimerInstance firstInstance = FirstInstance;
+			TimerInstance lastInstance = LastInstance;
+			TimerInstance timerInstance = firstInstance;
+			if (firstInstance != null)
+			{
+				float expiresAt2 = firstInstance.ExpiresAt;
+				float expiresAt3 = lastInstance.ExpiresAt;
+				if (expiresAt <= expiresAt2)
+				{
+					timerInstance = firstInstance;
+				}
+				else if (expiresAt >= expiresAt3)
+				{
+					timerInstance = null;
+				}
+				else if (expiresAt3 - expiresAt < expiresAt - expiresAt2)
+				{
+					timerInstance = lastInstance;
+					TimerInstance timerInstance2 = timerInstance;
+					while (timerInstance2 != null && !(timerInstance2.ExpiresAt <= expiresAt))
+					{
+						timerInstance = timerInstance2;
+						timerInstance2 = timerInstance2.PreviousInstance;
+					}
+				}
+				else
+				{
+					while (timerInstance != null && !(timerInstance.ExpiresAt > expiresAt))
+					{
+						timerInstance = timerInstance.NextInstance;
+					}
+				}
+			}
+			if (timerInstance == null)
+			{
+				timer.NextInstance = null;
+				if (lastInstance == null)
+				{
+					FirstInstance = timer;
+					LastInstance = timer;
+				}
+				else
+				{
+					lastInstance.NextInstance = timer;
+					timer.PreviousInstance = lastInstance;
+					LastInstance = timer;
+				}
+			}
+			else
+			{
+				TimerInstance previousInstance = timerInstance.PreviousInstance;
+				if (previousInstance == null)
+				{
+					FirstInstance = timer;
+				}
+				else
+				{
+					previousInstance.NextInstance = timer;
+				}
+				timerInstance.PreviousInstance = timer;
+				timer.PreviousInstance = previousInstance;
+				timer.NextInstance = timerInstance;
+			}
+			timer.Added(this);
+		}
+	}
+
+	public class TimerInstance
+	{
+		public const int MaxPooled = 5000;
+
+		internal static Queue<TimerInstance> Pool = new Queue<TimerInstance>();
+
+		internal float ExpiresAt;
+
+		internal TimeSlot TimeSlot;
+
+		internal TimerInstance NextInstance;
+
+		internal TimerInstance PreviousInstance;
+
+		private Event.Callback<Plugin, PluginManager> removedFromManager;
+
+		private Timer timer;
+
+		public int Repetitions { get; private set; }
+
+		public float Delay { get; private set; }
+
+		public Action Callback { get; private set; }
+
+		public bool Destroyed { get; private set; }
+
+		public Plugin Owner { get; private set; }
+
+		internal TimerInstance(Timer timer, int repetitions, float delay, Action callback, Plugin owner)
+		{
+			Load(timer, repetitions, delay, callback, owner);
+		}
+
+		internal void Load(Timer timer, int repetitions, float delay, Action callback, Plugin owner)
+		{
+			this.timer = timer;
+			Repetitions = repetitions;
+			Delay = delay;
+			Callback = callback;
+			ExpiresAt = Oxide.Now + delay;
+			Owner = owner;
+			Destroyed = false;
+			if (owner != null)
+			{
+				removedFromManager = owner.OnRemovedFromManager.Add(OnRemovedFromManager);
+			}
+		}
+
+		public void Reset(float delay = -1f, int repetitions = 1)
+		{
+			lock (Lock)
+			{
+				if (delay < 0f)
+				{
+					delay = Delay;
+				}
+				else
+				{
+					Delay = delay;
+				}
+				Repetitions = repetitions;
+				ExpiresAt = Oxide.Now + delay;
+				if (Destroyed)
+				{
+					Destroyed = false;
+					Plugin owner = Owner;
+					if (owner != null)
+					{
+						removedFromManager = owner.OnRemovedFromManager.Add(OnRemovedFromManager);
+					}
+				}
+				else
+				{
+					Remove();
+				}
+				timer.InsertTimer(this);
+			}
+		}
+
+		public bool Destroy()
+		{
+			lock (Lock)
+			{
+				if (Destroyed)
+				{
+					return false;
+				}
+				Destroyed = true;
+				Remove();
+				Event.Remove(ref removedFromManager);
+			}
+			return true;
+		}
+
+		public bool DestroyToPool()
+		{
+			lock (Lock)
+			{
+				if (Destroyed)
+				{
+					return false;
+				}
+				Destroyed = true;
+				Callback = null;
+				Remove();
+				Event.Remove(ref removedFromManager);
+				Queue<TimerInstance> pool = Pool;
+				if (pool.Count < 5000)
+				{
+					pool.Enqueue(this);
+				}
+			}
+			return true;
+		}
+
+		internal void Added(TimeSlot time_slot)
+		{
+			time_slot.Count++;
+			Count++;
+			TimeSlot = time_slot;
+		}
+
+		internal void Invoke(float now)
+		{
+			if (Repetitions > 0 && --Repetitions == 0)
+			{
+				Destroy();
+				FireCallback();
+				return;
+			}
+			Remove();
+			float num = (ExpiresAt += Delay);
+			timer.InsertTimer(this, num < now);
+			FireCallback();
+		}
+
+		internal void Remove()
+		{
+			TimeSlot timeSlot = TimeSlot;
+			if (timeSlot != null)
+			{
+				timeSlot.Count--;
+				Count--;
+				TimerInstance previousInstance = PreviousInstance;
+				TimerInstance nextInstance = NextInstance;
+				if (nextInstance == null)
+				{
+					timeSlot.LastInstance = previousInstance;
+				}
+				else
+				{
+					nextInstance.PreviousInstance = previousInstance;
+				}
+				if (previousInstance == null)
+				{
+					timeSlot.FirstInstance = nextInstance;
+				}
+				else
+				{
+					previousInstance.NextInstance = nextInstance;
+				}
+				TimeSlot = null;
+				PreviousInstance = null;
+				NextInstance = null;
+			}
+		}
+
+		private void FireCallback()
+		{
+			Owner?.TrackStart();
+			try
+			{
+				Callback();
+			}
+			catch (Exception ex)
+			{
+				Destroy();
+				string text = $"Failed to run a {Delay:0.00} timer";
+				if ((bool)Owner && Owner != null)
+				{
+					text += $" in '{Owner.Name} v{Owner.Version}'";
+				}
+				Interface.Oxide.LogException(text, ex);
+			}
+			finally
+			{
+				Owner?.TrackEnd();
+			}
+		}
+
+		private void OnRemovedFromManager(Plugin sender, PluginManager manager)
+		{
+			Destroy();
+		}
+	}
+
+	internal static readonly object Lock = new object();
+
+	internal static readonly OxideMod Oxide = Interface.Oxide;
+
+	public const int TimeSlots = 512;
+
+	public const int LastTimeSlot = 511;
+
+	public const float TickDuration = 0.01f;
+
+	private readonly TimeSlot[] timeSlots = new TimeSlot[512];
+
+	private readonly Queue<TimerInstance> expiredInstanceQueue = new Queue<TimerInstance>();
+
+	private int currentSlot;
+
+	private double nextSlotAt = 0.009999999776482582;
+
+	public override bool IsGlobal => false;
+
+	public static int Count { get; private set; }
+
+	public Timer()
+	{
+		for (int i = 0; i < 512; i++)
+		{
+			timeSlots[i] = new TimeSlot();
+		}
+	}
+
+	public void Update(float delta)
+	{
+		float now = Oxide.Now;
+		TimeSlot[] array = timeSlots;
+		Queue<TimerInstance> queue = expiredInstanceQueue;
+		int num = 0;
+		lock (Lock)
+		{
+			int num2 = currentSlot;
+			double num3 = nextSlotAt;
+			while (true)
+			{
+				array[num2].GetExpired((num3 > (double)now) ? ((double)now) : num3, queue);
+				if ((double)now <= num3)
+				{
+					break;
+				}
+				num++;
+				num2 = ((num2 < 511) ? (num2 + 1) : 0);
+				num3 += 0.009999999776482582;
+			}
+			if (num > 0)
+			{
+				currentSlot = num2;
+				nextSlotAt = num3;
+			}
+			int count = queue.Count;
+			for (int i = 0; i < count; i++)
+			{
+				TimerInstance timerInstance = queue.Dequeue();
+				if (!timerInstance.Destroyed)
+				{
+					timerInstance.Invoke(now);
+				}
+			}
+		}
+	}
+
+	internal TimerInstance AddTimer(int repetitions, float delay, Action callback, Plugin owner = null)
+	{
+		lock (Lock)
+		{
+			Queue<TimerInstance> pool = TimerInstance.Pool;
+			TimerInstance timerInstance;
+			if (pool.Count > 0)
+			{
+				timerInstance = pool.Dequeue();
+				timerInstance.Load(this, repetitions, delay, callback, owner);
+			}
+			else
+			{
+				timerInstance = new TimerInstance(this, repetitions, delay, callback, owner);
+			}
+			InsertTimer(timerInstance, timerInstance.ExpiresAt < Oxide.Now);
+			return timerInstance;
+		}
+	}
+
+	private void InsertTimer(TimerInstance timer, bool in_past = false)
+	{
+		int num = (in_past ? currentSlot : ((int)(timer.ExpiresAt / 0.01f) & 0x1FF));
+		timeSlots[num].InsertTimer(timer);
+	}
+
+	[LibraryFunction("Once")]
+	public TimerInstance Once(float delay, Action callback, Plugin owner = null)
+	{
+		return AddTimer(1, delay, callback, owner);
+	}
+
+	[LibraryFunction("Repeat")]
+	public TimerInstance Repeat(float delay, int reps, Action callback, Plugin owner = null)
+	{
+		return AddTimer(reps, delay, callback, owner);
+	}
+
+	[LibraryFunction("NextFrame")]
+	public TimerInstance NextFrame(Action callback)
+	{
+		return AddTimer(1, 0f, callback);
+	}
+}

@@ -1,0 +1,804 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Cache;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using Mono.Unix.Native;
+using ObjectStream;
+using ObjectStream.Data;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.Extensions;
+using Oxide.Core.Libraries;
+using Oxide.Core.Logging;
+using Oxide.Logging;
+using Oxide.Plugins;
+
+internal class CompilerService
+{
+	private static readonly Regex SymbolEscapeRegex = new Regex("[^\\w\\d]", RegexOptions.Compiled);
+
+	private const string baseUrl = "https://downloads.oxidemod.com/artifacts/Oxide.Compiler/{0}/";
+
+	private Hash<int, Compilation> compilations;
+
+	private Queue<CompilerMessage> messageQueue;
+
+	private Process process;
+
+	private volatile int lastId;
+
+	private volatile bool ready;
+
+	private Oxide.Core.Libraries.Timer.TimerInstance idleTimer;
+
+	private ObjectStreamClient<CompilerMessage> client;
+
+	private string filePath;
+
+	private string remoteName;
+
+	private string compilerBasicArguments = "-unsafe true --setting:Force true -ms true";
+
+	private static Regex fileErrorRegex = new Regex("^\\[(?'Severity'\\S+)\\]\\[(?'Code'\\S+)\\]\\[(?'File'\\S+)\\] (?'Message'.+)$", RegexOptions.Compiled);
+
+	private float startTime;
+
+	private string[] preprocessor;
+
+	public bool Installed => File.Exists(filePath);
+
+	public CompilerService(Extension extension)
+	{
+		compilations = new Hash<int, Compilation>();
+		messageQueue = new Queue<CompilerMessage>();
+		string text = ((IntPtr.Size == 8) ? "x64" : "x86");
+		filePath = Path.Combine(Interface.Oxide.RootDirectory, "Oxide.Compiler");
+		string text2 = $"https://downloads.oxidemod.com/artifacts/Oxide.Compiler/{extension.Branch}/";
+		switch (Environment.OSVersion.Platform)
+		{
+		case PlatformID.Win32S:
+		case PlatformID.Win32Windows:
+		case PlatformID.Win32NT:
+			filePath += ".exe";
+			remoteName = text2 + "win-" + text + ".Compiler.exe";
+			break;
+		case PlatformID.MacOSX:
+			remoteName = text2 + "osx-x64.Compiler";
+			break;
+		case PlatformID.Unix:
+			remoteName = text2 + "linux-x64.Compiler";
+			break;
+		}
+		EnvironmentHelper.SetVariable("Path:Root", Interface.Oxide.RootDirectory);
+		EnvironmentHelper.SetVariable("Path:Logging", Interface.Oxide.LogDirectory);
+		EnvironmentHelper.SetVariable("Path:Plugins", Interface.Oxide.PluginDirectory);
+		EnvironmentHelper.SetVariable("Path:Configuration", Interface.Oxide.ConfigDirectory);
+		EnvironmentHelper.SetVariable("Path:Data", Interface.Oxide.DataDirectory);
+		EnvironmentHelper.SetVariable("Path:Libraries", Interface.Oxide.ExtensionDirectory);
+		if (Interface.Oxide.Config.Compiler.Publicize == true)
+		{
+			EnvironmentHelper.SetVariable("AllowPublicize", "true", throwOnExisting: false, force: true);
+		}
+	}
+
+	private void ExpireFileCache()
+	{
+		lock (CompilerFile.FileCache)
+		{
+			object[] array = ArrayPool.Get(CompilerFile.FileCache.Count);
+			int num = 0;
+			foreach (KeyValuePair<string, CompilerFile> item in CompilerFile.FileCache)
+			{
+				if (!item.Value.KeepCached)
+				{
+					array[num] = item.Key;
+					num++;
+				}
+			}
+			for (int i = 0; i < num; i++)
+			{
+				string text = (string)array[i];
+				Log(LogType.Info, "Removing cached dependency " + Path.GetFileName(text));
+				CompilerFile.FileCache.Remove(text);
+			}
+			ArrayPool.Free(array);
+		}
+	}
+
+	internal bool Precheck()
+	{
+		List<string> list = new List<string> { "OXIDE", "OXIDEMOD" };
+		Extension extension = Interface.Oxide.GetAllExtensions().SingleOrDefault((Extension e) => e.IsGameExtension);
+		if (extension != null)
+		{
+			string text = extension.Name.ToUpperInvariant();
+			string text2 = extension.Branch?.ToUpperInvariant() ?? "PUBLIC";
+			list.Add(EscapeSymbolName(text));
+			list.Add(EscapeSymbolName(text + "_" + text2));
+			if (extension.Version != default(VersionNumber))
+			{
+				list.Add(EscapeSymbolName(text + "_" + extension.Version.ToString()));
+				list.Add(EscapeSymbolName(text + "_" + extension.Version.ToString() + "_" + text2));
+			}
+		}
+		foreach (Extension allExtension in Interface.Oxide.GetAllExtensions())
+		{
+			try
+			{
+				string text3 = allExtension.Name.ToUpper() + "_EXT";
+				foreach (string preprocessorDirective in allExtension.GetPreprocessorDirectives())
+				{
+					if (!allExtension.IsGameExtension && !allExtension.IsCoreExtension && !preprocessorDirective.StartsWith(text3))
+					{
+						Interface.Oxide.LogWarning("Missing extension preprocessor prefix '{0}' for directive '{1}' (by extension '{2}')", text3, preprocessorDirective, allExtension.Name);
+					}
+					list.Add(EscapeSymbolName(preprocessorDirective));
+				}
+			}
+			catch (Exception ex)
+			{
+				Interface.Oxide.LogException("An error occurred processing preprocessor directives for extension `" + allExtension.Name + "`", ex);
+			}
+		}
+		if (Interface.Oxide.Config.Compiler.PreprocessorDirectives.Count > 0)
+		{
+			list.AddRange(Interface.Oxide.Config.Compiler.PreprocessorDirectives);
+		}
+		if (Interface.Oxide.Config.Compiler.Publicize == true)
+		{
+			EnvironmentHelper.SetVariable("AllowPublicize", "true", throwOnExisting: false, force: true);
+			list.Add("OXIDE_PUBLICIZED");
+		}
+		preprocessor = list.Distinct().ToArray();
+		if (!DownloadFile(remoteName, filePath))
+		{
+			return false;
+		}
+		return SetFilePermissions(filePath);
+	}
+
+	private bool Start()
+	{
+		if (filePath == null)
+		{
+			return false;
+		}
+		if (process != null && process.Handle != IntPtr.Zero && !process.HasExited)
+		{
+			return true;
+		}
+		try
+		{
+			int num = 0;
+			while (!File.Exists(filePath))
+			{
+				num++;
+				if (num > 3)
+				{
+					throw new IOException("Compiler failed to download after 3 attempts");
+				}
+				Log(LogType.Error, $"Compiler doesn't exist at {filePath}, attempting to download again | Attempt: {num} of 3");
+				Precheck();
+				Thread.Sleep(100);
+			}
+		}
+		catch (Exception ex)
+		{
+			Log(LogType.Error, ex.Message);
+			return false;
+		}
+		Stop(synchronous: false, "starting new process");
+		startTime = Interface.Oxide.Now;
+		string text = compilerBasicArguments + $" --parent {Process.GetCurrentProcess().Id} -l:file \"{Path.Combine(Interface.Oxide.LogDirectory, $"oxide.compiler_{DateTime.Now:yyyy-MM-dd}.log")}\"";
+		Log(LogType.Info, "Starting compiler with parameters: " + text);
+		try
+		{
+			process = new Process
+			{
+				StartInfo = 
+				{
+					FileName = filePath,
+					CreateNoWindow = true,
+					UseShellExecute = false,
+					RedirectStandardInput = true,
+					RedirectStandardOutput = true,
+					Arguments = text
+				},
+				EnableRaisingEvents = true
+			};
+			process.Exited += OnProcessExited;
+			process.Start();
+		}
+		catch (Exception ex2)
+		{
+			process?.Dispose();
+			process = null;
+			Interface.Oxide.LogException("Exception while starting compiler", ex2);
+			if (filePath.Contains("'"))
+			{
+				Interface.Oxide.LogError("Server directory path contains an apostrophe, compiler will not work until path is renamed");
+			}
+			else if (Environment.OSVersion.Platform == PlatformID.Unix)
+			{
+				Interface.Oxide.LogError("Compiler may not be set as executable; chmod +x or 0744/0755 required");
+			}
+			if (ex2.GetBaseException() != ex2)
+			{
+				Interface.Oxide.LogException("BaseException: ", ex2.GetBaseException());
+			}
+			if (ex2 is Win32Exception ex3)
+			{
+				Interface.Oxide.LogError($"Win32 NativeErrorCode: {ex3.NativeErrorCode} ErrorCode: {ex3.ErrorCode} HelpLink: {ex3.HelpLink}");
+			}
+		}
+		if (process == null)
+		{
+			return false;
+		}
+		client = new ObjectStreamClient<CompilerMessage>(process.StandardOutput.BaseStream, process.StandardInput.BaseStream);
+		client.Message += OnMessage;
+		client.Error += OnError;
+		client.Start();
+		ResetIdleTimer();
+		Interface.Oxide.LogInfo("[CSharp] Started Oxide.Compiler v" + GetCompilerVersion() + " successfully");
+		return true;
+	}
+
+	internal void Stop(bool synchronous, string reason)
+	{
+		ready = false;
+		Process endedProcess = process;
+		ObjectStreamClient<CompilerMessage> stream = client;
+		if (endedProcess == null || stream == null)
+		{
+			return;
+		}
+		process = null;
+		client = null;
+		endedProcess.Exited -= OnProcessExited;
+		endedProcess.Refresh();
+		stream.Message -= OnMessage;
+		stream.Error -= OnError;
+		if (!string.IsNullOrEmpty(reason))
+		{
+			Interface.Oxide.LogInfo("Shutting down compiler because " + reason);
+		}
+		if (!endedProcess.HasExited)
+		{
+			stream.PushMessage(new CompilerMessage
+			{
+				Type = CompilerMessageType.Exit
+			});
+			if (synchronous)
+			{
+				if (endedProcess.WaitForExit(10000))
+				{
+					Interface.Oxide.LogInfo("Compiler shutdown completed");
+				}
+				else
+				{
+					Interface.Oxide.LogWarning("Compiler failed to gracefully shutdown, killing the process...");
+					endedProcess.Kill();
+				}
+				stream.Stop();
+				stream = null;
+				endedProcess.Close();
+			}
+			else
+			{
+				ThreadPool.QueueUserWorkItem(delegate
+				{
+					if (endedProcess.WaitForExit(10000))
+					{
+						Interface.Oxide.LogInfo("Compiler shutdown completed");
+					}
+					else
+					{
+						Interface.Oxide.LogWarning("Compiler failed to gracefully shutdown, killing the process...");
+						endedProcess.Kill();
+					}
+					stream.Stop();
+					stream = null;
+					endedProcess.Close();
+				});
+			}
+		}
+		else
+		{
+			stream.Stop();
+			stream = null;
+			endedProcess.Close();
+			Log(LogType.Info, "Released compiler resources");
+		}
+		ExpireFileCache();
+	}
+
+	private void OnMessage(ObjectStreamConnection<CompilerMessage, CompilerMessage> connection, CompilerMessage message)
+	{
+		if (message == null)
+		{
+			return;
+		}
+		switch (message.Type)
+		{
+		case CompilerMessageType.Assembly:
+		{
+			Compilation compilation = compilations[message.Id];
+			if (compilation == null)
+			{
+				Log(LogType.Error, "Compiler compiled an unknown assembly");
+				return;
+			}
+			compilation.endedAt = Interface.Oxide.Now;
+			string text2 = (string)message.ExtraData;
+			if (text2 != null)
+			{
+				string[] array = text2.Split(new char[2] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+				foreach (string text3 in array)
+				{
+					Match match = fileErrorRegex.Match(text3.Trim());
+					if (!match.Success || match.Groups["Severity"].Value != "Error")
+					{
+						continue;
+					}
+					string value = match.Groups["File"].Value;
+					string scriptName = Path.GetFileNameWithoutExtension(value);
+					string value2 = match.Groups["Message"].Value;
+					CompilablePlugin compilablePlugin = compilation.plugins.SingleOrDefault((CompilablePlugin pl) => pl.ScriptName == scriptName);
+					if (compilablePlugin == null)
+					{
+						Interface.Oxide.LogError("Unable to resolve script error to " + value + ": " + value2);
+						continue;
+					}
+					IEnumerable<string> source = compilablePlugin.Requires.Where((string name) => !compilation.IncludesRequiredPlugin(name));
+					if (source.Any())
+					{
+						compilablePlugin.CompilerErrors = "Missing dependencies: " + string.Join(",", source.ToArray());
+						Log(LogType.Error, "[" + match.Groups["Severity"].Value + "][" + scriptName + "] Missing dependencies: " + string.Join(",", source.ToArray()));
+					}
+					else
+					{
+						string text4 = value2.Trim();
+						string pluginDirectory = Interface.Oxide.PluginDirectory;
+						char directorySeparatorChar = Path.DirectorySeparatorChar;
+						compilablePlugin.CompilerErrors = text4.Replace(pluginDirectory + directorySeparatorChar, string.Empty);
+					}
+				}
+			}
+			CompilationResult compilationResult = (CompilationResult)message.Data;
+			if (compilationResult.Data == null || compilationResult.Data.Length == 0)
+			{
+				compilation.Completed();
+			}
+			else
+			{
+				compilation.Completed(compilationResult.Data, compilationResult.Symbols);
+			}
+			compilations.Remove(message.Id);
+			break;
+		}
+		case CompilerMessageType.Error:
+		{
+			Exception ex = (Exception)message.Data;
+			Compilation compilation2 = compilations[message.Id];
+			compilations.Remove(message.Id);
+			if (compilation2 == null)
+			{
+				Interface.Oxide.LogException("Compiler returned a error for a untracked compilation", ex);
+				return;
+			}
+			foreach (CompilablePlugin plugin in compilation2.plugins)
+			{
+				plugin.CompilerErrors = ex.Message;
+			}
+			compilation2.Completed();
+			break;
+		}
+		case CompilerMessageType.Ready:
+		{
+			string text = $"Ready signal received from compiler (Startup took: {Math.Round((Interface.Oxide.Now - startTime) * 1000f)}ms)";
+			switch (messageQueue.Count)
+			{
+			case 0:
+				Log(LogType.Info, text);
+				break;
+			case 1:
+				Log(LogType.Info, text + ", sending compilation. . .");
+				break;
+			default:
+				Log(LogType.Info, text + $", sending {messageQueue.Count} compilations. . .");
+				break;
+			}
+			connection.PushMessage(message);
+			if (!ready)
+			{
+				ready = true;
+				while (messageQueue.Count > 0)
+				{
+					CompilerMessage compilerMessage = messageQueue.Dequeue();
+					compilations[compilerMessage.Id].startedAt = Interface.Oxide.Now;
+					connection.PushMessage(compilerMessage);
+				}
+			}
+			break;
+		}
+		}
+		Interface.Oxide.NextTick(delegate
+		{
+			ResetIdleTimer();
+		});
+	}
+
+	private void OnError(Exception exception)
+	{
+		OnCompilerFailed($"Compiler threw a error: {exception}");
+	}
+
+	private void OnProcessExited(object sender, EventArgs eventArgs)
+	{
+		Interface.Oxide.NextTick(delegate
+		{
+			OnCompilerFailed("compiler was closed unexpectedly");
+			string environmentVariable = Environment.GetEnvironmentVariable("PATH");
+			string text = Path.Combine(Interface.Oxide.ExtensionDirectory, ".dotnet");
+			if (string.IsNullOrEmpty(environmentVariable) || !environmentVariable.Contains(text))
+			{
+				Log(LogType.Warning, "PATH does not contain path to compiler dependencies: " + text);
+			}
+			else
+			{
+				Log(LogType.Warning, "User running server may not have the proper permissions or install is missing files");
+			}
+			Stop(synchronous: false, "process exited");
+		});
+	}
+
+	private void ResetIdleTimer()
+	{
+		if (idleTimer != null)
+		{
+			idleTimer.Destroy();
+		}
+		if (Interface.Oxide.Config.Compiler.IdleShutdown)
+		{
+			idleTimer = Interface.Oxide.GetLibrary<Oxide.Core.Libraries.Timer>().Once(Interface.Oxide.Config.Compiler.IdleTimeout, delegate
+			{
+				Stop(synchronous: false, "idle shutdown");
+			});
+		}
+	}
+
+	internal void Compile(CompilablePlugin[] plugins, Action<Compilation> callback)
+	{
+		int num = lastId++;
+		Compilation compilation = new Compilation(num, callback, plugins);
+		compilations[num] = compilation;
+		compilation.Prepare(delegate
+		{
+			EnqueueCompilation(compilation);
+		});
+	}
+
+	internal void OnCompileTimeout()
+	{
+		Stop(synchronous: false, "compiler timeout");
+	}
+
+	private void EnqueueCompilation(Compilation compilation)
+	{
+		if (compilation.plugins.Count < 1)
+		{
+			return;
+		}
+		if ((!Installed && !Precheck()) || !Start())
+		{
+			OnCompilerFailed("compiler couldn't be started");
+			Stop(synchronous: false, "failed to start");
+			return;
+		}
+		compilation.Started();
+		HashSet<string> hashSet = new HashSet<string>();
+		List<CompilerFile> list = new List<CompilerFile>();
+		foreach (CompilablePlugin plugin in compilation.plugins)
+		{
+			string fileName = Path.GetFileName(plugin.ScriptPath ?? plugin.ScriptName);
+			if (plugin.ScriptSource == null || plugin.ScriptSource.Length == 0)
+			{
+				plugin.CompilerErrors = "No data contained in .cs file";
+				Log(LogType.Error, "Ignoring plugin " + fileName + ", file is empty");
+				continue;
+			}
+			foreach (string item in plugin.IncludePaths.Distinct())
+			{
+				if (hashSet.Contains(item))
+				{
+					Interface.Oxide.LogWarning("Tried to include " + item + " but it has already been added to the compilation");
+					continue;
+				}
+				CompilerFile compilerFile = new CompilerFile(item);
+				if (compilerFile.Data == null || compilerFile.Data.Length == 0)
+				{
+					Interface.Oxide.LogWarning("Ignoring plugin " + compilerFile.Name + ", file is empty");
+					continue;
+				}
+				Interface.Oxide.LogWarning("Adding " + compilerFile.Name + " to compilation project");
+				list.Add(compilerFile);
+				hashSet.Add(item);
+			}
+			Log(LogType.Info, "Adding plugin " + fileName + " to compilation project");
+			list.Add(new CompilerFile(plugin.ScriptPath ?? plugin.ScriptName, plugin.ScriptSource));
+		}
+		if (list.Count == 0)
+		{
+			Interface.Oxide.LogError("Compilation job contained no valid plugins");
+			compilations.Remove(compilation.id);
+			compilation.Completed();
+			return;
+		}
+		CompilerData data = new CompilerData
+		{
+			OutputFile = compilation.name,
+			SourceFiles = list.ToArray(),
+			ReferenceFiles = compilation.references.Values.ToArray(),
+			Preprocessor = preprocessor
+		};
+		CompilerMessage compilerMessage = new CompilerMessage
+		{
+			Id = compilation.id,
+			Data = data,
+			Type = CompilerMessageType.Compile
+		};
+		if (ready)
+		{
+			compilation.startedAt = Interface.Oxide.Now;
+			client.PushMessage(compilerMessage);
+		}
+		else
+		{
+			messageQueue.Enqueue(compilerMessage);
+		}
+	}
+
+	private void OnCompilerFailed(string reason)
+	{
+		foreach (Compilation value in compilations.Values)
+		{
+			foreach (CompilablePlugin plugin in value.plugins)
+			{
+				plugin.CompilerErrors = reason;
+			}
+			value.Completed();
+		}
+		compilations.Clear();
+	}
+
+	private static bool SetFilePermissions(string filePath)
+	{
+		PlatformID platform = Environment.OSVersion.Platform;
+		if (platform != PlatformID.Unix && platform != PlatformID.MacOSX)
+		{
+			return true;
+		}
+		string fileName = Path.GetFileName(filePath);
+		try
+		{
+			if (Syscall.access(filePath, AccessModes.X_OK) == 0)
+			{
+				Log(LogType.Info, fileName + " is executable");
+			}
+		}
+		catch (Exception ex)
+		{
+			Interface.Oxide.LogException("Unable to check " + fileName + " for executable permission", ex);
+		}
+		try
+		{
+			Syscall.chmod(filePath, FilePermissions.S_IRWXU);
+			Interface.Oxide.LogInfo("File permissions set for " + fileName);
+			return true;
+		}
+		catch (Exception ex2)
+		{
+			Interface.Oxide.LogException("Could not set " + filePath + " as executable, please set manually", ex2);
+		}
+		return false;
+	}
+
+	private static bool DownloadFile(string url, string path, int retries = 3)
+	{
+		string fileName = Path.GetFileName(path);
+		int current = 0;
+		string md = null;
+		try
+		{
+			DateTime? lastModified = null;
+			if (File.Exists(path))
+			{
+				md = GenerateFileHash(path);
+				lastModified = File.GetLastWriteTimeUtc(path);
+				string text = "[CSharp] Checking for updates for " + fileName + " | Local MD5: " + md;
+				if (lastModified.HasValue)
+				{
+					text += $" | Last modified: {lastModified.Value:yyyy-MM-dd HH:mm:ss}";
+				}
+				Interface.Oxide.LogInfo(text);
+			}
+			else
+			{
+				Interface.Oxide.LogInfo("[CSharp] Downloading " + fileName + ". . .");
+			}
+			if (!TryDownload(url, retries, ref current, lastModified, out var data, out var code, out var newerFound, ref md))
+			{
+				string text2 = ((retries == 1) ? "attempt" : "attempts");
+				Interface.Oxide.LogError($"[CSharp] Failed to download {fileName} after {current} {text2} with response code '{code}', please manually download it from {url} and save it here {path}");
+				return false;
+			}
+			if (data != null)
+			{
+				using (FileStream fileStream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+				{
+					fileStream.Write(data, 0, data.Length);
+				}
+				if (newerFound)
+				{
+					string text3 = ((md != null) ? ("Remote MD5: " + md) : "Newer found");
+					Interface.Oxide.LogInfo("[CSharp] Downloaded newer version of " + fileName + " | " + text3);
+				}
+				else
+				{
+					Interface.Oxide.LogInfo("[CSharp] Downloaded " + fileName);
+				}
+			}
+			else
+			{
+				Interface.Oxide.LogInfo("[CSharp] " + fileName + " is up to date");
+			}
+			return true;
+		}
+		catch (Exception ex)
+		{
+			Interface.Oxide.LogException("Unexpected error occurred while trying to download " + fileName + ", please manually download it from " + url + " and save it here " + path, ex);
+			return false;
+		}
+	}
+
+	private static bool TryDownload(string url, int retries, ref int current, DateTime? lastModified, out byte[] data, out int code, out bool newerFound, ref string md5)
+	{
+		newerFound = true;
+		data = null;
+		code = -1;
+		try
+		{
+			HttpWebRequest httpWebRequest = (HttpWebRequest)WebRequest.Create(url);
+			httpWebRequest.AllowAutoRedirect = true;
+			httpWebRequest.CachePolicy = new RequestCachePolicy(RequestCacheLevel.NoCacheNoStore);
+			if (!string.IsNullOrEmpty(md5))
+			{
+				string text = "Validating checksum with server for " + Path.GetFileName(url) + " | Local: " + md5;
+				int current2 = 0;
+				string md6 = null;
+				if (TryDownload(url + ".md5", retries, ref current2, null, out var data2, out var code2, out var _, ref md6) && code2 == 200)
+				{
+					md6 = Encoding.UTF8.GetString(data2).Trim();
+					if (string.IsNullOrEmpty(md6))
+					{
+						md6 = "N/A";
+					}
+					text = text + " | Server: " + md6;
+					if (md6.Equals(md5, StringComparison.InvariantCultureIgnoreCase))
+					{
+						md5 = md6;
+						newerFound = false;
+						text += " | Match!";
+						Log(LogType.Debug, text);
+						return true;
+					}
+					md5 = md6;
+					text += " | No Match!";
+					Log(LogType.Warning, text);
+				}
+				else if (lastModified.HasValue)
+				{
+					md5 = null;
+					Log(LogType.Warning, $"Failed to download {url}.md5 after {current2} attempts with response code '{code2}', using last modified date instead");
+					httpWebRequest.IfModifiedSince = lastModified.Value;
+				}
+			}
+			else if (lastModified.HasValue)
+			{
+				httpWebRequest.IfModifiedSince = lastModified.Value;
+			}
+			HttpWebResponse httpWebResponse = (HttpWebResponse)httpWebRequest.GetResponse();
+			switch (code = (int)httpWebResponse.StatusCode)
+			{
+			case 304:
+				newerFound = false;
+				return true;
+			default:
+				if (current <= retries)
+				{
+					current++;
+					Thread.Sleep(1000);
+					return TryDownload(url, retries, ref current, lastModified, out data, out code, out newerFound, ref md5);
+				}
+				return false;
+			case 200:
+			{
+				MemoryStream memoryStream = new MemoryStream();
+				Stream responseStream = httpWebResponse.GetResponseStream();
+				int num = 10000;
+				byte[] buffer = new byte[num];
+				while (true)
+				{
+					int num2 = responseStream.Read(buffer, 0, num);
+					if (num2 == -1 || num2 == 0)
+					{
+						break;
+					}
+					memoryStream.Write(buffer, 0, num2);
+				}
+				data = memoryStream.ToArray();
+				memoryStream.Close();
+				responseStream.Close();
+				httpWebResponse.Close();
+				return true;
+			}
+			}
+		}
+		catch (WebException ex)
+		{
+			if (ex.Response != null)
+			{
+				HttpWebResponse httpWebResponse2 = (HttpWebResponse)ex.Response;
+				code = (int)httpWebResponse2.StatusCode;
+				if (httpWebResponse2.StatusCode == HttpStatusCode.NotModified)
+				{
+					newerFound = false;
+					return true;
+				}
+				if (current <= retries)
+				{
+					current++;
+					Thread.Sleep(1000);
+					return TryDownload(url, retries, ref current, lastModified, out data, out code, out newerFound, ref md5);
+				}
+				return false;
+			}
+		}
+		return false;
+	}
+
+	private static void Log(LogType type, string message, Exception exception = null)
+	{
+		Interface.Oxide.RootLogger.WriteDebug(type, LogEvent.Compile, "CSharp", message, exception);
+	}
+
+	private string GetCompilerVersion()
+	{
+		if (!Installed)
+		{
+			return "0.0.0";
+		}
+		return FileVersionInfo.GetVersionInfo(filePath).FileVersion;
+	}
+
+	private static string GenerateFileHash(string file)
+	{
+		using MD5 mD = MD5.Create();
+		using FileStream inputStream = File.OpenRead(file);
+		return BitConverter.ToString(mD.ComputeHash(inputStream)).Replace("-", string.Empty).ToLowerInvariant();
+	}
+
+	private string EscapeSymbolName(string name)
+	{
+		return SymbolEscapeRegex.Replace(name, "_");
+	}
+}

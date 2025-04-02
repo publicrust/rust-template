@@ -1,0 +1,444 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using Oxide.Core;
+using Oxide.Core.Configuration;
+using Oxide.Core.Libraries;
+using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Plugins;
+
+public abstract class Plugin
+{
+	private class CommandInfo
+	{
+		public readonly string[] Names;
+
+		public readonly string[] PermissionsRequired;
+
+		public readonly CommandCallback Callback;
+
+		public CommandInfo(string[] names, string[] perms, CommandCallback callback)
+		{
+			Names = names;
+			PermissionsRequired = perms;
+			Callback = callback;
+		}
+	}
+
+	private string name;
+
+	private bool isCorePlugin;
+
+	public PluginManagerEvent OnAddedToManager = new PluginManagerEvent();
+
+	public PluginManagerEvent OnRemovedFromManager = new PluginManagerEvent();
+
+	private Stopwatch trackStopwatch = new Stopwatch();
+
+	private Stopwatch stopwatch = new Stopwatch();
+
+	private float averageAt;
+
+	private double sum;
+
+	private int preHookGcCount;
+
+	protected int nestcount;
+
+	private IDictionary<string, CommandInfo> commandInfos;
+
+	private Permission permission = Interface.Oxide.GetLibrary<Permission>();
+
+	public string Filename { get; protected set; }
+
+	public string Name
+	{
+		get
+		{
+			return name;
+		}
+		set
+		{
+			if (string.IsNullOrEmpty(Name) || name == GetType().Name)
+			{
+				name = value;
+			}
+		}
+	}
+
+	public string Title { get; protected set; }
+
+	public string Description { get; protected set; }
+
+	public string Author { get; protected set; }
+
+	public VersionNumber Version { get; protected set; }
+
+	public int ResourceId { get; protected set; }
+
+	public PluginManager Manager { get; private set; }
+
+	public bool HasConfig { get; protected set; }
+
+	public bool HasMessages { get; protected set; }
+
+	public bool IsCorePlugin
+	{
+		get
+		{
+			return isCorePlugin;
+		}
+		set
+		{
+			if (!Interface.Oxide.HasLoadedCorePlugins)
+			{
+				isCorePlugin = value;
+			}
+		}
+	}
+
+	public PluginLoader Loader { get; set; }
+
+	public virtual object Object => this;
+
+	public DynamicConfigFile Config { get; private set; }
+
+	public bool IsLoaded { get; internal set; }
+
+	public double TotalHookTime { get; internal set; }
+
+	public long TotalHookMemory { get; internal set; }
+
+	private long _currentMemoryUsed { get; set; }
+
+	public event PluginError OnError;
+
+	public static implicit operator bool(Plugin plugin)
+	{
+		return plugin != null;
+	}
+
+	public static bool operator !(Plugin plugin)
+	{
+		return !(bool)plugin;
+	}
+
+	protected Plugin()
+	{
+		Name = GetType().Name;
+		Title = Name.Humanize();
+		Author = "Unnamed";
+		Version = new VersionNumber(1, 0, 0);
+		commandInfos = new Dictionary<string, CommandInfo>();
+	}
+
+	protected void Subscribe(string hook)
+	{
+		Manager.SubscribeToHook(hook, this);
+	}
+
+	protected void Unsubscribe(string hook)
+	{
+		Manager.UnsubscribeToHook(hook, this);
+	}
+
+	public virtual void HandleAddedToManager(PluginManager manager)
+	{
+		Manager = manager;
+		if (HasConfig)
+		{
+			LoadConfig();
+		}
+		if (HasMessages)
+		{
+			LoadDefaultMessages();
+		}
+		OnAddedToManager?.Invoke(this, manager);
+		RegisterWithCovalence();
+	}
+
+	public virtual void HandleRemovedFromManager(PluginManager manager)
+	{
+		UnregisterWithCovalence();
+		if (Manager == manager)
+		{
+			Manager = null;
+		}
+		OnRemovedFromManager?.Invoke(this, manager);
+	}
+
+	public virtual void Load()
+	{
+	}
+
+	public object CallHook(string hook, params object[] args)
+	{
+		float num = 0f;
+		if (!IsCorePlugin && nestcount == 0)
+		{
+			preHookGcCount = GC.CollectionCount(0);
+			num = Interface.Oxide.Now;
+			stopwatch.Start();
+			if (averageAt < 1f)
+			{
+				averageAt = num;
+			}
+		}
+		TrackStart();
+		nestcount++;
+		try
+		{
+			return OnCallHook(hook, args);
+		}
+		catch (Exception ex)
+		{
+			Interface.Oxide.LogException($"Failed to call hook '{hook}' on plugin '{Name} v{Version}'", ex);
+			return null;
+		}
+		finally
+		{
+			nestcount--;
+			TrackEnd();
+			if (num > 0f)
+			{
+				stopwatch.Stop();
+				double totalSeconds = stopwatch.Elapsed.TotalSeconds;
+				if (totalSeconds > 0.1)
+				{
+					string text = ((preHookGcCount == GC.CollectionCount(0)) ? string.Empty : " [GARBAGE COLLECT]");
+					Interface.Oxide.LogWarning($"Calling '{hook}' on '{Name} v{Version}' took {totalSeconds * 1000.0:0}ms{text}");
+				}
+				stopwatch.Reset();
+				double num2 = sum + totalSeconds;
+				double num3 = (double)num + totalSeconds;
+				if (num3 - (double)averageAt > 10.0)
+				{
+					num2 /= num3 - (double)averageAt;
+					if (num2 > 0.1)
+					{
+						string text2 = ((preHookGcCount == GC.CollectionCount(0)) ? string.Empty : " [GARBAGE COLLECT]");
+						Interface.Oxide.LogWarning($"Calling '{hook}' on '{Name} v{Version}' took average {sum * 1000.0:0}ms{text2}");
+					}
+					sum = 0.0;
+					averageAt = 0f;
+				}
+				else
+				{
+					sum = num2;
+				}
+			}
+		}
+	}
+
+	public object Call(string hook, params object[] args)
+	{
+		return CallHook(hook, args);
+	}
+
+	public T Call<T>(string hook, params object[] args)
+	{
+		return (T)Convert.ChangeType(CallHook(hook, args), typeof(T));
+	}
+
+	protected abstract object OnCallHook(string hook, object[] args);
+
+	public void RaiseError(string message)
+	{
+		this.OnError?.Invoke(this, message);
+	}
+
+	public void TrackStart()
+	{
+		if (!IsCorePlugin && nestcount <= 0)
+		{
+			Stopwatch stopwatch = trackStopwatch;
+			if (!stopwatch.IsRunning)
+			{
+				_currentMemoryUsed = GetMemory();
+				stopwatch.Start();
+			}
+		}
+	}
+
+	public void TrackEnd()
+	{
+		if (!IsCorePlugin && nestcount <= 0)
+		{
+			Stopwatch stopwatch = trackStopwatch;
+			if (stopwatch.IsRunning)
+			{
+				stopwatch.Stop();
+				TotalHookTime += stopwatch.Elapsed.TotalSeconds;
+				TotalHookMemory += Math.Max(0L, GetMemory() - _currentMemoryUsed);
+				stopwatch.Reset();
+			}
+		}
+	}
+
+	private static long GetMemory()
+	{
+		return GC.GetTotalMemory(forceFullCollection: false);
+	}
+
+	protected virtual void LoadConfig()
+	{
+		Config = new DynamicConfigFile(Path.Combine(Manager.ConfigPath, Name + ".json"));
+		if (!Config.Exists())
+		{
+			LoadDefaultConfig();
+			SaveConfig();
+		}
+		try
+		{
+			Config.Load();
+		}
+		catch (Exception ex)
+		{
+			RaiseError("Failed to load config file (is the config file corrupt?) (" + ex.Message + ")");
+		}
+	}
+
+	protected virtual void LoadDefaultConfig()
+	{
+		CallHook("LoadDefaultConfig", null);
+	}
+
+	protected virtual void SaveConfig()
+	{
+		if (Config == null)
+		{
+			return;
+		}
+		try
+		{
+			Config.Save();
+		}
+		catch (Exception ex)
+		{
+			RaiseError("Failed to save config file (does the config have illegal objects in it?) (" + ex.Message + ")");
+		}
+	}
+
+	protected virtual void LoadDefaultMessages()
+	{
+		CallHook("LoadDefaultMessages", null);
+	}
+
+	public void AddUniversalCommand(string command, string callback, string perm = null)
+	{
+		AddCovalenceCommand(new string[1] { command }, callback, string.IsNullOrEmpty(perm) ? null : new string[1] { perm });
+	}
+
+	public void AddCovalenceCommand(string command, string callback, string perm = null)
+	{
+		AddCovalenceCommand(new string[1] { command }, callback, string.IsNullOrEmpty(perm) ? null : new string[1] { perm });
+	}
+
+	public void AddUniversalCommand(string[] commands, string callback, string perm)
+	{
+		AddCovalenceCommand(commands, callback, string.IsNullOrEmpty(perm) ? null : new string[1] { perm });
+	}
+
+	public void AddCovalenceCommand(string[] commands, string callback, string perm)
+	{
+		AddCovalenceCommand(commands, callback, string.IsNullOrEmpty(perm) ? null : new string[1] { perm });
+	}
+
+	public void AddUniversalCommand(string[] commands, string callback, string[] perms = null)
+	{
+		AddCovalenceCommand(commands, callback, perms);
+	}
+
+	public void AddCovalenceCommand(string[] commands, string callback, string[] perms = null)
+	{
+		AddCovalenceCommand(commands, perms, delegate(IPlayer caller, string command, string[] args)
+		{
+			CallHook(callback, caller, command, args);
+			return true;
+		});
+		Covalence library = Interface.Oxide.GetLibrary<Covalence>();
+		foreach (string command2 in commands)
+		{
+			library.RegisterCommand(command2, this, CovalenceCommandCallback);
+		}
+	}
+
+	protected void AddUniversalCommand(string[] commands, string[] perms, CommandCallback callback)
+	{
+		AddCovalenceCommand(commands, perms, callback);
+	}
+
+	protected void AddCovalenceCommand(string[] commands, string[] perms, CommandCallback callback)
+	{
+		string[] array = commands;
+		foreach (string text in array)
+		{
+			if (commandInfos.ContainsKey(text.ToLowerInvariant()))
+			{
+				Interface.Oxide.LogWarning("Covalence command alias already exists: {0}", text);
+			}
+			else
+			{
+				commandInfos.Add(text.ToLowerInvariant(), new CommandInfo(commands, perms, callback));
+			}
+		}
+		if (perms == null)
+		{
+			return;
+		}
+		array = perms;
+		foreach (string text2 in array)
+		{
+			if (!permission.PermissionExists(text2))
+			{
+				permission.RegisterPermission(text2, this);
+			}
+		}
+	}
+
+	private void RegisterWithCovalence()
+	{
+		Covalence library = Interface.Oxide.GetLibrary<Covalence>();
+		foreach (KeyValuePair<string, CommandInfo> commandInfo in commandInfos)
+		{
+			library.RegisterCommand(commandInfo.Key, this, CovalenceCommandCallback);
+		}
+	}
+
+	private bool CovalenceCommandCallback(IPlayer caller, string cmd, string[] args)
+	{
+		if (!commandInfos.TryGetValue(cmd, out var value))
+		{
+			return false;
+		}
+		if (caller == null)
+		{
+			Interface.Oxide.LogWarning("Plugin.CovalenceCommandCallback received null as the caller (bad game Covalence bindings?)");
+			return false;
+		}
+		if (value.PermissionsRequired != null)
+		{
+			string[] permissionsRequired = value.PermissionsRequired;
+			foreach (string perm in permissionsRequired)
+			{
+				if (!caller.HasPermission(perm) && !caller.IsServer && (!caller.IsAdmin || !IsCorePlugin))
+				{
+					caller.Message("You do not have permission to use the command '" + cmd + "'!");
+					return true;
+				}
+			}
+		}
+		value.Callback(caller, cmd, args);
+		return true;
+	}
+
+	private void UnregisterWithCovalence()
+	{
+		Covalence library = Interface.Oxide.GetLibrary<Covalence>();
+		foreach (KeyValuePair<string, CommandInfo> commandInfo in commandInfos)
+		{
+			library.UnregisterCommand(commandInfo.Key, this);
+		}
+	}
+}

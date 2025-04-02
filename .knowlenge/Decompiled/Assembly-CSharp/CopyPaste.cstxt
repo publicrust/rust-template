@@ -1,0 +1,639 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using ConVar;
+using Facepunch;
+using Network;
+using ProtoBuf;
+using Rust;
+using UnityEngine;
+
+[Factory("copypaste")]
+public class CopyPaste : ConsoleSystem
+{
+	private class EntityWrapper
+	{
+		public BaseEntity Entity;
+
+		public ProtoBuf.Entity Protobuf;
+
+		public Vector3 Position;
+
+		public Quaternion Rotation;
+
+		public bool HasParent;
+	}
+
+	public class PasteOptions
+	{
+		public const string Argument_NPCs = "--npcs";
+
+		public const string Argument_Resources = "--resources";
+
+		public const string Argument_Vehicles = "--vehicles";
+
+		public const string Argument_Deployables = "--deployables";
+
+		public const string Argument_FoundationsOnly = "--foundations-only";
+
+		public const string Argument_BuildingBlocksOnly = "--building-only";
+
+		public const string Argument_SnapToTerrain = "--autosnap-terrain";
+
+		public const string Argument_PastePlayers = "--players";
+
+		public bool Resources;
+
+		public bool NPCs;
+
+		public bool Vehicles;
+
+		public bool Deployables;
+
+		public bool FoundationsOnly;
+
+		public bool BuildingBlocksOnly;
+
+		public bool SnapToTerrain;
+
+		public bool Players;
+
+		public Vector3 Origin;
+
+		public Quaternion PlayerRotation;
+
+		public Vector3 HeightOffset;
+
+		public PasteOptions(Arg arg)
+		{
+			Resources = arg.HasArg("--resources", remove: true);
+			NPCs = arg.HasArg("--npcs", remove: true);
+			Vehicles = arg.HasArg("--vehicles", remove: true);
+			Deployables = arg.HasArg("--deployables", remove: true);
+			FoundationsOnly = arg.HasArg("--foundations-only", remove: true);
+			BuildingBlocksOnly = arg.HasArg("--building-only", remove: true);
+			SnapToTerrain = arg.HasArg("--autosnap-terrain", remove: true);
+			Players = arg.HasArg("--players", remove: true);
+		}
+
+		public PasteOptions(PasteRequest request)
+		{
+			Resources = request.resources;
+			NPCs = request.npcs;
+			Vehicles = request.vehicles;
+			Deployables = request.deployables;
+			FoundationsOnly = request.foundationsOnly;
+			BuildingBlocksOnly = request.buildingBlocksOnly;
+			SnapToTerrain = request.snapToTerrain;
+			Players = request.players;
+			Origin = request.origin;
+			PlayerRotation = Quaternion.Euler(request.playerRotation);
+			HeightOffset = request.heightOffset;
+		}
+	}
+
+	private static CopyPasteHistoryManager playerHistory = new CopyPasteHistoryManager();
+
+	private static void PrintPasteNames(StringBuilder builder, string directory)
+	{
+		if (!Directory.Exists(directory))
+		{
+			builder.AppendLine("No pastes found");
+			return;
+		}
+		string[] files = Directory.GetFiles(directory, "*.data");
+		builder.AppendLine($"Found {files.Length} pastes");
+		foreach (string item in files.OrderBy((string x) => x))
+		{
+			string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(item);
+			builder.AppendLine(fileNameWithoutExtension);
+		}
+	}
+
+	private static void CopyEntities(BasePlayer player, List<BaseEntity> entities, string name, Vector3 originPos, Quaternion originRot)
+	{
+		OrderEntitiesForSave(entities);
+		using CopyPasteEntityInfo copyPasteEntityInfo = Facepunch.Pool.Get<CopyPasteEntityInfo>();
+		copyPasteEntityInfo.entities = Facepunch.Pool.Get<List<ProtoBuf.Entity>>();
+		Transform transform = new GameObject("Align").transform;
+		transform.position = originPos;
+		transform.rotation = originRot;
+		foreach (BaseEntity entity in entities)
+		{
+			if (!entity.isClient && entity.enableSaving)
+			{
+				BaseEntity baseEntity = entity.parentEntity.Get(serverside: true);
+				if (baseEntity != null && (!entities.Contains(baseEntity) || !baseEntity.enableSaving))
+				{
+					Debug.LogWarning("Skipping " + entity.ShortPrefabName + " as it is parented to an entity not included in the copy (it would become orphaned)");
+				}
+				else
+				{
+					SaveEntity(entity, copyPasteEntityInfo, baseEntity, transform);
+				}
+			}
+		}
+		UnityEngine.Object.Destroy(transform.gameObject);
+		CopyPasteEntity.ServerInstance?.ClientRPC(RpcTarget.Player("RecievePaste", player), name, copyPasteEntityInfo);
+	}
+
+	public static List<BaseEntity> PasteEntitiesInternal(CopyPasteEntityInfo toLoad, PasteOptions options)
+	{
+		toLoad = toLoad.Copy();
+		Transform transform = new GameObject("Align").transform;
+		transform.position = options.Origin;
+		transform.rotation = options.PlayerRotation;
+		List<EntityWrapper> list = new List<EntityWrapper>();
+		Dictionary<ulong, ulong> remapping = new Dictionary<ulong, ulong>();
+		Dictionary<uint, uint> dictionary = new Dictionary<uint, uint>();
+		foreach (ProtoBuf.Entity entity in toLoad.entities)
+		{
+			entity.InspectUids(UpdateWithNewUid);
+			EntityWrapper item = new EntityWrapper
+			{
+				Protobuf = entity,
+				HasParent = (entity.parent != null && entity.parent.uid != default(NetworkableId))
+			};
+			list.Add(item);
+			if (entity.decayEntity != null)
+			{
+				if (!dictionary.TryGetValue(entity.decayEntity.buildingID, out var value))
+				{
+					value = BuildingManager.server.NewBuildingID();
+					dictionary.Add(entity.decayEntity.buildingID, value);
+				}
+				entity.decayEntity.buildingID = value;
+			}
+		}
+		foreach (EntityWrapper item2 in list)
+		{
+			item2.Position = item2.Protobuf.baseEntity.pos;
+			item2.Rotation = Quaternion.Euler(item2.Protobuf.baseEntity.rot);
+			if (!item2.HasParent)
+			{
+				item2.Protobuf.baseEntity.pos = transform.TransformPoint(item2.Protobuf.baseEntity.pos);
+				item2.Protobuf.baseEntity.rot = (transform.rotation * Quaternion.Euler(item2.Protobuf.baseEntity.rot)).eulerAngles;
+			}
+			if (CanPrefabBePasted(item2.Protobuf.baseNetworkable.prefabID, options))
+			{
+				item2.Entity = GameManager.server.CreateEntity(StringPool.Get(item2.Protobuf.baseNetworkable.prefabID), item2.Protobuf.baseEntity.pos, Quaternion.Euler(item2.Protobuf.baseEntity.rot));
+				if (item2.Protobuf.basePlayer != null && item2.Protobuf.basePlayer.userid > 10000000)
+				{
+					ulong userid = 10000000uL + (ulong)UnityEngine.Random.Range(1, int.MaxValue);
+					item2.Protobuf.basePlayer.userid = userid;
+				}
+				item2.Entity.InitLoad(item2.Protobuf.baseNetworkable.uid);
+				item2.Entity.PreServerLoad();
+			}
+		}
+		list.RemoveAll((EntityWrapper x) => x.Entity == null);
+		UnityEngine.Object.Destroy(transform.gameObject);
+		for (int i = 0; i < list.Count; i++)
+		{
+			EntityWrapper entityWrapper = list[i];
+			BaseNetworkable.LoadInfo info = default(BaseNetworkable.LoadInfo);
+			info.fromDisk = true;
+			info.fromCopy = true;
+			info.msg = entityWrapper.Protobuf;
+			try
+			{
+				entityWrapper.Entity.Spawn();
+				bool flag = false;
+				if (!flag && entityWrapper.Protobuf.parent != null && entityWrapper.Protobuf.parent.uid != default(NetworkableId))
+				{
+					BaseEntity baseEntity = BaseNetworkable.serverEntities.Find(entityWrapper.Protobuf.parent.uid) as BaseEntity;
+					if (baseEntity == null || baseEntity.net == null)
+					{
+						flag = true;
+					}
+				}
+				if (flag)
+				{
+					entityWrapper.Entity.Kill();
+					list.RemoveAt(i);
+					i--;
+				}
+				else
+				{
+					entityWrapper.Entity.Load(info);
+				}
+			}
+			catch (Exception exception)
+			{
+				Debug.LogException(exception);
+				entityWrapper.Entity.Kill();
+			}
+		}
+		float num = float.MaxValue;
+		float num2 = float.MinValue;
+		foreach (EntityWrapper item3 in list)
+		{
+			Vector3 position = item3.Entity.transform.position;
+			if ((item3.Entity.parentEntity.Get(serverside: true) == null && item3.Entity.ShortPrefabName == "foundation") || item3.Entity.ShortPrefabName == "foundation.triangle")
+			{
+				float num3 = TerrainMeta.HeightMap.GetHeight(position);
+				if (UnityEngine.Physics.Raycast(new Vector3(position.x, num3, position.z) + new Vector3(0f, 100f, 0f), Vector3.down, out var hitInfo, 100f, 8454144))
+				{
+					num3 = hitInfo.point.y;
+				}
+				if (position.y > num3)
+				{
+					num = Mathf.Min(num, position.y - num3);
+				}
+				if (num3 > position.y)
+				{
+					num2 = Mathf.Max(num2, num3 - position.y);
+				}
+			}
+		}
+		if (!options.SnapToTerrain || (num == float.MaxValue && num2 == float.MinValue))
+		{
+			num2 = 0f;
+			num = 0f;
+		}
+		Vector3 vector = new Vector3(0f, (num < num2 || num2 == float.MinValue) ? (num * -1f) : num2, 0f);
+		vector += options.HeightOffset;
+		if (vector != Vector3.zero)
+		{
+			foreach (EntityWrapper item4 in list)
+			{
+				if (item4.Entity.parentEntity.Get(serverside: true) == null)
+				{
+					item4.Entity.transform.position += vector;
+				}
+				if (!(item4.Entity is IOEntity iOEntity))
+				{
+					continue;
+				}
+				if (iOEntity.inputs != null)
+				{
+					IOEntity.IOSlot[] inputs = iOEntity.inputs;
+					for (int j = 0; j < inputs.Length; j++)
+					{
+						inputs[j].originPosition += vector;
+					}
+				}
+				if (iOEntity.outputs != null)
+				{
+					IOEntity.IOSlot[] inputs = iOEntity.outputs;
+					for (int j = 0; j < inputs.Length; j++)
+					{
+						inputs[j].originPosition += vector;
+					}
+				}
+			}
+		}
+		foreach (EntityWrapper item5 in list)
+		{
+			item5.Entity.PostServerLoad();
+			item5.Entity.UpdateNetworkGroup();
+		}
+		foreach (EntityWrapper item6 in list)
+		{
+			item6.Entity.RefreshEntityLinks();
+		}
+		foreach (EntityWrapper item7 in list)
+		{
+			if (item7.Entity is BuildingBlock buildingBlock)
+			{
+				buildingBlock.UpdateSkin(force: true);
+			}
+		}
+		return (from x in list
+			select x.Entity into x
+			where x != null
+			select x).ToList();
+		void UpdateWithNewUid(UidType type, ref ulong prevUid)
+		{
+			if (type == UidType.Clear)
+			{
+				prevUid = 0uL;
+			}
+			else if (prevUid != 0L)
+			{
+				if (!remapping.TryGetValue(prevUid, out var value2))
+				{
+					value2 = Network.Net.sv.TakeUID();
+					remapping.Add(prevUid, value2);
+				}
+				prevUid = value2;
+			}
+		}
+	}
+
+	private static void SaveEntity(BaseEntity baseEntity, CopyPasteEntityInfo toSave, BaseEntity parent, Transform alignObject)
+	{
+		BaseNetworkable.SaveInfo info = default(BaseNetworkable.SaveInfo);
+		info.forDisk = true;
+		info.msg = Facepunch.Pool.Get<ProtoBuf.Entity>();
+		baseEntity.Save(info);
+		if (parent == null)
+		{
+			info.msg.baseEntity.pos = alignObject.InverseTransformPoint(info.msg.baseEntity.pos);
+			_ = alignObject.rotation * baseEntity.transform.rotation;
+			info.msg.baseEntity.rot = (Quaternion.Inverse(alignObject.transform.rotation) * baseEntity.transform.rotation).eulerAngles;
+		}
+		toSave.entities.Add(info.msg);
+	}
+
+	private static void GetEntitiesLookingAt(Vector3 originPoint, Vector3 direction, List<BaseEntity> entityList)
+	{
+		entityList.Clear();
+		BuildingBlock buildingBlock = GamePhysics.RaycastEntity(GamePhysics.Realm.Server, new Ray(originPoint, direction), 100f, 2097408) as BuildingBlock;
+		if (!(buildingBlock == null))
+		{
+			ListHashSet<DecayEntity> listHashSet = buildingBlock.GetBuilding()?.decayEntities;
+			if (listHashSet != null)
+			{
+				entityList.AddRange(listHashSet);
+			}
+		}
+	}
+
+	private static void GetEntitiesInRadius(Vector3 originPoint, float radius, List<BaseEntity> entityList)
+	{
+		if (radius <= 0f)
+		{
+			return;
+		}
+		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
+		Vis.Entities(originPoint, radius, obj);
+		foreach (BaseEntity item in obj)
+		{
+			if (!item.isClient)
+			{
+				entityList.Add(item);
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	private static void GetEntitiesInBounds(Bounds bounds, List<BaseEntity> entityList)
+	{
+		OBB bounds2 = new OBB(bounds);
+		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
+		Vis.Entities(bounds2, obj);
+		foreach (BaseEntity item in obj)
+		{
+			if (!item.isClient)
+			{
+				entityList.Add(item);
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	private static bool CanPrefabBePasted(uint prefabId, PasteOptions options)
+	{
+		GameObject gameObject = GameManager.server.FindPrefab(prefabId);
+		if (gameObject == null)
+		{
+			return false;
+		}
+		BaseEntity component = gameObject.GetComponent<BaseEntity>();
+		if (component == null)
+		{
+			return false;
+		}
+		if (options.FoundationsOnly && component.ShortPrefabName != "foundation" && component.ShortPrefabName != "foundation.triangle")
+		{
+			return false;
+		}
+		if (options.BuildingBlocksOnly && !(component is BuildingBlock))
+		{
+			return false;
+		}
+		if (component is DecayEntity && !(component is BuildingBlock) && !options.Deployables)
+		{
+			return false;
+		}
+		if (component is BasePlayer { IsNpc: false } && !options.Players)
+		{
+			return false;
+		}
+		if (component is PointEntity || component is RelationshipManager)
+		{
+			return false;
+		}
+		if ((component is ResourceEntity || component is BushEntity) && !options.Resources)
+		{
+			return false;
+		}
+		if ((component is BaseNpc || component is BaseRidableAnimal) && !options.NPCs)
+		{
+			return false;
+		}
+		if (component is BaseVehicle && !(component is BaseRidableAnimal) && !options.Vehicles)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private static void OrderEntitiesForSave(List<BaseEntity> entities)
+	{
+		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
+		obj.AddRange(entities);
+		entities.Clear();
+		HashSet<BaseEntity> hash = new HashSet<BaseEntity>();
+		foreach (BaseEntity item in obj.OrderBy((BaseEntity x) => x.net.ID.Value))
+		{
+			AddRecursive(item);
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+		void AddRecursive(BaseEntity current)
+		{
+			if (hash.Add(current))
+			{
+				entities.Add(current);
+				if (current.children != null)
+				{
+					foreach (BaseEntity child in current.children)
+					{
+						AddRecursive(child);
+					}
+				}
+			}
+		}
+	}
+
+	[ServerVar(Name = "copybox_sv")]
+	public static void copybox_sv(Arg args)
+	{
+		if (!args.HasArgs(3))
+		{
+			args.ReplyWith("Missing args: copybox_sv <name> <center> <size> <rotation>");
+			return;
+		}
+		string @string = args.GetString(0);
+		Vector3 vector = args.GetVector3(1);
+		Vector3 vector2 = args.GetVector3(2);
+		Quaternion originRot = Quaternion.Euler(args.GetVector3(3));
+		Bounds bounds = new Bounds(vector, vector2);
+		List<BaseEntity> obj = Facepunch.Pool.GetList<BaseEntity>();
+		GetEntitiesInBounds(bounds, obj);
+		CopyEntities(ArgEx.Player(args), obj, @string, vector, originRot);
+		Facepunch.Pool.FreeList(ref obj);
+	}
+
+	public static void PasteEntities(CopyPasteEntityInfo data, PasteOptions options, ulong steamId)
+	{
+		List<BaseEntity> entities;
+		try
+		{
+			Rust.Application.isLoadingSave = true;
+			Rust.Application.isLoading = true;
+			entities = PasteEntitiesInternal(data, options);
+		}
+		catch (Exception exception)
+		{
+			Debug.LogException(exception);
+			return;
+		}
+		finally
+		{
+			Rust.Application.isLoadingSave = false;
+			Rust.Application.isLoading = false;
+		}
+		playerHistory.AddToHistory(steamId, entities);
+	}
+
+	[ServerVar]
+	public static void undopaste_sv(Arg args)
+	{
+		ulong steamId = ArgEx.Player(args)?.userID ?? ((EncryptedValue<ulong>)0uL);
+		PasteResult pasteResult = playerHistory.Undo(steamId);
+		if (pasteResult == null)
+		{
+			args.ReplyWith("History empty");
+			return;
+		}
+		foreach (BaseEntity entity in pasteResult.Entities)
+		{
+			entity.Kill();
+		}
+	}
+
+	[ServerVar]
+	public static void copyradius_sv(Arg args)
+	{
+		string @string = args.GetString(0);
+		Vector3 vector = args.GetVector3(1);
+		float @float = args.GetFloat(2);
+		Quaternion originRot = Quaternion.Euler(args.GetVector3(3));
+		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
+		if (@float <= 0f)
+		{
+			args.ReplyWith("Invalid radius: must be greater than zero");
+			return;
+		}
+		GetEntitiesInRadius(vector, @float, obj);
+		CopyEntities(ArgEx.Player(args), obj, @string, vector, originRot);
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	[ServerVar]
+	public static void copybuilding_sv(Arg args)
+	{
+		string @string = args.GetString(0);
+		Vector3 vector = args.GetVector3(1);
+		Vector3 vector2 = args.GetVector3(2);
+		Quaternion originRot = Quaternion.Euler(args.GetVector3(3));
+		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
+		GetEntitiesLookingAt(vector, vector2, obj);
+		CopyEntities(ArgEx.Player(args), obj, @string, vector, originRot);
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	[ServerVar]
+	public static void printselection_sv(Arg args)
+	{
+		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
+		Vector3 vector = args.GetVector3(0);
+		Vector3 vector2 = args.GetVector3(1);
+		args.GetVector3(2);
+		GetEntitiesInBounds(new Bounds(vector, vector2), obj);
+		StringBuilder stringBuilder = new StringBuilder();
+		if (obj.Count == 0)
+		{
+			stringBuilder.AppendLine("Empty");
+		}
+		else
+		{
+			foreach (BaseEntity item in obj)
+			{
+				if (!item.isClient)
+				{
+					stringBuilder.AppendLine(item.name);
+				}
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+		args.ReplyWith(stringBuilder.ToString());
+	}
+
+	private static string GetLegacyServerDirectory()
+	{
+		return ConVar.Server.GetServerFolder("copypaste");
+	}
+
+	private static string GetLegacyServerPath(string name)
+	{
+		return GetLegacyServerDirectory() + "/" + name + ".data";
+	}
+
+	[ServerVar]
+	public static void download_paste(Arg arg)
+	{
+		if (!arg.HasArgs())
+		{
+			arg.ReplyWith("Missing args: download_paste <name>");
+			return;
+		}
+		string @string = arg.GetString(0);
+		string legacyServerPath = GetLegacyServerPath(arg.GetString(0));
+		if (!File.Exists(legacyServerPath))
+		{
+			arg.ReplyWith("Paste '" + @string + "' not found");
+			return;
+		}
+		using CopyPasteEntityInfo arg2 = CopyPasteEntityInfo.Deserialize(File.ReadAllBytes(legacyServerPath));
+		CopyPasteEntity.ServerInstance.ClientRPC(RpcTarget.Player("RecievePaste", arg.Connection), @string, arg2);
+	}
+
+	[ServerVar]
+	public static void list_pastes_sv(Arg arg)
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+		PrintPasteNames(stringBuilder, GetLegacyServerDirectory());
+		arg.ReplyWith(stringBuilder.ToString());
+	}
+
+	[ServerVar]
+	public static void killbox_sv(Arg args)
+	{
+		Vector3 vector = args.GetVector3(0);
+		Vector3 vector2 = args.GetVector3(1);
+		PasteOptions options = new PasteOptions(args);
+		Bounds bounds = new Bounds(vector, vector2);
+		List<BaseEntity> obj = Facepunch.Pool.Get<List<BaseEntity>>();
+		GetEntitiesInBounds(bounds, obj);
+		foreach (BaseEntity item in obj)
+		{
+			if (!item.isClient && !CanPrefabBePasted(item.prefabID, options))
+			{
+				item.Kill();
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	private static Quaternion GetPlayerRotation(BasePlayer ply)
+	{
+		Vector3 forward = ply.eyes.BodyForward();
+		forward.y = 0f;
+		return Quaternion.LookRotation(forward, Vector3.up);
+	}
+}

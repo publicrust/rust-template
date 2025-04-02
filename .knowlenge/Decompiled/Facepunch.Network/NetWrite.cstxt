@@ -1,0 +1,459 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Threading;
+using Facepunch;
+using Facepunch.Extend;
+using Network;
+using SilentOrbit.ProtocolBuffers;
+using UnityEngine;
+
+public class NetWrite : Stream, Pool.IPooled, IStreamWriter
+{
+	private static MemoryStream stringBuffer = new MemoryStream();
+
+	private BaseNetwork peer;
+
+	public byte[] Data;
+
+	private int _position;
+
+	private int _length;
+
+	public int refCount = 1;
+
+	public SendMethod method;
+
+	public sbyte channel;
+
+	public Priority priority;
+
+	public List<Connection> connections = new List<Connection>();
+
+	public override bool CanSeek => true;
+
+	public override bool CanRead => true;
+
+	public override bool CanWrite => true;
+
+	public override long Length => _length;
+
+	public override long Position
+	{
+		get
+		{
+			return _position;
+		}
+		set
+		{
+			Seek(value, SeekOrigin.Begin);
+		}
+	}
+
+	public void AddReference()
+	{
+		Interlocked.Increment(ref refCount);
+	}
+
+	public void RemoveReference()
+	{
+		if (Interlocked.Decrement(ref refCount) == 0)
+		{
+			NetWrite obj = this;
+			Pool.Free(ref obj);
+		}
+	}
+
+	public void EnterPool()
+	{
+		peer = null;
+		connections.Clear();
+		if (Data != null)
+		{
+			BaseNetwork.ArrayPool.Return(Data);
+			Data = null;
+		}
+	}
+
+	public void LeavePool()
+	{
+		refCount = 1;
+	}
+
+	public bool Start(BaseNetwork peer)
+	{
+		this.peer = peer;
+		connections.Clear();
+		_position = 0;
+		_length = 0;
+		return true;
+	}
+
+	public void Send(SendInfo info)
+	{
+		method = info.method;
+		channel = info.channel;
+		priority = info.priority;
+		if (info.connections != null)
+		{
+			connections.AddRange(info.connections);
+			if (PacketProfiler.enabled)
+			{
+				PacketProfiler.LogOutbound(Data[0] - 140, info.connections.Count, _length);
+			}
+		}
+		if (info.connection != null)
+		{
+			connections.Add(info.connection);
+			if (PacketProfiler.enabled)
+			{
+				PacketProfiler.LogOutbound(Data[0] - 140, 1, _length);
+			}
+		}
+		if (BaseNetwork.Multithreading)
+		{
+			peer.EnqueueWrite(this);
+		}
+		else
+		{
+			peer.ProcessWrite(this);
+		}
+	}
+
+	public void SendImmediate(SendInfo info)
+	{
+		method = info.method;
+		channel = info.channel;
+		priority = info.priority;
+		if (info.connections != null)
+		{
+			connections.AddRange(info.connections);
+		}
+		if (info.connection != null)
+		{
+			connections.Add(info.connection);
+		}
+		if (DemoConVars.ServerDemosEnabled && peer.SupportsServerDemos)
+		{
+			peer.EnqueueToDemoThread(new DemoQueueItem(this));
+		}
+		peer.ProcessWrite(this);
+	}
+
+	public byte PeekPacketID()
+	{
+		if (_length <= 0)
+		{
+			return 0;
+		}
+		return Data[0];
+	}
+
+	public void PacketID(Message.Type val)
+	{
+		byte b = (byte)val;
+		b += 140;
+		UInt8(b);
+	}
+
+	public void UInt8(byte val)
+	{
+		Write(in val);
+	}
+
+	public void UInt16(ushort val)
+	{
+		Write(in val);
+	}
+
+	public void UInt32(uint val)
+	{
+		Write(in val);
+	}
+
+	public void UInt64(ulong val)
+	{
+		Write(in val);
+	}
+
+	public void Int8(sbyte val)
+	{
+		Write(in val);
+	}
+
+	public void Int16(short val)
+	{
+		Write(in val);
+	}
+
+	public void Int32(int val)
+	{
+		Write(in val);
+	}
+
+	public void Int64(long val)
+	{
+		Write(in val);
+	}
+
+	public void Bool(bool val)
+	{
+		Write<byte>((byte)(val ? 1 : 0));
+	}
+
+	public void Float(float val)
+	{
+		Write(in val);
+	}
+
+	public void Double(double val)
+	{
+		Write(in val);
+	}
+
+	public void Bytes(byte[] val)
+	{
+		Write(val, 0, val.Length);
+	}
+
+	public void VarUInt32(uint val)
+	{
+		EnsureCapacity(9);
+		_position += ProtocolParser.WriteUInt32(val, Data, (int)Position);
+		if (_position > _length)
+		{
+			_length = _position;
+		}
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	public void WriteUInt32(uint value, bool variableLength)
+	{
+		if (variableLength)
+		{
+			VarUInt32(value);
+		}
+		else
+		{
+			UInt32(value);
+		}
+	}
+
+	public void String(string val, bool variableLength = false)
+	{
+		if (string.IsNullOrEmpty(val))
+		{
+			BytesWithSize((MemoryStream)null, variableLength);
+			return;
+		}
+		if (stringBuffer.Capacity < val.Length * 8)
+		{
+			stringBuffer.Capacity = val.Length * 8;
+		}
+		stringBuffer.Position = 0L;
+		stringBuffer.SetLength(stringBuffer.Capacity);
+		int bytes = Encoding.UTF8.GetBytes(val, 0, val.Length, stringBuffer.GetBuffer(), 0);
+		stringBuffer.SetLength(bytes);
+		BytesWithSize(stringBuffer, variableLength);
+	}
+
+	public void Vector3(in Vector3 obj)
+	{
+		Float(obj.x);
+		Float(obj.y);
+		Float(obj.z);
+	}
+
+	public void Vector4(in Vector4 obj)
+	{
+		Float(obj.x);
+		Float(obj.y);
+		Float(obj.z);
+		Float(obj.w);
+	}
+
+	public void Quaternion(in Quaternion obj)
+	{
+		Float(obj.x);
+		Float(obj.y);
+		Float(obj.z);
+		Float(obj.w);
+	}
+
+	public void Ray(in Ray obj)
+	{
+		Vector3(obj.origin);
+		Vector3(obj.direction);
+	}
+
+	public void Color(in Color obj)
+	{
+		Float(obj.r);
+		Float(obj.g);
+		Float(obj.b);
+		Float(obj.a);
+	}
+
+	public void Color32(in Color32 obj)
+	{
+		UInt8(obj.r);
+		UInt8(obj.g);
+		UInt8(obj.b);
+		UInt8(obj.a);
+	}
+
+	public void EntityID(NetworkableId id)
+	{
+		UInt64(id.Value);
+	}
+
+	public void ItemContainerID(ItemContainerId id)
+	{
+		UInt64(id.Value);
+	}
+
+	public void ItemID(ItemId id)
+	{
+		UInt64(id.Value);
+	}
+
+	public void GroupID(uint id)
+	{
+		UInt32(id);
+	}
+
+	public void BytesWithSize(MemoryStream val, bool variableLength = false)
+	{
+		if (val == null || val.Length == 0L)
+		{
+			WriteUInt32(0u, variableLength);
+		}
+		else
+		{
+			BytesWithSize(val.GetBuffer(), (int)val.Length, variableLength);
+		}
+	}
+
+	public void BytesWithSize(byte[] b, bool variableLength = false)
+	{
+		BytesWithSize(b, b.Length, variableLength);
+	}
+
+	public void BytesWithSize(byte[] b, int length, bool variableLength = false)
+	{
+		if (b == null || b.Length == 0 || length == 0)
+		{
+			WriteUInt32(0u, variableLength);
+		}
+		else if ((uint)length > 10485760u)
+		{
+			WriteUInt32(0u, variableLength);
+			Debug.LogError("BytesWithSize: Too big " + length);
+		}
+		else
+		{
+			WriteUInt32((uint)length, variableLength);
+			Write(b, 0, length);
+		}
+	}
+
+	private unsafe void Write<T>(in T val) where T : unmanaged
+	{
+		int num = sizeof(T);
+		EnsureCapacity(num);
+		Data.WriteUnsafe(in val, _position);
+		_position += num;
+		if (_position > _length)
+		{
+			_length = _position;
+		}
+	}
+
+	private void EnsureCapacity(int spaceRequired)
+	{
+		if (Data == null)
+		{
+			int num = ((spaceRequired <= 2048) ? 2048 : spaceRequired);
+			int num2 = Mathf.NextPowerOfTwo(num);
+			if (num2 > 4194304)
+			{
+				throw new Exception($"Preventing NetWrite buffer from growing too large (requiredLength={num})");
+			}
+			Data = BaseNetwork.ArrayPool.Rent(num2);
+		}
+		else if (Data.Length - _position < spaceRequired)
+		{
+			int num3 = _position + spaceRequired;
+			int num4 = Mathf.NextPowerOfTwo(Math.Max(num3, Data.Length));
+			if (num4 > 4194304)
+			{
+				throw new Exception($"Preventing NetWrite buffer from growing too large (requiredLength={num3})");
+			}
+			byte[] array = BaseNetwork.ArrayPool.Rent(num4);
+			Buffer.BlockCopy(Data, 0, array, 0, _length);
+			BaseNetwork.ArrayPool.Return(Data);
+			Data = array;
+		}
+	}
+
+	public override void Flush()
+	{
+	}
+
+	public override int Read(byte[] buffer, int offset, int count)
+	{
+		int max = _length - _position;
+		int num = Mathf.Clamp(count, 0, max);
+		Buffer.BlockCopy(Data, _position, buffer, offset, count);
+		_position += num;
+		return num;
+	}
+
+	public override int ReadByte()
+	{
+		if (_position >= _length)
+		{
+			return -1;
+		}
+		return Data[_position++];
+	}
+
+	public override void Write(byte[] buffer, int offset, int count)
+	{
+		EnsureCapacity(count);
+		Buffer.BlockCopy(buffer, offset, Data, _position, count);
+		_position += count;
+		if (_position > _length)
+		{
+			_length = _position;
+		}
+	}
+
+	public override void WriteByte(byte value)
+	{
+		UInt8(value);
+	}
+
+	public override long Seek(long offset, SeekOrigin origin)
+	{
+		int num = origin switch
+		{
+			SeekOrigin.Current => _position + (int)offset, 
+			SeekOrigin.End => _length + (int)offset, 
+			_ => (int)offset, 
+		};
+		if (num < 0 || num > _length)
+		{
+			throw new ArgumentOutOfRangeException("offset");
+		}
+		_position = num;
+		return _position;
+	}
+
+	public override void SetLength(long value)
+	{
+		throw new NotImplementedException();
+	}
+}

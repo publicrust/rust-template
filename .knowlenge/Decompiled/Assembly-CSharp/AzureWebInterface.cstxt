@@ -1,0 +1,209 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Threading.Tasks;
+using Cysharp.Text;
+using Network;
+using Rust;
+using Steamworks;
+using UnityEngine;
+
+public class AzureWebInterface
+{
+	public static readonly AzureWebInterface client = new AzureWebInterface(isClient: true);
+
+	public static readonly AzureWebInterface server = new AzureWebInterface(isClient: false);
+
+	private AzureAnalyticsUploader GameplayBulkUploader;
+
+	public bool IsClient;
+
+	public int MaxRetries = 1;
+
+	public int FlushSize = 1000;
+
+	public TimeSpan FlushDelay = TimeSpan.FromSeconds(30.0);
+
+	private DateTime nextFlush;
+
+	private ConcurrentQueue<EventRecord> uploadQueue = new ConcurrentQueue<EventRecord>();
+
+	private HttpClient HttpClient = new HttpClient();
+
+	private static readonly MediaTypeHeaderValue JsonContentType = new MediaTypeHeaderValue("application/json")
+	{
+		CharSet = Encoding.UTF8.WebName
+	};
+
+	public int PendingCount => uploadQueue.Count;
+
+	public AzureWebInterface(bool isClient)
+	{
+		IsClient = isClient;
+		Task.Run((Func<Task>)UploadSchedulingThread);
+	}
+
+	public void EnqueueEvent(EventRecord point)
+	{
+		if (!IsClient && !string.IsNullOrEmpty(GetContainerUrl()))
+		{
+			if (GameplayBulkUploader.NeedsCreation())
+			{
+				GameplayBulkUploader = AzureAnalyticsUploader.Create("gameplay_events", TimeSpan.FromMinutes(5.0));
+				GameplayBulkUploader.UseJsonDataObject = true;
+			}
+			GameplayBulkUploader.Append(point);
+		}
+		else
+		{
+			point.MarkSubmitted();
+			uploadQueue.Enqueue(point);
+		}
+	}
+
+	private async Task UploadSchedulingThread()
+	{
+		while (!global::Rust.Application.isQuitting)
+		{
+			try
+			{
+				DateTime utcNow = DateTime.UtcNow;
+				if (uploadQueue.IsEmpty || (uploadQueue.Count < FlushSize && nextFlush > utcNow))
+				{
+					await Task.Delay(1000);
+					continue;
+				}
+				nextFlush = utcNow.Add(FlushDelay);
+				List<EventRecord> list = Pool.Get<List<EventRecord>>();
+				EventRecord result;
+				while (uploadQueue.TryDequeue(out result))
+				{
+					list.Add(result);
+				}
+				Task.Run(async delegate
+				{
+					await UploadAsync(list);
+				});
+			}
+			catch (Exception exception)
+			{
+				Debug.LogException(exception);
+				await Task.Delay(1000);
+			}
+		}
+	}
+
+	private void SerializeEvents(List<EventRecord> records, MemoryStream stream)
+	{
+		int num = 0;
+		Utf8ValueStringBuilder writer = ZString.CreateUtf8StringBuilder();
+		try
+		{
+			writer.Append("[");
+			foreach (EventRecord record in records)
+			{
+				if (num > 0)
+				{
+					writer.Append(',');
+				}
+				record.SerializeAsJson(ref writer);
+				num++;
+			}
+			writer.Append("]");
+			writer.WriteTo(stream);
+		}
+		finally
+		{
+			writer.Dispose();
+		}
+	}
+
+	private async Task UploadAsync(List<EventRecord> records)
+	{
+		if (!(IsClient ? (Application.Manifest?.Features?.ClientAnalytics == true) : (Application.Manifest?.Features?.ServerAnalytics == true)))
+		{
+			Pool.Free(ref records, freeElements: true);
+			return;
+		}
+		if (records.Count == 0)
+		{
+			Pool.Free(ref records, freeElements: false);
+			return;
+		}
+		MemoryStream stream = Pool.Get<MemoryStream>();
+		stream.Position = 0L;
+		stream.SetLength(0L);
+		try
+		{
+			SerializeEvents(records, stream);
+			AuthTicket ticket = null;
+			for (int attempt = 0; attempt < MaxRetries; attempt++)
+			{
+				try
+				{
+					using ByteArrayContent content = new ByteArrayContent(stream.GetBuffer(), 0, (int)stream.Length);
+					content.Headers.ContentType = JsonContentType;
+					if (!string.IsNullOrEmpty(AnalyticsSecret))
+					{
+						content.Headers.Add(AnalyticsHeader, AnalyticsSecret);
+					}
+					else
+					{
+						content.Headers.Add(AnalyticsHeader, AnalyticsPublicKey);
+					}
+					if (!IsClient)
+					{
+						content.Headers.Add("X-SERVER-IP", Net.sv.ip);
+						content.Headers.Add("X-SERVER-PORT", Net.sv.port.ToString());
+					}
+					(await HttpClient.PostAsync(IsClient ? ClientAnalyticsUrl : ServerAnalyticsUrl, content)).EnsureSuccessStatusCode();
+				}
+				catch (Exception ex)
+				{
+					if (ex is HttpRequestException ex2)
+					{
+						Debug.Log("HTTP Error when uploading analytics: " + ex2.Message);
+					}
+					else
+					{
+						Debug.LogException(ex);
+					}
+					goto IL_02ae;
+				}
+				break;
+				IL_02ae:
+				if (ticket != null)
+				{
+					try
+					{
+						ticket.Cancel();
+					}
+					catch (Exception ex3)
+					{
+						Debug.LogError("Failed to cancel auth ticket in analytics: " + ex3.ToString());
+					}
+				}
+			}
+		}
+		catch (Exception ex4)
+		{
+			if (IsClient)
+			{
+				Debug.LogWarning(ex4.ToString());
+			}
+			else
+			{
+				Debug.LogException(ex4);
+			}
+		}
+		finally
+		{
+			Pool.Free(ref records, freeElements: true);
+			Pool.FreeUnmanaged(ref stream);
+		}
+	}
+}

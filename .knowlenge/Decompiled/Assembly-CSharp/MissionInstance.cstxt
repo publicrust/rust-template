@@ -1,0 +1,249 @@
+using System;
+using System.Collections.Generic;
+using Facepunch;
+using Facepunch.Extend;
+using UnityEngine;
+
+public class MissionInstance : Pool.IPooled
+{
+	[Serializable]
+	public class ObjectiveStatus
+	{
+		public bool started;
+
+		public bool completed;
+
+		public bool failed;
+
+		public float progressTarget;
+
+		public float progressCurrent;
+
+		public RealTimeSince sinceLastThink;
+	}
+
+	public enum ObjectiveType
+	{
+		MOVE,
+		KILL
+	}
+
+	private BaseEntity _cachedProviderEntity;
+
+	private BaseMission _cachedMission;
+
+	public NetworkableId providerID;
+
+	public uint missionID;
+
+	public MissionStatus status;
+
+	public float startTime;
+
+	public float endTime;
+
+	public Vector3 missionLocation;
+
+	public float timePassed;
+
+	public Dictionary<string, Vector3> missionPoints = new Dictionary<string, Vector3>();
+
+	public Dictionary<string, MissionEntity> missionEntities = new Dictionary<string, MissionEntity>();
+
+	private int playerInputCounter;
+
+	public ObjectiveStatus[] objectiveStatuses;
+
+	public BaseEntity ProviderEntity()
+	{
+		if (_cachedProviderEntity == null)
+		{
+			_cachedProviderEntity = BaseNetworkable.serverEntities.Find(providerID) as BaseEntity;
+		}
+		return _cachedProviderEntity;
+	}
+
+	public BaseMission GetMission()
+	{
+		if (_cachedMission == null)
+		{
+			_cachedMission = MissionManifest.GetFromID(missionID);
+		}
+		return _cachedMission;
+	}
+
+	public bool ShouldShowOnMap()
+	{
+		if (status == MissionStatus.Active || status == MissionStatus.Accomplished)
+		{
+			return missionLocation != Vector3.zero;
+		}
+		return false;
+	}
+
+	public bool ShouldShowOnCompass()
+	{
+		return ShouldShowOnMap();
+	}
+
+	public bool NeedsPlayerInput()
+	{
+		return playerInputCounter > 0;
+	}
+
+	public void EnablePlayerInput()
+	{
+		playerInputCounter++;
+	}
+
+	public void DisablePlayerInput()
+	{
+		playerInputCounter--;
+		if (playerInputCounter < 0)
+		{
+			playerInputCounter = 0;
+		}
+	}
+
+	public virtual void ProcessMissionEvent(BasePlayer playerFor, MissionEventType type, MissionEventPayload payload, float amount)
+	{
+		if (status == MissionStatus.Active)
+		{
+			BaseMission mission = GetMission();
+			for (int i = 0; i < mission.objectives.Length; i++)
+			{
+				mission.objectives[i].objective.ProcessMissionEvent(playerFor, this, i, type, payload, amount);
+			}
+		}
+	}
+
+	public void Think(BasePlayer assignee, float delta)
+	{
+		if (status != MissionStatus.Failed && status != MissionStatus.Completed)
+		{
+			BaseMission mission = GetMission();
+			timePassed += delta;
+			mission.Think(this, assignee, delta);
+			if (mission.timeLimitSeconds > 0f && timePassed >= mission.timeLimitSeconds)
+			{
+				mission.MissionFailed(this, assignee, MissionFailReason.TimeOut);
+			}
+		}
+	}
+
+	public Vector3 GetMissionPoint(string identifier, BasePlayer playerFor, int depth = 0)
+	{
+		if (identifier == null)
+		{
+			identifier = "";
+		}
+		if (missionPoints.TryGetValue(identifier, out var value))
+		{
+			return value;
+		}
+		BaseMission mission = GetMission();
+		if (playerFor == null)
+		{
+			Debug.LogError("Massive mission failure to get point, correct mission definition of: " + mission.shortname + " (player is null)");
+			return Vector3.zero;
+		}
+		PositionGenerator positionGenerator = ((IReadOnlyCollection<PositionGenerator>)(object)mission.positionGenerators).FindWith((PositionGenerator p) => p.identifier, identifier);
+		if (positionGenerator == null)
+		{
+			Debug.LogError("Massive mission failure to get point, correct mission definition of: " + mission.shortname + " (cannot find position '" + identifier + "')");
+			return Vector3.zero;
+		}
+		Vector3 position = positionGenerator.GetPosition(this, playerFor, depth);
+		missionPoints.Add(identifier, position);
+		AddBlocker(position);
+		return position;
+	}
+
+	public MissionEntity GetMissionEntity(string identifier, BasePlayer playerFor)
+	{
+		if (identifier == null)
+		{
+			identifier = "";
+		}
+		if (missionEntities.TryGetValue(identifier, out var value))
+		{
+			return value;
+		}
+		MissionEntityEntry missionEntityEntry = ((IReadOnlyCollection<MissionEntityEntry>)(object)GetMission().missionEntities).FindWith((MissionEntityEntry e) => e.identifier, identifier);
+		if (missionEntityEntry == null)
+		{
+			Debug.LogError($"Cannot spawn mission entity, identifier '{identifier}' not found in mission ID {missionID}");
+			value = null;
+		}
+		else if (!missionEntityEntry.entityRef.isValid)
+		{
+			Debug.LogError($"Cannot spawn mission entity, identifier '{identifier}' has no entity set in mission ID {missionID}");
+			value = null;
+		}
+		else
+		{
+			Vector3 missionPoint = GetMissionPoint(missionEntityEntry.spawnPositionToUse, playerFor);
+			BaseEntity baseEntity = GameManager.server.CreateEntity(missionEntityEntry.entityRef.resourcePath, missionPoint, Quaternion.identity);
+			MissionEntity component;
+			MissionEntity obj = (baseEntity.gameObject.TryGetComponent<MissionEntity>(out component) ? component : baseEntity.gameObject.AddComponent<MissionEntity>());
+			obj.Setup(playerFor, this, identifier, missionEntityEntry.cleanupOnMissionSuccess, missionEntityEntry.cleanupOnMissionFailed);
+			baseEntity.Spawn();
+			value = obj;
+		}
+		missionEntities.Add(identifier, value);
+		if (value != null)
+		{
+			value.MissionStarted(playerFor, this);
+		}
+		return value;
+	}
+
+	public void PostServerLoad(BasePlayer player)
+	{
+		BaseMission mission = GetMission();
+		for (int i = 0; i < mission.objectives.Length; i++)
+		{
+			if (i >= 0 && i < objectiveStatuses.Length)
+			{
+				mission.objectives[i].objective.PostServerLoad(player, objectiveStatuses[i]);
+			}
+		}
+	}
+
+	public int GetTotalRequiredRewardItemSlots()
+	{
+		BaseMission mission = GetMission();
+		int num = 0;
+		for (int i = 0; i < mission.objectives.Length; i++)
+		{
+			if (!mission.objectives[i].isRequired && objectiveStatuses[i].completed)
+			{
+				num += mission.objectives[i].bonusRewards.Length;
+			}
+		}
+		return mission.GetMissionRewards().Length + num;
+	}
+
+	public void Reset()
+	{
+		providerID = default(NetworkableId);
+		missionID = 0u;
+		status = MissionStatus.Default;
+		startTime = -1f;
+		endTime = -1f;
+		missionLocation = Vector3.zero;
+		_cachedMission = null;
+		timePassed = 0f;
+		missionPoints.Clear();
+		missionEntities.Clear();
+	}
+
+	public void EnterPool()
+	{
+		Reset();
+	}
+
+	public void LeavePool()
+	{
+	}
+}

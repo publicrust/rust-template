@@ -1,0 +1,425 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using Azure.Storage;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Network;
+using Newtonsoft.Json;
+using SilentOrbit.ProtocolBuffers;
+using UnityEngine;
+
+public class FullServerDemos
+{
+	public class DebugEntry
+	{
+		public long i { get; set; }
+
+		public long s { get; set; }
+
+		public long e { get; set; }
+
+		public ulong ts { get; set; }
+
+		public long conLen { get; set; }
+
+		public ushort cons { get; set; }
+	}
+
+	private DemoUploadManager upload;
+
+	private DemoDiskManager disk = new DemoDiskManager();
+
+	private IServerCallback serverCallback;
+
+	private AutoResetEvent threadResetEvent;
+
+	private string sessionId;
+
+	private DateTime sessionStartTime = DateTime.MaxValue;
+
+	private int chunkIndex;
+
+	private DateTime nextFlushTime;
+
+	private DateTime timeStart;
+
+	private FileStream fileStream;
+
+	private GZipStream zipStream;
+
+	private BinaryWriter writer;
+
+	private long packetCount;
+
+	private int playerIndex;
+
+	private Dictionary<Connection, int> playerIndexes = new Dictionary<Connection, int>();
+
+	private string localChunkFileId;
+
+	private long uncompressedBytes;
+
+	private bool isZipped;
+
+	private MemoryStream saveStream;
+
+	private bool saveDone;
+
+	private volatile int writeChunkInd;
+
+	private volatile int readChunkInd;
+
+	private byte[] scratchBuffer = new byte[64];
+
+	private bool initSaveReady;
+
+	private bool serializeDebugJson;
+
+	private FileStream debugJson;
+
+	private JsonSerializer debugSerializer;
+
+	private StreamWriter debugWriter;
+
+	private JsonTextWriter jsonDebugWriter;
+
+	private DebugEntry debugEntry;
+
+	public int DemoCount { get; private set; }
+
+	public async Task BenchmarkDemoUpload(int concurrencyCount, string pathOverride, int transferSizeOverride)
+	{
+		ServicePointManager.FindServicePoint(new Uri(DemoConVars.UploadEndpoint)).ConnectionLimit = 4;
+		Task task = CreateDemoUploadTask(concurrencyCount, pathOverride, transferSizeOverride);
+		Task task2 = CreateDemoUploadTask(concurrencyCount, pathOverride, transferSizeOverride);
+		await Task.WhenAll(task, task2);
+	}
+
+	private async Task CreateDemoUploadTask(int concurrencyCount, string pathOverride, int transferSizeOverride)
+	{
+		try
+		{
+			string path = "Bundles/shared/monuments.bundle";
+			if (!string.IsNullOrEmpty(pathOverride))
+			{
+				path = pathOverride;
+			}
+			BlobClient blobClient = new BlobContainerClient(new Uri(DemoConVars.UploadEndpoint)).GetBlobClient($"benchmark/upload/{Guid.NewGuid()}");
+			Stopwatch stopwatch = Stopwatch.StartNew();
+			UnityEngine.Debug.Log("Beginning to upload file...");
+			DateTime nextLogTime = default(DateTime);
+			int num = 8388608;
+			CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
+			cancellationTokenSource.CancelAfter(TimeSpan.FromSeconds(20.0));
+			if (transferSizeOverride > 0)
+			{
+				num = transferSizeOverride;
+			}
+			await blobClient.UploadAsync(path, new BlobUploadOptions
+			{
+				ProgressHandler = new Progress<long>(delegate(long bytesTransferred)
+				{
+					if (DateTime.UtcNow > nextLogTime)
+					{
+						nextLogTime = DateTime.UtcNow.AddSeconds(1.0);
+						int num2 = (int)(bytesTransferred / 1024 / 1024);
+						UnityEngine.Debug.Log($"Transferred {num2}MB");
+					}
+				}),
+				TransferOptions = new StorageTransferOptions
+				{
+					MaximumConcurrency = concurrencyCount,
+					InitialTransferSize = num,
+					MaximumTransferSize = num
+				}
+			}, cancellationTokenSource.Token);
+			UnityEngine.Debug.Log($"Took {Math.Round(stopwatch.Elapsed.TotalSeconds, 1)}s to upload 1GB texture bundle");
+		}
+		catch (Exception exception)
+		{
+			UnityEngine.Debug.LogException(exception);
+		}
+	}
+
+	internal FullServerDemos(Func<bool> isConnected, IServerCallback serverCallback, AutoResetEvent resetEvent)
+	{
+		upload = new DemoUploadManager(isConnected);
+		this.serverCallback = serverCallback;
+		threadResetEvent = resetEvent;
+	}
+
+	internal void OnDemoThreadStart()
+	{
+		InitializeFullServerDemo();
+	}
+
+	internal void OnDemoThreadStop()
+	{
+		CleanupFullServerDemo();
+	}
+
+	internal void Cycle()
+	{
+		try
+		{
+			disk.EnforceDemoDiskSpaceQuota();
+		}
+		catch (Exception exception)
+		{
+			UnityEngine.Debug.LogException(exception);
+		}
+		if (!initSaveReady && saveDone)
+		{
+			ConsumeSave(localChunkFileId);
+			initSaveReady = true;
+			sessionStartTime = DateTime.UtcNow;
+		}
+		else if (DateTime.UtcNow > nextFlushTime)
+		{
+			if (saveStream == null)
+			{
+				RequestSave();
+			}
+			else if (saveDone)
+			{
+				DateTime utcNow = DateTime.UtcNow;
+				FlushServerDemo(utcNow);
+				SetupNextDemoChunk(utcNow);
+				ConsumeSave(localChunkFileId);
+			}
+		}
+	}
+
+	private void InitializeFullServerDemo()
+	{
+		Directory.CreateDirectory(DemoConVars.ServerDemoDirectory);
+		chunkIndex = 0;
+		sessionId = Guid.NewGuid().ToString("N");
+		SetupNextDemoChunk(DateTime.UtcNow);
+		initSaveReady = false;
+		RequestSave();
+	}
+
+	private void CleanupFullServerDemo()
+	{
+		FlushServerDemo(DateTime.UtcNow);
+	}
+
+	internal void RecordServerDemoPacket(ICollection<Connection> connections, byte[] data, int dataLength, bool isOutgoing, DateTime timestamp)
+	{
+		if (timestamp < sessionStartTime)
+		{
+			return;
+		}
+		if (connections == null)
+		{
+			connections = Array.Empty<Connection>();
+		}
+		packetCount++;
+		ulong num = (ulong)(timestamp - timeStart).TotalMilliseconds;
+		int num2 = ProtocolParser.WriteUInt64(num, scratchBuffer, 0);
+		int num3 = (isOutgoing ? 2 : 0) + connections.Count * 2;
+		int num4 = 1 + num2 + num3 + dataLength;
+		uncompressedBytes += num4;
+		int num5 = ProtocolParser.WriteUInt32((uint)num4, scratchBuffer, 32);
+		uncompressedBytes += num5;
+		writer.Write(scratchBuffer, 32, num5);
+		int num6 = (isOutgoing ? 1 : 0);
+		writer.Write((byte)num6);
+		writer.Write(scratchBuffer, 0, num2);
+		if (isOutgoing)
+		{
+			writer.Write((ushort)connections.Count);
+		}
+		foreach (Connection connection in connections)
+		{
+			if (!playerIndexes.TryGetValue(connection, out var value))
+			{
+				value = playerIndex++;
+				playerIndexes.Add(connection, value);
+			}
+			writer.Write((ushort)value);
+		}
+		writer.Write(data, 0, dataLength);
+		if (debugJson != null)
+		{
+			WriteDebug(packetCount - 1, uncompressedBytes - num4 - num5, uncompressedBytes, num, num3, (ushort)connections.Count);
+		}
+	}
+
+	private void FlushServerDemo(DateTime endOfChunk)
+	{
+		Directory.CreateDirectory(DemoConVars.ServerDemoDirectory);
+		if (fileStream != null)
+		{
+			if (debugJson != null)
+			{
+				((JsonWriter)jsonDebugWriter).WriteEndArray();
+				((JsonWriter)jsonDebugWriter).Close();
+				debugWriter.Close();
+				debugSerializer = null;
+				debugJson = null;
+				debugEntry = null;
+			}
+			if (zipStream != null)
+			{
+				zipStream.Flush();
+			}
+			fileStream.Flush();
+			DemoChunkHeader header = CreateDemoHeader(timeStart, endOfChunk);
+			SaveChunkHeader(header);
+			writer.Dispose();
+			if (zipStream != null)
+			{
+				zipStream.Dispose();
+				zipStream = null;
+			}
+			fileStream.Dispose();
+			if (DemoConVars.UploadDemos && !string.IsNullOrEmpty(DemoConVars.UploadEndpoint))
+			{
+				DemoUploadRequest request = new DemoUploadRequest(header, DemoPaths.GetLocalDemoPath(localChunkFileId), DemoPaths.GetLocalHeaderPath(localChunkFileId), DemoConVars.UploadEndpoint);
+				upload.EnqueueUpload(request);
+			}
+			chunkIndex++;
+			DemoCount++;
+		}
+	}
+
+	private void SetupNextDemoChunk(DateTime startTime)
+	{
+		//IL_0089: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0093: Expected O, but got Unknown
+		Directory.CreateDirectory(DemoConVars.ServerDemoDirectory);
+		localChunkFileId = Guid.NewGuid().ToString("N");
+		fileStream = new FileStream(DemoPaths.GetLocalDemoPath(localChunkFileId), FileMode.OpenOrCreate, FileAccess.Write, FileShare.None, 4096, FileOptions.Asynchronous | FileOptions.SequentialScan);
+		if (serializeDebugJson)
+		{
+			debugJson = new FileStream(DemoPaths.GetDebugPath(localChunkFileId), FileMode.OpenOrCreate, FileAccess.Write);
+			debugSerializer = JsonSerializer.CreateDefault();
+			debugWriter = new StreamWriter(debugJson);
+			jsonDebugWriter = new JsonTextWriter((TextWriter)debugWriter);
+			((JsonWriter)jsonDebugWriter).WriteStartArray();
+			debugEntry = new DebugEntry();
+		}
+		isZipped = DemoConVars.ZipServerDemos;
+		if (isZipped)
+		{
+			zipStream = new GZipStream(fileStream, System.IO.Compression.CompressionLevel.Optimal);
+			writer = new BinaryWriter(zipStream);
+		}
+		else
+		{
+			writer = new BinaryWriter(fileStream);
+		}
+		nextFlushTime = DateTime.UtcNow.AddSeconds(DemoConVars.ServerDemoFlushIntervalSeconds);
+		playerIndexes.Clear();
+		playerIndex = 0;
+		packetCount = 0L;
+		timeStart = startTime;
+		uncompressedBytes = 0L;
+	}
+
+	private DemoChunkHeader CreateDemoHeader(DateTime startTime, DateTime endTime)
+	{
+		ServerInfo serverInfo = serverCallback.GetServerInfo();
+		long length = fileStream.Length;
+		return new DemoChunkHeader
+		{
+			ServerId = DemoConVars.ServerId,
+			SessionId = sessionId,
+			LocalChunkId = localChunkFileId,
+			ChunkIndex = chunkIndex,
+			SessionStartTime = sessionStartTime,
+			TimeStart = startTime,
+			TimeEnd = endTime,
+			BytesDecompressed = (isZipped ? uncompressedBytes : length),
+			BytesCompressed = length,
+			PacketCount = packetCount,
+			Players = playerIndexes.Select((KeyValuePair<Connection, int> x) => new DemoPlayerInfo
+			{
+				ChunkPlayerIndex = x.Value,
+				Guid = x.Key.guid,
+				UserId = x.Key.userid
+			}).ToList(),
+			IsZipped = isZipped,
+			NetworkVersion = serverInfo.NetworkVersion,
+			Changeset = serverInfo.Changeset,
+			Hostname = serverInfo.Hostname,
+			Seed = serverInfo.Seed.ToString(),
+			WorldSize = serverInfo.WorldSize.ToString(),
+			Level = serverInfo.Level,
+			LevelUrl = serverInfo.LevelUrl,
+			Checksum = serverInfo.Checksum
+		};
+	}
+
+	private void SaveChunkHeader(DemoChunkHeader header)
+	{
+		string localHeaderPath = DemoPaths.GetLocalHeaderPath(localChunkFileId);
+		string contents = JsonConvert.SerializeObject((object)header, (Formatting)1);
+		File.WriteAllText(localHeaderPath, contents);
+	}
+
+	private void RequestSave()
+	{
+		Interlocked.Increment(ref writeChunkInd);
+		serverCallback.AddOnSaveCallback(OnSaveDone);
+		saveStream = new MemoryStream(33554432);
+		serverCallback.RequestSave(saveStream);
+	}
+
+	private void ConsumeSave(string filename)
+	{
+		using (FileStream stream = new FileStream(DemoPaths.GetSavePath(filename), FileMode.Create))
+		{
+			saveStream.Position = 0L;
+			saveStream.WriteTo(stream);
+		}
+		saveStream.Dispose();
+		saveStream = null;
+		saveDone = false;
+		Interlocked.Increment(ref readChunkInd);
+	}
+
+	private void OnSaveDone(Stream stream)
+	{
+		if (stream == saveStream)
+		{
+			saveDone = true;
+			serverCallback.RemoveOnSaveCallback(OnSaveDone);
+			if (sessionStartTime == DateTime.MaxValue)
+			{
+				sessionStartTime = DateTime.UtcNow;
+			}
+			threadResetEvent.Set();
+		}
+	}
+
+	internal int GetWriteChunkBit()
+	{
+		return writeChunkInd & 1;
+	}
+
+	internal int GetReadChunkBit()
+	{
+		return readChunkInd & 1;
+	}
+
+	private void WriteDebug(long index, long start, long end, ulong timestamp, long connectionsLength, ushort connectionCount)
+	{
+		debugEntry.i = index;
+		debugEntry.s = start;
+		debugEntry.e = end;
+		debugEntry.ts = timestamp;
+		debugEntry.conLen = connectionsLength;
+		debugEntry.cons = connectionCount;
+		debugSerializer.Serialize((JsonWriter)(object)jsonDebugWriter, (object)debugEntry);
+	}
+}

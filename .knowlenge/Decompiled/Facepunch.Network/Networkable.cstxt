@@ -1,0 +1,320 @@
+#define UNITY_ASSERTIONS
+using System.Collections.Generic;
+using Facepunch;
+using Facepunch.Extend;
+using Network;
+using Network.Visibility;
+using Oxide.Core;
+using UnityEngine;
+
+public class Networkable : Pool.IPooled
+{
+	public NetworkableId ID;
+
+	public Group group;
+
+	public Group secondaryGroup;
+
+	public Subscriber subscriber;
+
+	public NetworkHandler handler;
+
+	public bool updateSubscriptions;
+
+	public Server sv;
+
+	internal Client cl;
+
+	public Connection connection { get; private set; }
+
+	public void Destroy()
+	{
+		CloseSubscriber();
+		if (ID.IsValid)
+		{
+			SwitchGroup(null);
+			if (sv != null)
+			{
+				sv.ReturnUID(ID.Value);
+			}
+		}
+	}
+
+	public void EnterPool()
+	{
+		ID = default(NetworkableId);
+		connection = null;
+		group = null;
+		secondaryGroup = null;
+		sv = null;
+		cl = null;
+		handler = null;
+		updateSubscriptions = false;
+	}
+
+	public void LeavePool()
+	{
+	}
+
+	public void StartSubscriber()
+	{
+		if (subscriber != null)
+		{
+			Debug.Log("BecomeSubscriber called twice!");
+			return;
+		}
+		subscriber = sv.visibility.CreateSubscriber(connection);
+		OnSubscriptionChange();
+	}
+
+	public void OnConnected(Connection c)
+	{
+		connection = c;
+	}
+
+	public void OnDisconnected()
+	{
+		connection = null;
+		CloseSubscriber();
+	}
+
+	public void CloseSubscriber()
+	{
+		if (subscriber != null)
+		{
+			sv.visibility.DestroySubscriber(ref subscriber);
+		}
+	}
+
+	public bool UpdateGroups(Vector3 position)
+	{
+		Debug.Assert(sv != null, "SV IS NULL");
+		Debug.Assert(sv.visibility != null, "sv.visibility IS NULL");
+		Group newGroup = sv.visibility.GetGroup(position);
+		return SwitchGroup(newGroup);
+	}
+
+	public bool SwitchGroup(Group newGroup)
+	{
+		if (newGroup == group)
+		{
+			return false;
+		}
+		using (TimeWarning.New("SwitchGroup"))
+		{
+			if (group != null)
+			{
+				using (TimeWarning.New("group.Leave"))
+				{
+					group.Leave(this);
+				}
+			}
+			Group oldGroup = group;
+			group = newGroup;
+			if (group != null)
+			{
+				using (TimeWarning.New("group.Join"))
+				{
+					group.Join(this);
+				}
+			}
+			if (handler != null && group != null)
+			{
+				using (TimeWarning.New("OnNetworkGroupChange"))
+				{
+					handler.OnNetworkGroupChange();
+				}
+			}
+			using (TimeWarning.New("OnSubscriptionChange"))
+			{
+				OnSubscriptionChange();
+			}
+			using (TimeWarning.New("OnGroupTransition"))
+			{
+				OnGroupTransition(oldGroup);
+			}
+		}
+		return true;
+	}
+
+	public void OnGroupTransition(Group oldGroup)
+	{
+		if (oldGroup == null)
+		{
+			if (group != null && handler != null)
+			{
+				handler.OnNetworkSubscribersEnter(group.subscribers);
+			}
+			return;
+		}
+		if (group == null)
+		{
+			if (oldGroup != null && handler != null)
+			{
+				handler.OnNetworkSubscribersLeave(oldGroup.subscribers);
+			}
+			return;
+		}
+		List<Connection> obj = Pool.Get<List<Connection>>();
+		List<Connection> obj2 = Pool.Get<List<Connection>>();
+		oldGroup.subscribers.Compare(group.subscribers, obj, obj2, null);
+		if (handler != null)
+		{
+			handler.OnNetworkSubscribersEnter(obj);
+		}
+		if (handler != null)
+		{
+			handler.OnNetworkSubscribersLeave(obj2);
+		}
+		Pool.FreeUnmanaged(ref obj);
+		Pool.FreeUnmanaged(ref obj2);
+	}
+
+	public void OnSubscriptionChange()
+	{
+		if (subscriber == null)
+		{
+			return;
+		}
+		if (group != null && !subscriber.IsSubscribed(group))
+		{
+			subscriber.Subscribe(group);
+			if (handler != null)
+			{
+				handler.OnNetworkGroupEnter(group);
+			}
+		}
+		updateSubscriptions = true;
+		UpdateHighPrioritySubscriptions();
+	}
+
+	public bool SwitchSecondaryGroup(Group newGroup)
+	{
+		if (newGroup == secondaryGroup)
+		{
+			return false;
+		}
+		using (TimeWarning.New("SwitchSecondaryGroup"))
+		{
+			secondaryGroup = newGroup;
+			using (TimeWarning.New("OnSubscriptionChange"))
+			{
+				OnSubscriptionChange();
+			}
+		}
+		return true;
+	}
+
+	public void AddVisibleFromNear(Group additionalGroup, List<Group> groupsVisible)
+	{
+		if (additionalGroup == null)
+		{
+			return;
+		}
+		List<Group> obj = Pool.Get<List<Group>>();
+		sv.visibility.GetVisibleFromNear(additionalGroup, obj);
+		for (int i = 0; i < obj.Count; i++)
+		{
+			Group item = obj[i];
+			if (!groupsVisible.Contains(item))
+			{
+				groupsVisible.Add(item);
+			}
+		}
+		Pool.FreeUnmanaged(ref obj);
+	}
+
+	public bool UpdateSubscriptions(int removeLimit, int addLimit)
+	{
+		if (!updateSubscriptions)
+		{
+			return false;
+		}
+		if (subscriber == null)
+		{
+			return false;
+		}
+		using (TimeWarning.New("UpdateSubscriptions"))
+		{
+			updateSubscriptions = false;
+			List<Group> obj = Pool.Get<List<Group>>();
+			List<Group> obj2 = Pool.Get<List<Group>>();
+			List<Group> obj3 = Pool.Get<List<Group>>();
+			sv.visibility.GetVisibleFromFar(this.group, obj3);
+			AddVisibleFromNear(secondaryGroup, obj3);
+			subscriber.subscribed.Compare(obj3, obj, obj2, null);
+			if (Interface.CallHook("OnNetworkSubscriptionsUpdate", this, obj, obj2) == null)
+			{
+				for (int i = 0; i < obj2.Count; i++)
+				{
+					Group group = obj2[i];
+					if (removeLimit > 0)
+					{
+						subscriber.Unsubscribe(group);
+						if (handler != null)
+						{
+							handler.OnNetworkGroupLeave(group);
+						}
+						removeLimit -= group.networkables.Count;
+					}
+					else
+					{
+						updateSubscriptions = true;
+					}
+				}
+				for (int j = 0; j < obj.Count; j++)
+				{
+					Group group2 = obj[j];
+					if (addLimit > 0)
+					{
+						subscriber.Subscribe(group2);
+						if (handler != null)
+						{
+							handler.OnNetworkGroupEnter(group2);
+						}
+						addLimit -= group2.networkables.Count;
+					}
+					else
+					{
+						updateSubscriptions = true;
+					}
+				}
+			}
+			Pool.FreeUnmanaged(ref obj);
+			Pool.FreeUnmanaged(ref obj2);
+			Pool.FreeUnmanaged(ref obj3);
+		}
+		return true;
+	}
+
+	public bool UpdateHighPrioritySubscriptions()
+	{
+		if (subscriber == null)
+		{
+			return false;
+		}
+		using (TimeWarning.New("UpdateHighPrioritySubscriptions"))
+		{
+			List<Group> obj = Pool.Get<List<Group>>();
+			List<Group> obj2 = Pool.Get<List<Group>>();
+			sv.visibility.GetVisibleFromNear(this.group, obj2);
+			AddVisibleFromNear(secondaryGroup, obj2);
+			subscriber.subscribed.Compare(obj2, obj, null, null);
+			if (Interface.CallHook("OnNetworkSubscriptionsUpdate", this, obj, null) == null)
+			{
+				for (int i = 0; i < obj.Count; i++)
+				{
+					Group group = obj[i];
+					subscriber.Subscribe(group);
+					if (handler != null)
+					{
+						handler.OnNetworkGroupEnter(group);
+					}
+				}
+			}
+			Pool.FreeUnmanaged(ref obj);
+			Pool.FreeUnmanaged(ref obj2);
+		}
+		return true;
+	}
+}

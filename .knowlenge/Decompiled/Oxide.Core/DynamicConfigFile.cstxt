@@ -1,0 +1,287 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
+using Newtonsoft.Json;
+using Oxide.Core;
+using Oxide.Core.Configuration;
+
+public class DynamicConfigFile : ConfigFile, IEnumerable<KeyValuePair<string, object>>, IEnumerable
+{
+	private Dictionary<string, object> _keyvalues;
+
+	private readonly JsonSerializerSettings _settings;
+
+	private readonly string _chroot;
+
+	public JsonSerializerSettings Settings { get; set; } = new JsonSerializerSettings();
+
+	public object this[string key]
+	{
+		get
+		{
+			if (!_keyvalues.TryGetValue(key, out var value))
+			{
+				return null;
+			}
+			return value;
+		}
+		set
+		{
+			_keyvalues[key] = value;
+		}
+	}
+
+	public object this[string keyLevel1, string keyLevel2]
+	{
+		get
+		{
+			return Get(keyLevel1, keyLevel2);
+		}
+		set
+		{
+			Set(keyLevel1, keyLevel2, value);
+		}
+	}
+
+	public object this[string keyLevel1, string keyLevel2, string keyLevel3]
+	{
+		get
+		{
+			return Get(keyLevel1, keyLevel2, keyLevel3);
+		}
+		set
+		{
+			Set(keyLevel1, keyLevel2, keyLevel3, value);
+		}
+	}
+
+	public DynamicConfigFile(string filename)
+		: base(filename)
+	{
+		_keyvalues = new Dictionary<string, object>();
+		_settings = new JsonSerializerSettings();
+		_settings.Converters.Add(new KeyValuesConverter());
+		_chroot = Interface.Oxide.InstanceDirectory;
+	}
+
+	public override void Load(string filename = null)
+	{
+		filename = CheckPath(filename ?? base.Filename);
+		string value = File.ReadAllText(filename);
+		_keyvalues = JsonConvert.DeserializeObject<Dictionary<string, object>>(value, _settings);
+	}
+
+	public T ReadObject<T>(string filename = null)
+	{
+		filename = CheckPath(filename ?? base.Filename);
+		T val;
+		if (Exists(filename))
+		{
+			val = JsonConvert.DeserializeObject<T>(File.ReadAllText(filename), Settings);
+		}
+		else
+		{
+			val = Activator.CreateInstance<T>();
+			WriteObject(val, sync: false, filename);
+		}
+		return val;
+	}
+
+	public override void Save(string filename = null)
+	{
+		filename = CheckPath(filename ?? base.Filename);
+		string directoryName = Utility.GetDirectoryName(filename);
+		if (directoryName != null && !Directory.Exists(directoryName))
+		{
+			Directory.CreateDirectory(directoryName);
+		}
+		File.WriteAllText(filename, JsonConvert.SerializeObject(_keyvalues, Formatting.Indented, _settings));
+	}
+
+	public void WriteObject<T>(T config, bool sync = false, string filename = null)
+	{
+		filename = CheckPath(filename ?? base.Filename);
+		string directoryName = Utility.GetDirectoryName(filename);
+		if (directoryName != null && !Directory.Exists(directoryName))
+		{
+			Directory.CreateDirectory(directoryName);
+		}
+		string text = JsonConvert.SerializeObject(config, Formatting.Indented, Settings);
+		File.WriteAllText(filename, text);
+		if (sync)
+		{
+			_keyvalues = JsonConvert.DeserializeObject<Dictionary<string, object>>(text, _settings);
+		}
+	}
+
+	public bool Exists(string filename = null)
+	{
+		filename = CheckPath(filename ?? base.Filename);
+		string directoryName = Utility.GetDirectoryName(filename);
+		if (directoryName != null && !Directory.Exists(directoryName))
+		{
+			return false;
+		}
+		return File.Exists(filename);
+	}
+
+	public void Delete(string filename = null)
+	{
+		filename = CheckPath(filename ?? base.Filename);
+		if (Exists(filename))
+		{
+			File.Delete(filename);
+		}
+	}
+
+	private string CheckPath(string filename)
+	{
+		filename = SanitizeName(filename);
+		string fullPath = Path.GetFullPath(filename);
+		if (!fullPath.StartsWith(_chroot, StringComparison.Ordinal))
+		{
+			throw new Exception("Only access to oxide directory!\nPath: " + fullPath);
+		}
+		return fullPath;
+	}
+
+	public static string SanitizeName(string name)
+	{
+		if (string.IsNullOrEmpty(name))
+		{
+			return string.Empty;
+		}
+		name = name.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
+		name = Regex.Replace(name, "[" + Regex.Escape(new string(Path.GetInvalidPathChars())) + "]", "_");
+		name = Regex.Replace(name, "\\.+", ".");
+		return name.TrimStart(new char[1] { '.' });
+	}
+
+	[Obsolete("SanitiseName is deprecated, use SanitizeName instead")]
+	public static string SanitiseName(string name)
+	{
+		return SanitizeName(name);
+	}
+
+	public void Clear()
+	{
+		_keyvalues.Clear();
+	}
+
+	public void Remove(string key)
+	{
+		_keyvalues.Remove(key);
+	}
+
+	public object ConvertValue(object value, Type destinationType)
+	{
+		if (!destinationType.IsGenericType)
+		{
+			return Convert.ChangeType(value, destinationType);
+		}
+		if (destinationType.GetGenericTypeDefinition() == typeof(List<>))
+		{
+			Type conversionType = destinationType.GetGenericArguments()[0];
+			IList list = (IList)Activator.CreateInstance(destinationType);
+			{
+				foreach (object item in (IList)value)
+				{
+					list.Add(Convert.ChangeType(item, conversionType));
+				}
+				return list;
+			}
+		}
+		if (destinationType.GetGenericTypeDefinition() == typeof(Dictionary<, >))
+		{
+			Type conversionType2 = destinationType.GetGenericArguments()[0];
+			Type conversionType3 = destinationType.GetGenericArguments()[1];
+			IDictionary dictionary = (IDictionary)Activator.CreateInstance(destinationType);
+			{
+				foreach (object key in ((IDictionary)value).Keys)
+				{
+					dictionary.Add(Convert.ChangeType(key, conversionType2), Convert.ChangeType(((IDictionary)value)[key], conversionType3));
+				}
+				return dictionary;
+			}
+		}
+		throw new InvalidCastException("Generic types other than List<> and Dictionary<,> are not supported");
+	}
+
+	public T ConvertValue<T>(object value)
+	{
+		return (T)ConvertValue(value, typeof(T));
+	}
+
+	public object Get(params string[] path)
+	{
+		if (path.Length < 1)
+		{
+			throw new ArgumentException("path must not be empty");
+		}
+		if (!_keyvalues.TryGetValue(path[0], out var value))
+		{
+			return null;
+		}
+		for (int i = 1; i < path.Length; i++)
+		{
+			if (!(value is Dictionary<string, object> dictionary) || !dictionary.TryGetValue(path[i], out value))
+			{
+				return null;
+			}
+		}
+		return value;
+	}
+
+	public T Get<T>(params string[] path)
+	{
+		return ConvertValue<T>(Get(path));
+	}
+
+	public void Set(params object[] pathAndTrailingValue)
+	{
+		if (pathAndTrailingValue.Length < 2)
+		{
+			throw new ArgumentException("path must not be empty");
+		}
+		string[] array = new string[pathAndTrailingValue.Length - 1];
+		for (int i = 0; i < pathAndTrailingValue.Length - 1; i++)
+		{
+			array[i] = (string)pathAndTrailingValue[i];
+		}
+		object value = pathAndTrailingValue[^1];
+		if (array.Length == 1)
+		{
+			_keyvalues[array[0]] = value;
+			return;
+		}
+		if (!_keyvalues.TryGetValue(array[0], out var value2))
+		{
+			value2 = (_keyvalues[array[0]] = new Dictionary<string, object>());
+		}
+		for (int j = 1; j < array.Length - 1; j++)
+		{
+			if (!(value2 is Dictionary<string, object>))
+			{
+				throw new ArgumentException("path is not a dictionary");
+			}
+			Dictionary<string, object> dictionary2 = (Dictionary<string, object>)value2;
+			if (!dictionary2.TryGetValue(array[j], out value2))
+			{
+				value2 = (dictionary2[array[j]] = new Dictionary<string, object>());
+			}
+		}
+		((Dictionary<string, object>)value2)[array[^1]] = value;
+	}
+
+	public IEnumerator<KeyValuePair<string, object>> GetEnumerator()
+	{
+		return _keyvalues.GetEnumerator();
+	}
+
+	IEnumerator IEnumerable.GetEnumerator()
+	{
+		return _keyvalues.GetEnumerator();
+	}
+}

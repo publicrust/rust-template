@@ -1,0 +1,659 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using Mono;
+using Mono.Cecil;
+using Mono.Cecil.Metadata;
+using Mono.Collections.Generic;
+
+internal class MetadataImporter
+{
+	private readonly ModuleDefinition module;
+
+	private static readonly Dictionary<Type, ElementType> type_etype_mapping = new Dictionary<Type, ElementType>(18)
+	{
+		{
+			typeof(void),
+			ElementType.Void
+		},
+		{
+			typeof(bool),
+			ElementType.Boolean
+		},
+		{
+			typeof(char),
+			ElementType.Char
+		},
+		{
+			typeof(sbyte),
+			ElementType.I1
+		},
+		{
+			typeof(byte),
+			ElementType.U1
+		},
+		{
+			typeof(short),
+			ElementType.I2
+		},
+		{
+			typeof(ushort),
+			ElementType.U2
+		},
+		{
+			typeof(int),
+			ElementType.I4
+		},
+		{
+			typeof(uint),
+			ElementType.U4
+		},
+		{
+			typeof(long),
+			ElementType.I8
+		},
+		{
+			typeof(ulong),
+			ElementType.U8
+		},
+		{
+			typeof(float),
+			ElementType.R4
+		},
+		{
+			typeof(double),
+			ElementType.R8
+		},
+		{
+			typeof(string),
+			ElementType.String
+		},
+		{
+			typeof(TypedReference),
+			ElementType.TypedByRef
+		},
+		{
+			typeof(IntPtr),
+			ElementType.I
+		},
+		{
+			typeof(UIntPtr),
+			ElementType.U
+		},
+		{
+			typeof(object),
+			ElementType.Object
+		}
+	};
+
+	public MetadataImporter(ModuleDefinition module)
+	{
+		this.module = module;
+	}
+
+	public TypeReference ImportType(Type type, ImportGenericContext context)
+	{
+		return ImportType(type, context, ImportGenericKind.Open);
+	}
+
+	public TypeReference ImportType(Type type, ImportGenericContext context, ImportGenericKind import_kind)
+	{
+		if (IsTypeSpecification(type) || ImportOpenGenericType(type, import_kind))
+		{
+			return ImportTypeSpecification(type, context);
+		}
+		TypeReference typeReference = new TypeReference(string.Empty, type.Name, module, ImportScope(type.Assembly), type.IsValueType);
+		typeReference.etype = ImportElementType(type);
+		if (IsNestedType(type))
+		{
+			typeReference.DeclaringType = ImportType(type.DeclaringType, context, import_kind);
+		}
+		else
+		{
+			typeReference.Namespace = type.Namespace ?? string.Empty;
+		}
+		if (type.IsGenericType)
+		{
+			ImportGenericParameters(typeReference, type.GetGenericArguments());
+		}
+		return typeReference;
+	}
+
+	private static bool ImportOpenGenericType(Type type, ImportGenericKind import_kind)
+	{
+		if (type.IsGenericType && type.IsGenericTypeDefinition)
+		{
+			return import_kind == ImportGenericKind.Open;
+		}
+		return false;
+	}
+
+	private static bool ImportOpenGenericMethod(MethodBase method, ImportGenericKind import_kind)
+	{
+		if (method.IsGenericMethod && method.IsGenericMethodDefinition)
+		{
+			return import_kind == ImportGenericKind.Open;
+		}
+		return false;
+	}
+
+	private static bool IsNestedType(Type type)
+	{
+		return type.IsNested;
+	}
+
+	private TypeReference ImportTypeSpecification(Type type, ImportGenericContext context)
+	{
+		if (type.IsByRef)
+		{
+			return new ByReferenceType(ImportType(type.GetElementType(), context));
+		}
+		if (type.IsPointer)
+		{
+			return new PointerType(ImportType(type.GetElementType(), context));
+		}
+		if (type.IsArray)
+		{
+			return new ArrayType(ImportType(type.GetElementType(), context), type.GetArrayRank());
+		}
+		if (type.IsGenericType)
+		{
+			return ImportGenericInstance(type, context);
+		}
+		if (type.IsGenericParameter)
+		{
+			return ImportGenericParameter(type, context);
+		}
+		throw new NotSupportedException(type.FullName);
+	}
+
+	private static TypeReference ImportGenericParameter(Type type, ImportGenericContext context)
+	{
+		if (context.IsEmpty)
+		{
+			throw new InvalidOperationException();
+		}
+		if (type.DeclaringMethod != null)
+		{
+			return context.MethodParameter(NormalizeMethodName(type.DeclaringMethod), type.GenericParameterPosition);
+		}
+		if (type.DeclaringType != null)
+		{
+			return context.TypeParameter(NormalizeTypeFullName(type.DeclaringType), type.GenericParameterPosition);
+		}
+		throw new InvalidOperationException();
+	}
+
+	private static string NormalizeMethodName(MethodBase method)
+	{
+		return NormalizeTypeFullName(method.DeclaringType) + "." + method.Name;
+	}
+
+	private static string NormalizeTypeFullName(Type type)
+	{
+		if (IsNestedType(type))
+		{
+			return NormalizeTypeFullName(type.DeclaringType) + "/" + type.Name;
+		}
+		return type.FullName;
+	}
+
+	private TypeReference ImportGenericInstance(Type type, ImportGenericContext context)
+	{
+		TypeReference typeReference = ImportType(type.GetGenericTypeDefinition(), context, ImportGenericKind.Definition);
+		GenericInstanceType genericInstanceType = new GenericInstanceType(typeReference);
+		Type[] genericArguments = type.GetGenericArguments();
+		Collection<TypeReference> genericArguments2 = genericInstanceType.GenericArguments;
+		context.Push(typeReference);
+		try
+		{
+			for (int i = 0; i < genericArguments.Length; i++)
+			{
+				genericArguments2.Add(ImportType(genericArguments[i], context));
+			}
+			return genericInstanceType;
+		}
+		finally
+		{
+			context.Pop();
+		}
+	}
+
+	private static bool IsTypeSpecification(Type type)
+	{
+		if (!type.HasElementType && !IsGenericInstance(type))
+		{
+			return type.IsGenericParameter;
+		}
+		return true;
+	}
+
+	private static bool IsGenericInstance(Type type)
+	{
+		if (type.IsGenericType)
+		{
+			return !type.IsGenericTypeDefinition;
+		}
+		return false;
+	}
+
+	private static ElementType ImportElementType(Type type)
+	{
+		if (!type_etype_mapping.TryGetValue(type, out var value))
+		{
+			return ElementType.None;
+		}
+		return value;
+	}
+
+	private AssemblyNameReference ImportScope(Assembly assembly)
+	{
+		AssemblyName name = assembly.GetName();
+		if (TryGetAssemblyNameReference(name, out var assembly_reference))
+		{
+			return assembly_reference;
+		}
+		assembly_reference = new AssemblyNameReference(name.Name, name.Version)
+		{
+			Culture = name.CultureInfo.Name,
+			PublicKeyToken = name.GetPublicKeyToken(),
+			HashAlgorithm = (AssemblyHashAlgorithm)name.HashAlgorithm
+		};
+		module.AssemblyReferences.Add(assembly_reference);
+		return assembly_reference;
+	}
+
+	private bool TryGetAssemblyNameReference(AssemblyName name, out AssemblyNameReference assembly_reference)
+	{
+		Collection<AssemblyNameReference> assemblyReferences = module.AssemblyReferences;
+		for (int i = 0; i < assemblyReferences.Count; i++)
+		{
+			AssemblyNameReference assemblyNameReference = assemblyReferences[i];
+			if (!(name.FullName != assemblyNameReference.FullName))
+			{
+				assembly_reference = assemblyNameReference;
+				return true;
+			}
+		}
+		assembly_reference = null;
+		return false;
+	}
+
+	public FieldReference ImportField(FieldInfo field, ImportGenericContext context)
+	{
+		TypeReference typeReference = ImportType(field.DeclaringType, context);
+		if (IsGenericInstance(field.DeclaringType))
+		{
+			field = ResolveFieldDefinition(field);
+		}
+		context.Push(typeReference);
+		try
+		{
+			return new FieldReference
+			{
+				Name = field.Name,
+				DeclaringType = typeReference,
+				FieldType = ImportType(field.FieldType, context)
+			};
+		}
+		finally
+		{
+			context.Pop();
+		}
+	}
+
+	private static FieldInfo ResolveFieldDefinition(FieldInfo field)
+	{
+		return field.Module.ResolveField(field.MetadataToken);
+	}
+
+	public MethodReference ImportMethod(MethodBase method, ImportGenericContext context, ImportGenericKind import_kind)
+	{
+		if (IsMethodSpecification(method) || ImportOpenGenericMethod(method, import_kind))
+		{
+			return ImportMethodSpecification(method, context);
+		}
+		TypeReference declaringType = ImportType(method.DeclaringType, context);
+		if (IsGenericInstance(method.DeclaringType))
+		{
+			method = method.Module.ResolveMethod(method.MetadataToken);
+		}
+		MethodReference methodReference = new MethodReference
+		{
+			Name = method.Name,
+			HasThis = HasCallingConvention(method, CallingConventions.HasThis),
+			ExplicitThis = HasCallingConvention(method, CallingConventions.ExplicitThis),
+			DeclaringType = ImportType(method.DeclaringType, context, ImportGenericKind.Definition)
+		};
+		if (HasCallingConvention(method, CallingConventions.VarArgs))
+		{
+			methodReference.CallingConvention &= MethodCallingConvention.VarArg;
+		}
+		if (method.IsGenericMethod)
+		{
+			ImportGenericParameters(methodReference, method.GetGenericArguments());
+		}
+		context.Push(methodReference);
+		try
+		{
+			MethodInfo methodInfo = method as MethodInfo;
+			methodReference.ReturnType = ((methodInfo != null) ? ImportType(methodInfo.ReturnType, context) : ImportType(typeof(void), default(ImportGenericContext)));
+			ParameterInfo[] parameters = method.GetParameters();
+			Collection<ParameterDefinition> parameters2 = methodReference.Parameters;
+			for (int i = 0; i < parameters.Length; i++)
+			{
+				parameters2.Add(new ParameterDefinition(ImportType(parameters[i].ParameterType, context)));
+			}
+			methodReference.DeclaringType = declaringType;
+			return methodReference;
+		}
+		finally
+		{
+			context.Pop();
+		}
+	}
+
+	private static void ImportGenericParameters(IGenericParameterProvider provider, Type[] arguments)
+	{
+		Collection<GenericParameter> genericParameters = provider.GenericParameters;
+		for (int i = 0; i < arguments.Length; i++)
+		{
+			genericParameters.Add(new GenericParameter(arguments[i].Name, provider));
+		}
+	}
+
+	private static bool IsMethodSpecification(MethodBase method)
+	{
+		if (method.IsGenericMethod)
+		{
+			return !method.IsGenericMethodDefinition;
+		}
+		return false;
+	}
+
+	private MethodReference ImportMethodSpecification(MethodBase method, ImportGenericContext context)
+	{
+		MethodInfo methodInfo = method as MethodInfo;
+		if (methodInfo == null)
+		{
+			throw new InvalidOperationException();
+		}
+		MethodReference methodReference = ImportMethod(methodInfo.GetGenericMethodDefinition(), context, ImportGenericKind.Definition);
+		GenericInstanceMethod genericInstanceMethod = new GenericInstanceMethod(methodReference);
+		Type[] genericArguments = method.GetGenericArguments();
+		Collection<TypeReference> genericArguments2 = genericInstanceMethod.GenericArguments;
+		context.Push(methodReference);
+		try
+		{
+			for (int i = 0; i < genericArguments.Length; i++)
+			{
+				genericArguments2.Add(ImportType(genericArguments[i], context));
+			}
+			return genericInstanceMethod;
+		}
+		finally
+		{
+			context.Pop();
+		}
+	}
+
+	private static bool HasCallingConvention(MethodBase method, CallingConventions conventions)
+	{
+		return (method.CallingConvention & conventions) != 0;
+	}
+
+	public TypeReference ImportType(TypeReference type, ImportGenericContext context)
+	{
+		if (type.IsTypeSpecification())
+		{
+			return ImportTypeSpecification(type, context);
+		}
+		TypeReference typeReference = new TypeReference(type.Namespace, type.Name, module, ImportScope(type.Scope), type.IsValueType);
+		MetadataSystem.TryProcessPrimitiveTypeReference(typeReference);
+		if (type.IsNested)
+		{
+			typeReference.DeclaringType = ImportType(type.DeclaringType, context);
+		}
+		if (type.HasGenericParameters)
+		{
+			ImportGenericParameters(typeReference, type);
+		}
+		return typeReference;
+	}
+
+	private IMetadataScope ImportScope(IMetadataScope scope)
+	{
+		switch (scope.MetadataScopeType)
+		{
+		case MetadataScopeType.AssemblyNameReference:
+			return ImportAssemblyName((AssemblyNameReference)scope);
+		case MetadataScopeType.ModuleDefinition:
+			if (scope == module)
+			{
+				return scope;
+			}
+			return ImportAssemblyName(((ModuleDefinition)scope).Assembly.Name);
+		case MetadataScopeType.ModuleReference:
+			throw new NotImplementedException();
+		default:
+			throw new NotSupportedException();
+		}
+	}
+
+	private AssemblyNameReference ImportAssemblyName(AssemblyNameReference name)
+	{
+		if (TryGetAssemblyNameReference(name, out var assembly_reference))
+		{
+			return assembly_reference;
+		}
+		assembly_reference = new AssemblyNameReference(name.Name, name.Version)
+		{
+			Culture = name.Culture,
+			HashAlgorithm = name.HashAlgorithm,
+			IsRetargetable = name.IsRetargetable
+		};
+		byte[] array = ((!name.PublicKeyToken.IsNullOrEmpty()) ? new byte[name.PublicKeyToken.Length] : Empty<byte>.Array);
+		if (array.Length != 0)
+		{
+			Buffer.BlockCopy(name.PublicKeyToken, 0, array, 0, array.Length);
+		}
+		assembly_reference.PublicKeyToken = array;
+		module.AssemblyReferences.Add(assembly_reference);
+		return assembly_reference;
+	}
+
+	private bool TryGetAssemblyNameReference(AssemblyNameReference name_reference, out AssemblyNameReference assembly_reference)
+	{
+		Collection<AssemblyNameReference> assemblyReferences = module.AssemblyReferences;
+		for (int i = 0; i < assemblyReferences.Count; i++)
+		{
+			AssemblyNameReference assemblyNameReference = assemblyReferences[i];
+			if (!(name_reference.FullName != assemblyNameReference.FullName))
+			{
+				assembly_reference = assemblyNameReference;
+				return true;
+			}
+		}
+		assembly_reference = null;
+		return false;
+	}
+
+	private static void ImportGenericParameters(IGenericParameterProvider imported, IGenericParameterProvider original)
+	{
+		Collection<GenericParameter> genericParameters = original.GenericParameters;
+		Collection<GenericParameter> genericParameters2 = imported.GenericParameters;
+		for (int i = 0; i < genericParameters.Count; i++)
+		{
+			genericParameters2.Add(new GenericParameter(genericParameters[i].Name, imported));
+		}
+	}
+
+	private TypeReference ImportTypeSpecification(TypeReference type, ImportGenericContext context)
+	{
+		switch (type.etype)
+		{
+		case ElementType.SzArray:
+		{
+			ArrayType arrayType = (ArrayType)type;
+			return new ArrayType(ImportType(arrayType.ElementType, context));
+		}
+		case ElementType.Ptr:
+		{
+			PointerType pointerType = (PointerType)type;
+			return new PointerType(ImportType(pointerType.ElementType, context));
+		}
+		case ElementType.ByRef:
+		{
+			ByReferenceType byReferenceType = (ByReferenceType)type;
+			return new ByReferenceType(ImportType(byReferenceType.ElementType, context));
+		}
+		case ElementType.Pinned:
+		{
+			PinnedType pinnedType = (PinnedType)type;
+			return new PinnedType(ImportType(pinnedType.ElementType, context));
+		}
+		case ElementType.Sentinel:
+		{
+			SentinelType sentinelType = (SentinelType)type;
+			return new SentinelType(ImportType(sentinelType.ElementType, context));
+		}
+		case ElementType.CModOpt:
+		{
+			OptionalModifierType optionalModifierType = (OptionalModifierType)type;
+			return new OptionalModifierType(ImportType(optionalModifierType.ModifierType, context), ImportType(optionalModifierType.ElementType, context));
+		}
+		case ElementType.CModReqD:
+		{
+			RequiredModifierType requiredModifierType = (RequiredModifierType)type;
+			return new RequiredModifierType(ImportType(requiredModifierType.ModifierType, context), ImportType(requiredModifierType.ElementType, context));
+		}
+		case ElementType.Array:
+		{
+			ArrayType arrayType2 = (ArrayType)type;
+			ArrayType arrayType3 = new ArrayType(ImportType(arrayType2.ElementType, context));
+			if (arrayType2.IsVector)
+			{
+				return arrayType3;
+			}
+			Collection<ArrayDimension> dimensions = arrayType2.Dimensions;
+			Collection<ArrayDimension> dimensions2 = arrayType3.Dimensions;
+			dimensions2.Clear();
+			for (int j = 0; j < dimensions.Count; j++)
+			{
+				ArrayDimension arrayDimension = dimensions[j];
+				dimensions2.Add(new ArrayDimension(arrayDimension.LowerBound, arrayDimension.UpperBound));
+			}
+			return arrayType3;
+		}
+		case ElementType.GenericInst:
+		{
+			GenericInstanceType genericInstanceType = (GenericInstanceType)type;
+			GenericInstanceType genericInstanceType2 = new GenericInstanceType(ImportType(genericInstanceType.ElementType, context));
+			Collection<TypeReference> genericArguments = genericInstanceType.GenericArguments;
+			Collection<TypeReference> genericArguments2 = genericInstanceType2.GenericArguments;
+			for (int i = 0; i < genericArguments.Count; i++)
+			{
+				genericArguments2.Add(ImportType(genericArguments[i], context));
+			}
+			return genericInstanceType2;
+		}
+		case ElementType.Var:
+		{
+			GenericParameter genericParameter2 = (GenericParameter)type;
+			if (genericParameter2.DeclaringType == null)
+			{
+				throw new InvalidOperationException();
+			}
+			return context.TypeParameter(genericParameter2.DeclaringType.FullName, genericParameter2.Position);
+		}
+		case ElementType.MVar:
+		{
+			GenericParameter genericParameter = (GenericParameter)type;
+			if (genericParameter.DeclaringMethod == null)
+			{
+				throw new InvalidOperationException();
+			}
+			return context.MethodParameter(context.NormalizeMethodName(genericParameter.DeclaringMethod), genericParameter.Position);
+		}
+		default:
+			throw new NotSupportedException(type.etype.ToString());
+		}
+	}
+
+	public FieldReference ImportField(FieldReference field, ImportGenericContext context)
+	{
+		TypeReference typeReference = ImportType(field.DeclaringType, context);
+		context.Push(typeReference);
+		try
+		{
+			return new FieldReference
+			{
+				Name = field.Name,
+				DeclaringType = typeReference,
+				FieldType = ImportType(field.FieldType, context)
+			};
+		}
+		finally
+		{
+			context.Pop();
+		}
+	}
+
+	public MethodReference ImportMethod(MethodReference method, ImportGenericContext context)
+	{
+		if (method.IsGenericInstance)
+		{
+			return ImportMethodSpecification(method, context);
+		}
+		TypeReference declaringType = ImportType(method.DeclaringType, context);
+		MethodReference methodReference = new MethodReference
+		{
+			Name = method.Name,
+			HasThis = method.HasThis,
+			ExplicitThis = method.ExplicitThis,
+			DeclaringType = declaringType,
+			CallingConvention = method.CallingConvention
+		};
+		if (method.HasGenericParameters)
+		{
+			ImportGenericParameters(methodReference, method);
+		}
+		context.Push(methodReference);
+		try
+		{
+			methodReference.ReturnType = ImportType(method.ReturnType, context);
+			if (!method.HasParameters)
+			{
+				return methodReference;
+			}
+			Collection<ParameterDefinition> parameters = methodReference.Parameters;
+			Collection<ParameterDefinition> parameters2 = method.Parameters;
+			for (int i = 0; i < parameters2.Count; i++)
+			{
+				parameters.Add(new ParameterDefinition(ImportType(parameters2[i].ParameterType, context)));
+			}
+			return methodReference;
+		}
+		finally
+		{
+			context.Pop();
+		}
+	}
+
+	private MethodSpecification ImportMethodSpecification(MethodReference method, ImportGenericContext context)
+	{
+		if (!method.IsGenericInstance)
+		{
+			throw new NotSupportedException();
+		}
+		GenericInstanceMethod genericInstanceMethod = (GenericInstanceMethod)method;
+		GenericInstanceMethod genericInstanceMethod2 = new GenericInstanceMethod(ImportMethod(genericInstanceMethod.ElementMethod, context));
+		Collection<TypeReference> genericArguments = genericInstanceMethod.GenericArguments;
+		Collection<TypeReference> genericArguments2 = genericInstanceMethod2.GenericArguments;
+		for (int i = 0; i < genericArguments.Count; i++)
+		{
+			genericArguments2.Add(ImportType(genericArguments[i], context));
+		}
+		return genericInstanceMethod2;
+	}
+}

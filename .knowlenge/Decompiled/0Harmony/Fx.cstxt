@@ -1,0 +1,1402 @@
+using System;
+using System.Runtime.CompilerServices;
+using MonoMod.Core.Interop;
+using MonoMod.Core.Interop.Attributes;
+using MonoMod.Utils;
+
+internal static class Fx
+{
+	public static class V48
+	{
+		public enum MethodClassification
+		{
+			IL,
+			FCall,
+			NDirect,
+			EEImpl,
+			Array,
+			Instantiated,
+			ComInterop,
+			Dynamic
+		}
+
+		public enum MethodDescClassification : ushort
+		{
+			ClassificationMask = 7,
+			HasNonVtableSlot = 8,
+			MethodImpl = 16,
+			Static = 32,
+			Intercepted = 64,
+			RequiresLinktimeCheck = 128,
+			RequiresInheritanceCheck = 256,
+			ParentRequiresInheritanceCheck = 512,
+			Duplicate = 1024,
+			VerifiedState = 2048,
+			Verifiable = 4096,
+			NotInline = 8192,
+			Synchronized = 16384,
+			RequiresFullSlotNumber = 32768
+		}
+
+		public struct MethodImpl
+		{
+			public unsafe uint* pdwSlots;
+
+			public unsafe MethodDesc* pImplementedMD;
+		}
+
+		public struct MethodDesc
+		{
+			[Flags]
+			public enum Flags3 : ushort
+			{
+				TokenRemainderMask = 0x3FFF,
+				HasForwardedValuetypeParameter = 0x4000,
+				ValueTypeParametersWalked = 0x4000,
+				DoesNotHaveEquivalentValuetypeParameters = 0x8000
+			}
+
+			[Flags]
+			public enum Flags2 : byte
+			{
+				HasStableEntryPoint = 1,
+				HasPrecode = 2,
+				IsUnboxingStub = 4,
+				HasNativeCodeSlot = 8,
+				TransparencyMask = 0x30,
+				TransparencyUnknown = 0,
+				TransparencyTransparent = 0x10,
+				TransparencyCritical = 0x20,
+				TransparencyTreatAsSafe = 0x30,
+				CASDemandsOnly = 0x40,
+				HostProtectionLinkChecksOnly = 0x80
+			}
+
+			public static readonly nuint Alignment = (nuint)((IntPtr.Size == 8) ? 8 : 4);
+
+			public Flags3 m_wFlags3AndTokenRemainder;
+
+			public byte m_chunkIndex;
+
+			public Flags2 m_bFlags2;
+
+			public const ushort PackedSlot_SlotMask = 1023;
+
+			public const ushort PackedSlot_NameHashMask = 64512;
+
+			public ushort m_wSlotNumber;
+
+			public MethodDescClassification m_wFlags;
+
+			private unsafe static readonly nuint[] s_ClassificationSizeTable = new UIntPtr[8]
+			{
+				(nuint)sizeof(MethodDesc),
+				(nuint)FCallMethodDescPtr.CurrentSize,
+				(nuint)NDirectMethodDescPtr.CurrentSize,
+				(nuint)EEImplMethodDescPtr.CurrentSize,
+				(nuint)ArrayMethodDescPtr.CurrentSize,
+				(nuint)sizeof(InstantiatedMethodDesc),
+				(nuint)sizeof(ComPlusCallMethodDesc),
+				(nuint)DynamicMethodDescPtr.CurrentSize
+			};
+
+			public ushort SlotNumber
+			{
+				get
+				{
+					if (!m_wFlags.Has(MethodDescClassification.RequiresFullSlotNumber))
+					{
+						return (ushort)(m_wSlotNumber & 0x3FF);
+					}
+					return m_wSlotNumber;
+				}
+			}
+
+			public MethodClassification Classification => (MethodClassification)(m_wFlags & MethodDescClassification.ClassificationMask);
+
+			public unsafe MethodDescChunk* MethodDescChunk => (MethodDescChunk*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref System.Runtime.CompilerServices.Unsafe.SubtractByteOffset(ref this, (nuint)sizeof(MethodDescChunk) + m_chunkIndex * Alignment));
+
+			public unsafe MethodTable* MethodTable => MethodDescChunk->MethodTable;
+
+			public bool HasNonVtableSlot => m_wFlags.Has(MethodDescClassification.HasNonVtableSlot);
+
+			public bool HasStableEntryPoint => m_bFlags2.Has(Flags2.HasStableEntryPoint);
+
+			public bool HasPrecode => m_bFlags2.Has(Flags2.HasPrecode);
+
+			public bool HasNativeCodeSlot => m_bFlags2.Has(Flags2.HasNativeCodeSlot);
+
+			public bool IsUnboxingStub => m_bFlags2.Has(Flags2.IsUnboxingStub);
+
+			public unsafe bool HasMethodInstantiation
+			{
+				get
+				{
+					if (TryAsInstantiated(out var md))
+					{
+						return md->IMD_HasMethodInstantiation;
+					}
+					return false;
+				}
+			}
+
+			public unsafe bool IsGenericMethodDefinition
+			{
+				get
+				{
+					if (TryAsInstantiated(out var md))
+					{
+						return md->IMD_IsGenericMethodDefinition;
+					}
+					return false;
+				}
+			}
+
+			public unsafe bool IsInstantiatingStub
+			{
+				get
+				{
+					if (!IsUnboxingStub && TryAsInstantiated(out var md))
+					{
+						return md->IMD_IsWrapperStubWithInstantiations;
+					}
+					return false;
+				}
+			}
+
+			public unsafe bool IsGenericComPlusCall
+			{
+				get
+				{
+					if (TryAsInstantiated(out var md))
+					{
+						return md->IMD_HasComPlusCallInfo;
+					}
+					return false;
+				}
+			}
+
+			public bool IsWrapperStub
+			{
+				get
+				{
+					if (!IsUnboxingStub)
+					{
+						return IsInstantiatingStub;
+					}
+					return true;
+				}
+			}
+
+			public bool IsTightlyBoundToMethodTable
+			{
+				get
+				{
+					if (!HasNonVtableSlot)
+					{
+						return true;
+					}
+					if (HasMethodInstantiation)
+					{
+						return IsGenericMethodDefinition;
+					}
+					if (IsWrapperStub)
+					{
+						return false;
+					}
+					return true;
+				}
+			}
+
+			public unsafe void* GetMethodEntryPoint()
+			{
+				if (HasNonVtableSlot)
+				{
+					nuint baseSize = GetBaseSize();
+					return *(void**)((byte*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref this) + baseSize);
+				}
+				return MethodTable->GetSlot(SlotNumber);
+			}
+
+			public unsafe bool TryAsInstantiated(out InstantiatedMethodDesc* md)
+			{
+				if (Classification == MethodClassification.Instantiated)
+				{
+					md = (InstantiatedMethodDesc*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref this);
+					return true;
+				}
+				md = default(InstantiatedMethodDesc*);
+				return false;
+			}
+
+			public unsafe nuint SizeOf(bool includeNonVtable = true, bool includeMethodImpl = true, bool includeComPlus = true, bool includeNativeCode = true)
+			{
+				nuint num = (nuint)((nint)GetBaseSize() + (nint)((includeNonVtable && m_wFlags.Has(MethodDescClassification.HasNonVtableSlot)) ? sizeof(void*) : 0) + ((includeMethodImpl && m_wFlags.Has(MethodDescClassification.MethodImpl)) ? sizeof(MethodImpl) : 0));
+				if (includeNativeCode && HasNativeCodeSlot)
+				{
+					num += (uint)((((nint)(nuint)System.Runtime.CompilerServices.Unsafe.As<MethodDesc, UIntPtr>(ref System.Runtime.CompilerServices.Unsafe.AddByteOffset(ref this, num)) & 1) != 0) ? (sizeof(void*) + sizeof(void*)) : sizeof(void*));
+				}
+				if (includeComPlus && IsGenericComPlusCall)
+				{
+					num += (uint)ComPlusCallInfoPtr.CurrentSize;
+				}
+				return num;
+			}
+
+			public unsafe void* GetNativeCode()
+			{
+				if (HasNativeCodeSlot)
+				{
+					nuint num = (nuint)((RelativePointer*)GetAddrOfNativeCodeSlot())->Value & (nuint)(~(nint)1);
+					if (num != 0)
+					{
+						return (void*)num;
+					}
+				}
+				if (!HasStableEntryPoint || HasPrecode)
+				{
+					return null;
+				}
+				return GetStableEntryPoint();
+			}
+
+			public unsafe void* GetStableEntryPoint()
+			{
+				return GetMethodEntryPoint();
+			}
+
+			public unsafe static MethodDesc* FindTightlyBoundWrappedMethodDesc(MethodDesc* pMD)
+			{
+				if (pMD->IsUnboxingStub && pMD->TryAsInstantiated(out var md))
+				{
+					pMD = md->IMD_GetWrappedMethodDesc();
+				}
+				if (!pMD->IsTightlyBoundToMethodTable)
+				{
+					pMD = pMD->GetCanonicalMethodTable()->GetParallelMethodDesc(pMD);
+				}
+				if (pMD->IsUnboxingStub)
+				{
+					pMD = GetNextIntroducedMethod(pMD);
+				}
+				return pMD;
+			}
+
+			public unsafe static MethodDesc* GetNextIntroducedMethod(MethodDesc* pMD)
+			{
+				MethodDescChunk* methodDescChunk = pMD->MethodDescChunk;
+				nuint num = (nuint)((byte*)pMD + pMD->SizeOf());
+				nuint num2 = (nuint)((byte*)methodDescChunk + methodDescChunk->SizeOf);
+				if (num < num2)
+				{
+					return (MethodDesc*)num;
+				}
+				methodDescChunk = methodDescChunk->m_next;
+				if (methodDescChunk != null)
+				{
+					return methodDescChunk->FirstMethodDesc;
+				}
+				return null;
+			}
+
+			public unsafe MethodTable* GetCanonicalMethodTable()
+			{
+				return MethodTable->GetCanonicalMethodTable();
+			}
+
+			public unsafe void* GetAddrOfNativeCodeSlot()
+			{
+				nuint byteOffset = SizeOf(includeNonVtable: true, includeMethodImpl: true, includeComPlus: false, includeNativeCode: false);
+				return System.Runtime.CompilerServices.Unsafe.AsPointer(ref System.Runtime.CompilerServices.Unsafe.AddByteOffset(ref this, byteOffset));
+			}
+
+			public nuint GetBaseSize()
+			{
+				return GetBaseSize(Classification);
+			}
+
+			public static nuint GetBaseSize(MethodClassification classification)
+			{
+				return s_ClassificationSizeTable[(int)classification];
+			}
+		}
+
+		[FatInterface]
+		public struct StoredSigMethodDescPtr
+		{
+			private unsafe readonly void* ptr_;
+
+			private readonly IntPtr[] vtbl_;
+
+			public static IntPtr[] CurrentVtable { get; } = (IntPtr.Size == 8) ? StoredSigMethodDesc_64.FatVtable_ : StoredSigMethodDesc_32.FatVtable_;
+
+			public unsafe static int CurrentSize { get; } = (IntPtr.Size == 8) ? sizeof(StoredSigMethodDesc_64) : sizeof(StoredSigMethodDesc_32);
+
+			public unsafe void* m_pSig
+			{
+				[FatInterfaceIgnore]
+				get
+				{
+					return GetPSig();
+				}
+			}
+
+			public uint m_cSig
+			{
+				[FatInterfaceIgnore]
+				get
+				{
+					return GetCSig();
+				}
+			}
+
+			private unsafe void* GetPSig()
+			{
+				return ((delegate*<void*, void*>)(void*)vtbl_[0])(ptr_);
+			}
+
+			private unsafe uint GetCSig()
+			{
+				return ((delegate*<void*, uint>)(void*)vtbl_[0])(ptr_);
+			}
+
+			public unsafe StoredSigMethodDescPtr(void* ptr, IntPtr[] vtbl)
+			{
+				ptr_ = ptr;
+				vtbl_ = vtbl;
+			}
+		}
+
+		[FatInterfaceImpl(typeof(StoredSigMethodDescPtr))]
+		public struct StoredSigMethodDesc_64
+		{
+			public MethodDesc @base;
+
+			public unsafe void* m_pSig;
+
+			public uint m_cSig;
+
+			public uint m_dwExtendedFlags;
+
+			private static IntPtr[]? fatVtable_;
+
+			public unsafe static IntPtr[] FatVtable_
+			{
+				get
+				{
+					object obj = fatVtable_;
+					if (obj == null)
+					{
+						obj = new IntPtr[2]
+						{
+							(IntPtr)(delegate*<void*, void*>)(&S_GetPSig_0),
+							(IntPtr)(delegate*<void*, uint>)(&S_GetCSig_1)
+						};
+						fatVtable_ = (IntPtr[]?)obj;
+					}
+					return (IntPtr[])obj;
+					unsafe static uint S_GetCSig_1(void* ptr__)
+					{
+						return ((StoredSigMethodDesc_64*)ptr__)->GetCSig();
+					}
+					unsafe static void* S_GetPSig_0(void* ptr__)
+					{
+						return ((StoredSigMethodDesc_64*)ptr__)->GetPSig();
+					}
+				}
+			}
+
+			private unsafe void* GetPSig()
+			{
+				return m_pSig;
+			}
+
+			private uint GetCSig()
+			{
+				return m_cSig;
+			}
+		}
+
+		[FatInterfaceImpl(typeof(StoredSigMethodDescPtr))]
+		public struct StoredSigMethodDesc_32
+		{
+			public MethodDesc @base;
+
+			public unsafe void* m_pSig;
+
+			public uint m_cSig;
+
+			private static IntPtr[]? fatVtable_;
+
+			public unsafe static IntPtr[] FatVtable_
+			{
+				get
+				{
+					object obj = fatVtable_;
+					if (obj == null)
+					{
+						obj = new IntPtr[2]
+						{
+							(IntPtr)(delegate*<void*, void*>)(&S_GetPSig_0),
+							(IntPtr)(delegate*<void*, uint>)(&S_GetCSig_1)
+						};
+						fatVtable_ = (IntPtr[]?)obj;
+					}
+					return (IntPtr[])obj;
+					unsafe static uint S_GetCSig_1(void* ptr__)
+					{
+						return ((StoredSigMethodDesc_32*)ptr__)->GetCSig();
+					}
+					unsafe static void* S_GetPSig_0(void* ptr__)
+					{
+						return ((StoredSigMethodDesc_32*)ptr__)->GetPSig();
+					}
+				}
+			}
+
+			private unsafe void* GetPSig()
+			{
+				return m_pSig;
+			}
+
+			private uint GetCSig()
+			{
+				return m_cSig;
+			}
+		}
+
+		[FatInterface]
+		public struct FCallMethodDescPtr
+		{
+			private unsafe readonly void* ptr_;
+
+			private readonly IntPtr[] vtbl_;
+
+			public static IntPtr[] CurrentVtable { get; } = (IntPtr.Size == 8) ? FCallMethodDesc_64.FatVtable_ : FCallMethodDesc_32.FatVtable_;
+
+			public unsafe static int CurrentSize { get; } = (IntPtr.Size == 8) ? sizeof(FCallMethodDesc_64) : sizeof(FCallMethodDesc_32);
+
+			public uint m_dwECallID
+			{
+				[FatInterfaceIgnore]
+				get
+				{
+					return GetECallID();
+				}
+			}
+
+			private unsafe uint GetECallID()
+			{
+				return ((delegate*<void*, uint>)(void*)vtbl_[0])(ptr_);
+			}
+
+			public unsafe FCallMethodDescPtr(void* ptr, IntPtr[] vtbl)
+			{
+				ptr_ = ptr;
+				vtbl_ = vtbl;
+			}
+		}
+
+		[FatInterfaceImpl(typeof(FCallMethodDescPtr))]
+		public struct FCallMethodDesc_64
+		{
+			public MethodDesc @base;
+
+			public uint m_dwECallID;
+
+			public uint m_padding;
+
+			private static IntPtr[]? fatVtable_;
+
+			public unsafe static IntPtr[] FatVtable_
+			{
+				get
+				{
+					object obj = fatVtable_;
+					if (obj == null)
+					{
+						obj = new IntPtr[1] { (IntPtr)(delegate*<void*, uint>)(&S_GetECallID_0) };
+						fatVtable_ = (IntPtr[]?)obj;
+					}
+					return (IntPtr[])obj;
+					unsafe static uint S_GetECallID_0(void* ptr__)
+					{
+						return ((FCallMethodDesc_64*)ptr__)->GetECallID();
+					}
+				}
+			}
+
+			private uint GetECallID()
+			{
+				return m_dwECallID;
+			}
+		}
+
+		[FatInterfaceImpl(typeof(FCallMethodDescPtr))]
+		public struct FCallMethodDesc_32
+		{
+			public MethodDesc @base;
+
+			public uint m_dwECallID;
+
+			private static IntPtr[]? fatVtable_;
+
+			public unsafe static IntPtr[] FatVtable_
+			{
+				get
+				{
+					object obj = fatVtable_;
+					if (obj == null)
+					{
+						obj = new IntPtr[1] { (IntPtr)(delegate*<void*, uint>)(&S_GetECallID_0) };
+						fatVtable_ = (IntPtr[]?)obj;
+					}
+					return (IntPtr[])obj;
+					unsafe static uint S_GetECallID_0(void* ptr__)
+					{
+						return ((FCallMethodDesc_32*)ptr__)->GetECallID();
+					}
+				}
+			}
+
+			private uint GetECallID()
+			{
+				return m_dwECallID;
+			}
+		}
+
+		public struct DynamicResolver
+		{
+		}
+
+		[Flags]
+		public enum DynamicMethodDesc_ExtendedFlags : uint
+		{
+			Attrs = 0xFFFFu,
+			ILStubAttrs = 0x17u,
+			MemberAccessMask = 7u,
+			ReverseStub = 8u,
+			Static = 0x10u,
+			CALLIStub = 0x20u,
+			DelegateStub = 0x40u,
+			CopyCtorArgs = 0x80u,
+			Unbreakable = 0x100u,
+			DelegateCOMStub = 0x200u,
+			SignatureNeedsResture = 0x400u,
+			StubNeedsCOMStarted = 0x800u,
+			MulticastStub = 0x1000u,
+			UnboxingILStub = 0x2000u,
+			ILStub = 0x10000u,
+			LCGMethod = 0x20000u,
+			StackArgSize = 0xFFFC0000u
+		}
+
+		[FatInterface]
+		public struct DynamicMethodDescPtr
+		{
+			private unsafe readonly void* ptr_;
+
+			private readonly IntPtr[] vtbl_;
+
+			public static IntPtr[] CurrentVtable { get; } = (IntPtr.Size == 8) ? DynamicMethodDesc_64.FatVtable_ : DynamicMethodDesc_32.FatVtable_;
+
+			public unsafe static int CurrentSize { get; } = (IntPtr.Size == 8) ? sizeof(DynamicMethodDesc_64) : sizeof(DynamicMethodDesc_32);
+
+			public DynamicMethodDesc_ExtendedFlags Flags => GetFlags();
+
+			private unsafe DynamicMethodDesc_ExtendedFlags GetFlags()
+			{
+				return ((delegate*<void*, DynamicMethodDesc_ExtendedFlags>)(void*)vtbl_[0])(ptr_);
+			}
+
+			public unsafe DynamicMethodDescPtr(void* ptr, IntPtr[] vtbl)
+			{
+				ptr_ = ptr;
+				vtbl_ = vtbl;
+			}
+		}
+
+		[FatInterfaceImpl(typeof(DynamicMethodDescPtr))]
+		public struct DynamicMethodDesc_64
+		{
+			public StoredSigMethodDesc_64 @base;
+
+			public unsafe byte* m_pszMethodName;
+
+			public unsafe DynamicResolver* m_pResolver;
+
+			private static IntPtr[]? fatVtable_;
+
+			public DynamicMethodDesc_ExtendedFlags Flags => GetFlags();
+
+			public unsafe static IntPtr[] FatVtable_
+			{
+				get
+				{
+					object obj = fatVtable_;
+					if (obj == null)
+					{
+						obj = new IntPtr[1] { (IntPtr)(delegate*<void*, DynamicMethodDesc_ExtendedFlags>)(&S_GetFlags_0) };
+						fatVtable_ = (IntPtr[]?)obj;
+					}
+					return (IntPtr[])obj;
+					unsafe static DynamicMethodDesc_ExtendedFlags S_GetFlags_0(void* ptr__)
+					{
+						return ((DynamicMethodDesc_64*)ptr__)->GetFlags();
+					}
+				}
+			}
+
+			private DynamicMethodDesc_ExtendedFlags GetFlags()
+			{
+				return (DynamicMethodDesc_ExtendedFlags)@base.m_dwExtendedFlags;
+			}
+		}
+
+		[FatInterfaceImpl(typeof(DynamicMethodDescPtr))]
+		public struct DynamicMethodDesc_32
+		{
+			public StoredSigMethodDesc_32 @base;
+
+			public unsafe byte* m_pszMethodName;
+
+			public unsafe DynamicResolver* m_pResolver;
+
+			public uint m_dwExtendedFlags;
+
+			private static IntPtr[]? fatVtable_;
+
+			public DynamicMethodDesc_ExtendedFlags Flags => GetFlags();
+
+			public unsafe static IntPtr[] FatVtable_
+			{
+				get
+				{
+					object obj = fatVtable_;
+					if (obj == null)
+					{
+						obj = new IntPtr[1] { (IntPtr)(delegate*<void*, DynamicMethodDesc_ExtendedFlags>)(&S_GetFlags_0) };
+						fatVtable_ = (IntPtr[]?)obj;
+					}
+					return (IntPtr[])obj;
+					unsafe static DynamicMethodDesc_ExtendedFlags S_GetFlags_0(void* ptr__)
+					{
+						return ((DynamicMethodDesc_32*)ptr__)->GetFlags();
+					}
+				}
+			}
+
+			private DynamicMethodDesc_ExtendedFlags GetFlags()
+			{
+				return (DynamicMethodDesc_ExtendedFlags)m_dwExtendedFlags;
+			}
+		}
+
+		[FatInterface]
+		public struct ArrayMethodDescPtr
+		{
+			private unsafe readonly void* ptr_;
+
+			private readonly IntPtr[] vtbl_;
+
+			public static IntPtr[] CurrentVtable { get; } = (IntPtr.Size == 8) ? ArrayMethodDesc_64.FatVtable_ : ArrayMethodDesc_32.FatVtable_;
+
+			public unsafe static int CurrentSize { get; } = (IntPtr.Size == 8) ? sizeof(ArrayMethodDesc_64) : sizeof(ArrayMethodDesc_32);
+
+			public unsafe ArrayMethodDescPtr(void* ptr, IntPtr[] vtbl)
+			{
+				ptr_ = ptr;
+				vtbl_ = vtbl;
+			}
+		}
+
+		public enum ArrayFunc
+		{
+			Get,
+			Set,
+			Address,
+			Ctor
+		}
+
+		[FatInterfaceImpl(typeof(ArrayMethodDescPtr))]
+		public struct ArrayMethodDesc_64
+		{
+			public StoredSigMethodDesc_64 @base;
+
+			private static IntPtr[]? fatVtable_;
+
+			public static IntPtr[] FatVtable_ => fatVtable_ ?? (fatVtable_ = new IntPtr[0]);
+		}
+
+		[FatInterfaceImpl(typeof(ArrayMethodDescPtr))]
+		public struct ArrayMethodDesc_32
+		{
+			public StoredSigMethodDesc_32 @base;
+
+			private static IntPtr[]? fatVtable_;
+
+			public static IntPtr[] FatVtable_ => fatVtable_ ?? (fatVtable_ = new IntPtr[0]);
+		}
+
+		public struct NDirectWriteableData
+		{
+		}
+
+		[Flags]
+		public enum NDirectMethodDesc_Flags : ushort
+		{
+			EarlyBound = 1,
+			HasSuppressUnmanagedCodeAccess = 2,
+			DefaultDllImportSearchPathIsCached = 4,
+			IsMarshalingRequiredCached = 0x10,
+			CachedMarshalingRequired = 0x20,
+			NativeAnsi = 0x40,
+			LastError = 0x80,
+			NativeNoMangle = 0x100,
+			VarArgs = 0x200,
+			StdCall = 0x400,
+			ThisCall = 0x800,
+			IsQCall = 0x1000,
+			DefaultDllImportSearchPathsStatus = 0x2000,
+			NDirectPopulated = 0x8000
+		}
+
+		[FatInterface]
+		public struct NDirectMethodDescPtr
+		{
+			private unsafe readonly void* ptr_;
+
+			private readonly IntPtr[] vtbl_;
+
+			public static IntPtr[] CurrentVtable { get; } = (PlatformDetection.Architecture == ArchitectureKind.x86) ? NDirectMethodDesc_x86.FatVtable_ : NDirectMethodDesc_other.FatVtable_;
+
+			public unsafe static int CurrentSize { get; } = (PlatformDetection.Architecture == ArchitectureKind.x86) ? sizeof(NDirectMethodDesc_x86) : sizeof(NDirectMethodDesc_other);
+
+			public unsafe NDirectMethodDescPtr(void* ptr, IntPtr[] vtbl)
+			{
+				ptr_ = ptr;
+				vtbl_ = vtbl;
+			}
+		}
+
+		[FatInterfaceImpl(typeof(NDirectMethodDescPtr))]
+		public struct NDirectMethodDesc_other
+		{
+			public struct NDirect
+			{
+				public unsafe void* m_pNativeNDirectTarget;
+
+				public unsafe byte* m_pszEntrypointName;
+
+				public nuint union_pszLibName_dwECallID;
+
+				public unsafe NDirectWriteableData* m_pWriteableData;
+
+				public unsafe void* m_pImportThunkGlue;
+
+				public uint m_DefaultDllImportSearchPathsAttributeValue;
+
+				public NDirectMethodDesc_Flags m_wFlags;
+
+				public unsafe MethodDesc* m_pStubMD;
+			}
+
+			public MethodDesc @base;
+
+			private NDirect ndirect;
+
+			private static IntPtr[]? fatVtable_;
+
+			public static IntPtr[] FatVtable_ => fatVtable_ ?? (fatVtable_ = new IntPtr[0]);
+		}
+
+		[FatInterfaceImpl(typeof(NDirectMethodDescPtr))]
+		public struct NDirectMethodDesc_x86
+		{
+			public struct NDirect
+			{
+				public unsafe void* m_pNativeNDirectTarget;
+
+				public unsafe byte* m_pszEntrypointName;
+
+				public nuint union_pszLibName_dwECallID;
+
+				public unsafe NDirectWriteableData* m_pWriteableData;
+
+				public unsafe void* m_pImportThunkGlue;
+
+				public uint m_DefaultDllImportSearchPathsAttributeValue;
+
+				public NDirectMethodDesc_Flags m_wFlags;
+
+				public ushort m_cbStackArgumentSize;
+
+				public unsafe MethodDesc* m_pStubMD;
+			}
+
+			public MethodDesc @base;
+
+			private NDirect ndirect;
+
+			private static IntPtr[]? fatVtable_;
+
+			public static IntPtr[] FatVtable_ => fatVtable_ ?? (fatVtable_ = new IntPtr[0]);
+		}
+
+		[FatInterface]
+		public struct EEImplMethodDescPtr
+		{
+			private unsafe readonly void* ptr_;
+
+			private readonly IntPtr[] vtbl_;
+
+			public static IntPtr[] CurrentVtable { get; } = (IntPtr.Size == 8) ? EEImplMethodDesc_64.FatVtable_ : EEImplMethodDesc_32.FatVtable_;
+
+			public unsafe static int CurrentSize { get; } = (IntPtr.Size == 8) ? sizeof(EEImplMethodDesc_64) : sizeof(EEImplMethodDesc_32);
+
+			public unsafe EEImplMethodDescPtr(void* ptr, IntPtr[] vtbl)
+			{
+				ptr_ = ptr;
+				vtbl_ = vtbl;
+			}
+		}
+
+		[FatInterfaceImpl(typeof(EEImplMethodDescPtr))]
+		public struct EEImplMethodDesc_64
+		{
+			public StoredSigMethodDesc_64 @base;
+
+			private static IntPtr[]? fatVtable_;
+
+			public static IntPtr[] FatVtable_ => fatVtable_ ?? (fatVtable_ = new IntPtr[0]);
+		}
+
+		[FatInterfaceImpl(typeof(EEImplMethodDescPtr))]
+		public struct EEImplMethodDesc_32
+		{
+			public StoredSigMethodDesc_32 @base;
+
+			private static IntPtr[]? fatVtable_;
+
+			public static IntPtr[] FatVtable_ => fatVtable_ ?? (fatVtable_ = new IntPtr[0]);
+		}
+
+		[FatInterface]
+		public struct ComPlusCallInfoPtr
+		{
+			private unsafe readonly void* ptr_;
+
+			private readonly IntPtr[] vtbl_;
+
+			public unsafe static int CurrentSize { get; } = (PlatformDetection.Architecture == ArchitectureKind.x86) ? sizeof(ComPlusCallInfo_x86) : sizeof(ComPlusCallInfo_other);
+
+			public unsafe ComPlusCallInfoPtr(void* ptr, IntPtr[] vtbl)
+			{
+				ptr_ = ptr;
+				vtbl_ = vtbl;
+			}
+		}
+
+		public struct ComPlusCallInfo_x86
+		{
+			public unsafe void* union_m_pILStub_pEventProviderMD;
+
+			public unsafe MethodTable* m_pInterfaceMT;
+
+			public byte m_flags;
+
+			public ushort m_cachedComSlot;
+
+			public ushort m_cbStackArgumentSize;
+
+			public unsafe void* union_m_pRetThunk_pInterceptStub;
+
+			private RelativePointer m_pStubMD;
+		}
+
+		public struct ComPlusCallInfo_other
+		{
+			public unsafe void* union_m_pILStub_pEventProviderMD;
+
+			public unsafe MethodTable* m_pInterfaceMT;
+
+			public byte m_flags;
+
+			public ushort m_cachedComSlot;
+
+			private RelativePointer m_pStubMD;
+		}
+
+		public struct ComPlusCallMethodDesc
+		{
+			public MethodDesc @base;
+
+			public unsafe void* m_pComPlusCallInfo;
+		}
+
+		public struct InstantiatedMethodDesc
+		{
+			[Flags]
+			public enum Flags : ushort
+			{
+				KindMask = 7,
+				GenericMethodDefinition = 0,
+				UnsharedMethodInstantiation = 1,
+				SharedMethodInstantiation = 2,
+				WrapperStubWithInstantiations = 3,
+				EnCAddedMethod = 7,
+				Unrestored = 8,
+				HasComPlusCallInfo = 0x10
+			}
+
+			public MethodDesc @base;
+
+			public unsafe void* union_pDictLayout_pWrappedMethodDesc;
+
+			public unsafe Dictionary* m_pPerInstInfo;
+
+			public Flags m_wFlags2;
+
+			public ushort m_wNumGenericArgs;
+
+			public unsafe bool IMD_HasMethodInstantiation
+			{
+				get
+				{
+					if (!IMD_IsGenericMethodDefinition)
+					{
+						return m_pPerInstInfo != null;
+					}
+					return true;
+				}
+			}
+
+			public bool IMD_IsGenericMethodDefinition => (m_wFlags2 & Flags.KindMask) == 0;
+
+			public bool IMD_IsWrapperStubWithInstantiations => (m_wFlags2 & Flags.KindMask) == Flags.WrapperStubWithInstantiations;
+
+			public bool IMD_HasComPlusCallInfo => m_wFlags2.Has(Flags.HasComPlusCallInfo);
+
+			public unsafe MethodDesc* IMD_GetWrappedMethodDesc()
+			{
+				Helpers.Assert(IMD_IsWrapperStubWithInstantiations, null, "IMD_IsWrapperStubWithInstantiations");
+				return (MethodDesc*)union_pDictLayout_pWrappedMethodDesc;
+			}
+		}
+
+		public struct RelativeFixupPointer
+		{
+			private readonly nint value;
+
+			public unsafe void* Value
+			{
+				get
+				{
+					nint num = value;
+					if (num == 0)
+					{
+						return null;
+					}
+					nint num2 = (nint)((byte*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref this) + num);
+					if ((num2 & 1) != 0)
+					{
+						num2 = *(nint*)(num2 - 1);
+					}
+					return (void*)num2;
+				}
+			}
+		}
+
+		public struct MethodDescChunk
+		{
+			[Flags]
+			public enum Flags : ushort
+			{
+				TokenRangeMask = 0x3FF,
+				HasCompactEntrypoints = 0x4000,
+				IsZapped = 0x8000
+			}
+
+			public RelativeFixupPointer m_methodTable;
+
+			public unsafe MethodDescChunk* m_next;
+
+			public byte m_size;
+
+			public byte m_count;
+
+			public Flags m_flagsAndTokenRange;
+
+			public unsafe MethodTable* MethodTable => (MethodTable*)m_methodTable.Value;
+
+			public unsafe MethodDesc* FirstMethodDesc => (MethodDesc*)((byte*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref this) + sizeof(MethodDescChunk));
+
+			public uint Size => (uint)(m_size + 1);
+
+			public uint Count => (uint)(m_count + 1);
+
+			public unsafe nuint SizeOf => (nuint)sizeof(MethodDescChunk) + Size * MethodDesc.Alignment;
+		}
+
+		public struct Dictionary
+		{
+		}
+
+		public struct Module
+		{
+		}
+
+		public struct MethodTableWriteableData
+		{
+		}
+
+		public struct RelativePointer
+		{
+			private nint m_delta;
+
+			public unsafe void* Value
+			{
+				get
+				{
+					nint delta = m_delta;
+					if (delta != 0)
+					{
+						return System.Runtime.CompilerServices.Unsafe.AsPointer(ref System.Runtime.CompilerServices.Unsafe.AddByteOffset(ref this, delta));
+					}
+					return null;
+				}
+			}
+
+			public RelativePointer(nint delta)
+			{
+				m_delta = delta;
+			}
+		}
+
+		public struct MethodTable
+		{
+			[Flags]
+			public enum WFlagsLow : uint
+			{
+				UNUSED_ComponentSize_1 = 1u,
+				StaticsMask = 6u,
+				StaticsMask_NonDynamic = 0u,
+				StaticsMask_Dynamic = 2u,
+				StaticsMask_Generics = 4u,
+				StaticsMask_CrossModuleGenerics = 6u,
+				StaticsMask_IfGenericsThenCrossModule = 2u,
+				NotInPZM = 8u,
+				GenericsMask = 0x30u,
+				GenericsMask_NonGeneric = 0u,
+				GenericsMask_GenericInst = 0x10u,
+				GenericsMask_SharedInst = 0x20u,
+				GenericsMask_TypicalInst = 0x30u,
+				ContextStatic = 0x40u,
+				HasRemotingVtsInfo = 0x80u,
+				HasVariance = 0x100u,
+				HasDefaultCtor = 0x200u,
+				HasPreciseInitCctors = 0x400u,
+				IsHFA_IsRegStructPassed = 0x800u,
+				IsByRefLike = 0x1000u,
+				UNUSED_ComponentSize_5 = 0x2000u,
+				UNUSED_ComponentSize_6 = 0x4000u,
+				UNUSED_ComponentSize_7 = 0x8000u,
+				StringArrayValues = 0u
+			}
+
+			[Flags]
+			public enum WFlagsHigh : uint
+			{
+				Category_Mask = 0xF0000u,
+				Category_Class = 0u,
+				Category_Unused_1 = 0x10000u,
+				Category_MarshalByRef_Mask = 0xE0000u,
+				Category_MarshalByRef = 0x20000u,
+				Category_Contextful = 0x30000u,
+				Category_ValueType = 0x40000u,
+				Category_ValueType_Mask = 0xC0000u,
+				Category_Nullable = 0x50000u,
+				Category_PrimitiveValueType = 0x60000u,
+				Category_TruePrimitive = 0x70000u,
+				Category_Array = 0x80000u,
+				Category_Array_Mask = 0xC0000u,
+				Category_IfArrayThenSzArray = 0x20000u,
+				Category_Interface = 0xC0000u,
+				Category_Unused_2 = 0xD0000u,
+				Category_TransparentProxy = 0xE0000u,
+				Category_AsyncPin = 0xF0000u,
+				Category_ElementTypeMask = 0xE0000u,
+				HasFinalizer = 0x100000u,
+				IfNotInterfaceThenMarshalable = 0x200000u,
+				IfInterfaceThenHasGuidInfo = 0x200000u,
+				ICastable = 0x400000u,
+				HasIndirectParent = 0x800000u,
+				ContainsPointers = 0x1000000u,
+				HasTypeEquivalence = 0x2000000u,
+				HasRCWPerTypeData = 0x4000000u,
+				HasCriticalFinalizer = 0x8000000u,
+				Collectible = 0x10000000u,
+				ContainsGenericVariables = 0x20000000u,
+				ComObject = 0x40000000u,
+				HasComponentSize = 0x80000000u,
+				NonTrivialInterfaceCast = 0x40480000u
+			}
+
+			[Flags]
+			public enum Flags2 : ushort
+			{
+				MultipurposeSlotsMask = 0x1F,
+				HasPerInstInfo = 1,
+				HasInterfaceMap = 2,
+				HasDispatchMapSlot = 4,
+				HasNonVirtualSlots = 8,
+				HasModuleOverride = 0x10,
+				IsZapped = 0x20,
+				IsPreRestored = 0x40,
+				HasModuleDependencies = 0x80,
+				NoSecurityProperties = 0x100,
+				RequiresDispatchTokenFat = 0x200,
+				HasCctor = 0x400,
+				HasCCWTemplate = 0x800,
+				RequiresAlign8 = 0x1000,
+				HasBoxedRegularStatics = 0x2000,
+				HasSingleNonVirtualSlot = 0x4000,
+				DependsOnEquivalentOrForwardedStructs = 0x8000
+			}
+
+			public enum UnionLowBits
+			{
+				EEClass,
+				Invalid,
+				MethodTable,
+				Indirection
+			}
+
+			private static class MultipurposeSlotHelpers
+			{
+				public unsafe static byte OffsetOfMp1()
+				{
+					MethodTable methodTable = default(MethodTable);
+					return (byte)((byte*)(&methodTable.union_pPerInstInfo_ElementTypeHnd_pMultipurposeSlot1) - (byte*)(&methodTable));
+				}
+
+				public unsafe static byte OffsetOfMp2()
+				{
+					MethodTable methodTable = default(MethodTable);
+					return (byte)((byte*)(&methodTable.union_p_InterfaceMap_pMultipurposeSlot2) - (byte*)(&methodTable));
+				}
+
+				public unsafe static byte RegularOffset(int index)
+				{
+					return (byte)(sizeof(MethodTable) + index * IntPtr.Size - 2 * IntPtr.Size);
+				}
+			}
+
+			private uint m_dwFlags;
+
+			public uint m_BaseSize;
+
+			public Flags2 m_wFlags2;
+
+			public ushort m_wToken;
+
+			public ushort m_wNumVirtuals;
+
+			public ushort m_wNumInterfaces;
+
+			private unsafe void* m_pParentMethodTable;
+
+			public unsafe Module* m_pLoaderModule;
+
+			public unsafe MethodTableWriteableData* m_pWriteableData;
+
+			public unsafe void* union_pEEClass_pCanonMT;
+
+			public unsafe void* union_pPerInstInfo_ElementTypeHnd_pMultipurposeSlot1;
+
+			public unsafe void* union_p_InterfaceMap_pMultipurposeSlot2;
+
+			public const int VTABLE_SLOTS_PER_CHUNK = 8;
+
+			public const int VTABLE_SLOTS_PER_CHUNK_LOG2 = 3;
+
+			private static readonly byte[] c_NonVirtualSlotsOffsets = GetNonVirtualSlotsOffsets();
+
+			public WFlagsHigh FlagsHigh => (WFlagsHigh)(m_dwFlags & 0xFFFF0000u);
+
+			public WFlagsLow FlagsLow
+			{
+				get
+				{
+					if (!FlagsHigh.Has(WFlagsHigh.HasComponentSize))
+					{
+						return (WFlagsLow)(m_dwFlags & 0xFFFF);
+					}
+					return WFlagsLow.StaticsMask_NonDynamic;
+				}
+			}
+
+			public int ComponentSize
+			{
+				get
+				{
+					if (!FlagsHigh.Has(WFlagsHigh.HasComponentSize))
+					{
+						return 0;
+					}
+					return (int)(m_dwFlags & 0xFFFF);
+				}
+			}
+
+			public bool IsInterface => (m_dwFlags & 0xF0000) == 786432;
+
+			public bool HasIndirectParent => FlagsHigh.Has(WFlagsHigh.HasIndirectParent);
+
+			public unsafe MethodTable* ParentMethodTable
+			{
+				get
+				{
+					void* pParentMethodTable = m_pParentMethodTable;
+					if (HasIndirectParent)
+					{
+						return (MethodTable*)((MethodTable*)pParentMethodTable)->m_pParentMethodTable;
+					}
+					return (MethodTable*)pParentMethodTable;
+				}
+			}
+
+			public bool HasSingleNonVirtualSlot => m_wFlags2.Has(Flags2.HasSingleNonVirtualSlot);
+
+			public unsafe MethodTable* GetCanonicalMethodTable()
+			{
+				nuint num = (nuint)union_pEEClass_pCanonMT;
+				if ((num & 2) == 0)
+				{
+					return (MethodTable*)num;
+				}
+				if ((num & 1) != 0)
+				{
+					return *(MethodTable**)(num - 3);
+				}
+				return (MethodTable*)(num - 2);
+			}
+
+			public unsafe MethodDesc* GetParallelMethodDesc(MethodDesc* pDefMD)
+			{
+				return GetMethodDescForSlot(pDefMD->SlotNumber);
+			}
+
+			public unsafe MethodDesc* GetMethodDescForSlot(uint slotNumber)
+			{
+				if (IsInterface)
+				{
+					GetNumVirtuals();
+				}
+				throw new NotImplementedException();
+			}
+
+			public unsafe void* GetRestoredSlot(uint slotNumber)
+			{
+				MethodTable* ptr = (MethodTable*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref this);
+				void* slot;
+				while (true)
+				{
+					ptr = ptr->GetCanonicalMethodTable();
+					slot = ptr->GetSlot(slotNumber);
+					if (slot != null)
+					{
+						break;
+					}
+					ptr = ptr->ParentMethodTable;
+				}
+				return slot;
+			}
+
+			public unsafe void* GetSlot(uint slotNumber)
+			{
+				return *(void**)GetSlotPtrRaw(slotNumber);
+			}
+
+			public unsafe nint GetSlotPtrRaw(uint slotNum)
+			{
+				if (slotNum < GetNumVirtuals())
+				{
+					uint indexOfVtableIndirection = GetIndexOfVtableIndirection(slotNum);
+					void** ptr = (void**)GetVtableIndirections()[indexOfVtableIndirection];
+					return (nint)(ptr + GetIndexAfterVtableIndirection(slotNum));
+				}
+				if (HasSingleNonVirtualSlot)
+				{
+					return GetNonVirtualSlotsPtr();
+				}
+				return (nint)(GetNonVirtualSlotsArray() + (slotNum - GetNumVirtuals()));
+			}
+
+			public ushort GetNumVirtuals()
+			{
+				return m_wNumVirtuals;
+			}
+
+			public static uint GetIndexOfVtableIndirection(uint slotNum)
+			{
+				return slotNum >> 3;
+			}
+
+			public unsafe void** GetVtableIndirections()
+			{
+				return (void**)((byte*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref this) + sizeof(MethodTable));
+			}
+
+			public static uint GetIndexAfterVtableIndirection(uint slotNum)
+			{
+				return slotNum & 7;
+			}
+
+			[MultipurposeSlotOffsetTable(3, typeof(MultipurposeSlotHelpers))]
+			private static byte[] GetNonVirtualSlotsOffsets()
+			{
+				return new byte[8]
+				{
+					MultipurposeSlotHelpers.OffsetOfMp1(),
+					MultipurposeSlotHelpers.OffsetOfMp2(),
+					MultipurposeSlotHelpers.OffsetOfMp1(),
+					MultipurposeSlotHelpers.RegularOffset(2),
+					MultipurposeSlotHelpers.OffsetOfMp2(),
+					MultipurposeSlotHelpers.RegularOffset(2),
+					MultipurposeSlotHelpers.RegularOffset(2),
+					MultipurposeSlotHelpers.RegularOffset(3)
+				};
+			}
+
+			public nint GetNonVirtualSlotsPtr()
+			{
+				return GetMultipurposeSlotPtr(Flags2.HasNonVirtualSlots, c_NonVirtualSlotsOffsets);
+			}
+
+			public unsafe nint GetMultipurposeSlotPtr(Flags2 flag, byte[] offsets)
+			{
+				nint num = offsets[(uint)(m_wFlags2 & (flag - 1))];
+				if (num >= sizeof(MethodTable))
+				{
+					num += (nint)GetNumVTableIndirections() * (nint)sizeof(void**);
+				}
+				return (nint)((byte*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref this) + num);
+			}
+
+			public unsafe void** GetNonVirtualSlotsArray()
+			{
+				return (void**)((RelativePointer*)GetNonVirtualSlotsPtr())->Value;
+			}
+
+			public uint GetNumVTableIndirections()
+			{
+				return GetNumVtableIndirections(GetNumVirtuals());
+			}
+
+			public static uint GetNumVtableIndirections(uint numVirtuals)
+			{
+				return numVirtuals + 7 >> 3;
+			}
+		}
+	}
+}

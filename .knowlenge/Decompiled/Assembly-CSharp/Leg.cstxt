@@ -1,0 +1,3118 @@
+using System;
+using System.Collections.Generic;
+using FIMSpace.FTools;
+using UnityEngine;
+
+[Serializable]
+public class Leg
+{
+	private struct GlueAttachement
+	{
+		public RaycastHit AttachHit;
+
+		public Transform AttachedTo;
+
+		public Vector3 PosInAttachementLocal;
+
+		public Vector3 NormalInAttachementLocal;
+
+		public Quaternion RotInAttachementLocal;
+
+		public bool NoTransform { get; private set; }
+
+		public GlueAttachement(Leg leg, RaycastHit legGroundHit)
+		{
+			AttachHit = legGroundHit;
+			AttachedTo = legGroundHit.transform;
+			if (legGroundHit.transform == null)
+			{
+				NoTransform = true;
+				PosInAttachementLocal = legGroundHit.point;
+				NormalInAttachementLocal = legGroundHit.normal;
+				RotInAttachementLocal = leg._PreviousFinalIKRot;
+				return;
+			}
+			NoTransform = false;
+			PosInAttachementLocal = legGroundHit.transform.InverseTransformPoint(legGroundHit.point);
+			NormalInAttachementLocal = legGroundHit.transform.InverseTransformDirection(legGroundHit.normal);
+			if (!leg.Owner.AnimateFeet)
+			{
+				RotInAttachementLocal = Quaternion.identity;
+			}
+			else
+			{
+				RotInAttachementLocal = FEngineering.QToLocal(AttachedTo.rotation, leg.GetAlignedOnGroundHitRot(leg._SourceIKRot, legGroundHit.normal));
+			}
+		}
+
+		internal Vector3 GetRelevantAlignedHitPoint(Leg leg)
+		{
+			Vector3 relevantHitPoint = GetRelevantHitPoint();
+			return leg.GetAlignedOnGroundHitPos(leg.ToRootLocalSpace(relevantHitPoint), relevantHitPoint, GetRelevantNormal());
+		}
+
+		internal Vector3 GetRelevantHitPoint()
+		{
+			if (NoTransform || AttachedTo == null)
+			{
+				return PosInAttachementLocal;
+			}
+			return AttachedTo.TransformPoint(PosInAttachementLocal);
+		}
+
+		internal Vector3 GetRelevantNormal()
+		{
+			if (NoTransform)
+			{
+				return NormalInAttachementLocal;
+			}
+			return AttachedTo.TransformDirection(NormalInAttachementLocal);
+		}
+
+		internal Quaternion GetRelevantAttachementRotation()
+		{
+			if (NoTransform)
+			{
+				return RotInAttachementLocal;
+			}
+			return FEngineering.QToWorld(AttachedTo.rotation, RotInAttachementLocal);
+		}
+
+		internal void OverwritePosition(Vector3 legAnimPos)
+		{
+			if (AttachedTo == null)
+			{
+				PosInAttachementLocal = legAnimPos;
+			}
+			else
+			{
+				PosInAttachementLocal = AttachedTo.transform.InverseTransformPoint(legAnimPos);
+			}
+		}
+	}
+
+	private class GlueAttachementHandler
+	{
+		public class LegTransitionAnimation
+		{
+			private enum EMoveType
+			{
+				FromAnimation,
+				FromLastAttachement
+			}
+
+			private GlueAttachementHandler handler;
+
+			public float LegAdjustementYOffset;
+
+			public float LegAdjustementFootAngleOffset;
+
+			private Vector3 _legSpherizeLocalVector = Vector3.zero;
+
+			private float _legMoveDurMul = 1f;
+
+			private Quaternion baseRotationOnStepUp;
+
+			public float legMoveDistanceFactor;
+
+			private float sd_trProgress;
+
+			private Vector3 previousPositionLocal;
+
+			private Vector3 previousPositionWorld;
+
+			private Quaternion previousRotationWorld;
+
+			private Vector3 lastAppliedGluePosition;
+
+			private Vector3 lastAppliedGluePositionLocal;
+
+			private Quaternion lastAppliedGlueRotation;
+
+			private float lastSpeedup;
+
+			private EMoveType animationMoveType;
+
+			private bool _instantTransition;
+
+			private bool _wasAnimatingLeg;
+
+			private LegsAnimator Owner => handler.Owner;
+
+			private Leg leg => handler.leg;
+
+			public bool duringLegAdjustMovement { get; private set; }
+
+			public bool wasAttaching { get; private set; }
+
+			public bool attached { get; private set; }
+
+			public float transitionProgress { get; private set; }
+
+			public float lastAttachCompleteTime { get; private set; }
+
+			public float transitionProgressLastFrame { get; private set; }
+
+			public EGlueMode LastAnimationGlueMode
+			{
+				get
+				{
+					if (animationMoveType != 0)
+					{
+						return EGlueMode.Idle;
+					}
+					return EGlueMode.Moving;
+				}
+			}
+
+			public LegTransitionAnimation(GlueAttachementHandler glueTransitionHelper)
+			{
+				handler = glueTransitionHelper;
+				Reset();
+			}
+
+			public void Reset()
+			{
+				animationMoveType = EMoveType.FromAnimation;
+				transitionProgress = 0f;
+				transitionProgressLastFrame = 0f;
+				baseRotationOnStepUp = Owner.BaseTransform.rotation;
+				duringLegAdjustMovement = false;
+				wasAttaching = false;
+				attached = false;
+				_legSpherizeLocalVector = Vector3.zero;
+				ReInitialize();
+			}
+
+			public void ReInitialize()
+			{
+				lastAppliedGluePosition = leg._SourceIKPos;
+				lastAppliedGlueRotation = leg._SourceIKRot;
+				previousPositionWorld = leg._SourceIKPos;
+				previousRotationWorld = leg._SourceIKRot;
+				previousPositionLocal = leg.ToRootLocalSpace(leg._SourceIKPos);
+			}
+
+			internal void ScheduleInstantTransition()
+			{
+				_instantTransition = true;
+			}
+
+			internal void DoAttaching(bool canAttach)
+			{
+				if (canAttach != wasAttaching)
+				{
+					wasAttaching = canAttach;
+					if (canAttach)
+					{
+						OnChangeTargetPosition();
+					}
+					else
+					{
+						attached = false;
+						if (transitionProgress != 0f)
+						{
+							OnChangeTargetPosition();
+						}
+					}
+				}
+				if (duringLegAdjustMovement && transitionProgress >= 1f)
+				{
+					duringLegAdjustMovement = false;
+				}
+			}
+
+			internal Vector3 EnsureAnkleNotOverlappingGroundLevel(Vector3 legAnimPos)
+			{
+				if (leg.A_PreWasAligning && leg.A_WasAligningFrameBack)
+				{
+					Vector3 localPos = Owner.ToRootLocalSpace(legAnimPos);
+					Vector3 vector = ((!(Owner.SmoothSuddenSteps < 0.0001f)) ? (leg.A_WasSmoothing ? leg.A_LastSmoothTargetedPosLocal : leg.ankleAlignedOnGroundHitRootLocal) : leg.ankleAlignedOnGroundHitRootLocal);
+					if (localPos.y < vector.y)
+					{
+						localPos.y = vector.y;
+						legAnimPos = Owner.RootToWorldSpace(localPos);
+					}
+				}
+				return legAnimPos;
+			}
+
+			public Vector3 CalculateAnimatedLegPosition(Vector3 a, Vector3 b)
+			{
+				LegStepAnimatingParameters legAnimatingSettings = leg.LegAnimatingSettings;
+				Vector3 result = Vector3.LerpUnclamped(a, b, legAnimatingSettings.MoveToGoalCurve.Evaluate(transitionProgress));
+				if (legAnimatingSettings.SpherizeTrack.length > 1)
+				{
+					float num = legAnimatingSettings.SpherizeTrack.Evaluate(transitionProgress) * legAnimatingSettings.SpherizePower * Owner.BaseTransform.lossyScale.x;
+					result += leg.RootSpaceToWorldVec(_legSpherizeLocalVector * (num * 12f));
+				}
+				if (Owner.AnimateFeet)
+				{
+					LegAdjustementFootAngleOffset = legAnimatingSettings.FootRotationCurve.Evaluate(transitionProgress) * 90f * Mathf.Min(0.5f, legMoveDistanceFactor * 1.1f);
+					LegAdjustementFootAngleOffset /= lastSpeedup;
+				}
+				float num2 = Owner.ScaleReferenceNoScale * 0.75f;
+				float num3 = Mathf.Lerp(legAnimatingSettings.MinFootRaise, legAnimatingSettings.MaxFootRaise, legMoveDistanceFactor);
+				num3 *= num2;
+				LegAdjustementYOffset = num3 * legAnimatingSettings.RaiseYAxisCurve.Evaluate(transitionProgress);
+				_wasAnimatingLeg = true;
+				return result;
+			}
+
+			internal Vector3 GetTargetPosition()
+			{
+				float glueAnimationBlend = handler.glueAnimationBlend;
+				if (animationMoveType == EMoveType.FromAnimation)
+				{
+					if (glueAnimationBlend < 0.0001f)
+					{
+						return Owner.RootToWorldSpace(previousPositionLocal);
+					}
+					Vector3 vector = Owner.RootToWorldSpace(previousPositionLocal);
+					if (transitionProgress < 0.0001f)
+					{
+						return vector;
+					}
+					Vector3 vector2 = ((!attached) ? leg.ankleAlignedOnGroundHitWorldPos : ((glueAnimationBlend > 0.9995f) ? leg._GlueLastAttachPosition : ((!leg.Owner.OnlyLocalAnimation) ? Vector3.LerpUnclamped(leg.RootSpaceToWorld(leg._GlueLastAttachPositionRootLocal), leg._GlueLastAttachPosition, glueAnimationBlend) : leg.RootSpaceToWorld(leg._GlueLastAttachPositionRootLocal))));
+					if (transitionProgress > 0.9995f)
+					{
+						return vector2;
+					}
+					return Vector3.LerpUnclamped(vector, vector2, transitionProgress);
+				}
+				Vector3 vector3;
+				if (leg.Owner.OnlyLocalAnimation)
+				{
+					vector3 = Owner.RootToWorldSpace(previousPositionLocal);
+					if (transitionProgress < 0.0001f)
+					{
+						return vector3;
+					}
+				}
+				else
+				{
+					vector3 = previousPositionWorld;
+					if (transitionProgress < 0.0001f)
+					{
+						return vector3;
+					}
+					vector3 = Vector3.LerpUnclamped(previousPositionWorld, Owner.RootToWorldSpace(previousPositionLocal), transitionProgress);
+				}
+				Vector3 vector4 = ((!(transitionProgress > 0.9995f)) ? CalculateAnimatedLegPosition(vector3, leg.ankleAlignedOnGroundHitWorldPos) : leg._GlueLastAttachPosition);
+				if (transitionProgress >= 1f)
+				{
+					return vector4;
+				}
+				float num = 1f - transitionProgress;
+				return Vector3.LerpUnclamped(vector3, vector4, 1f - num * num);
+			}
+
+			internal void RequireRepose()
+			{
+				if (attached)
+				{
+					attached = false;
+					OnChangeTargetPosition();
+				}
+			}
+
+			internal Quaternion GetTargetRotation()
+			{
+				Quaternion quaternion = previousRotationWorld;
+				if (transitionProgress < 0.001f)
+				{
+					return quaternion;
+				}
+				Quaternion quaternion2 = ((!attached) ? leg.ankleAlignedOnGroundHitRotation : leg._GlueLastAttachRotation);
+				if (transitionProgress > 0.9995f)
+				{
+					return quaternion2;
+				}
+				return Quaternion.LerpUnclamped(quaternion, quaternion2, transitionProgress);
+			}
+
+			internal void OnChangeTargetPosition()
+			{
+				handler.lasGlueModeOnAttaching = Owner._glueModeExecuted;
+				baseRotationOnStepUp = Owner.BaseTransform.rotation;
+				if (handler.glueAnimationBlend < 0.2f)
+				{
+					animationMoveType = EMoveType.FromAnimation;
+				}
+				else if (handler.lasGlueModeOnAttaching == EGlueMode.Moving)
+				{
+					animationMoveType = EMoveType.FromAnimation;
+				}
+				else if (animationMoveType == EMoveType.FromLastAttachement)
+				{
+					animationMoveType = EMoveType.FromLastAttachement;
+				}
+				else if (handler.glueAnimationBlend > 0.75f)
+				{
+					if (transitionProgress < 0.1f || transitionProgress > 0.9f)
+					{
+						animationMoveType = EMoveType.FromLastAttachement;
+					}
+					else
+					{
+						animationMoveType = EMoveType.FromAnimation;
+					}
+				}
+				else
+				{
+					animationMoveType = EMoveType.FromAnimation;
+				}
+				if (leg.Owner.OnlyLocalAnimation)
+				{
+					previousPositionWorld = leg.RootSpaceToWorld(lastAppliedGluePositionLocal);
+				}
+				else
+				{
+					previousPositionWorld = lastAppliedGluePosition;
+				}
+				previousRotationWorld = lastAppliedGlueRotation;
+				previousPositionLocal = Owner.ToRootLocalSpace(previousPositionWorld);
+				if (animationMoveType == EMoveType.FromLastAttachement)
+				{
+					if (!(transitionProgress > 0.1f) || !(transitionProgress < 0.9f))
+					{
+						transitionProgress = 0f;
+					}
+					Vector3 vector = previousPositionWorld;
+					Vector3 vector2 = leg.ankleAlignedOnGroundHitWorldPos - vector;
+					float magnitude = vector2.magnitude;
+					legMoveDistanceFactor = magnitude / (Owner.ScaleReference * 0.6f);
+					legMoveDistanceFactor = Mathf.Clamp(legMoveDistanceFactor, 0.05f, 1f);
+					Vector3 normalized = vector2.normalized;
+					normalized = Vector3.ProjectOnPlane(normalized, Owner.Up);
+					normalized.Normalize();
+					leg.SendRaiseEvent(magnitude);
+					if (legMoveDistanceFactor > 0.0401f)
+					{
+						_legMoveDurMul = Mathf.Lerp(1.55f, 0.85f, legMoveDistanceFactor * 2f);
+						Vector3 worldDir = Vector3.Cross(normalized, Owner.Up);
+						worldDir.Normalize();
+						_legSpherizeLocalVector = leg.ToRootLocalSpaceDir(worldDir) * Owner.ScaleReferenceNoScale * -0.03f;
+						duringLegAdjustMovement = true;
+					}
+					else
+					{
+						animationMoveType = EMoveType.FromAnimation;
+						_legSpherizeLocalVector = Vector3.zero;
+						duringLegAdjustMovement = false;
+					}
+				}
+				else
+				{
+					duringLegAdjustMovement = false;
+					transitionProgress = 0f;
+				}
+			}
+
+			public void UpdateAnimation()
+			{
+				float num = (Owner.JustGrounded ? 0.2f : 1f);
+				float num2 = (Owner.JustGrounded ? 5f : 1f);
+				transitionProgressLastFrame = transitionProgress;
+				if (_instantTransition)
+				{
+					_instantTransition = false;
+					transitionProgress = 1f;
+					lastAttachCompleteTime = Time.time;
+				}
+				if (!Owner.IsGrounded)
+				{
+					return;
+				}
+				if (animationMoveType == EMoveType.FromLastAttachement)
+				{
+					float num3 = 1f / (leg.LegAnimatingSettings.StepMoveDuration * 0.8f);
+					float num4 = 1f;
+					lastSpeedup = 1f;
+					if (leg.LegAnimatingSettings.AllowSpeedups > 0f)
+					{
+						if (leg.hasOppositeleg)
+						{
+							Leg oppositeLeg = leg.GetOppositeLeg();
+							Vector3 targetPos = oppositeLeg._PreviousFinalIKPos;
+							if (leg.Owner.OnlyLocalAnimation)
+							{
+								targetPos = leg.RootSpaceToWorld(oppositeLeg._PreviousFinalIKPosRootLocal);
+							}
+							float stretchValue = oppositeLeg.IKProcessor.GetStretchValue(targetPos);
+							if (stretchValue > leg.LegStretchLimit * 0.95f)
+							{
+								float num5 = (stretchValue - leg.LegStretchLimit * 0.95f) * 2f;
+								if (num5 < 0f)
+								{
+									num5 = 0f;
+								}
+								num4 += num5;
+							}
+							if (!oppositeLeg._UsingCustomRaycast && oppositeLeg.G_AttachementHandler.legMoveAnimation.attached)
+							{
+								float magnitude = (leg.RootSpaceToWorld(oppositeLeg.AnkleH.LastKeyframeRootPos) - oppositeLeg.G_Attachement.GetRelevantHitPoint()).magnitude;
+								float num6 = Owner.ScaleReference * 0.4f;
+								if (magnitude > num6)
+								{
+									float num7 = magnitude - num6;
+									num4 += num7 / num6 * 2f;
+								}
+							}
+						}
+						if (leg.LegAnimatingSettings.AllowSpeedups > 0.25f)
+						{
+							float num8 = Quaternion.Angle(baseRotationOnStepUp, Owner.BaseTransform.rotation);
+							if (num8 > 12f)
+							{
+								float t = Mathf.InverseLerp(30f, 135f, num8);
+								t = Mathf.LerpUnclamped(0.5f, 2f, t) * (0.4f + leg.LegAnimatingSettings.AllowSpeedups * 0.6f);
+								transitionProgress += Owner.DeltaTime * t * num2;
+							}
+						}
+						num4 = Mathf.LerpUnclamped(1f, num4, leg.LegAnimatingSettings.AllowSpeedups);
+					}
+					lastSpeedup = num4;
+					transitionProgress = Mathf.MoveTowards(transitionProgress, 1f, num3 * num4 * _legMoveDurMul * leg.LegMoveSpeedMultiplier * Owner.DeltaTime * num2);
+					if (transitionProgress > 0.9995f && duringLegAdjustMovement)
+					{
+						TriggerAttach();
+					}
+				}
+				else if (transitionProgress > 0.9995f && handler.glueAnimationBlend > 0.95f)
+				{
+					TriggerAttach();
+				}
+				else
+				{
+					transitionProgress = Mathf.SmoothDamp(transitionProgress, 1.001f, ref sd_trProgress, (0.01f + Mathf.LerpUnclamped(0.225f, 0.01f, wasAttaching ? Owner.GlueFadeInSpeed : Owner.GlueFadeOutSpeed)) * num, 10000000f, Owner.DeltaTime);
+				}
+			}
+
+			private void TriggerAttach()
+			{
+				if (!attached)
+				{
+					transitionProgress = 1f;
+					lastAttachCompleteTime = Time.time;
+					attached = leg.Glue_TriggerFinalAttach();
+					duringLegAdjustMovement = false;
+				}
+			}
+
+			public void PostUpdate()
+			{
+				lastAppliedGluePosition = leg._GluePosition;
+				lastAppliedGluePositionLocal = leg.ToRootLocalSpace(lastAppliedGluePosition);
+				lastAppliedGlueRotation = leg._GlueRotation;
+				if (!_wasAnimatingLeg)
+				{
+					LegAdjustementFootAngleOffset = Mathf.MoveTowards(LegAdjustementFootAngleOffset, 0f, leg.DeltaTime * 20f);
+					LegAdjustementYOffset = Mathf.MoveTowards(LegAdjustementYOffset, 0f, leg.DeltaTime * 20f);
+				}
+				else
+				{
+					_wasAnimatingLeg = false;
+				}
+			}
+		}
+
+		private LegsAnimator Owner;
+
+		private Leg ParentLeg;
+
+		private float _sd_glueAnimationBlend;
+
+		private bool _instantTransition;
+
+		private Vector3 lastGluePosition = Vector3.zero;
+
+		private Quaternion lastGlueRotation = Quaternion.identity;
+
+		public LegTransitionAnimation legMoveAnimation { get; private set; }
+
+		private Leg leg => ParentLeg;
+
+		public float glueAnimationBlend { get; private set; }
+
+		public float attachTransitionProgress => legMoveAnimation.transitionProgress;
+
+		public float attachTransitionProgressLastFrame => legMoveAnimation.transitionProgressLastFrame;
+
+		public float legMoveDistanceFactor => legMoveAnimation.legMoveDistanceFactor;
+
+		public EGlueMode lasGlueModeOnAttaching { get; private set; }
+
+		public GlueAttachementHandler(Leg leg)
+		{
+			ParentLeg = leg;
+			Owner = leg.Owner;
+			legMoveAnimation = new LegTransitionAnimation(this);
+			lasGlueModeOnAttaching = Owner._glueModeExecuted;
+			Reset(initializing: true);
+		}
+
+		public void Reset(bool initializing)
+		{
+			glueAnimationBlend = 0f;
+			_sd_glueAnimationBlend = 0f;
+			if (initializing)
+			{
+				lastGluePosition = leg.BoneEnd.position;
+				lastGlueRotation = leg.BoneEnd.rotation;
+			}
+			legMoveAnimation.Reset();
+		}
+
+		public void SheduleInstantTransition()
+		{
+			_instantTransition = true;
+			legMoveAnimation.ScheduleInstantTransition();
+		}
+
+		public void TransitionToGlueAnimation()
+		{
+			legMoveAnimation.DoAttaching(canAttach: true);
+			ChangeGlueAnimationBlendTo(1f, Owner.GlueFadeInSpeed);
+		}
+
+		public void TransitionToDisableGlueAnimation()
+		{
+			legMoveAnimation.DoAttaching(canAttach: false);
+			ChangeGlueAnimationBlendTo(0f, Owner.GlueFadeOutSpeed);
+		}
+
+		public Vector3 GetGluePosition()
+		{
+			if (glueAnimationBlend > 0.9995f)
+			{
+				lastGluePosition = legMoveAnimation.GetTargetPosition();
+			}
+			else if (glueAnimationBlend < 0.0001f)
+			{
+				lastGluePosition = leg.A_PreIKPosForGluing;
+			}
+			else
+			{
+				lastGluePosition = Vector3.LerpUnclamped(leg.A_PreIKPosForGluing, legMoveAnimation.GetTargetPosition(), glueAnimationBlend);
+			}
+			return lastGluePosition;
+		}
+
+		public Quaternion GetGlueRotation()
+		{
+			if (glueAnimationBlend > 0.999f)
+			{
+				lastGlueRotation = legMoveAnimation.GetTargetRotation();
+			}
+			else if (glueAnimationBlend < 0f)
+			{
+				lastGlueRotation = leg._FinalIKRot;
+			}
+			else
+			{
+				lastGlueRotation = Quaternion.LerpUnclamped(leg._FinalIKRot, legMoveAnimation.GetTargetRotation(), glueAnimationBlend);
+			}
+			return lastGlueRotation;
+		}
+
+		public void UpdateTransitioning(bool attaching)
+		{
+			legMoveAnimation.UpdateAnimation();
+		}
+
+		public void PostUpdate()
+		{
+			legMoveAnimation.PostUpdate();
+		}
+
+		internal void OnLegRequireRepose()
+		{
+			legMoveAnimation.RequireRepose();
+		}
+
+		private void ChangeGlueAnimationBlendTo(float target, float speed)
+		{
+			if (Owner.GroundedTime < 0f)
+			{
+				speed = 0.99f;
+			}
+			if (_instantTransition && target > 0f)
+			{
+				glueAnimationBlend = target;
+				_instantTransition = false;
+				return;
+			}
+			if (speed >= 1f)
+			{
+				glueAnimationBlend = target;
+				return;
+			}
+			if (leg.G_JustLanded)
+			{
+				glueAnimationBlend = Mathf.MoveTowards(glueAnimationBlend, target, Owner.DeltaTime * 3f);
+			}
+			glueAnimationBlend = Mathf.SmoothDamp(glueAnimationBlend, target, ref _sd_glueAnimationBlend, Mathf.LerpUnclamped(0.2f, 0.005f, speed), 100000f, Owner.DeltaTime);
+			if (float.IsNaN(_sd_glueAnimationBlend))
+			{
+				_sd_glueAnimationBlend = 0f;
+			}
+		}
+	}
+
+	public enum GlueReposeRequest
+	{
+		None,
+		Repose,
+		ReposeIfFar
+	}
+
+	public class LegHelper
+	{
+		public Transform Bone;
+
+		public LegHelper Child;
+
+		public Vector3 InitPositionRootSpace;
+
+		public Vector3 LastKeyframeRootPos;
+
+		public LegHelper(Leg leg, Transform bone)
+		{
+			Bone = bone;
+			InitPositionRootSpace = leg.ToRootLocalSpace(bone.position);
+		}
+
+		public void Calibrate(Leg leg, Vector3 wPos)
+		{
+			LastKeyframeRootPos = leg.ToRootLocalSpace(wPos);
+		}
+	}
+
+	private GlueAttachement G_Attachement;
+
+	public bool G_CustomForceAttach;
+
+	public bool G_CustomForceNOTDetach;
+
+	public bool G_CustomForceDetach;
+
+	public bool G_CustomForceNOTAttach;
+
+	private float lastFootForwardAngleDiffABS;
+
+	private GlueAttachementHandler G_AttachementHandler;
+
+	private Vector3 A_PreviousRelevantAnklePos;
+
+	private Vector3 A_LastApppliedAlignPos;
+
+	private Vector3 A_LastApppliedAlignPosLocal;
+
+	private Vector3 A_PreIKPosForGluing;
+
+	private Quaternion A_LastApppliedAlignRot;
+
+	private Quaternion A_LastTargetAlignRot;
+
+	private bool A_WasFullAlign;
+
+	private float A_aligningBlendByGluing = 1f;
+
+	private Vector3 A_LastElevation;
+
+	private float A_LastElevateH;
+
+	private float _sd_A_Elev;
+
+	[NonSerialized]
+	public float Adj_A_ElevateLerpSpeedStart = 8f;
+
+	[NonSerialized]
+	public float Adj_A_ElevateLerpSpeedAfter = 5f;
+
+	[NonSerialized]
+	public float Adj_A_ElevateSpeedupMargin = 0.014f;
+
+	private float A_AligningFor;
+
+	private Vector3 A_LastAlignRootSpacePos;
+
+	private Vector3 A_LastSmoothTargetedPosLocal;
+
+	private float A_LastSuddenSmoothYOffset;
+
+	private float A_SuddenSmoothing;
+
+	private float A_lastSuddenSmoothingDiff;
+
+	private bool A_WasSmoothing;
+
+	private bool A_WasAligningFrameBack;
+
+	private Vector3 A_SmoothedIKPos;
+
+	[NonSerialized]
+	public bool G_InstantReglue;
+
+	private float _glueTargetBlend = 1f;
+
+	private float _gluingCulldown;
+
+	protected bool G_JustLanded;
+
+	[NonSerialized]
+	public float ExtraGluingBlend = 1f;
+
+	private Vector3 _GlueLastAttachPosition;
+
+	private Vector3 _GlueLastAttachPositionRootLocal;
+
+	private Quaternion _GlueLastAttachRotation;
+
+	private Vector3 _GluePosition;
+
+	private Quaternion _GlueRotation;
+
+	private Vector3 _G_LastPreGlueSourceLocalIKPos;
+
+	private Vector3 _G_PreGlueSourceLocalIKPos;
+
+	private Vector3 _G_sd_RefSwing = Vector3.zero;
+
+	private bool _G_WasDisabled = true;
+
+	[NonSerialized]
+	public GlueReposeRequest G_RequestRepose;
+
+	private bool _G_WasGrounded = true;
+
+	private Vector3 _G_LasGroundedPosLocal;
+
+	private Quaternion _G_LasGroundedRotLocal;
+
+	private Vector3 G_GlueDragOffset = Vector3.zero;
+
+	private LegHelper _h_boneStart;
+
+	private LegHelper _h_boneMid;
+
+	private LegHelper _h_boneEnd;
+
+	private Vector3 C_AnkleToHeelRootSpace = Vector3.one;
+
+	private Vector3 C_LastHeelWorldPos;
+
+	private Vector3 C_LastHeelRootSpacePos;
+
+	private Vector3 C_LastFootEndWorldPos;
+
+	private Vector3 C_LastFootEndRootSpacePos;
+
+	private Vector3 C_Local_AnkleToHeelRotated;
+
+	private float _C_DynamicYScale = 1f;
+
+	public LegsAnimator Owner;
+
+	[FPD_Suffix(0f, 1f, FPD_SuffixAttribute.SuffixMode.From0to100, "%", true, 0)]
+	public float LegBlendWeight = 1f;
+
+	internal float InternalModuleBlendWeight = 1f;
+
+	private float finalBoneBlend = 1f;
+
+	[Tooltip("Make idle glue animation motion faster for this single leg")]
+	public float LegMoveSpeedMultiplier = 1f;
+
+	public float LegRaiseMultiplier = 1f;
+
+	[Space(3f)]
+	public float GlueThresholdMultiplier = 1f;
+
+	public Vector2 GluePointOffset = Vector2.zero;
+
+	[Range(0f, 1f)]
+	[Space(3f)]
+	public float LegStretchMultiplier = 1f;
+
+	[Tooltip("Motion preset for the leg to be animated with different character than the other legs ('Idle Glue Motion' settings)")]
+	public LegMotionSettingsPreset CustomLegAnimating;
+
+	[Range(-40f, 40f)]
+	public float FootPitchOffset;
+
+	public Transform BoneStart;
+
+	public Transform BoneMid;
+
+	public Transform BoneEnd;
+
+	public ELegSide Side;
+
+	public int OppositeLegIndex = -1;
+
+	public ERaycastPrecision RaycastPrecision;
+
+	[Tooltip("(Experimental) If you want to animate in additional feet bone which in some cases can add nice animation feeling")]
+	public bool UseFeet;
+
+	public Transform BoneFeet;
+
+	[Tooltip("Defining how quick heel should get up if leg gets stretched (change max stretching param under IK tab to be lower value that 1.1)")]
+	[Range(0f, 1f)]
+	public float FeetSensitivity = 0.5f;
+
+	private bool hasOppositeleg;
+
+	private LegStepAnimatingParameters targetLegAnimating;
+
+	[Tooltip("Apply IK hint inversion, in case leg is bending in wrong direction.")]
+	public bool InverseHint;
+
+	public Vector3 AnkleToHeel = Vector3.zero;
+
+	public Vector3 AnkleToFeetEnd = Vector3.zero;
+
+	public Vector3 AnkleRight = Vector3.right;
+
+	public Vector3 AnkleUp = Vector3.up;
+
+	public Vector3 AnkleForward = Vector3.forward;
+
+	[Range(0f, 1.001f)]
+	public float FootMiddlePosition = 0.5f;
+
+	[Space(5f)]
+	[FPD_Suffix(-45f, 45f, FPD_SuffixAttribute.SuffixMode.FromMinToMax, "°", true, 0)]
+	public float AnkleYawCorrection;
+
+	private bool _StepSent = true;
+
+	private float _StepSentAt = -100f;
+
+	private float _RaiseSentAt = -100f;
+
+	private bool _OppositeLegStepped = true;
+
+	private float _ToConfirmStepEvent;
+
+	private Vector3 _SourceIKPosUnchangedY;
+
+	private Vector3 _SourceIKPos;
+
+	public Vector3 _FinalIKPos;
+
+	private Quaternion _SourceIKRot;
+
+	private Quaternion _FinalIKRot;
+
+	private bool customOverwritingIKPos;
+
+	private Vector3 customOverwritePos = Vector3.zero;
+
+	private bool customOverwritingIKRot;
+
+	private Quaternion customOverwriteRot = Quaternion.identity;
+
+	private bool _wasFixedCalibrateAnimationCaptured;
+
+	private bool _wasGrounded = true;
+
+	private Vector3 _ungroundLocalIKCache;
+
+	private bool _overwrittenSourceIKPos;
+
+	public RaycastHit legGroundHit;
+
+	public RaycastHit lastGroundHitWithTarget;
+
+	private Vector3 previousAnkleAlignedOnGroundHitWorldPos;
+
+	private Vector3 ankleAlignedOnGroundHitRootLocal;
+
+	private Quaternion ankleAlignedOnGroundHitRotation;
+
+	private RaycastHit replacementHit;
+
+	private bool _UsingEmptyRaycast;
+
+	private bool _UsingCustomRaycast;
+
+	private bool _disableSourceRaycast;
+
+	private float _CustomRaycastBlendIn;
+
+	private RaycastHit _CustomRaycastHit;
+
+	private Vector3 _PreviousCustomRaycastingStartIKPos;
+
+	private Vector3 _PreviousCustomRaycastingIKPos;
+
+	private bool _noRaycast_skipFeetCalcs;
+
+	public bool G_AttachPossible
+	{
+		get
+		{
+			if (RaycastHitted)
+			{
+				return C_Local_MidFootPosVsGroundHit.y < BelowFootRange * Owner.AllowGlueBelowFoot + FloorLevel;
+			}
+			return false;
+		}
+	}
+
+	public bool _Glue_AskingForDetach { get; private set; }
+
+	public float BelowFootRange => ScaleRef * _C_DynamicYScale * 0.2f;
+
+	private GlueAttachementHandler.LegTransitionAnimation G_LegAnimation => G_AttachementHandler.legMoveAnimation;
+
+	public Vector3 G_GluePosition => _GluePosition;
+
+	public float G_GlueAnimationBlend => G_AttachementHandler.glueAnimationBlend;
+
+	public float G_GlueInternalTransition => G_AttachementHandler.attachTransitionProgress;
+
+	public float G_LastAttachCompleteTime => G_AttachementHandler.legMoveAnimation.lastAttachCompleteTime;
+
+	public float G_GlueInternalTransitionLastFrame => G_AttachementHandler.attachTransitionProgressLastFrame;
+
+	public float G_LastLegMoveDistanceFactor => G_AttachementHandler.legMoveDistanceFactor;
+
+	public bool G_DuringLegAdjustMovement => G_AttachementHandler.legMoveAnimation.duringLegAdjustMovement;
+
+	public EGlueMode G_HandlerExecutingLegAnimationMode => G_AttachementHandler.legMoveAnimation.LastAnimationGlueMode;
+
+	public bool A_PreWasAligning { get; private set; }
+
+	public bool A_PreWasAligningNearGround { get; private set; }
+
+	public bool A_WasAligning { get; private set; }
+
+	public float A_AligningHelperBlend { get; private set; }
+
+	public float A_LastAlignHeightDiff { get; private set; }
+
+	public float A_LastAlignHeightCompareValue { get; private set; }
+
+	public bool G_Attached { get; private set; }
+
+	public bool G_DuringAttaching => G_LegAnimation.duringLegAdjustMovement;
+
+	public bool G_FadingIn => G_LegAnimation.duringLegAdjustMovement;
+
+	public Vector3 _G_RefernceSwing { get; private set; }
+
+	private float G_GlueTesholdRange => Owner.ScaleReferenceNoScale * GlueThresholdMultiplier * Owner.GlueRangeThreshold * 0.5f;
+
+	private Transform Root => Owner.BaseTransform;
+
+	private float ScaleRef => Owner.ScaleReference;
+
+	private float FloorLevel => Owner._glueingFloorLevel;
+
+	private float DeltaTime => Owner.DeltaTime;
+
+	public LegHelper ThighH => _h_boneStart;
+
+	private FimpIK_Limb.IKBone ThighIK => IKProcessor.StartIKBone;
+
+	public LegHelper LowerLegH => _h_boneMid;
+
+	private FimpIK_Limb.IKBone LowerLegIK => IKProcessor.MiddleIKBone;
+
+	public LegHelper AnkleH => _h_boneEnd;
+
+	public FimpIK_Limb.IKBone AnkleIK => IKProcessor.EndIKBone;
+
+	public Vector3 C_LastMidRefFootWorldPos { get; private set; }
+
+	public Vector3 C_LastMidRefFootRootSpacePos { get; private set; }
+
+	public Vector3 C_Local_MidFootPosVsGroundHit { get; private set; }
+
+	public float C_Local_FootElevateInAnimation { get; private set; }
+
+	public float C_AnkleToHeelWorldHeight { get; private set; }
+
+	public float C_AnimatedAnkleFlatHeight { get; private set; }
+
+	public int PlaymodeIndex { get; private set; }
+
+	public float BlendWeight { get; private set; }
+
+	[field: NonSerialized]
+	public Leg NextLeg { get; private set; }
+
+	[field: NonSerialized]
+	public HipsReference ParentHub { get; private set; }
+
+	public LegStepAnimatingParameters LegAnimatingSettings => targetLegAnimating;
+
+	public float LegStretchLimit { get; private set; } = 1f;
+
+	public FimpIK_Limb IKProcessor { get; private set; }
+
+	public Vector3 _PreviousFinalIKPos { get; private set; }
+
+	public Vector3 _PreviousFinalIKPosRootLocal { get; private set; }
+
+	public Vector3 _PreviousFinalIKPosForStability { get; private set; }
+
+	public Quaternion _PreviousFinalIKRot { get; private set; }
+
+	public Vector3 _AnimatorStartBonePos { get; private set; }
+
+	public Vector3 _AnimatorMidBonePos { get; private set; }
+
+	public Vector3 _AnimatorEndBonePos { get; private set; }
+
+	public Quaternion _AnimatorStartBoneLocRot { get; private set; }
+
+	public Quaternion _AnimatorMidBoneLocRot { get; private set; }
+
+	public Quaternion _AnimatorEndBoneLocRot { get; private set; }
+
+	public bool RaycastHitted { get; private set; }
+
+	public RaycastHit LastGroundHit => legGroundHit;
+
+	public Vector3 groundHitRootSpacePos { get; private set; }
+
+	public Vector3 lastRaycastingOrigin { get; private set; }
+
+	public Vector3 lastRaycastingEndPoint { get; private set; }
+
+	public Vector3 ankleAlignedOnGroundHitWorldPos { get; private set; }
+
+	public bool User_RaycastHittedSource { get; private set; }
+
+	public float raycastSlopeAngle { get; private set; }
+
+	public Vector3 InitialPosInRootSpace { get; private set; }
+
+	public List<Leg> Legs => Owner.Legs;
+
+	public bool Glue_CheckDetachement()
+	{
+		bool flag = Glue_Conditions_Detach();
+		if (!flag)
+		{
+			flag = Glue_Conditions_DetachForced();
+		}
+		_Glue_AskingForDetach = flag;
+		return flag;
+	}
+
+	public bool Glue_CheckIdleDetachementConfirm()
+	{
+		if (Owner._glueModeExecuted != 0)
+		{
+			return true;
+		}
+		if (hasOppositeleg)
+		{
+			Leg oppositeLeg = GetOppositeLeg();
+			if (Glue_CheckOppositeLegMovementRestriction(oppositeLeg))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private bool Glue_Conditions_Attach()
+	{
+		if (!Owner.IsGrounded)
+		{
+			return false;
+		}
+		if (_glueTargetBlend < 0.0001f)
+		{
+			return false;
+		}
+		if (!RaycastHitted)
+		{
+			return false;
+		}
+		if (G_CustomForceNOTDetach)
+		{
+			return true;
+		}
+		if (_gluingCulldown > 0f)
+		{
+			return false;
+		}
+		if (G_CustomForceAttach)
+		{
+			return true;
+		}
+		if (Owner.DontGlueAttachIfTooNearOppositeLeg > 0f && hasOppositeleg)
+		{
+			Vector3 vector = ToRootLocalSpace(_PreviousFinalIKPos);
+			Leg oppositeLeg = GetOppositeLeg();
+			Vector3 vector2 = ToRootLocalSpace(oppositeLeg._PreviousFinalIKPos);
+			float num = Owner.DontGlueAttachIfTooNearOppositeLeg * Owner.ScaleReference;
+			if (Vector2.Distance(new Vector2(vector.x, vector.z), new Vector2(vector2.x, vector2.z)) < num)
+			{
+				return false;
+			}
+		}
+		if (G_HandlerExecutingLegAnimationMode == EGlueMode.Moving)
+		{
+			bool flag = false;
+			float y = C_Local_MidFootPosVsGroundHit.y;
+			if (y > FloorLevel)
+			{
+				if (y < BelowFootRange * Owner.AllowGlueBelowFoot + FloorLevel)
+				{
+					flag = true;
+				}
+			}
+			else
+			{
+				flag = true;
+			}
+			if (!flag)
+			{
+				return false;
+			}
+		}
+		if (G_CustomForceNOTAttach)
+		{
+			return false;
+		}
+		if (Owner._glueModeExecuted == EGlueMode.Moving && Owner.SwingHelper > 0f && Owner.DesiredMovementDirection != Vector3.zero)
+		{
+			Vector3 vector3 = ToRootLocalSpaceDir(Owner.DesiredMovementDirection);
+			Vector3 g_RefernceSwing = _G_RefernceSwing;
+			if (Vector3.Dot(vector3.normalized, g_RefernceSwing.normalized) > 1f - Owner.SwingHelper)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private bool Glue_CheckOppositeLegMovementRestriction(Leg oppositeLeg)
+	{
+		if (!RaycastHitted)
+		{
+			return false;
+		}
+		if (!Owner.IsGrounded)
+		{
+			return false;
+		}
+		if (C_Local_MidFootPosVsGroundHit.y > BelowFootRange)
+		{
+			return false;
+		}
+		if (G_CustomForceNOTDetach)
+		{
+			return true;
+		}
+		if (!oppositeLeg.RaycastHitted)
+		{
+			return false;
+		}
+		if (oppositeLeg.C_Local_MidFootPosVsGroundHit.y > oppositeLeg.BelowFootRange)
+		{
+			return false;
+		}
+		if (oppositeLeg.G_GlueInternalTransition < LegAnimatingSettings.AllowDetachBefore)
+		{
+			return true;
+		}
+		return false;
+	}
+
+	private Leg GetOppositeLeg()
+	{
+		if (OppositeLegIndex < 0)
+		{
+			return null;
+		}
+		if (OppositeLegIndex >= Owner.Legs.Count)
+		{
+			return null;
+		}
+		return Owner.Legs[OppositeLegIndex];
+	}
+
+	private void Gluing_SetCulldown(float minDuration = 0.01f)
+	{
+		_gluingCulldown = Mathf.Max(_gluingCulldown, minDuration + (0.02f - Owner.GlueFadeOutSpeed * 0.03f));
+	}
+
+	public bool Glue_Conditions_Detach()
+	{
+		bool flag = false;
+		if (G_CustomForceNOTDetach)
+		{
+			return flag;
+		}
+		if (G_AttachementHandler.legMoveAnimation.duringLegAdjustMovement)
+		{
+			return false;
+		}
+		if (!Glue_Conditions_Attach())
+		{
+			flag = true;
+		}
+		if (Owner.AnimateFeet && lastFootForwardAngleDiffABS > Owner.UnglueOn && !G_JustLanded)
+		{
+			if (Owner._glueModeExecuted != 0)
+			{
+				Gluing_SetCulldown();
+			}
+			flag = true;
+		}
+		if (!flag && !G_JustLanded)
+		{
+			Vector3 vector = Vector3.zero;
+			if (GluePointOffset != Vector2.zero)
+			{
+				vector = -GetGluePointOffset();
+			}
+			if (Vector3.Distance(ankleAlignedOnGroundHitRootLocal + vector, _GlueLastAttachPositionRootLocal) > G_GlueTesholdRange)
+			{
+				if (Owner._glueModeExecuted != 0)
+				{
+					Gluing_SetCulldown();
+				}
+				flag = true;
+			}
+		}
+		return flag;
+	}
+
+	public Vector3 GetGluePointOffset()
+	{
+		float num = Owner.ScaleReferenceNoScale * Owner.GlueRangeThreshold;
+		return Owner.RootToWorldSpaceVec(new Vector3(GluePointOffset.x * num, 0f, GluePointOffset.y * num));
+	}
+
+	private bool Glue_Conditions_DetachForced()
+	{
+		if (G_CustomForceDetach)
+		{
+			return true;
+		}
+		if (G_RequestRepose != 0)
+		{
+			if (G_RequestRepose != GlueReposeRequest.ReposeIfFar)
+			{
+				G_RequestRepose = GlueReposeRequest.None;
+				return true;
+			}
+			G_RequestRepose = GlueReposeRequest.None;
+			if (G_Attached && Vector3.Distance(_GluePosition, ankleAlignedOnGroundHitWorldPos) > ScaleRef * 0.1f)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private void ExtraProcessingApply()
+	{
+		if (G_LegAnimation.LegAdjustementYOffset != 0f)
+		{
+			_FinalIKPos += RootSpaceToWorldVec(new Vector3(0f, G_LegAnimation.LegAdjustementYOffset * LegRaiseMultiplier * _glueTargetBlend, 0f));
+		}
+		if (Owner.AnimateFeet)
+		{
+			PostCalculate_LimitFootYaw();
+		}
+	}
+
+	private void ExtraIKPostProcessingApply()
+	{
+		if (Owner._stepPointsOverlapRadius > 0f)
+		{
+			PostCalculate_FeetOverlapRadius();
+		}
+		if (Owner.FeetYOffset != 0f)
+		{
+			PostCalculate_FeetYOffset();
+		}
+	}
+
+	public void PostCalculate_LimitFootYaw()
+	{
+		Vector3 worldDir = ankleAlignedOnGroundHitRotation * AnkleIK.forward;
+		worldDir = ToRootLocalSpaceDir(worldDir);
+		worldDir.y = 0f;
+		worldDir = RootSpaceToWorldVec(worldDir);
+		Vector3 worldDir2 = _FinalIKRot * AnkleIK.forward;
+		worldDir = ToRootLocalSpaceDir(worldDir);
+		worldDir.y = 0f;
+		worldDir2 = ToRootLocalSpaceDir(worldDir2);
+		worldDir2.y = 0f;
+		float num = (lastFootForwardAngleDiffABS = Mathf.Abs(Vector3.SignedAngle(worldDir.normalized, worldDir2.normalized, Vector3.up)));
+		if (Owner.LimitFeetYaw > 0f && Owner.LimitFeetYaw < 90f && num > Owner.LimitFeetYaw)
+		{
+			float num2 = num - Owner.LimitFeetYaw;
+			Quaternion a = (A_WasAligning ? ankleAlignedOnGroundHitRotation : AnkleIK.srcRotation);
+			_FinalIKRot = Quaternion.LerpUnclamped(a, _FinalIKRot, 1f - num2 / (90f - Owner.LimitFeetYaw));
+		}
+	}
+
+	private void PostCalculate_FeetOverlapRadius()
+	{
+		float num = Owner._stepPointsOverlapRadius * GlueThresholdMultiplier;
+		Vector3 vector = ToRootLocalSpace(IKProcessor.IKTargetPosition);
+		Leg leg = Owner.Legs[0];
+		while (leg != null)
+		{
+			if (leg == this)
+			{
+				leg = leg.NextLeg;
+				continue;
+			}
+			Vector3 vector2 = ToRootLocalSpace(leg.IKProcessor.IKTargetPosition);
+			Vector2 vector3 = new Vector2(vector2.x, vector2.z) - new Vector2(vector.x, vector.z);
+			float magnitude = vector3.magnitude;
+			if (magnitude < num)
+			{
+				Vector2 vector4 = -vector3 * (num - magnitude) * 2f;
+				IKProcessor.IKTargetPosition += RootSpaceToWorldVec(new Vector3(vector4.x, 0f, vector4.y));
+			}
+			leg = leg.NextLeg;
+		}
+	}
+
+	private void PostCalculate_FeetYOffset()
+	{
+		IKProcessor.IKTargetPosition += _FinalIKRot * (Owner.FeetYOffset * Owner.Scale * A_AligningHelperBlend * AnkleIK.up);
+	}
+
+	private void AlignStep_Init()
+	{
+		A_PreWasAligning = false;
+		A_PreWasAligningNearGround = false;
+		A_WasAligning = false;
+		A_AligningHelperBlend = 0f;
+		A_LastTargetAlignRot = BoneEnd.rotation;
+		A_LastApppliedAlignRot = BoneEnd.rotation;
+		A_PreIKPosForGluing = _FinalIKPos;
+	}
+
+	private void AlignStep_CheckAlignStatePre()
+	{
+		A_PreIKPosForGluing = _FinalIKPos;
+		if (_noRaycast_skipFeetCalcs)
+		{
+			return;
+		}
+		bool flag = false;
+		A_PreWasAligningNearGround = false;
+		if (RaycastHitted)
+		{
+			float hips_StepHeightAdjustOffset = ParentHub._Hips_StepHeightAdjustOffset;
+			hips_StepHeightAdjustOffset = ((!(hips_StepHeightAdjustOffset < 0f)) ? 0f : (hips_StepHeightAdjustOffset * -0.03f));
+			A_LastAlignHeightDiff = C_Local_MidFootPosVsGroundHit.y;
+			A_LastAlignHeightCompareValue = ScaleRef * (0.002f + Owner.AnimationFloorLevel) + hips_StepHeightAdjustOffset;
+			if (Owner.FootAlignRapidity > 0.9999f)
+			{
+				if (A_LastAlignHeightDiff <= A_LastAlignHeightCompareValue)
+				{
+					flag = true;
+					A_PreWasAligningNearGround = true;
+				}
+			}
+			else if (A_LastAlignHeightDiff <= A_LastAlignHeightCompareValue + ScaleRef * (0.04f + (1f - Owner.FootAlignRapidity) * 0.04f))
+			{
+				A_PreWasAligningNearGround = true;
+				if (A_LastAlignHeightDiff <= A_LastAlignHeightCompareValue)
+				{
+					flag = true;
+				}
+			}
+		}
+		else
+		{
+			A_LastAlignHeightDiff = 100f;
+		}
+		A_PreWasAligning = flag;
+		if (flag)
+		{
+			Vector3 vector = ankleAlignedOnGroundHitWorldPos;
+			if (A_AligningHelperBlend > 0.99f)
+			{
+				_FinalIKPos = vector;
+			}
+			else
+			{
+				_FinalIKPos = Vector3.Lerp(_FinalIKPos, vector, A_AligningHelperBlend * 8f);
+			}
+			A_PreIKPosForGluing = vector;
+		}
+		else if (A_AligningHelperBlend > 0.01f)
+		{
+			_FinalIKPos = Vector3.Lerp(_FinalIKPos, RootSpaceToWorld(A_LastApppliedAlignPosLocal), A_AligningHelperBlend);
+		}
+	}
+
+	private void AlignStep_ValidateFootRotation()
+	{
+		if (!Owner.AnimateFeet || _noRaycast_skipFeetCalcs)
+		{
+			return;
+		}
+		if (A_PreWasAligningNearGround)
+		{
+			float num = Owner.FootRotationBlend * A_AligningHelperBlend;
+			if (A_LastElevateH < 0.02f)
+			{
+				if (num >= 1f)
+				{
+					A_LastTargetAlignRot = ankleAlignedOnGroundHitRotation;
+				}
+				else
+				{
+					A_LastTargetAlignRot = Quaternion.LerpUnclamped(_FinalIKRot, ankleAlignedOnGroundHitRotation, num);
+				}
+			}
+			else
+			{
+				float num2 = A_LastElevateH / (ScaleRef * 0.15f);
+				if (A_LastElevateH > 1f)
+				{
+					A_LastElevateH = 1f;
+				}
+				A_LastTargetAlignRot = Quaternion.LerpUnclamped(ankleAlignedOnGroundHitRotation, _FinalIKRot, num2 * num);
+			}
+		}
+		else if (A_AligningHelperBlend < 0.001f)
+		{
+			A_LastTargetAlignRot = _FinalIKRot;
+		}
+		else
+		{
+			A_LastTargetAlignRot = Quaternion.Lerp(_FinalIKRot, A_LastTargetAlignRot, A_AligningHelperBlend);
+		}
+		if (Owner.FootAlignRapidity >= 1f)
+		{
+			A_LastApppliedAlignRot = A_LastTargetAlignRot;
+		}
+		else
+		{
+			A_LastApppliedAlignRot = Quaternion.Lerp(A_LastApppliedAlignRot, A_LastTargetAlignRot, DeltaTime * (8f + Owner.FootAlignRapidity * 26f));
+		}
+		_FinalIKRot = A_LastApppliedAlignRot;
+	}
+
+	private void AlignStep_OnGroundAlign()
+	{
+		if (_noRaycast_skipFeetCalcs)
+		{
+			A_WasAligning = A_PreWasAligning;
+			if (A_PreWasAligning)
+			{
+				if (A_AligningHelperBlend < 0.05f)
+				{
+					A_AligningHelperBlend = 0.05f;
+				}
+				A_AligningHelperBlend = Mathf.MoveTowards(A_AligningHelperBlend, 1f, Owner.DeltaTime * 8f);
+				if (!A_WasFullAlign && A_AligningHelperBlend >= 1f - Owner.EventExecuteSooner)
+				{
+					A_WasFullAlign = true;
+					if (!Owner.UseGluing)
+					{
+						SendStepEvent();
+					}
+				}
+			}
+			else
+			{
+				if (A_AligningHelperBlend > 0.5f)
+				{
+					A_AligningHelperBlend = 0.5f;
+				}
+				A_AligningHelperBlend = Mathf.MoveTowards(A_AligningHelperBlend, 0f, Owner.DeltaTime * 14f);
+			}
+			if (A_AligningHelperBlend < 0.65f)
+			{
+				A_WasFullAlign = false;
+			}
+			return;
+		}
+		A_aligningBlendByGluing = 1f;
+		if (Owner.UseGluing)
+		{
+			A_aligningBlendByGluing = 1f - _glueTargetBlend * G_GlueAnimationBlend;
+		}
+		if (A_PreWasAligning)
+		{
+			if (A_WasAligning)
+			{
+				A_PreviousRelevantAnklePos = previousAnkleAlignedOnGroundHitWorldPos;
+			}
+			float num = A_aligningBlendByGluing * A_AligningHelperBlend;
+			if (num >= 1f)
+			{
+				_FinalIKPos = ankleAlignedOnGroundHitWorldPos;
+			}
+			else
+			{
+				_FinalIKPos = Vector3.LerpUnclamped(_FinalIKPos, ankleAlignedOnGroundHitWorldPos, num);
+			}
+			if (A_AligningHelperBlend < 0.05f)
+			{
+				A_AligningHelperBlend = 0.05f;
+			}
+			A_AligningHelperBlend = Mathf.MoveTowards(A_AligningHelperBlend, 1f, Owner.DeltaTime * 8f);
+			if (!A_WasFullAlign && A_AligningHelperBlend >= 1f - Owner.EventExecuteSooner)
+			{
+				A_WasFullAlign = true;
+				if (!Owner.UseGluing)
+				{
+					SendStepEvent();
+				}
+			}
+			A_LastApppliedAlignPosLocal = ToRootLocalSpace(_FinalIKPos);
+		}
+		else
+		{
+			A_PreviousRelevantAnklePos = _SourceIKPosUnchangedY;
+			if (A_AligningHelperBlend > 0.75f)
+			{
+				A_AligningHelperBlend = 0.75f;
+			}
+			A_AligningHelperBlend = Mathf.MoveTowards(A_AligningHelperBlend, 0f, Owner.DeltaTime * 18f);
+		}
+		if (A_AligningHelperBlend < 0.6f)
+		{
+			A_WasFullAlign = false;
+		}
+		A_LastApppliedAlignPos = _FinalIKPos;
+		A_WasAligning = A_PreWasAligning;
+	}
+
+	private void AlignStep_LegElevation()
+	{
+		if (Owner.LegElevateBlend < 0.001f)
+		{
+			return;
+		}
+		if (_noRaycast_skipFeetCalcs)
+		{
+			A_LastElevation = Vector3.zero;
+			return;
+		}
+		float scaleRef = ScaleRef;
+		float num = groundHitRootSpacePos.y - A_LastSuddenSmoothYOffset - ParentHub._Hips_StepHeightAdjustOffset;
+		float num2 = Owner.AnimationFloorLevel * scaleRef;
+		float c_Local_FootElevateInAnimation = C_Local_FootElevateInAnimation;
+		if (c_Local_FootElevateInAnimation > num2 && num > 0.001f * scaleRef + num2 + 0.1f)
+		{
+			c_Local_FootElevateInAnimation -= num2;
+			float num3 = c_Local_FootElevateInAnimation;
+			float num4 = c_Local_FootElevateInAnimation - num;
+			float num5 = scaleRef * 0.015f;
+			float num6 = scaleRef * 0.35f;
+			float value = num4 / num6;
+			value = Mathf.Clamp01(value);
+			if (num4 > num5)
+			{
+				num3 *= 1f - value;
+				if (A_AligningFor < 0f)
+				{
+					A_AligningFor = DeltaTime;
+				}
+				if (A_AligningFor < 0.3f)
+				{
+					A_AligningFor += DeltaTime;
+				}
+				else
+				{
+					A_AligningFor = 0.3f;
+				}
+			}
+			else if (A_AligningFor > 0f)
+			{
+				A_AligningFor -= DeltaTime;
+			}
+			else
+			{
+				A_AligningFor = 0f;
+			}
+			float num7 = num3;
+			float num8 = scaleRef * Mathf.LerpUnclamped(0.1f, 0.9f, Owner.LegElevateHeightLimit);
+			if (num7 > num8)
+			{
+				num7 = num8;
+			}
+			if (groundHitRootSpacePos.y > 0f)
+			{
+				float num9 = ScaleRef * 0.2f;
+				if (num9 > 0f)
+				{
+					float num10 = groundHitRootSpacePos.y / num9;
+					if (num10 > 0.8f)
+					{
+						num7 = Mathf.LerpUnclamped(num7, 0f, Mathf.InverseLerp(0.8f, 1.1f, num10));
+					}
+				}
+			}
+			if (Mathf.Abs(num7 - A_LastElevateH) > scaleRef * Adj_A_ElevateSpeedupMargin)
+			{
+				A_LastElevateH = Mathf.Lerp(A_LastElevateH, num7, DeltaTime * Adj_A_ElevateLerpSpeedAfter);
+			}
+			else
+			{
+				A_LastElevateH = Mathf.Lerp(A_LastElevateH, num7, DeltaTime * Adj_A_ElevateLerpSpeedStart);
+			}
+			if (A_LastElevateH < 0f)
+			{
+				A_LastElevateH = 0f;
+			}
+		}
+		else
+		{
+			A_LastElevateH = Mathf.SmoothDamp(A_LastElevateH, 0f, ref _sd_A_Elev, 0.02f, 100000f, DeltaTime);
+		}
+		A_LastElevation = RootSpaceToWorldVec(new Vector3(0f, A_LastElevateH * Owner.LegElevateBlend * A_aligningBlendByGluing, 0f));
+		_FinalIKPos += A_LastElevation;
+	}
+
+	private void AlignStep_SmoothSuddenSteps()
+	{
+		if (Owner.SmoothSuddenSteps < 0.0001f)
+		{
+			return;
+		}
+		if (_noRaycast_skipFeetCalcs || G_Attached)
+		{
+			A_WasAligningFrameBack = A_WasAligning;
+			A_WasSmoothing = false;
+			return;
+		}
+		float scaleRef = ScaleRef;
+		if (A_WasAligning || A_WasAligningFrameBack)
+		{
+			if (!A_WasAligning)
+			{
+				A_PreviousRelevantAnklePos = previousAnkleAlignedOnGroundHitWorldPos;
+			}
+			Vector3 vector = ToRootLocalSpace(ankleAlignedOnGroundHitWorldPos);
+			float f = ((!A_WasSmoothing) ? ToRootLocalSpace(A_PreviousRelevantAnklePos) : ToRootLocalSpace(previousAnkleAlignedOnGroundHitWorldPos)).y - vector.y;
+			f = Mathf.Abs(f);
+			float num = scaleRef * 0.006f;
+			if ((raycastSlopeAngle < 17f || raycastSlopeAngle > 80f || Owner.RaycastShape == ERaycastMode.Spherecast) && f > num)
+			{
+				float num2 = f / (scaleRef * 0.275f);
+				if (num2 > 1f)
+				{
+					num2 = 1f;
+				}
+				if (num2 > Mathf.LerpUnclamped(0.25f, 0.1f, Owner.SmoothSuddenSteps))
+				{
+					float num3 = Mathf.LerpUnclamped(0.3f, 0.1f, Owner.SmoothSuddenSteps);
+					if (A_lastSuddenSmoothingDiff == 0f || A_SuddenSmoothing < num2)
+					{
+						A_lastSuddenSmoothingDiff = f;
+						A_LastAlignRootSpacePos = ToRootLocalSpace(previousAnkleAlignedOnGroundHitWorldPos);
+						num3 *= 0.7f;
+					}
+					else if (Owner.SmoothSuddenSteps < 0.5f)
+					{
+						float t = Mathf.LerpUnclamped(0.5f, 0f, Owner.SmoothSuddenSteps);
+						A_lastSuddenSmoothingDiff = Mathf.LerpUnclamped(A_lastSuddenSmoothingDiff, f, t);
+					}
+					A_SuddenSmoothing += Mathf.Clamp01(A_lastSuddenSmoothingDiff / (scaleRef * num3));
+					float num4 = 0.85f + Owner.SmoothSuddenSteps * 0.165f;
+					if (A_SuddenSmoothing > num4)
+					{
+						A_SuddenSmoothing = num4;
+					}
+				}
+			}
+		}
+		if (A_SuddenSmoothing > 0f)
+		{
+			Vector3 vector2 = ToRootLocalSpace(_FinalIKPos);
+			A_LastSuddenSmoothYOffset = vector2.y;
+			A_SuddenSmoothing -= Owner.DeltaTime * Mathf.LerpUnclamped(60f, 7.5f, Owner.SmoothSuddenSteps);
+			vector2.y = Mathf.Lerp(vector2.y, A_LastAlignRootSpacePos.y, A_SuddenSmoothing);
+			A_LastSuddenSmoothYOffset = vector2.y - A_LastSuddenSmoothYOffset;
+			A_LastSmoothTargetedPosLocal = vector2;
+			A_SmoothedIKPos = RootSpaceToWorld(vector2);
+			_FinalIKPos = A_SmoothedIKPos;
+			if (A_SuddenSmoothing < 0f)
+			{
+				A_SuddenSmoothing = 0f;
+			}
+			A_WasSmoothing = true;
+		}
+		else
+		{
+			A_LastSuddenSmoothYOffset = 0f;
+			A_WasSmoothing = false;
+		}
+	}
+
+	private void AlignStep_Complete()
+	{
+		A_WasAligningFrameBack = A_WasAligning;
+	}
+
+	private void Gluing_Init()
+	{
+		G_AttachementHandler = new GlueAttachementHandler(this);
+		Glue_Reset(initializing: true);
+	}
+
+	public void Glue_Reset(bool initializing)
+	{
+		G_Attached = false;
+		if (initializing)
+		{
+			_GlueLastAttachPosition = BoneEnd.position;
+			_GlueLastAttachRotation = BoneEnd.rotation;
+			_GluePosition = BoneEnd.position;
+			_GlueLastAttachPositionRootLocal = ToRootLocalSpace(BoneEnd.position);
+			_G_LastPreGlueSourceLocalIKPos = _GlueLastAttachPosition;
+			_G_PreGlueSourceLocalIKPos = _SourceIKPos;
+			A_PreIKPosForGluing = BoneEnd.position;
+			_G_LasGroundedPosLocal = _GlueLastAttachPositionRootLocal;
+		}
+		GlueAttachement g_Attachement = default(GlueAttachement);
+		g_Attachement.PosInAttachementLocal = _FinalIKPos;
+		g_Attachement.RotInAttachementLocal = _FinalIKRot;
+		G_Attachement = g_Attachement;
+		_G_RefernceSwing = Vector3.zero;
+		_G_WasDisabled = true;
+		G_AttachementHandler.Reset(initializing);
+	}
+
+	private void Gluing_Update()
+	{
+		_glueTargetBlend = Owner.GlueBlend * ExtraGluingBlend * Owner.RagdolledDisablerBlend * Owner.NotSlidingBlend;
+		if (Owner.GlueOnlyOnIdle)
+		{
+			_glueTargetBlend *= 1f - Owner.IsMovingBlend;
+		}
+		if (Owner.IsGrounded)
+		{
+			if (Owner.GroundedTime < 0.25f)
+			{
+				G_JustLanded = true;
+				_glueTargetBlend *= 0.1f + Mathf.InverseLerp(0f, 0.25f, Owner.GroundedTime) * 0.9f;
+			}
+			else
+			{
+				G_JustLanded = false;
+			}
+		}
+		else
+		{
+			G_JustLanded = false;
+			_glueTargetBlend *= Owner.IsGroundedBlend;
+		}
+		if (_glueTargetBlend < 0.0001f)
+		{
+			_glueTargetBlend = 0f;
+			_G_WasDisabled = true;
+			return;
+		}
+		if (_G_WasDisabled)
+		{
+			Glue_Reset(initializing: false);
+			_G_WasDisabled = false;
+		}
+		if (_gluingCulldown > 0f)
+		{
+			_gluingCulldown -= Owner.DeltaTime;
+		}
+		if (!Owner.IsGrounded)
+		{
+			if (_G_WasGrounded)
+			{
+				_G_WasGrounded = false;
+				_G_LasGroundedPosLocal = ToRootLocalSpace(_GluePosition);
+				_G_LasGroundedRotLocal = _GlueRotation;
+				G_AttachementHandler.legMoveAnimation.Reset();
+			}
+			_GluePosition = RootSpaceToWorld(_G_LasGroundedPosLocal);
+			_GlueRotation = _G_LasGroundedRotLocal;
+			return;
+		}
+		_G_WasGrounded = true;
+		if (Owner._glueModeExecuted == EGlueMode.Moving && Owner.SwingHelper > 0f)
+		{
+			Vector3 vector = AnkleH.LastKeyframeRootPos - _G_LastPreGlueSourceLocalIKPos;
+			if (vector.magnitude > Owner.ScaleReferenceNoScale * 0.001f)
+			{
+				_G_LastPreGlueSourceLocalIKPos = _G_PreGlueSourceLocalIKPos;
+			}
+			_G_PreGlueSourceLocalIKPos = AnkleH.LastKeyframeRootPos;
+			_G_RefernceSwing = Vector3.SmoothDamp(_G_RefernceSwing, vector * 2f, ref _G_sd_RefSwing, 0.04f, 100000f, Owner.DeltaTime);
+		}
+		else
+		{
+			_G_RefernceSwing = Vector3.zero;
+			_G_sd_RefSwing = Vector3.zero;
+		}
+		_Glue_AskingForDetach = false;
+		if (G_Attached)
+		{
+			bool flag = !Glue_CheckDetachement();
+			if (!flag)
+			{
+				flag = !Glue_CheckIdleDetachementConfirm();
+			}
+			if (!flag)
+			{
+				G_Attached = flag;
+				G_AttachementHandler.OnLegRequireRepose();
+				flag = Glue_Conditions_Attach();
+			}
+			else if (!Glue_Conditions_Attach())
+			{
+				flag = false;
+			}
+			if (flag)
+			{
+				G_AttachementHandler.TransitionToGlueAnimation();
+			}
+			else
+			{
+				G_AttachementHandler.TransitionToDisableGlueAnimation();
+			}
+		}
+		else if (Glue_Conditions_Attach())
+		{
+			G_AttachementHandler.TransitionToGlueAnimation();
+		}
+		else
+		{
+			G_AttachementHandler.TransitionToDisableGlueAnimation();
+		}
+		if (G_InstantReglue)
+		{
+			G_AttachementHandler.SheduleInstantTransition();
+			G_InstantReglue = false;
+		}
+		G_AttachementHandler.UpdateTransitioning(G_DuringAttaching);
+		Gluing_UpdateAttachement();
+	}
+
+	private bool Glue_TriggerFinalAttach()
+	{
+		if ((bool)legGroundHit.transform || _UsingEmptyRaycast)
+		{
+			G_Attached = true;
+			G_Attachement = new GlueAttachement(this, legGroundHit);
+			return true;
+		}
+		return false;
+	}
+
+	private void Gluing_UpdateAttachement()
+	{
+		if (!G_Attachement.NoTransform && G_Attachement.AttachedTo == null)
+		{
+			G_Attachement = default(GlueAttachement);
+			G_AttachementHandler.OnLegRequireRepose();
+			G_Attached = false;
+		}
+		if (!G_Attached)
+		{
+			_GluePosition = G_AttachementHandler.GetGluePosition();
+			Gluing_DragStretchApply();
+			if (Owner.AnimateFeet)
+			{
+				if (Owner.LimitFeetYaw > 0f)
+				{
+					_GlueRotation = G_AttachementHandler.GetGlueRotation();
+				}
+				else
+				{
+					_GlueRotation = A_LastApppliedAlignRot;
+				}
+			}
+		}
+		else
+		{
+			_GlueLastAttachPosition = G_Attachement.GetRelevantAlignedHitPoint(this);
+			_GlueLastAttachPositionRootLocal = ToRootLocalSpace(_GlueLastAttachPosition);
+			Quaternion relevantAttachementRotation = G_Attachement.GetRelevantAttachementRotation();
+			_GlueLastAttachRotation = relevantAttachementRotation;
+			_GluePosition = G_AttachementHandler.GetGluePosition();
+			Gluing_DragStretchApply();
+			if (Owner.AnimateFeet)
+			{
+				if (Owner.LimitFeetYaw > 0f)
+				{
+					_GlueRotation = G_AttachementHandler.GetGlueRotation();
+				}
+				else
+				{
+					_GlueRotation = A_LastApppliedAlignRot;
+				}
+			}
+		}
+		G_AttachementHandler.PostUpdate();
+	}
+
+	private void Gluing_DragStretchApply()
+	{
+		if (Owner.AllowGlueDrag > 0f)
+		{
+			float stretchValue = IKProcessor.GetStretchValue(_GluePosition - Owner._LastAppliedHipsStabilityOffset);
+			float num = Mathf.LerpUnclamped(1f, 0.825f, Owner.AllowGlueDrag);
+			float num2 = num * Mathf.LerpUnclamped(1f, LegStretchLimit, Owner.AllowGlueDrag);
+			if (num2 > num)
+			{
+				num2 = num;
+			}
+			Vector3 vector = _GluePosition;
+			if (stretchValue > num2 * 1.1f)
+			{
+				float t = (stretchValue - num2 * 1.1f) * 2f * Mathf.Min(1f, Owner.AllowGlueDrag);
+				vector = ((!A_PreWasAligning) ? Vector3.Lerp(_GluePosition, A_PreIKPosForGluing, t) : Vector3.Lerp(_GluePosition, ankleAlignedOnGroundHitWorldPos, t));
+			}
+			Vector3 b = vector - _GluePosition;
+			G_GlueDragOffset = Vector3.Lerp(G_GlueDragOffset, b, Owner.DeltaTime * 14f);
+			if (float.IsNaN(G_GlueDragOffset.x) || float.IsNaN(G_GlueDragOffset.z))
+			{
+				G_GlueDragOffset = Vector3.zero;
+			}
+		}
+	}
+
+	private void Gluing_ApplyCoords()
+	{
+		if (_glueTargetBlend < 0.0001f)
+		{
+			return;
+		}
+		float num = _glueTargetBlend * G_AttachementHandler.glueAnimationBlend;
+		if (num >= 1f)
+		{
+			_FinalIKPos = _GluePosition + G_GlueDragOffset;
+			if (Owner.AnimateFeet)
+			{
+				_FinalIKRot = _GlueRotation;
+			}
+		}
+		else
+		{
+			_FinalIKPos = Vector3.LerpUnclamped(A_PreIKPosForGluing, _GluePosition + G_GlueDragOffset, num);
+			if (Owner.AnimateFeet)
+			{
+				_FinalIKRot = Quaternion.LerpUnclamped(_FinalIKRot, _GlueRotation, num);
+			}
+		}
+	}
+
+	private void Controll_Init()
+	{
+		C_AnkleToHeelRootSpace = ToRootLocalSpace(Root.position + BoneEnd.TransformVector(AnkleToHeel));
+		ThighH.Calibrate(this, ThighH.Bone.position);
+		AnkleH.Calibrate(this, AnkleH.Bone.position);
+	}
+
+	private Vector3 TransformVectorAnkleWithAlignedRotation(Vector3 offset)
+	{
+		return ankleAlignedOnGroundHitRotation * Vector3.Scale(offset, BoneEnd.lossyScale);
+	}
+
+	private void Controll_Calibrate()
+	{
+		_C_DynamicYScale = Owner.DynamicYScale;
+		ThighH.Calibrate(this, ThighH.Bone.position);
+		AnkleH.Calibrate(this, _SourceIKPosUnchangedY);
+		Vector3 ankleToHeel = AnkleToHeel;
+		Vector3 vector = TransformVectorAnkleWithAlignedRotation(AnkleToHeel);
+		C_LastFootEndWorldPos = _SourceIKPosUnchangedY + TransformVectorAnkleWithAlignedRotation(ankleToHeel);
+		C_LastFootEndRootSpacePos = ToRootLocalSpace(C_LastFootEndWorldPos);
+		C_AnimatedAnkleFlatHeight = ToRootLocalSpaceDir(vector).y;
+		C_LastHeelWorldPos = _SourceIKPosUnchangedY + vector;
+		C_LastHeelRootSpacePos = ToRootLocalSpace(C_LastHeelWorldPos);
+		if (Owner.AnimateFeet)
+		{
+			C_LastMidRefFootWorldPos = Vector3.LerpUnclamped(C_LastFootEndWorldPos, C_LastHeelWorldPos, FootMiddlePosition);
+			C_LastMidRefFootRootSpacePos = Vector3.LerpUnclamped(C_LastFootEndRootSpacePos, C_LastHeelRootSpacePos, FootMiddlePosition);
+		}
+		else
+		{
+			C_LastMidRefFootRootSpacePos = C_LastHeelRootSpacePos;
+			C_LastMidRefFootWorldPos = C_LastHeelWorldPos;
+		}
+		C_Local_MidFootPosVsGroundHit = C_LastMidRefFootRootSpacePos - groundHitRootSpacePos;
+		C_Local_FootElevateInAnimation = C_LastMidRefFootRootSpacePos.y - ParentHub._Hips_LastHipsOffset;
+		C_Local_AnkleToHeelRotated = ToRootLocalSpace(Root.position + BoneEnd.TransformVector(AnkleToHeel));
+		C_AnkleToHeelWorldHeight = BoneEnd.TransformVector(AnkleToHeel).magnitude;
+	}
+
+	private Vector3 RootSpaceToWorldVec(Vector3 localVec)
+	{
+		return Owner.RootToWorldSpaceVec(localVec);
+	}
+
+	private Vector3 RootSpaceToWorld(Vector3 rootLocal)
+	{
+		return Owner.RootToWorldSpace(rootLocal);
+	}
+
+	private Vector3 ToRootLocalSpaceDir(Vector3 worldDir)
+	{
+		return Owner.ToRootLocalSpaceVec(worldDir);
+	}
+
+	private Vector3 ToRootLocalSpace(Vector3 worldPos)
+	{
+		return Owner.ToRootLocalSpace(worldPos);
+	}
+
+	private Vector3 ChangeLocalY(Vector3 worldPos, float targetLocalY)
+	{
+		worldPos = ToRootLocalSpace(worldPos);
+		worldPos.y = targetLocalY;
+		return RootSpaceToWorld(worldPos);
+	}
+
+	private Vector3 ChangeLocalPosExceptY(Vector3 worldPos, Vector3 targetWorldPos)
+	{
+		worldPos = ToRootLocalSpace(worldPos);
+		Vector3 vector = ToRootLocalSpace(targetWorldPos);
+		worldPos.x = vector.x;
+		worldPos.z = vector.z;
+		return RootSpaceToWorld(worldPos);
+	}
+
+	private void Control_StepEventCalcs()
+	{
+		StepEventRestore();
+		if (!Owner.UseGluing || _StepSent)
+		{
+			return;
+		}
+		if (Owner._glueModeExecuted == EGlueMode.Idle)
+		{
+			if (G_GlueInternalTransition >= 0.85f - Owner.EventExecuteSooner)
+			{
+				if (_ToConfirmStepEvent > 0.1f)
+				{
+					SendStepEvent(G_AttachementHandler.legMoveDistanceFactor);
+					return;
+				}
+				float num = Mathf.InverseLerp(1f, 0f, LegAnimatingSettings.RaiseYAxisCurve.Evaluate(G_GlueInternalTransition));
+				_ToConfirmStepEvent += DeltaTime * (3f + 3f * num);
+			}
+			else
+			{
+				_ToConfirmStepEvent = 0f;
+			}
+		}
+		else
+		{
+			if (G_HandlerExecutingLegAnimationMode != EGlueMode.Moving || !Owner.SendOnMovingGlue || G_CustomForceNOTAttach)
+			{
+				return;
+			}
+			float num2 = FloorLevel * Owner.BaseTransform.lossyScale.y + C_AnkleToHeelWorldHeight * 0.5f + A_LastAlignHeightCompareValue * (1.65f + Owner.EventExecuteSooner);
+			if (G_CustomForceAttach)
+			{
+				_ToConfirmStepEvent += DeltaTime * 5f;
+				num2 += ScaleRef * 0.1f;
+			}
+			if (A_LastAlignHeightDiff <= num2)
+			{
+				if (_ToConfirmStepEvent > 0.2f)
+				{
+					SendStepEvent(1f, EStepType.MovementGluing);
+					_ToConfirmStepEvent = 0f;
+					return;
+				}
+				_ToConfirmStepEvent += DeltaTime;
+				if (A_LastAlignHeightDiff < num2 * 0.75f)
+				{
+					_ToConfirmStepEvent += DeltaTime * 1f;
+				}
+				if (A_LastAlignHeightDiff < num2 * 0.5f)
+				{
+					_ToConfirmStepEvent += DeltaTime * 1f;
+				}
+			}
+			else
+			{
+				_ToConfirmStepEvent = 0f;
+			}
+		}
+	}
+
+	internal void StepEventSentInCustomWay()
+	{
+		_StepSent = true;
+		_StepSentAt = Time.unscaledTime;
+	}
+
+	public void InitLegBasics(LegsAnimator creator, int index, Leg nextLeg)
+	{
+		if (creator != null)
+		{
+			Owner = creator;
+		}
+		PlaymodeIndex = index;
+		NextLeg = nextLeg;
+		LegStretchLimit = 1f;
+		BlendWeight = 1f;
+		InternalModuleBlendWeight = 1f;
+		EnsureAxesNormalization();
+		_h_boneStart = new LegHelper(this, BoneStart);
+		_h_boneMid = new LegHelper(this, BoneMid);
+		_h_boneEnd = new LegHelper(this, BoneEnd);
+		_h_boneStart.Child = _h_boneMid;
+		_h_boneMid.Child = _h_boneEnd;
+		Gluing_Init();
+		Reset();
+		Controll_Init();
+		Raycasting_Init();
+		Stability_Init();
+		AlignStep_Init();
+		RefreshHasOppositeLeg();
+		targetLegAnimating = (CustomLegAnimating ? CustomLegAnimating.Settings : creator.LegAnimatingSettings);
+		ankleAlignedOnGroundHitWorldPos = _FinalIKPos;
+	}
+
+	public void RefreshHasOppositeLeg()
+	{
+		hasOppositeleg = false;
+		if (GetOppositeLeg() != null)
+		{
+			hasOppositeleg = true;
+		}
+	}
+
+	public void Leg_UpdateParams()
+	{
+		targetLegAnimating = (CustomLegAnimating ? CustomLegAnimating.Settings : Owner.LegAnimatingSettings);
+		IK_UpdateParams();
+	}
+
+	internal void AssignParentHub(HipsReference hipsReference)
+	{
+		ParentHub = hipsReference;
+	}
+
+	internal void Reset()
+	{
+		_SourceIKPos = BoneEnd.position;
+		_SourceIKRot = BoneEnd.rotation;
+		_FinalIKPos = _SourceIKPos;
+		_FinalIKRot = _SourceIKRot;
+		_PreviousFinalIKPos = _FinalIKPos;
+		_PreviousFinalIKRot = _FinalIKRot;
+		legGroundHit = default(RaycastHit);
+		legGroundHit.point = _FinalIKPos;
+		legGroundHit.normal = Owner.Up;
+		_PreviousFinalIKPosForStability = _SourceIKPos;
+		ankleAlignedOnGroundHitRotation = _SourceIKRot;
+		A_LastApppliedAlignRot = _SourceIKRot;
+		A_LastTargetAlignRot = _SourceIKRot;
+		groundHitRootSpacePos = ToRootLocalSpace(_SourceIKPos);
+		_SourceIKPosUnchangedY = groundHitRootSpacePos;
+		RaycastHit raycastHit = default(RaycastHit);
+		raycastHit.point = _FinalIKPos;
+		raycastHit.normal = Owner.Up;
+		legGroundHit = raycastHit;
+		Glue_Reset(initializing: true);
+	}
+
+	public void PreCalibrate()
+	{
+		BlendWeight *= InternalModuleBlendWeight;
+		finalBoneBlend = BlendWeight * Owner._MainBlend;
+		if (finalBoneBlend < 0.0001f)
+		{
+			if (!_G_WasDisabled)
+			{
+				G_Attached = false;
+				G_AttachementHandler.Reset(initializing: false);
+				G_Attachement = default(GlueAttachement);
+				_G_WasDisabled = true;
+				legGroundHit = default(RaycastHit);
+				RaycastHitted = false;
+			}
+		}
+		else if (Owner.Calibrate == ECalibrateMode.Calibrate)
+		{
+			IKProcessor.PreCalibrate();
+		}
+		else if (Owner.Calibrate == ECalibrateMode.FixedCalibrate)
+		{
+			if (!_wasFixedCalibrateAnimationCaptured)
+			{
+				IKProcessor.PreCalibrate();
+				return;
+			}
+			BoneStart.localRotation = _AnimatorStartBoneLocRot;
+			BoneMid.localRotation = _AnimatorMidBoneLocRot;
+			BoneEnd.localRotation = _AnimatorEndBoneLocRot;
+		}
+	}
+
+	public void CheckAnimatorPose()
+	{
+		_AnimatorStartBonePos = BoneStart.position;
+		_AnimatorMidBonePos = BoneMid.position;
+		_AnimatorEndBonePos = BoneEnd.position;
+		if (Owner.Calibrate == ECalibrateMode.FixedCalibrate)
+		{
+			_wasFixedCalibrateAnimationCaptured = true;
+			_AnimatorStartBoneLocRot = BoneStart.localRotation;
+			_AnimatorMidBoneLocRot = BoneMid.localRotation;
+			_AnimatorEndBoneLocRot = BoneEnd.localRotation;
+		}
+	}
+
+	public void BeginLateUpdate()
+	{
+		if (!(finalBoneBlend < 0.0001f))
+		{
+			G_CustomForceAttach = false;
+			G_CustomForceNOTDetach = false;
+			G_CustomForceDetach = false;
+			G_CustomForceNOTAttach = false;
+			IK_PreUpdate();
+			LegStretchLimit = Owner.LimitLegStretch * LegStretchMultiplier;
+		}
+	}
+
+	public void PreLateUpdate()
+	{
+		if (!customOverwritingIKPos && (!_G_WasDisabled || !(finalBoneBlend < 0.0001f)))
+		{
+			Owner.Modules_LegBeforeRaycastingUpdate(this);
+			Raycasting_PreLateUpdate();
+			Controll_Calibrate();
+		}
+	}
+
+	public void LateUpdate()
+	{
+		if (!(finalBoneBlend < 0.0001f) && !customOverwritingIKPos)
+		{
+			Owner.Modules_Leg_LateUpdate(this);
+			AlignStep_CheckAlignStatePre();
+			AlignStep_ValidateFootRotation();
+			Gluing_Update();
+			Gluing_ApplyCoords();
+			AlignStep_OnGroundAlign();
+			AlignStep_SmoothSuddenSteps();
+			AlignStep_LegElevation();
+			AlignStep_Complete();
+			Control_StepEventCalcs();
+			ExtraProcessingApply();
+		}
+	}
+
+	public void LateUpdate_Apply()
+	{
+		IK_PostUpdate();
+	}
+
+	public void FixedUpdate()
+	{
+	}
+
+	public float LegLimbLength()
+	{
+		if (BoneStart == null || BoneMid == null || BoneEnd == null)
+		{
+			return Owner.HipsToGroundDistance();
+		}
+		return 0f + Vector3.Distance(BoneStart.position, BoneMid.position) + Vector3.Distance(BoneEnd.position, BoneMid.position);
+	}
+
+	public bool HasAllBonesSet()
+	{
+		if (BoneStart == null)
+		{
+			return false;
+		}
+		if (BoneMid == null)
+		{
+			return false;
+		}
+		if (BoneEnd == null)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public float R(float toRound, int digits = 2)
+	{
+		return (float)Math.Round(toRound, digits);
+	}
+
+	private void SendStepEvent(float factor = 1f, EStepType type = EStepType.IdleGluing)
+	{
+		if (!_StepSent)
+		{
+			if (Owner.GroundedTime < 0.1f)
+			{
+				type = EStepType.OnLanding;
+			}
+			else if (!Owner.IsMoving && Owner.StoppedTime < 0.15f)
+			{
+				type = EStepType.OnStopping;
+			}
+			Owner.Events_OnStep(this, factor, type);
+			_StepSent = true;
+			_StepSentAt = Time.unscaledTime;
+			if (hasOppositeleg)
+			{
+				_OppositeLegStepped = true;
+				GetOppositeLeg()._OppositeLegStepped = !Owner.IsMoving;
+			}
+		}
+	}
+
+	private void SendRaiseEvent(float distanceToNew = 1f)
+	{
+		if (!(Time.unscaledTime - _RaiseSentAt < 0.05f))
+		{
+			_RaiseSentAt = Time.unscaledTime;
+			EStepType type = EStepType.IdleGluing;
+			if (!Owner.IsMoving && Owner.StoppedTime < 0.15f)
+			{
+				type = EStepType.OnStopping;
+			}
+			Owner.Events_OnRaise(this, distanceToNew, type);
+		}
+	}
+
+	private void StepEventRestore()
+	{
+		if (!Owner.UseEvents || !_StepSent || Time.unscaledTime - _StepSentAt < 0.1f || Owner.GroundedTime < 0.1f)
+		{
+			return;
+		}
+		if (Owner.UseGluing)
+		{
+			if (G_AttachementHandler.glueAnimationBlend > 0.5f && G_GlueInternalTransition > 0.25f)
+			{
+				return;
+			}
+			if (Owner._glueModeExecuted == EGlueMode.Idle)
+			{
+				if (!G_DuringAttaching || (Owner.GlueMode == EGlueMode.Automatic && (Owner.IsMoving || Owner.Helper_WasMoving)) || (!Owner.SendOnStopping && Owner.StoppedTime < 0.155f) || G_AttachementHandler.lasGlueModeOnAttaching != 0 || G_AttachementHandler.legMoveDistanceFactor < 0.05f)
+				{
+					return;
+				}
+			}
+			else
+			{
+				if ((Owner.GlueMode == EGlueMode.Automatic && !Owner.IsMoving) || Owner.MovingTime < 0.06f || A_PreWasAligning || A_AligningHelperBlend > 0.5f - Owner.EventExecuteSooner || (hasOppositeleg && !GetOppositeLeg()._OppositeLegStepped))
+				{
+					return;
+				}
+				float num = (0f - ScaleRef) * 0.2f + FloorLevel * Owner.BaseTransform.lossyScale.y + C_AnkleToHeelWorldHeight * 0.75f + A_LastAlignHeightCompareValue * (3f + Owner.EventExecuteSooner);
+				if (A_LastAlignHeightDiff < num)
+				{
+					return;
+				}
+			}
+		}
+		else
+		{
+			if (A_PreWasAligning || A_AligningHelperBlend > 0.05f)
+			{
+				return;
+			}
+			if (Owner.IsMovingBlend < 0.05f)
+			{
+				_StepSent = true;
+				return;
+			}
+			if (!Owner.Helper_WasMoving)
+			{
+				_StepSent = true;
+				return;
+			}
+			if (!Owner.IsMoving)
+			{
+				_StepSent = true;
+				return;
+			}
+		}
+		_StepSent = false;
+	}
+
+	public void IK_Initialize(bool generateNew = true)
+	{
+		if (generateNew)
+		{
+			IKProcessor = new FimpIK_Limb();
+		}
+		if ((bool)BoneFeet)
+		{
+			IKProcessor.SetLegWithFeet(BoneStart, BoneMid, BoneEnd, BoneFeet);
+		}
+		else
+		{
+			IKProcessor.SetBones(BoneStart, BoneMid, BoneEnd);
+		}
+		IKProcessor.Init(Owner.BaseTransform);
+		IKProcessor.UseEndBoneMapping = false;
+		IKProcessor.IKWeight = 1f;
+		IKProcessor.IKPositionWeight = 1f;
+		IKProcessor.FootRotationWeight = 1f;
+		IKProcessor.ManualHintPositionWeight = 0f;
+		IKProcessor.FeetStretchSensitivity = 0.9f;
+		IKProcessor.FeetFadeQuicker = 1.1f;
+		IKProcessor.FeetStretchLimit = 0.8f;
+		IKProcessor.HumanoidAnimator = Owner.Mecanim;
+		IKProcessor.IsRight = Side == ELegSide.Right;
+		_FinalIKPos = IKProcessor.EndIKBone.transform.position;
+		_PreviousFinalIKPos = _FinalIKPos;
+		_PreviousFinalIKPosForStability = _FinalIKPos;
+		_PreviousFinalIKPosRootLocal = ToRootLocalSpace(_FinalIKPos);
+		IKProcessor.IKTargetPosition = _FinalIKPos;
+		IKProcessor.IKTargetRotation = _FinalIKRot;
+	}
+
+	public void AssignCustomIKProcessor(FimpIK_Limb ik)
+	{
+		IKProcessor = ik;
+		IK_Initialize(generateNew: false);
+	}
+
+	public void OverrideTargetIKPosition(Vector3? targetIKPos)
+	{
+		if (!targetIKPos.HasValue)
+		{
+			customOverwritingIKPos = false;
+			return;
+		}
+		customOverwritingIKPos = true;
+		customOverwritePos = targetIKPos.Value;
+	}
+
+	public void OverrideTargetIKRotation(Quaternion? targetIKRot)
+	{
+		if (!targetIKRot.HasValue)
+		{
+			if (customOverwritingIKRot)
+			{
+				IKProcessor.FootRotationWeight = 1f;
+			}
+			customOverwritingIKRot = false;
+		}
+		else
+		{
+			customOverwritingIKRot = true;
+			customOverwriteRot = targetIKRot.Value;
+		}
+	}
+
+	public void OverrideFinalIKPos(Vector3 pos)
+	{
+		_FinalIKPos = pos;
+	}
+
+	public void OverrideFinalAndSourceIKPos(Vector3 pos)
+	{
+		_FinalIKPos = pos;
+		_SourceIKPos = pos;
+	}
+
+	public Vector3 GetFinalIKPos()
+	{
+		return _FinalIKPos;
+	}
+
+	public Vector3 GetSourceIKPos()
+	{
+		return _SourceIKPos;
+	}
+
+	public Quaternion GetFinalIKRot()
+	{
+		return _FinalIKRot;
+	}
+
+	public Quaternion GetSourceIKRot()
+	{
+		return _SourceIKRot;
+	}
+
+	public void OverrideFinalIKRot(Quaternion rot)
+	{
+		_FinalIKRot = rot;
+	}
+
+	public void IK_PreUpdate()
+	{
+		IKProcessor.CallPreCalibrate = Owner.Calibrate == ECalibrateMode.Calibrate;
+		if (!Owner.IsGrounded)
+		{
+			if (_wasGrounded)
+			{
+				_ungroundLocalIKCache = ToRootLocalSpace(_PreviousFinalIKPos);
+				_wasGrounded = false;
+			}
+			_SourceIKPos = RootSpaceToWorld(_ungroundLocalIKCache);
+			_SourceIKPos = Vector3.Lerp(_SourceIKPos, IKProcessor.EndIKBone.transform.position, 1f - Owner.IsGroundedBlend);
+			_ungroundLocalIKCache = ToRootLocalSpace(_SourceIKPos);
+			_SourceIKRot = BoneEnd.rotation;
+			_SourceIKPosUnchangedY = _SourceIKPos;
+			_FinalIKPos = _SourceIKPos;
+			_FinalIKRot = _SourceIKRot;
+		}
+		else
+		{
+			_wasGrounded = true;
+			if (!_overwrittenSourceIKPos)
+			{
+				_SourceIKPos = IKProcessor.EndIKBone.transform.position;
+			}
+			else
+			{
+				_overwrittenSourceIKPos = false;
+			}
+			_SourceIKRot = BoneEnd.rotation;
+			_SourceIKPosUnchangedY = _SourceIKPos;
+			_FinalIKPos = _SourceIKPos;
+			_FinalIKRot = _SourceIKRot;
+		}
+	}
+
+	public void IK_PostUpdate()
+	{
+		if (customOverwritingIKPos)
+		{
+			_FinalIKPos = customOverwritePos;
+			if (customOverwritingIKRot)
+			{
+				IKProcessor.FootRotationWeight = 1f;
+				_FinalIKRot = customOverwriteRot;
+			}
+			else
+			{
+				IKProcessor.FootRotationWeight = 0f;
+			}
+		}
+		else if (G_LegAnimation.LegAdjustementFootAngleOffset != 0f || FootPitchOffset != 0f)
+		{
+			_FinalIKRot = Quaternion.AngleAxis(G_LegAnimation.LegAdjustementFootAngleOffset + FootPitchOffset, _SourceIKRot * AnkleIK.right) * _FinalIKRot;
+		}
+		if (float.IsNaN(_FinalIKPos.x) || float.IsNaN(_FinalIKPos.y) || float.IsNaN(_FinalIKPos.z))
+		{
+			Reset();
+			_FinalIKPos = RootSpaceToWorld(InitialPosInRootSpace);
+			Gluing_Init();
+		}
+		_PreviousFinalIKPosForStability = _FinalIKPos;
+		IKProcessor.IKTargetPosition = _FinalIKPos;
+		IKProcessor.IKTargetRotation = _FinalIKRot;
+		if (IKProcessor.IKWeight > 0f)
+		{
+			if (!Owner.UseCustomIK && LegStretchLimit < 1.1f)
+			{
+				IKProcessor.ApplyMaxStretchingPreprocessing(LegStretchLimit, 3f);
+			}
+			ExtraIKPostProcessingApply();
+			if (!Owner.UseCustomIK)
+			{
+				IKProcessor.Update();
+			}
+		}
+		_PreviousFinalIKPos = IKProcessor.IKTargetPosition;
+		_PreviousFinalIKPosRootLocal = ToRootLocalSpace(_PreviousFinalIKPos);
+		if (Owner.AnimateFeet)
+		{
+			_PreviousFinalIKRot = IKProcessor.IKTargetRotation;
+		}
+	}
+
+	public void IK_UpdateParamsBase()
+	{
+		IKProcessor.IKWeight = Owner._MainBlend * LegBlendWeight * InternalModuleBlendWeight;
+		BlendWeight = IKProcessor.IKWeight;
+		IKProcessor.InverseHint = InverseHint;
+	}
+
+	public void IK_UpdateParams()
+	{
+		IK_UpdateParamsBase();
+		IKProcessor.AutoHintMode = Owner.IKHintMode;
+		IKProcessor.FeetStretchSensitivity = 0.7f + 0.6f * FeetSensitivity;
+		IKProcessor.FeetFadeQuicker = 0.95f + 0.35f * FeetSensitivity;
+		IKProcessor.FeetStretchLimit = 0.8f + 0.2f * FeetSensitivity;
+		IKProcessor.disableFeet = !UseFeet;
+	}
+
+	public void RandomizeIndividualSettings(float from, float to)
+	{
+		GlueThresholdMultiplier = UnityEngine.Random.Range(Mathf.Lerp(from, to, 0.4f), to);
+		LegMoveSpeedMultiplier = UnityEngine.Random.Range(from, to);
+		LegRaiseMultiplier = UnityEngine.Random.Range(from, to);
+	}
+
+	public void OverrideAnimatorAnklePosition(Vector3 targetPos)
+	{
+		_overwrittenSourceIKPos = true;
+		_AnimatorEndBonePos = targetPos + (Owner._LastAppliedHipsFinalPosition - ParentHub.LastKeyframePosition);
+		_SourceIKPos = _AnimatorEndBonePos;
+	}
+
+	public void User_OverrideRaycastHit(Transform tr, bool disableSourceRaycast = true)
+	{
+		if (!_UsingCustomRaycast)
+		{
+			_CustomRaycastBlendIn = 0f;
+			_PreviousCustomRaycastingStartIKPos = C_LastHeelWorldPos;
+		}
+		_disableSourceRaycast = disableSourceRaycast;
+		_UsingCustomRaycast = true;
+		RaycastHit hit = default(RaycastHit);
+		hit.point = tr.position;
+		hit.normal = tr.up;
+		_CustomRaycastOnBlendIn(hit);
+	}
+
+	public void User_OverrideRaycastHit(RaycastHit hit, bool disableSourceRaycast = true)
+	{
+		if (!_UsingCustomRaycast)
+		{
+			_CustomRaycastBlendIn = 0f;
+			_PreviousCustomRaycastingStartIKPos = C_LastHeelWorldPos;
+		}
+		_disableSourceRaycast = disableSourceRaycast;
+		_UsingCustomRaycast = true;
+		_CustomRaycastOnBlendIn(hit);
+	}
+
+	public void User_RestoreRaycasting()
+	{
+		if (_UsingCustomRaycast)
+		{
+			_CustomRaycastBlendIn = 1f;
+		}
+		_UsingCustomRaycast = false;
+		_disableSourceRaycast = false;
+	}
+
+	private void _CustomRaycastOnBlendIn(RaycastHit hit)
+	{
+		_CustomRaycastBlendIn += Owner.DeltaTime * 6f;
+		if (_CustomRaycastBlendIn > 1f)
+		{
+			_CustomRaycastBlendIn = 1f;
+		}
+		hit.point = Vector3.LerpUnclamped(_PreviousCustomRaycastingStartIKPos, hit.point, _CustomRaycastBlendIn);
+		_CustomRaycastHit = hit;
+		_PreviousCustomRaycastingIKPos = hit.point;
+	}
+
+	private void _CustomRaycastOnBlendOut()
+	{
+		if (!_UsingCustomRaycast && !(_CustomRaycastBlendIn <= 0f))
+		{
+			_CustomRaycastBlendIn -= Owner.DeltaTime * 8f;
+			if (_CustomRaycastBlendIn < 0f)
+			{
+				_CustomRaycastBlendIn = 0f;
+			}
+			if (!RaycastHitted)
+			{
+				legGroundHit = _CustomRaycastHit;
+				return;
+			}
+			RaycastHit raycastHit = legGroundHit;
+			raycastHit.point = Vector3.LerpUnclamped(raycastHit.point, _PreviousCustomRaycastingIKPos, _CustomRaycastBlendIn);
+			raycastHit.normal = Vector3.SlerpUnclamped(raycastHit.normal, _CustomRaycastHit.normal, _CustomRaycastBlendIn);
+			legGroundHit = raycastHit;
+		}
+	}
+
+	private void Raycasting_Init()
+	{
+		ankleAlignedOnGroundHitWorldPos = BoneEnd.position;
+		raycastSlopeAngle = 0f;
+	}
+
+	public void OverrideControlPositionsWithCurrentIKState()
+	{
+		AnkleH.LastKeyframeRootPos = ToRootLocalSpace(_FinalIKPos);
+		_AnimatorEndBonePos = _FinalIKPos;
+	}
+
+	public void OverrideSourceIKPos()
+	{
+		OverrideSourceIKPos(_FinalIKPos);
+	}
+
+	public void OverrideSourceIKPos(Vector3 newSrc)
+	{
+		_SourceIKPos = newSrc;
+	}
+
+	public void Raycasting_PreLateUpdate()
+	{
+		RaycastHitted = false;
+		_noRaycast_skipFeetCalcs = false;
+		if (!_disableSourceRaycast)
+		{
+			if (Owner.RaycastStyle == ERaycastStyle.NoRaycasting)
+			{
+				GenerateZeroFloorRaycastHit();
+				CustomRaycastValidate();
+				_noRaycast_skipFeetCalcs = true;
+				_UsingEmptyRaycast = true;
+				ankleAlignedOnGroundHitRotation = _SourceIKRot;
+			}
+			else
+			{
+				_UsingEmptyRaycast = false;
+				if (Owner.RaycastStyle == ERaycastStyle.StraightDown)
+				{
+					Raycast_StraightDown();
+				}
+				else if (Owner.RaycastStyle == ERaycastStyle.OriginToFoot)
+				{
+					Raycast_OriginToFoot();
+				}
+				else if (Owner.RaycastStyle == ERaycastStyle.OriginToFoot_DownOnNeed)
+				{
+					Raycast_OriginToFoot();
+					if (!RaycastHitted)
+					{
+						Raycast_StraightDown();
+					}
+				}
+				else if (Owner.RaycastStyle == ERaycastStyle.AlongBones)
+				{
+					Raycast_AlongBones();
+					if (!RaycastHitted)
+					{
+						Raycast_StraightDown();
+					}
+				}
+				if (!RaycastHitted)
+				{
+					NoRaycastBehaviour();
+				}
+			}
+			User_RaycastHittedSource = RaycastHitted;
+			_CustomRaycastOnBlendOut();
+		}
+		if (_UsingCustomRaycast)
+		{
+			RaycastHitted = true;
+			legGroundHit = _CustomRaycastHit;
+			groundHitRootSpacePos = ToRootLocalSpace(legGroundHit.point);
+			_UsingEmptyRaycast = true;
+			_noRaycast_skipFeetCalcs = true;
+			_Raycasting_CalculateBasis();
+			ankleAlignedOnGroundHitRotation = GetAlignedOnGroundHitRot(_SourceIKRot, legGroundHit.normal);
+		}
+		if (!_noRaycast_skipFeetCalcs)
+		{
+			if (RaycastHitted)
+			{
+				lastGroundHitWithTarget = legGroundHit;
+				ankleAlignedOnGroundHitRotation = GetAlignedOnGroundHitRot(_SourceIKRot, legGroundHit.normal);
+			}
+			else
+			{
+				ankleAlignedOnGroundHitRotation = _SourceIKRot;
+			}
+		}
+	}
+
+	private void NoRaycastBehaviour()
+	{
+		if (Owner.NoRaycastGroundBehaviour == ENoRaycastBehviour.Detach)
+		{
+			return;
+		}
+		if (Owner.NoRaycastGroundBehaviour == ENoRaycastBehviour.ZeroFloorSteps)
+		{
+			_noRaycast_skipFeetCalcs = true;
+			_UsingEmptyRaycast = true;
+			GenerateZeroFloorRaycastHit();
+			ankleAlignedOnGroundHitRotation = _SourceIKRot;
+		}
+		else if (Owner.NoRaycastGroundBehaviour == ENoRaycastBehviour.KeepAttached)
+		{
+			if (IKProcessor.GetStretchValue(_PreviousFinalIKPos) > Owner.NoRaycast_KeepAttachedUntilStretch)
+			{
+				lastGroundHitWithTarget = default(RaycastHit);
+			}
+			else if ((bool)lastGroundHitWithTarget.transform)
+			{
+				_noRaycast_skipFeetCalcs = true;
+				legGroundHit = lastGroundHitWithTarget;
+				RaycastHitted = true;
+				_Raycasting_CalculateBasis();
+				Vector3 vector = ToRootLocalSpace(lastGroundHitWithTarget.point);
+				vector.y = 0f;
+				groundHitRootSpacePos = vector;
+			}
+		}
+	}
+
+	private void GenerateZeroFloorRaycastHit()
+	{
+		RaycastHit raycastHit = default(RaycastHit);
+		Vector3 rootLocal = (ankleAlignedOnGroundHitRootLocal = ToRootLocalSpace(_SourceIKPos));
+		rootLocal.y = 0f;
+		Vector3 point = RootSpaceToWorld(rootLocal);
+		raycastHit.point = point;
+		raycastHit.normal = Owner.Up;
+		legGroundHit = raycastHit;
+		RaycastHitted = true;
+		groundHitRootSpacePos = rootLocal;
+	}
+
+	private void CustomRaycastValidate()
+	{
+		_Raycasting_CalculateBasis();
+		raycastSlopeAngle = 0f;
+		A_WasAligning = true;
+		A_WasAligningFrameBack = true;
+		A_LastTargetAlignRot = _SourceIKRot;
+		A_LastApppliedAlignRot = _SourceIKRot;
+		A_PreviousRelevantAnklePos = _SourceIKPos;
+		A_LastAlignHeightDiff = C_Local_MidFootPosVsGroundHit.y;
+		A_LastAlignHeightCompareValue = ScaleRef * 0.002f + ParentHub._Hips_StepHeightAdjustOffset;
+	}
+
+	private Vector3 Raycast_RefreshOrigin()
+	{
+		Vector3 lastRootLocalPos = ParentHub.LastRootLocalPos;
+		return lastRaycastingOrigin = RootSpaceToWorld(lastRootLocalPos);
+	}
+
+	private void Raycast_OriginToFoot()
+	{
+		Vector3 vector = Raycast_RefreshOrigin();
+		Vector3 vector2 = RootSpaceToWorld(AnkleH.LastKeyframeRootPos) - Owner.Up * C_AnkleToHeelWorldHeight - vector;
+		float num = vector2.magnitude * 1.05f;
+		vector2.Normalize();
+		Vector3 end = vector + vector2 * num;
+		if (Physics.Linecast(vector, end, out legGroundHit, Owner.GroundMask, Owner.RaycastHitTrigger))
+		{
+			CaptureRaycastHitForLeg();
+		}
+		else
+		{
+			ankleAlignedOnGroundHitWorldPos = AnkleIK.srcPosition;
+		}
+	}
+
+	private void Raycast_AlongBones()
+	{
+		Raycast_RefreshOrigin();
+		if (DoRaycasting(_AnimatorStartBonePos, _AnimatorMidBonePos))
+		{
+			CaptureRaycastHitForLeg();
+			return;
+		}
+		Vector3 rayEnd = _AnimatorEndBonePos + (_AnimatorEndBonePos - _AnimatorMidBonePos) * 0.1f;
+		if (DoRaycasting(_AnimatorMidBonePos, rayEnd))
+		{
+			CaptureRaycastHitForLeg();
+		}
+		else
+		{
+			ankleAlignedOnGroundHitWorldPos = AnkleIK.srcPosition;
+		}
+	}
+
+	private void Raycast_StraightDown()
+	{
+		Vector3 lastKeyframeRootPos = AnkleH.LastKeyframeRootPos;
+		Vector3 lastRootLocalPos = ParentHub.LastRootLocalPos;
+		float num;
+		if (Owner.RaycastStartHeight == ERaycastStartHeight.FirstBone)
+		{
+			lastRootLocalPos = BoneStart.position;
+			num = IKProcessor.fullLength;
+		}
+		else
+		{
+			lastRootLocalPos.x = lastKeyframeRootPos.x;
+			lastRootLocalPos.z = lastKeyframeRootPos.z;
+			num = Owner.ScaleReference * (Owner.RaycastStartHeightMul / Root.lossyScale.y);
+			if (Owner.RaycastStartHeight == ERaycastStartHeight.StaticScaleReference)
+			{
+				lastRootLocalPos.y = num;
+			}
+			lastRootLocalPos = RootSpaceToWorld(lastRootLocalPos);
+		}
+		lastRaycastingOrigin = lastRootLocalPos;
+		Vector3 vector = -Owner.Up;
+		Vector3 vector2 = lastRootLocalPos + vector * num;
+		float num2 = ScaleRef * Owner.CastDistance;
+		Vector3 rayEnd = (lastRaycastingEndPoint = vector2 + vector * num2);
+		if (DoRaycasting(lastRootLocalPos, rayEnd))
+		{
+			CaptureRaycastHitForLeg();
+		}
+		else
+		{
+			ankleAlignedOnGroundHitWorldPos = AnkleIK.srcPosition;
+		}
+	}
+
+	internal bool DoRaycasting(Vector3 origin, Vector3 rayEnd)
+	{
+		bool flag;
+		if (Owner.RaycastShape == ERaycastMode.Linecast)
+		{
+			flag = Physics.Linecast(origin, rayEnd, out legGroundHit, Owner.GroundMask, Owner.RaycastHitTrigger);
+		}
+		else
+		{
+			float num = Owner.ScaleReference * 0.065f * Owner.SpherecastResize;
+			Vector3 vector = rayEnd - origin;
+			float num2 = vector.magnitude - num;
+			flag = Physics.SphereCast(origin, num, vector.normalized, out legGroundHit, num2 - num, Owner.GroundMask, Owner.RaycastHitTrigger);
+			if (flag && Owner.SpherecastRealign > 0f)
+			{
+				Vector3 rootLocal = ToRootLocalSpace(legGroundHit.point);
+				rootLocal.x = Mathf.LerpUnclamped(rootLocal.x, AnkleH.LastKeyframeRootPos.x, Owner.SpherecastRealign);
+				rootLocal.z = Mathf.LerpUnclamped(rootLocal.z, AnkleH.LastKeyframeRootPos.z, Owner.SpherecastRealign);
+				legGroundHit.point = RootSpaceToWorld(rootLocal);
+			}
+		}
+		return flag;
+	}
+
+	private void CaptureRaycastHitForLeg()
+	{
+		RaycastHitted = true;
+		groundHitRootSpacePos = ToRootLocalSpace(legGroundHit.point);
+		raycastSlopeAngle = Vector3.Angle(Owner.Up, legGroundHit.normal);
+		if (raycastSlopeAngle > 45f)
+		{
+			RaycastHit raycastHit = legGroundHit;
+			raycastHit.normal = Vector3.Slerp(legGroundHit.normal, Owner.Up, Mathf.InverseLerp(45f, 90f, raycastSlopeAngle) * 0.5f);
+			legGroundHit = raycastHit;
+		}
+		_Raycasting_CalculateBasis();
+	}
+
+	private void _Raycasting_CalculateBasis()
+	{
+		previousAnkleAlignedOnGroundHitWorldPos = ankleAlignedOnGroundHitWorldPos;
+		ankleAlignedOnGroundHitWorldPos = GetAlignedOnGroundHitPos(groundHitRootSpacePos, legGroundHit.point, legGroundHit.normal);
+		ankleAlignedOnGroundHitRootLocal = ToRootLocalSpace(ankleAlignedOnGroundHitWorldPos);
+	}
+
+	private Vector3 GetAlignedOnGroundHitPos(Vector3 rootSpaceHitPos, Vector3 worldHit, Vector3 normal)
+	{
+		Vector3 rootLocal = rootSpaceHitPos;
+		rootLocal.y = ToRootLocalSpace(worldHit + normal * C_AnkleToHeelWorldHeight).y;
+		return RootSpaceToWorld(rootLocal);
+	}
+
+	private Quaternion GetAlignedOnGroundHitRot(Quaternion sourceRotation, Vector3 normal)
+	{
+		return Quaternion.FromToRotation(sourceRotation * AnkleIK.up, normal) * sourceRotation;
+	}
+
+	private void Stability_Init()
+	{
+		Vector3 initialPosInRootSpace = ToRootLocalSpace(BoneEnd.position);
+		InitialPosInRootSpace = initialPosInRootSpace;
+	}
+
+	public void DefineLegSide(LegsAnimator get, Leg knownOppositeLeg = null)
+	{
+		if (knownOppositeLeg != null && knownOppositeLeg.Side != 0)
+		{
+			if (knownOppositeLeg.Side == ELegSide.Left)
+			{
+				Side = ELegSide.Right;
+			}
+			else
+			{
+				Side = ELegSide.Left;
+			}
+		}
+		else if (BoneStart != null)
+		{
+			if (get.Util_OnLeftSide(BoneStart))
+			{
+				Side = ELegSide.Left;
+			}
+			else
+			{
+				Side = ELegSide.Right;
+			}
+		}
+	}
+
+	public void AssignOppositeLegIndex(int oppositeIndex)
+	{
+		if (oppositeIndex != OppositeLegIndex)
+		{
+			if ((bool)Owner && FLogicMethods.ContainsIndex(Owner.Legs, oppositeIndex, falseIfNull: true))
+			{
+				Owner.Legs[oppositeIndex].OppositeLegIndex = Owner.Leg_GetIndex(this);
+			}
+			OppositeLegIndex = oppositeIndex;
+		}
+	}
+
+	public Leg GetOppositeLegReference(LegsAnimator legs)
+	{
+		if (OppositeLegIndex < 0)
+		{
+			return null;
+		}
+		if (!FLogicMethods.ContainsIndex(legs.Legs, OppositeLegIndex, falseIfNull: true))
+		{
+			return null;
+		}
+		return legs.Legs[OppositeLegIndex];
+	}
+
+	public void RefreshLegAnkleToHeelAndFeetAndAxes(Transform baseT)
+	{
+		RefreshLegAnkleToHeelAndFeet(baseT);
+		RefreshLegAnkleAxes(baseT);
+	}
+
+	public void RefreshLegAnkleToHeelAndFeet(Transform baseT)
+	{
+		if (!(BoneEnd == null))
+		{
+			Vector3 position = BoneEnd.position;
+			position.y = baseT.position.y;
+			AnkleToHeel = BoneEnd.InverseTransformPoint(position);
+			AnkleToFeetEnd = BoneEnd.InverseTransformPoint(position + baseT.forward * ScaleRef * 0.15f);
+		}
+	}
+
+	public void RefreshLegAnkleAxes(Transform baseT)
+	{
+		if ((bool)BoneEnd)
+		{
+			Quaternion quaternion = baseT.rotation * Quaternion.Euler(0f, AnkleYawCorrection, 0f);
+			AnkleForward = BoneEnd.InverseTransformDirection(quaternion * Vector3.forward);
+			AnkleUp = BoneEnd.InverseTransformDirection(quaternion * Vector3.up);
+			AnkleRight = BoneEnd.InverseTransformDirection(quaternion * Vector3.right);
+		}
+	}
+
+	private void EnsureAxesNormalization()
+	{
+		AnkleRight.Normalize();
+		AnkleUp.Normalize();
+		AnkleForward.Normalize();
+	}
+}

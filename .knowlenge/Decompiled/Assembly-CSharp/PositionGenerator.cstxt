@@ -1,0 +1,197 @@
+using System;
+using System.Collections.Generic;
+using Facepunch;
+using UnityEngine;
+
+[Serializable]
+public class PositionGenerator
+{
+	public enum RelativeType
+	{
+		Player,
+		Provider,
+		Position
+	}
+
+	public enum PositionType
+	{
+		MissionPoint,
+		WorldPositionGenerator,
+		DungeonPoint,
+		Radius
+	}
+
+	public string identifier;
+
+	public float minDistForMovePoint;
+
+	public float maxDistForMovePoint = 25f;
+
+	public bool allowDoubleDistanceIfNoOptionsAreFound;
+
+	public RelativeType relativeTo;
+
+	public PositionType positionType;
+
+	public string centerOnPositionIdentifier = "";
+
+	[InspectorFlags]
+	public MissionPoint.MissionPointEnum Flags = (MissionPoint.MissionPointEnum)(-1);
+
+	[InspectorFlags]
+	public MissionPoint.MissionPointEnum ExclusionFlags;
+
+	public WorldPositionGenerator worldPositionGenerator;
+
+	public bool IsDependant()
+	{
+		return !string.IsNullOrEmpty(centerOnPositionIdentifier);
+	}
+
+	public bool Validate(BasePlayer assignee, BaseMission missionDef)
+	{
+		Vector3 position;
+		if (positionType == PositionType.MissionPoint)
+		{
+			List<MissionPoint> points = Pool.Get<List<MissionPoint>>();
+			bool missionPoints = MissionPoint.GetMissionPoints(ref points, assignee.transform.position, minDistForMovePoint, maxDistForMovePoint, (int)Flags, (int)ExclusionFlags);
+			if (!missionPoints && allowDoubleDistanceIfNoOptionsAreFound)
+			{
+				points.Clear();
+				missionPoints = MissionPoint.GetMissionPoints(ref points, assignee.transform.position, minDistForMovePoint, maxDistForMovePoint * 2f, (int)Flags, (int)ExclusionFlags);
+			}
+			Pool.FreeUnmanaged(ref points);
+			if (!missionPoints)
+			{
+				Debug.Log("FAILED TO FIND MISSION POINTS");
+				return false;
+			}
+		}
+		else if (positionType == PositionType.WorldPositionGenerator && worldPositionGenerator != null && !worldPositionGenerator.TrySample(assignee.transform.position, minDistForMovePoint, maxDistForMovePoint, out position, blockedPoints))
+		{
+			Debug.Log("FAILED TO GENERATE WORLD POSITION!!!!!");
+			return false;
+		}
+		return true;
+	}
+
+	public Vector3 GetPosition(MissionInstance instance, BasePlayer assignee, int depth = 0)
+	{
+		if (depth > 10)
+		{
+			Debug.LogError($"Exceeded max depth while calculating position! missionID={instance.missionID} identifier={identifier}");
+			return assignee.transform.position;
+		}
+		Vector3 relativeToPosition = GetRelativeToPosition(instance, assignee, depth);
+		Vector3 result;
+		if (positionType == PositionType.MissionPoint)
+		{
+			List<MissionPoint> points = Pool.Get<List<MissionPoint>>();
+			bool missionPoints = MissionPoint.GetMissionPoints(ref points, relativeToPosition, minDistForMovePoint, maxDistForMovePoint, (int)Flags, (int)ExclusionFlags);
+			if (!missionPoints && allowDoubleDistanceIfNoOptionsAreFound)
+			{
+				points.Clear();
+				missionPoints = MissionPoint.GetMissionPoints(ref points, relativeToPosition, minDistForMovePoint, maxDistForMovePoint * 2f, (int)Flags, (int)ExclusionFlags);
+			}
+			if (missionPoints)
+			{
+				result = points[UnityEngine.Random.Range(0, points.Count)].GetPosition();
+			}
+			else
+			{
+				Debug.LogError("UNABLE TO FIND MISSIONPOINT FOR MISSION!");
+				result = relativeToPosition;
+			}
+			Pool.FreeUnmanaged(ref points);
+		}
+		else if (positionType == PositionType.WorldPositionGenerator && worldPositionGenerator != null)
+		{
+			int num = 0;
+			while (true)
+			{
+				if (worldPositionGenerator.TrySample(relativeToPosition, minDistForMovePoint, maxDistForMovePoint, out var position, blockedPoints) && TryAlignToGround(position, out var correctedPosition))
+				{
+					result = correctedPosition;
+					break;
+				}
+				if (num >= 10)
+				{
+					Debug.LogError("UNABLE TO FIND WORLD POINT FOR MISSION!");
+					result = relativeToPosition;
+					break;
+				}
+				num++;
+			}
+		}
+		else if (positionType == PositionType.DungeonPoint)
+		{
+			result = DynamicDungeon.GetNextDungeonPoint();
+		}
+		else
+		{
+			int num2 = 0;
+			while (true)
+			{
+				Vector3 onUnitSphere = UnityEngine.Random.onUnitSphere;
+				onUnitSphere.y = 0f;
+				onUnitSphere.Normalize();
+				Vector3 vector = relativeToPosition + onUnitSphere * UnityEngine.Random.Range(minDistForMovePoint, maxDistForMovePoint);
+				vector.y = WaterLevel.GetWaterOrTerrainSurface(vector, waves: false, volumes: false);
+				if (TryAlignToGround(vector, out var correctedPosition2))
+				{
+					result = correctedPosition2;
+					break;
+				}
+				if (num2 >= 10)
+				{
+					Debug.LogError("UNABLE TO FIND WORLD POINT FOR MISSION!");
+					result = relativeToPosition;
+					break;
+				}
+				num2++;
+			}
+		}
+		return result;
+	}
+
+	private Vector3 GetRelativeToPosition(MissionInstance instance, BasePlayer assignee, int depth)
+	{
+		switch (relativeTo)
+		{
+		case RelativeType.Position:
+			return instance.GetMissionPoint(centerOnPositionIdentifier, assignee, depth + 1);
+		case RelativeType.Provider:
+		{
+			BaseEntity baseEntity = instance.ProviderEntity();
+			if (baseEntity != null)
+			{
+				return baseEntity.transform.position;
+			}
+			break;
+		}
+		}
+		if (assignee != null)
+		{
+			return assignee.transform.position;
+		}
+		Debug.LogError($"Cannot get mission point origin - assigne playere is null! missionID={instance.missionID} relativeTo={relativeTo}");
+		return Vector3.zero;
+	}
+
+	private static bool TryAlignToGround(Vector3 wishPosition, out Vector3 correctedPosition)
+	{
+		Vector3 origin = wishPosition.WithY(wishPosition.y + 50f);
+		if (!Physics.Raycast(new Ray(origin, Vector3.down), out var hitInfo, 50f, 1218652417, QueryTriggerInteraction.Ignore))
+		{
+			correctedPosition = wishPosition;
+			return true;
+		}
+		if (RaycastHitEx.GetEntity(hitInfo) != null)
+		{
+			correctedPosition = wishPosition;
+			return false;
+		}
+		correctedPosition = hitInfo.point;
+		return true;
+	}
+}

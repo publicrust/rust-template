@@ -1,0 +1,184 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
+using Mono.Cecil;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.CSharp;
+using Oxide.Core.Logging;
+using Oxide.CSharp;
+using Oxide.Logging;
+using Oxide.Plugins;
+
+public class CompiledAssembly
+{
+	public CompilablePlugin[] CompilablePlugins;
+
+	public string[] PluginNames;
+
+	public string Name;
+
+	public DateTime CompiledAt;
+
+	public byte[] RawAssembly;
+
+	public byte[] Symbols;
+
+	public byte[] PatchedAssembly;
+
+	public float Duration;
+
+	public Assembly LoadedAssembly;
+
+	public bool IsLoading;
+
+	private List<Action<bool>> loadCallbacks = new List<Action<bool>>();
+
+	private bool isPatching;
+
+	private bool isLoaded;
+
+	public bool IsBatch => CompilablePlugins.Length > 1;
+
+	public CompiledAssembly(string name, CompilablePlugin[] plugins, byte[] rawAssembly, float duration, byte[] symbols)
+	{
+		Name = name;
+		CompilablePlugins = plugins;
+		RawAssembly = rawAssembly;
+		Duration = duration;
+		PluginNames = CompilablePlugins.Select((CompilablePlugin pl) => pl.Name).ToArray();
+		Symbols = symbols;
+	}
+
+	public void LoadAssembly(Action<bool> callback)
+	{
+		if (isLoaded)
+		{
+			callback(obj: true);
+			return;
+		}
+		IsLoading = true;
+		loadCallbacks.Add(callback);
+		if (isPatching)
+		{
+			return;
+		}
+		ValidateAssembly(delegate(byte[] rawAssembly)
+		{
+			if (rawAssembly == null)
+			{
+				foreach (Action<bool> loadCallback in loadCallbacks)
+				{
+					loadCallback(obj: true);
+				}
+				loadCallbacks.Clear();
+				IsLoading = false;
+			}
+			else
+			{
+				LoadedAssembly = Assembly.Load(rawAssembly);
+				isLoaded = true;
+				foreach (Action<bool> loadCallback2 in loadCallbacks)
+				{
+					loadCallback2(obj: true);
+				}
+				loadCallbacks.Clear();
+				IsLoading = false;
+			}
+		});
+	}
+
+	private void ValidateAssembly(Action<byte[]> callback)
+	{
+		if (isPatching)
+		{
+			Interface.Oxide.RootLogger.WriteDebug(LogType.Warning, LogEvent.Compile, "CSharp", "Already patching plugin assembly: " + Oxide.Plugins.ExtensionMethods.ToSentence(PluginNames) + " (ignoring)");
+			return;
+		}
+		isPatching = true;
+		ThreadPool.QueueUserWorkItem(delegate
+		{
+			try
+			{
+				AssemblyDefinition assemblyDefinition = null;
+				ReaderParameters readerParameters = new ReaderParameters
+				{
+					AssemblyResolver = new AssemblyResolver()
+				};
+				using (MemoryStream stream = new MemoryStream(RawAssembly))
+				{
+					assemblyDefinition = AssemblyDefinition.ReadAssembly(stream, readerParameters);
+				}
+				int num = 0;
+				int num2 = CompilablePlugins.Count((CompilablePlugin p) => p.CompilerErrors == null);
+				for (int i = 0; i < assemblyDefinition.MainModule.Types.Count; i++)
+				{
+					if (num == num2)
+					{
+						Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Compile, "CSharp", $"Patched {num} of {num2} plugins");
+						break;
+					}
+					try
+					{
+						TypeDefinition type = assemblyDefinition.MainModule.Types[i];
+						if (!(type.Namespace != "Oxide.Plugins") && Oxide.Plugins.ExtensionMethods.Contains(PluginNames, type.Name))
+						{
+							num++;
+							Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Compile, "CSharp", "Preparing " + type.Name + " for runtime patching. . .");
+							if (type.Methods.FirstOrDefault((MethodDefinition m) => !m.IsStatic && m.IsConstructor && !m.HasParameters && !m.IsPublic) != null)
+							{
+								Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.Compile, "CSharp", "User defined constructors are not supported. Please remove the constructor from " + type.Name + ".cs");
+								CompilablePlugin compilablePlugin = CompilablePlugins.SingleOrDefault((CompilablePlugin p) => p.Name == type.Name);
+								if (compilablePlugin != null)
+								{
+									compilablePlugin.CompilerErrors = "Primary constructor in main class must be public";
+								}
+							}
+							else
+							{
+								Interface.Oxide.RootLogger.WriteDebug(LogType.Info, LogEvent.Compile, "CSharp", "Patching DirectCallMethod on " + type.Name);
+								new DirectCallMethod(assemblyDefinition.MainModule, type, readerParameters);
+							}
+						}
+					}
+					catch (Exception exception)
+					{
+						Interface.Oxide.RootLogger.WriteDebug(LogType.Error, LogEvent.Compile, "CSharp", $"Failed to patch type at index {i}", exception);
+					}
+				}
+				using (MemoryStream memoryStream = new MemoryStream())
+				{
+					assemblyDefinition.Write(memoryStream, new WriterParameters
+					{
+						WriteSymbols = false
+					});
+					PatchedAssembly = memoryStream.ToArray();
+				}
+				Interface.Oxide.NextTick(delegate
+				{
+					isPatching = false;
+					callback(PatchedAssembly);
+				});
+			}
+			catch (Exception ex)
+			{
+				Exception ex2 = ex;
+				Exception ex3 = ex2;
+				Interface.Oxide.NextTick(delegate
+				{
+					isPatching = false;
+					Interface.Oxide.RootLogger.WriteDebug(LogType.Warning, LogEvent.Compile, "CSharp", "Failed to patch DirectCallHook method on plugins " + Oxide.Plugins.ExtensionMethods.ToSentence(PluginNames) + ", performance may be degraded.", ex3);
+					callback(RawAssembly);
+				});
+			}
+		});
+	}
+
+	public bool IsOutdated()
+	{
+		return CompilablePlugins.Any((CompilablePlugin pl) => pl.GetLastModificationTime() != CompiledAt);
+	}
+}

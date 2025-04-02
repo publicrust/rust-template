@@ -1,0 +1,242 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Security.Permissions;
+using System.Text;
+using System.Text.RegularExpressions;
+using Mono.Unix.Native;
+using Oxide.Core;
+using Oxide.Core.Libraries;
+using Oxide.Core.Plugins.Watchers;
+using Oxide.Pooling;
+
+public sealed class FSWatcher : PluginChangeWatcher
+{
+	private class QueuedChange
+	{
+		internal WatcherChangeTypes type;
+
+		internal Timer.TimerInstance timer;
+	}
+
+	private FileSystemWatcher watcher;
+
+	private ICollection<string> watchedPlugins;
+
+	private Dictionary<string, QueuedChange> changeQueue;
+
+	private Timer timers;
+
+	private Dictionary<string, FileSystemWatcher> m_symlinkWatchers = new Dictionary<string, FileSystemWatcher>();
+
+	private IPoolProvider<StringBuilder> StringPool { get; }
+
+	public FSWatcher(string directory, string filter)
+	{
+		StringPool = Interface.Oxide.PoolFactory.GetProvider<StringBuilder>();
+		watchedPlugins = new HashSet<string>();
+		changeQueue = new Dictionary<string, QueuedChange>();
+		timers = Interface.Oxide.GetLibrary<Timer>();
+		if (Interface.Oxide.Config.Options.PluginWatchers)
+		{
+			LoadWatcher(directory, filter);
+			if (Environment.OSVersion.Platform != PlatformID.Unix)
+			{
+				return;
+			}
+			FileInfo[] files = new DirectoryInfo(directory).GetFiles(filter);
+			foreach (FileInfo fileInfo in files)
+			{
+				if (IsFileSymlink(fileInfo.FullName))
+				{
+					LoadWatcherSymlink(fileInfo.FullName);
+				}
+			}
+		}
+		else
+		{
+			Interface.Oxide.LogWarning("Automatic plugin reloading and unloading has been disabled");
+		}
+	}
+
+	private bool IsFileSymlink(string path)
+	{
+		return (File.GetAttributes(path) & FileAttributes.ReparsePoint) > (FileAttributes)0;
+	}
+
+	[PermissionSet(SecurityAction.Demand, Name = "FullTrust")]
+	private void LoadWatcherSymlink(string path)
+	{
+		StringBuilder stringBuilder = StringPool.Take();
+		try
+		{
+			int num = Syscall.readlink(path, stringBuilder);
+			if (num == -1)
+			{
+				Errno lastError = Stdlib.GetLastError();
+				if (lastError != Errno.EINVAL)
+				{
+					throw new IOException($"Unable to process symlink | {lastError}", (int)lastError);
+				}
+				return;
+			}
+			string path2 = stringBuilder.ToString(0, num);
+			string directoryName = Path.GetDirectoryName(path2);
+			string fileName = Path.GetFileName(path2);
+			FileSystemWatcher fileSystemWatcher = new FileSystemWatcher(directoryName, fileName);
+			m_symlinkWatchers[path] = fileSystemWatcher;
+			fileSystemWatcher.Changed += symlinkTarget_Changed;
+			fileSystemWatcher.Created += symlinkTarget_Changed;
+			fileSystemWatcher.Deleted += symlinkTarget_Changed;
+			fileSystemWatcher.Error += watcher_Error;
+			fileSystemWatcher.NotifyFilter = NotifyFilters.LastWrite;
+			fileSystemWatcher.IncludeSubdirectories = false;
+			fileSystemWatcher.EnableRaisingEvents = true;
+		}
+		finally
+		{
+			StringPool.Return(stringBuilder);
+		}
+		void symlinkTarget_Changed(object sender, FileSystemEventArgs e)
+		{
+			watcher_Changed(sender, e);
+		}
+	}
+
+	[PermissionSet(SecurityAction.Demand, Name = "FullTrust")]
+	private void LoadWatcher(string directory, string filter)
+	{
+		watcher = new FileSystemWatcher(directory, filter);
+		watcher.Changed += watcher_Changed;
+		watcher.Created += watcher_Changed;
+		watcher.Deleted += watcher_Changed;
+		watcher.Error += watcher_Error;
+		watcher.NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite;
+		watcher.IncludeSubdirectories = true;
+		watcher.EnableRaisingEvents = true;
+		GC.KeepAlive(watcher);
+	}
+
+	public void AddMapping(string name)
+	{
+		watchedPlugins.Add(name);
+	}
+
+	public void RemoveMapping(string name)
+	{
+		watchedPlugins.Remove(name);
+	}
+
+	private void watcher_Changed(object sender, FileSystemEventArgs e)
+	{
+		FileSystemWatcher fileSystemWatcher = (FileSystemWatcher)sender;
+		int length = e.FullPath.Length - fileSystemWatcher.Path.Length - Path.GetExtension(e.Name).Length - 1;
+		string subPath = e.FullPath.Substring(fileSystemWatcher.Path.Length + 1, length);
+		if (!changeQueue.TryGetValue(subPath, out var change))
+		{
+			change = new QueuedChange();
+			changeQueue[subPath] = change;
+		}
+		change.timer?.Destroy();
+		change.timer = null;
+		switch (e.ChangeType)
+		{
+		case WatcherChangeTypes.Changed:
+			if (change.type != WatcherChangeTypes.Created)
+			{
+				change.type = WatcherChangeTypes.Changed;
+			}
+			break;
+		case WatcherChangeTypes.Created:
+			if (change.type == WatcherChangeTypes.Deleted)
+			{
+				change.type = WatcherChangeTypes.Changed;
+			}
+			else
+			{
+				change.type = WatcherChangeTypes.Created;
+			}
+			break;
+		case WatcherChangeTypes.Deleted:
+			if (change.type == WatcherChangeTypes.Created)
+			{
+				changeQueue.Remove(subPath);
+				return;
+			}
+			change.type = WatcherChangeTypes.Deleted;
+			break;
+		}
+		Interface.Oxide.NextTick(delegate
+		{
+			if (Environment.OSVersion.Platform == PlatformID.Unix)
+			{
+				switch (e.ChangeType)
+				{
+				case WatcherChangeTypes.Created:
+					if (IsFileSymlink(e.FullPath))
+					{
+						LoadWatcherSymlink(e.FullPath);
+					}
+					break;
+				case WatcherChangeTypes.Deleted:
+					if (m_symlinkWatchers.ContainsKey(e.FullPath))
+					{
+						m_symlinkWatchers.TryGetValue(e.FullPath, out var value);
+						value?.Dispose();
+						m_symlinkWatchers.Remove(e.FullPath);
+					}
+					break;
+				}
+			}
+			change.timer?.Destroy();
+			change.timer = timers.Once(0.2f, delegate
+			{
+				change.timer = null;
+				changeQueue.Remove(subPath);
+				if (Regex.Match(subPath, "include\\\\", RegexOptions.IgnoreCase).Success)
+				{
+					if (change.type == WatcherChangeTypes.Created || change.type == WatcherChangeTypes.Changed)
+					{
+						FirePluginSourceChanged(subPath);
+					}
+				}
+				else
+				{
+					switch (change.type)
+					{
+					case WatcherChangeTypes.Changed:
+						if (watchedPlugins.Contains(subPath))
+						{
+							FirePluginSourceChanged(subPath);
+						}
+						else
+						{
+							FirePluginAdded(subPath);
+						}
+						break;
+					case WatcherChangeTypes.Created:
+						FirePluginAdded(subPath);
+						break;
+					case WatcherChangeTypes.Deleted:
+						if (watchedPlugins.Contains(subPath))
+						{
+							FirePluginRemoved(subPath);
+						}
+						break;
+					case WatcherChangeTypes.Created | WatcherChangeTypes.Deleted:
+						break;
+					}
+				}
+			});
+		});
+	}
+
+	private void watcher_Error(object sender, ErrorEventArgs e)
+	{
+		Interface.Oxide.NextTick(delegate
+		{
+			Interface.Oxide.LogError("FSWatcher error: {0}", e.GetException());
+			RemoteLogger.Exception("FSWatcher error", e.GetException());
+		});
+	}
+}

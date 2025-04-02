@@ -1,0 +1,1285 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+using Mono.Cecil.Metadata;
+using Mono.Cecil.PE;
+using Mono.Collections.Generic;
+
+internal sealed class MetadataBuilder
+{
+	private sealed class GenericParameterComparer : IComparer<GenericParameter>
+	{
+		public int Compare(GenericParameter a, GenericParameter b)
+		{
+			uint num = MakeCodedRID(a.Owner, CodedIndex.TypeOrMethodDef);
+			uint num2 = MakeCodedRID(b.Owner, CodedIndex.TypeOrMethodDef);
+			if (num == num2)
+			{
+				int position = a.Position;
+				int position2 = b.Position;
+				if (position != position2)
+				{
+					if (position <= position2)
+					{
+						return -1;
+					}
+					return 1;
+				}
+				return 0;
+			}
+			if (num <= num2)
+			{
+				return -1;
+			}
+			return 1;
+		}
+	}
+
+	internal readonly ModuleDefinition module;
+
+	internal readonly ISymbolWriterProvider symbol_writer_provider;
+
+	internal readonly ISymbolWriter symbol_writer;
+
+	internal readonly TextMap text_map;
+
+	internal readonly string fq_name;
+
+	private readonly Dictionary<Row<uint, uint, uint>, MetadataToken> type_ref_map;
+
+	private readonly Dictionary<uint, MetadataToken> type_spec_map;
+
+	private readonly Dictionary<Row<uint, uint, uint>, MetadataToken> member_ref_map;
+
+	private readonly Dictionary<Row<uint, uint>, MetadataToken> method_spec_map;
+
+	private readonly Collection<GenericParameter> generic_parameters;
+
+	private readonly Dictionary<MetadataToken, MetadataToken> method_def_map;
+
+	internal readonly CodeWriter code;
+
+	internal readonly DataBuffer data;
+
+	internal readonly ResourceBuffer resources;
+
+	internal readonly StringHeapBuffer string_heap;
+
+	internal readonly UserStringHeapBuffer user_string_heap;
+
+	internal readonly BlobHeapBuffer blob_heap;
+
+	internal readonly TableHeapBuffer table_heap;
+
+	internal MetadataToken entry_point;
+
+	private uint type_rid = 1u;
+
+	private uint field_rid = 1u;
+
+	private uint method_rid = 1u;
+
+	private uint param_rid = 1u;
+
+	private uint property_rid = 1u;
+
+	private uint event_rid = 1u;
+
+	private readonly TypeRefTable type_ref_table;
+
+	private readonly TypeDefTable type_def_table;
+
+	private readonly FieldTable field_table;
+
+	private readonly MethodTable method_table;
+
+	private readonly ParamTable param_table;
+
+	private readonly InterfaceImplTable iface_impl_table;
+
+	private readonly MemberRefTable member_ref_table;
+
+	private readonly ConstantTable constant_table;
+
+	private readonly CustomAttributeTable custom_attribute_table;
+
+	private readonly DeclSecurityTable declsec_table;
+
+	private readonly StandAloneSigTable standalone_sig_table;
+
+	private readonly EventMapTable event_map_table;
+
+	private readonly EventTable event_table;
+
+	private readonly PropertyMapTable property_map_table;
+
+	private readonly PropertyTable property_table;
+
+	private readonly TypeSpecTable typespec_table;
+
+	private readonly MethodSpecTable method_spec_table;
+
+	internal readonly bool write_symbols;
+
+	public MetadataBuilder(ModuleDefinition module, string fq_name, ISymbolWriterProvider symbol_writer_provider, ISymbolWriter symbol_writer)
+	{
+		this.module = module;
+		text_map = CreateTextMap();
+		this.fq_name = fq_name;
+		this.symbol_writer_provider = symbol_writer_provider;
+		this.symbol_writer = symbol_writer;
+		write_symbols = symbol_writer != null;
+		code = new CodeWriter(this);
+		data = new DataBuffer();
+		resources = new ResourceBuffer();
+		string_heap = new StringHeapBuffer();
+		user_string_heap = new UserStringHeapBuffer();
+		blob_heap = new BlobHeapBuffer();
+		table_heap = new TableHeapBuffer(module, this);
+		type_ref_table = GetTable<TypeRefTable>(Table.TypeRef);
+		type_def_table = GetTable<TypeDefTable>(Table.TypeDef);
+		field_table = GetTable<FieldTable>(Table.Field);
+		method_table = GetTable<MethodTable>(Table.Method);
+		param_table = GetTable<ParamTable>(Table.Param);
+		iface_impl_table = GetTable<InterfaceImplTable>(Table.InterfaceImpl);
+		member_ref_table = GetTable<MemberRefTable>(Table.MemberRef);
+		constant_table = GetTable<ConstantTable>(Table.Constant);
+		custom_attribute_table = GetTable<CustomAttributeTable>(Table.CustomAttribute);
+		declsec_table = GetTable<DeclSecurityTable>(Table.DeclSecurity);
+		standalone_sig_table = GetTable<StandAloneSigTable>(Table.StandAloneSig);
+		event_map_table = GetTable<EventMapTable>(Table.EventMap);
+		event_table = GetTable<EventTable>(Table.Event);
+		property_map_table = GetTable<PropertyMapTable>(Table.PropertyMap);
+		property_table = GetTable<PropertyTable>(Table.Property);
+		typespec_table = GetTable<TypeSpecTable>(Table.TypeSpec);
+		method_spec_table = GetTable<MethodSpecTable>(Table.MethodSpec);
+		RowEqualityComparer comparer = new RowEqualityComparer();
+		type_ref_map = new Dictionary<Row<uint, uint, uint>, MetadataToken>(comparer);
+		type_spec_map = new Dictionary<uint, MetadataToken>();
+		member_ref_map = new Dictionary<Row<uint, uint, uint>, MetadataToken>(comparer);
+		method_spec_map = new Dictionary<Row<uint, uint>, MetadataToken>(comparer);
+		generic_parameters = new Collection<GenericParameter>();
+		if (write_symbols)
+		{
+			method_def_map = new Dictionary<MetadataToken, MetadataToken>();
+		}
+	}
+
+	private TextMap CreateTextMap()
+	{
+		TextMap textMap = new TextMap();
+		textMap.AddMap(TextSegment.ImportAddressTable, (module.Architecture == TargetArchitecture.I386) ? 8 : 0);
+		textMap.AddMap(TextSegment.CLIHeader, 72, 8);
+		return textMap;
+	}
+
+	private TTable GetTable<TTable>(Table table) where TTable : MetadataTable, new()
+	{
+		return table_heap.GetTable<TTable>(table);
+	}
+
+	private uint GetStringIndex(string @string)
+	{
+		if (string.IsNullOrEmpty(@string))
+		{
+			return 0u;
+		}
+		return string_heap.GetStringIndex(@string);
+	}
+
+	private uint GetBlobIndex(ByteBuffer blob)
+	{
+		if (blob.length == 0)
+		{
+			return 0u;
+		}
+		return blob_heap.GetBlobIndex(blob);
+	}
+
+	private uint GetBlobIndex(byte[] blob)
+	{
+		if (blob.IsNullOrEmpty())
+		{
+			return 0u;
+		}
+		return GetBlobIndex(new ByteBuffer(blob));
+	}
+
+	public void BuildMetadata()
+	{
+		BuildModule();
+		table_heap.WriteTableHeap();
+	}
+
+	private void BuildModule()
+	{
+		GetTable<ModuleTable>(Table.Module).row = GetStringIndex(module.Name);
+		AssemblyDefinition assembly = module.Assembly;
+		if (assembly != null)
+		{
+			BuildAssembly();
+		}
+		if (module.HasAssemblyReferences)
+		{
+			AddAssemblyReferences();
+		}
+		if (module.HasModuleReferences)
+		{
+			AddModuleReferences();
+		}
+		if (module.HasResources)
+		{
+			AddResources();
+		}
+		if (module.HasExportedTypes)
+		{
+			AddExportedTypes();
+		}
+		BuildTypes();
+		if (assembly != null)
+		{
+			if (assembly.HasCustomAttributes)
+			{
+				AddCustomAttributes(assembly);
+			}
+			if (assembly.HasSecurityDeclarations)
+			{
+				AddSecurityDeclarations(assembly);
+			}
+		}
+		if (module.HasCustomAttributes)
+		{
+			AddCustomAttributes(module);
+		}
+		if (module.EntryPoint != null)
+		{
+			entry_point = LookupToken(module.EntryPoint);
+		}
+	}
+
+	private void BuildAssembly()
+	{
+		AssemblyDefinition assembly = module.Assembly;
+		AssemblyNameDefinition name = assembly.Name;
+		GetTable<AssemblyTable>(Table.Assembly).row = new Row<AssemblyHashAlgorithm, ushort, ushort, ushort, ushort, AssemblyAttributes, uint, uint, uint>(name.HashAlgorithm, (ushort)name.Version.Major, (ushort)name.Version.Minor, (ushort)name.Version.Build, (ushort)name.Version.Revision, name.Attributes, GetBlobIndex(name.PublicKey), GetStringIndex(name.Name), GetStringIndex(name.Culture));
+		if (assembly.Modules.Count > 1)
+		{
+			BuildModules();
+		}
+	}
+
+	private void BuildModules()
+	{
+		Collection<ModuleDefinition> modules = module.Assembly.Modules;
+		FileTable table = GetTable<FileTable>(Table.File);
+		for (int i = 0; i < modules.Count; i++)
+		{
+			ModuleDefinition moduleDefinition = modules[i];
+			if (!moduleDefinition.IsMain)
+			{
+				WriterParameters parameters = new WriterParameters
+				{
+					SymbolWriterProvider = symbol_writer_provider
+				};
+				string moduleFileName = GetModuleFileName(moduleDefinition.Name);
+				moduleDefinition.Write(moduleFileName, parameters);
+				byte[] blob = CryptoService.ComputeHash(moduleFileName);
+				table.AddRow(new Row<Mono.Cecil.FileAttributes, uint, uint>(Mono.Cecil.FileAttributes.ContainsMetaData, GetStringIndex(moduleDefinition.Name), GetBlobIndex(blob)));
+			}
+		}
+	}
+
+	private string GetModuleFileName(string name)
+	{
+		if (string.IsNullOrEmpty(name))
+		{
+			throw new NotSupportedException();
+		}
+		return Path.Combine(Path.GetDirectoryName(fq_name), name);
+	}
+
+	private void AddAssemblyReferences()
+	{
+		Collection<AssemblyNameReference> assemblyReferences = module.AssemblyReferences;
+		AssemblyRefTable table = GetTable<AssemblyRefTable>(Table.AssemblyRef);
+		for (int i = 0; i < assemblyReferences.Count; i++)
+		{
+			AssemblyNameReference assemblyNameReference = assemblyReferences[i];
+			byte[] blob = (assemblyNameReference.PublicKey.IsNullOrEmpty() ? assemblyNameReference.PublicKeyToken : assemblyNameReference.PublicKey);
+			Version version = assemblyNameReference.Version;
+			int rid = table.AddRow(new Row<ushort, ushort, ushort, ushort, AssemblyAttributes, uint, uint, uint, uint>((ushort)version.Major, (ushort)version.Minor, (ushort)version.Build, (ushort)version.Revision, assemblyNameReference.Attributes, GetBlobIndex(blob), GetStringIndex(assemblyNameReference.Name), GetStringIndex(assemblyNameReference.Culture), GetBlobIndex(assemblyNameReference.Hash)));
+			assemblyNameReference.token = new MetadataToken(TokenType.AssemblyRef, rid);
+		}
+	}
+
+	private void AddModuleReferences()
+	{
+		Collection<ModuleReference> moduleReferences = module.ModuleReferences;
+		ModuleRefTable table = GetTable<ModuleRefTable>(Table.ModuleRef);
+		for (int i = 0; i < moduleReferences.Count; i++)
+		{
+			ModuleReference moduleReference = moduleReferences[i];
+			moduleReference.token = new MetadataToken(TokenType.ModuleRef, table.AddRow(GetStringIndex(moduleReference.Name)));
+		}
+	}
+
+	private void AddResources()
+	{
+		Collection<Resource> collection = module.Resources;
+		ManifestResourceTable table = GetTable<ManifestResourceTable>(Table.ManifestResource);
+		for (int i = 0; i < collection.Count; i++)
+		{
+			Resource resource = collection[i];
+			Row<uint, ManifestResourceAttributes, uint, uint> row = new Row<uint, ManifestResourceAttributes, uint, uint>(0u, resource.Attributes, GetStringIndex(resource.Name), 0u);
+			switch (resource.ResourceType)
+			{
+			case ResourceType.Embedded:
+				row.Col1 = AddEmbeddedResource((EmbeddedResource)resource);
+				break;
+			case ResourceType.Linked:
+				row.Col4 = CodedIndex.Implementation.CompressMetadataToken(new MetadataToken(TokenType.File, AddLinkedResource((LinkedResource)resource)));
+				break;
+			case ResourceType.AssemblyLinked:
+				row.Col4 = CodedIndex.Implementation.CompressMetadataToken(((AssemblyLinkedResource)resource).Assembly.MetadataToken);
+				break;
+			default:
+				throw new NotSupportedException();
+			}
+			table.AddRow(row);
+		}
+	}
+
+	private uint AddLinkedResource(LinkedResource resource)
+	{
+		return (uint)GetTable<FileTable>(Table.File).AddRow(new Row<Mono.Cecil.FileAttributes, uint, uint>(col3: GetBlobIndex(resource.Hash.IsNullOrEmpty() ? CryptoService.ComputeHash(resource.File) : resource.Hash), col1: Mono.Cecil.FileAttributes.ContainsNoMetaData, col2: GetStringIndex(resource.File)));
+	}
+
+	private uint AddEmbeddedResource(EmbeddedResource resource)
+	{
+		return resources.AddResource(resource.GetResourceData());
+	}
+
+	private void AddExportedTypes()
+	{
+		Collection<ExportedType> exportedTypes = module.ExportedTypes;
+		ExportedTypeTable table = GetTable<ExportedTypeTable>(Table.ExportedType);
+		for (int i = 0; i < exportedTypes.Count; i++)
+		{
+			ExportedType exportedType = exportedTypes[i];
+			int rid = table.AddRow(new Row<TypeAttributes, uint, uint, uint, uint>(exportedType.Attributes, (uint)exportedType.Identifier, GetStringIndex(exportedType.Name), GetStringIndex(exportedType.Namespace), MakeCodedRID(GetExportedTypeScope(exportedType), CodedIndex.Implementation)));
+			exportedType.token = new MetadataToken(TokenType.ExportedType, rid);
+		}
+	}
+
+	private MetadataToken GetExportedTypeScope(ExportedType exported_type)
+	{
+		if (exported_type.DeclaringType != null)
+		{
+			return exported_type.DeclaringType.MetadataToken;
+		}
+		IMetadataScope scope = exported_type.Scope;
+		switch (scope.MetadataToken.TokenType)
+		{
+		case TokenType.AssemblyRef:
+			return scope.MetadataToken;
+		case TokenType.ModuleRef:
+		{
+			FileTable table = GetTable<FileTable>(Table.File);
+			for (int i = 0; i < table.length; i++)
+			{
+				if (table.rows[i].Col2 == GetStringIndex(scope.Name))
+				{
+					return new MetadataToken(TokenType.File, i + 1);
+				}
+			}
+			break;
+		}
+		}
+		throw new NotSupportedException();
+	}
+
+	private void BuildTypes()
+	{
+		if (module.HasTypes)
+		{
+			AttachTokens();
+			AddTypeDefs();
+			AddGenericParameters();
+		}
+	}
+
+	private void AttachTokens()
+	{
+		Collection<TypeDefinition> types = module.Types;
+		for (int i = 0; i < types.Count; i++)
+		{
+			AttachTypeDefToken(types[i]);
+		}
+	}
+
+	private void AttachTypeDefToken(TypeDefinition type)
+	{
+		type.token = new MetadataToken(TokenType.TypeDef, type_rid++);
+		type.fields_range.Start = field_rid;
+		type.methods_range.Start = method_rid;
+		if (type.HasFields)
+		{
+			AttachFieldsDefToken(type);
+		}
+		if (type.HasMethods)
+		{
+			AttachMethodsDefToken(type);
+		}
+		if (type.HasNestedTypes)
+		{
+			AttachNestedTypesDefToken(type);
+		}
+	}
+
+	private void AttachNestedTypesDefToken(TypeDefinition type)
+	{
+		Collection<TypeDefinition> nestedTypes = type.NestedTypes;
+		for (int i = 0; i < nestedTypes.Count; i++)
+		{
+			AttachTypeDefToken(nestedTypes[i]);
+		}
+	}
+
+	private void AttachFieldsDefToken(TypeDefinition type)
+	{
+		Collection<FieldDefinition> fields = type.Fields;
+		type.fields_range.Length = (uint)fields.Count;
+		for (int i = 0; i < fields.Count; i++)
+		{
+			fields[i].token = new MetadataToken(TokenType.Field, field_rid++);
+		}
+	}
+
+	private void AttachMethodsDefToken(TypeDefinition type)
+	{
+		Collection<MethodDefinition> methods = type.Methods;
+		type.methods_range.Length = (uint)methods.Count;
+		for (int i = 0; i < methods.Count; i++)
+		{
+			MethodDefinition methodDefinition = methods[i];
+			MetadataToken metadataToken = new MetadataToken(TokenType.Method, method_rid++);
+			if (write_symbols && methodDefinition.token != MetadataToken.Zero)
+			{
+				method_def_map.Add(metadataToken, methodDefinition.token);
+			}
+			methodDefinition.token = metadataToken;
+		}
+	}
+
+	public bool TryGetOriginalMethodToken(MetadataToken new_token, out MetadataToken original)
+	{
+		return method_def_map.TryGetValue(new_token, out original);
+	}
+
+	private MetadataToken GetTypeToken(TypeReference type)
+	{
+		if (type == null)
+		{
+			return MetadataToken.Zero;
+		}
+		if (type.IsDefinition)
+		{
+			return type.token;
+		}
+		if (type.IsTypeSpecification())
+		{
+			return GetTypeSpecToken(type);
+		}
+		return GetTypeRefToken(type);
+	}
+
+	private MetadataToken GetTypeSpecToken(TypeReference type)
+	{
+		uint blobIndex = GetBlobIndex(GetTypeSpecSignature(type));
+		if (type_spec_map.TryGetValue(blobIndex, out var value))
+		{
+			return value;
+		}
+		return AddTypeSpecification(type, blobIndex);
+	}
+
+	private MetadataToken AddTypeSpecification(TypeReference type, uint row)
+	{
+		type.token = new MetadataToken(TokenType.TypeSpec, typespec_table.AddRow(row));
+		MetadataToken token = type.token;
+		type_spec_map.Add(row, token);
+		return token;
+	}
+
+	private MetadataToken GetTypeRefToken(TypeReference type)
+	{
+		Row<uint, uint, uint> row = CreateTypeRefRow(type);
+		if (type_ref_map.TryGetValue(row, out var value))
+		{
+			return value;
+		}
+		return AddTypeReference(type, row);
+	}
+
+	private Row<uint, uint, uint> CreateTypeRefRow(TypeReference type)
+	{
+		return new Row<uint, uint, uint>(MakeCodedRID(GetScopeToken(type), CodedIndex.ResolutionScope), GetStringIndex(type.Name), GetStringIndex(type.Namespace));
+	}
+
+	private MetadataToken GetScopeToken(TypeReference type)
+	{
+		if (type.IsNested)
+		{
+			return GetTypeRefToken(type.DeclaringType);
+		}
+		return type.Scope?.MetadataToken ?? MetadataToken.Zero;
+	}
+
+	private static uint MakeCodedRID(IMetadataTokenProvider provider, CodedIndex index)
+	{
+		return MakeCodedRID(provider.MetadataToken, index);
+	}
+
+	private static uint MakeCodedRID(MetadataToken token, CodedIndex index)
+	{
+		return index.CompressMetadataToken(token);
+	}
+
+	private MetadataToken AddTypeReference(TypeReference type, Row<uint, uint, uint> row)
+	{
+		type.token = new MetadataToken(TokenType.TypeRef, type_ref_table.AddRow(row));
+		MetadataToken token = type.token;
+		type_ref_map.Add(row, token);
+		return token;
+	}
+
+	private void AddTypeDefs()
+	{
+		Collection<TypeDefinition> types = module.Types;
+		for (int i = 0; i < types.Count; i++)
+		{
+			AddType(types[i]);
+		}
+	}
+
+	private void AddType(TypeDefinition type)
+	{
+		type_def_table.AddRow(new Row<TypeAttributes, uint, uint, uint, uint, uint>(type.Attributes, GetStringIndex(type.Name), GetStringIndex(type.Namespace), MakeCodedRID(GetTypeToken(type.BaseType), CodedIndex.TypeDefOrRef), type.fields_range.Start, type.methods_range.Start));
+		if (type.HasGenericParameters)
+		{
+			AddGenericParameters(type);
+		}
+		if (type.HasInterfaces)
+		{
+			AddInterfaces(type);
+		}
+		if (type.HasLayoutInfo)
+		{
+			AddLayoutInfo(type);
+		}
+		if (type.HasFields)
+		{
+			AddFields(type);
+		}
+		if (type.HasMethods)
+		{
+			AddMethods(type);
+		}
+		if (type.HasProperties)
+		{
+			AddProperties(type);
+		}
+		if (type.HasEvents)
+		{
+			AddEvents(type);
+		}
+		if (type.HasCustomAttributes)
+		{
+			AddCustomAttributes(type);
+		}
+		if (type.HasSecurityDeclarations)
+		{
+			AddSecurityDeclarations(type);
+		}
+		if (type.HasNestedTypes)
+		{
+			AddNestedTypes(type);
+		}
+	}
+
+	private void AddGenericParameters(IGenericParameterProvider owner)
+	{
+		Collection<GenericParameter> genericParameters = owner.GenericParameters;
+		for (int i = 0; i < genericParameters.Count; i++)
+		{
+			generic_parameters.Add(genericParameters[i]);
+		}
+	}
+
+	private void AddGenericParameters()
+	{
+		GenericParameter[] items = generic_parameters.items;
+		int size = generic_parameters.size;
+		Array.Sort(items, 0, size, new GenericParameterComparer());
+		GenericParamTable table = GetTable<GenericParamTable>(Table.GenericParam);
+		GenericParamConstraintTable table2 = GetTable<GenericParamConstraintTable>(Table.GenericParamConstraint);
+		for (int i = 0; i < size; i++)
+		{
+			GenericParameter genericParameter = items[i];
+			int rid = table.AddRow(new Row<ushort, GenericParameterAttributes, uint, uint>((ushort)genericParameter.Position, genericParameter.Attributes, MakeCodedRID(genericParameter.Owner, CodedIndex.TypeOrMethodDef), GetStringIndex(genericParameter.Name)));
+			genericParameter.token = new MetadataToken(TokenType.GenericParam, rid);
+			if (genericParameter.HasConstraints)
+			{
+				AddConstraints(genericParameter, table2);
+			}
+			if (genericParameter.HasCustomAttributes)
+			{
+				AddCustomAttributes(genericParameter);
+			}
+		}
+	}
+
+	private void AddConstraints(GenericParameter generic_parameter, GenericParamConstraintTable table)
+	{
+		Collection<TypeReference> constraints = generic_parameter.Constraints;
+		uint rID = generic_parameter.token.RID;
+		for (int i = 0; i < constraints.Count; i++)
+		{
+			table.AddRow(new Row<uint, uint>(rID, MakeCodedRID(GetTypeToken(constraints[i]), CodedIndex.TypeDefOrRef)));
+		}
+	}
+
+	private void AddInterfaces(TypeDefinition type)
+	{
+		Collection<TypeReference> interfaces = type.Interfaces;
+		uint rID = type.token.RID;
+		for (int i = 0; i < interfaces.Count; i++)
+		{
+			iface_impl_table.AddRow(new Row<uint, uint>(rID, MakeCodedRID(GetTypeToken(interfaces[i]), CodedIndex.TypeDefOrRef)));
+		}
+	}
+
+	private void AddLayoutInfo(TypeDefinition type)
+	{
+		GetTable<ClassLayoutTable>(Table.ClassLayout).AddRow(new Row<ushort, uint, uint>((ushort)type.PackingSize, (uint)type.ClassSize, type.token.RID));
+	}
+
+	private void AddNestedTypes(TypeDefinition type)
+	{
+		Collection<TypeDefinition> nestedTypes = type.NestedTypes;
+		NestedClassTable table = GetTable<NestedClassTable>(Table.NestedClass);
+		for (int i = 0; i < nestedTypes.Count; i++)
+		{
+			TypeDefinition typeDefinition = nestedTypes[i];
+			AddType(typeDefinition);
+			table.AddRow(new Row<uint, uint>(typeDefinition.token.RID, type.token.RID));
+		}
+	}
+
+	private void AddFields(TypeDefinition type)
+	{
+		Collection<FieldDefinition> fields = type.Fields;
+		for (int i = 0; i < fields.Count; i++)
+		{
+			AddField(fields[i]);
+		}
+	}
+
+	private void AddField(FieldDefinition field)
+	{
+		field_table.AddRow(new Row<FieldAttributes, uint, uint>(field.Attributes, GetStringIndex(field.Name), GetBlobIndex(GetFieldSignature(field))));
+		if (!field.InitialValue.IsNullOrEmpty())
+		{
+			AddFieldRVA(field);
+		}
+		if (field.HasLayoutInfo)
+		{
+			AddFieldLayout(field);
+		}
+		if (field.HasCustomAttributes)
+		{
+			AddCustomAttributes(field);
+		}
+		if (field.HasConstant)
+		{
+			AddConstant(field, field.FieldType);
+		}
+		if (field.HasMarshalInfo)
+		{
+			AddMarshalInfo(field);
+		}
+	}
+
+	private void AddFieldRVA(FieldDefinition field)
+	{
+		GetTable<FieldRVATable>(Table.FieldRVA).AddRow(new Row<uint, uint>(data.AddData(field.InitialValue), field.token.RID));
+	}
+
+	private void AddFieldLayout(FieldDefinition field)
+	{
+		GetTable<FieldLayoutTable>(Table.FieldLayout).AddRow(new Row<uint, uint>((uint)field.Offset, field.token.RID));
+	}
+
+	private void AddMethods(TypeDefinition type)
+	{
+		Collection<MethodDefinition> methods = type.Methods;
+		for (int i = 0; i < methods.Count; i++)
+		{
+			AddMethod(methods[i]);
+		}
+	}
+
+	private void AddMethod(MethodDefinition method)
+	{
+		method_table.AddRow(new Row<uint, MethodImplAttributes, MethodAttributes, uint, uint, uint>(method.HasBody ? code.WriteMethodBody(method) : 0u, method.ImplAttributes, method.Attributes, GetStringIndex(method.Name), GetBlobIndex(GetMethodSignature(method)), param_rid));
+		AddParameters(method);
+		if (method.HasGenericParameters)
+		{
+			AddGenericParameters(method);
+		}
+		if (method.IsPInvokeImpl)
+		{
+			AddPInvokeInfo(method);
+		}
+		if (method.HasCustomAttributes)
+		{
+			AddCustomAttributes(method);
+		}
+		if (method.HasSecurityDeclarations)
+		{
+			AddSecurityDeclarations(method);
+		}
+		if (method.HasOverrides)
+		{
+			AddOverrides(method);
+		}
+	}
+
+	private void AddParameters(MethodDefinition method)
+	{
+		ParameterDefinition parameter = method.MethodReturnType.parameter;
+		if (parameter != null && RequiresParameterRow(parameter))
+		{
+			AddParameter(0, parameter, param_table);
+		}
+		if (!method.HasParameters)
+		{
+			return;
+		}
+		Collection<ParameterDefinition> parameters = method.Parameters;
+		for (int i = 0; i < parameters.Count; i++)
+		{
+			ParameterDefinition parameter2 = parameters[i];
+			if (RequiresParameterRow(parameter2))
+			{
+				AddParameter((ushort)(i + 1), parameter2, param_table);
+			}
+		}
+	}
+
+	private void AddPInvokeInfo(MethodDefinition method)
+	{
+		PInvokeInfo pInvokeInfo = method.PInvokeInfo;
+		if (pInvokeInfo != null)
+		{
+			GetTable<ImplMapTable>(Table.ImplMap).AddRow(new Row<PInvokeAttributes, uint, uint, uint>(pInvokeInfo.Attributes, MakeCodedRID(method, CodedIndex.MemberForwarded), GetStringIndex(pInvokeInfo.EntryPoint), pInvokeInfo.Module.MetadataToken.RID));
+		}
+	}
+
+	private void AddOverrides(MethodDefinition method)
+	{
+		Collection<MethodReference> overrides = method.Overrides;
+		MethodImplTable table = GetTable<MethodImplTable>(Table.MethodImpl);
+		for (int i = 0; i < overrides.Count; i++)
+		{
+			table.AddRow(new Row<uint, uint, uint>(method.DeclaringType.token.RID, MakeCodedRID(method, CodedIndex.MethodDefOrRef), MakeCodedRID(LookupToken(overrides[i]), CodedIndex.MethodDefOrRef)));
+		}
+	}
+
+	private static bool RequiresParameterRow(ParameterDefinition parameter)
+	{
+		if (string.IsNullOrEmpty(parameter.Name) && parameter.Attributes == ParameterAttributes.None && !parameter.HasMarshalInfo && !parameter.HasConstant)
+		{
+			return parameter.HasCustomAttributes;
+		}
+		return true;
+	}
+
+	private void AddParameter(ushort sequence, ParameterDefinition parameter, ParamTable table)
+	{
+		table.AddRow(new Row<ParameterAttributes, ushort, uint>(parameter.Attributes, sequence, GetStringIndex(parameter.Name)));
+		parameter.token = new MetadataToken(TokenType.Param, param_rid++);
+		if (parameter.HasCustomAttributes)
+		{
+			AddCustomAttributes(parameter);
+		}
+		if (parameter.HasConstant)
+		{
+			AddConstant(parameter, parameter.ParameterType);
+		}
+		if (parameter.HasMarshalInfo)
+		{
+			AddMarshalInfo(parameter);
+		}
+	}
+
+	private void AddMarshalInfo(IMarshalInfoProvider owner)
+	{
+		GetTable<FieldMarshalTable>(Table.FieldMarshal).AddRow(new Row<uint, uint>(MakeCodedRID(owner, CodedIndex.HasFieldMarshal), GetBlobIndex(GetMarshalInfoSignature(owner))));
+	}
+
+	private void AddProperties(TypeDefinition type)
+	{
+		Collection<PropertyDefinition> properties = type.Properties;
+		property_map_table.AddRow(new Row<uint, uint>(type.token.RID, property_rid));
+		for (int i = 0; i < properties.Count; i++)
+		{
+			AddProperty(properties[i]);
+		}
+	}
+
+	private void AddProperty(PropertyDefinition property)
+	{
+		property_table.AddRow(new Row<PropertyAttributes, uint, uint>(property.Attributes, GetStringIndex(property.Name), GetBlobIndex(GetPropertySignature(property))));
+		property.token = new MetadataToken(TokenType.Property, property_rid++);
+		MethodDefinition getMethod = property.GetMethod;
+		if (getMethod != null)
+		{
+			AddSemantic(MethodSemanticsAttributes.Getter, property, getMethod);
+		}
+		getMethod = property.SetMethod;
+		if (getMethod != null)
+		{
+			AddSemantic(MethodSemanticsAttributes.Setter, property, getMethod);
+		}
+		if (property.HasOtherMethods)
+		{
+			AddOtherSemantic(property, property.OtherMethods);
+		}
+		if (property.HasCustomAttributes)
+		{
+			AddCustomAttributes(property);
+		}
+		if (property.HasConstant)
+		{
+			AddConstant(property, property.PropertyType);
+		}
+	}
+
+	private void AddOtherSemantic(IMetadataTokenProvider owner, Collection<MethodDefinition> others)
+	{
+		for (int i = 0; i < others.Count; i++)
+		{
+			AddSemantic(MethodSemanticsAttributes.Other, owner, others[i]);
+		}
+	}
+
+	private void AddEvents(TypeDefinition type)
+	{
+		Collection<EventDefinition> events = type.Events;
+		event_map_table.AddRow(new Row<uint, uint>(type.token.RID, event_rid));
+		for (int i = 0; i < events.Count; i++)
+		{
+			AddEvent(events[i]);
+		}
+	}
+
+	private void AddEvent(EventDefinition @event)
+	{
+		event_table.AddRow(new Row<EventAttributes, uint, uint>(@event.Attributes, GetStringIndex(@event.Name), MakeCodedRID(GetTypeToken(@event.EventType), CodedIndex.TypeDefOrRef)));
+		@event.token = new MetadataToken(TokenType.Event, event_rid++);
+		MethodDefinition addMethod = @event.AddMethod;
+		if (addMethod != null)
+		{
+			AddSemantic(MethodSemanticsAttributes.AddOn, @event, addMethod);
+		}
+		addMethod = @event.InvokeMethod;
+		if (addMethod != null)
+		{
+			AddSemantic(MethodSemanticsAttributes.Fire, @event, addMethod);
+		}
+		addMethod = @event.RemoveMethod;
+		if (addMethod != null)
+		{
+			AddSemantic(MethodSemanticsAttributes.RemoveOn, @event, addMethod);
+		}
+		if (@event.HasOtherMethods)
+		{
+			AddOtherSemantic(@event, @event.OtherMethods);
+		}
+		if (@event.HasCustomAttributes)
+		{
+			AddCustomAttributes(@event);
+		}
+	}
+
+	private void AddSemantic(MethodSemanticsAttributes semantics, IMetadataTokenProvider provider, MethodDefinition method)
+	{
+		method.SemanticsAttributes = semantics;
+		GetTable<MethodSemanticsTable>(Table.MethodSemantics).AddRow(new Row<MethodSemanticsAttributes, uint, uint>(semantics, method.token.RID, MakeCodedRID(provider, CodedIndex.HasSemantics)));
+	}
+
+	private void AddConstant(IConstantProvider owner, TypeReference type)
+	{
+		object constant = owner.Constant;
+		ElementType constantType = GetConstantType(type, constant);
+		constant_table.AddRow(new Row<ElementType, uint, uint>(constantType, MakeCodedRID(owner.MetadataToken, CodedIndex.HasConstant), GetBlobIndex(GetConstantSignature(constantType, constant))));
+	}
+
+	private static ElementType GetConstantType(TypeReference constant_type, object constant)
+	{
+		if (constant == null)
+		{
+			return ElementType.Class;
+		}
+		ElementType etype = constant_type.etype;
+		switch (etype)
+		{
+		case ElementType.None:
+		{
+			TypeDefinition typeDefinition = constant_type.CheckedResolve();
+			if (typeDefinition.IsEnum)
+			{
+				return GetConstantType(typeDefinition.GetEnumUnderlyingType(), constant);
+			}
+			return ElementType.Class;
+		}
+		case ElementType.String:
+			return ElementType.String;
+		case ElementType.Object:
+			return GetConstantType(constant.GetType());
+		case ElementType.Var:
+		case ElementType.Array:
+		case ElementType.SzArray:
+		case ElementType.MVar:
+			return ElementType.Class;
+		case ElementType.GenericInst:
+		{
+			GenericInstanceType genericInstanceType = (GenericInstanceType)constant_type;
+			if (genericInstanceType.ElementType.IsTypeOf("System", "Nullable`1"))
+			{
+				return GetConstantType(genericInstanceType.GenericArguments[0], constant);
+			}
+			return GetConstantType(((TypeSpecification)constant_type).ElementType, constant);
+		}
+		case ElementType.ByRef:
+		case ElementType.CModReqD:
+		case ElementType.CModOpt:
+		case ElementType.Sentinel:
+			return GetConstantType(((TypeSpecification)constant_type).ElementType, constant);
+		case ElementType.Boolean:
+		case ElementType.Char:
+		case ElementType.I1:
+		case ElementType.U1:
+		case ElementType.I2:
+		case ElementType.U2:
+		case ElementType.I4:
+		case ElementType.U4:
+		case ElementType.I8:
+		case ElementType.U8:
+		case ElementType.R4:
+		case ElementType.R8:
+		case ElementType.I:
+		case ElementType.U:
+			return GetConstantType(constant.GetType());
+		default:
+			return etype;
+		}
+	}
+
+	private static ElementType GetConstantType(Type type)
+	{
+		return Type.GetTypeCode(type) switch
+		{
+			TypeCode.Boolean => ElementType.Boolean, 
+			TypeCode.Byte => ElementType.U1, 
+			TypeCode.SByte => ElementType.I1, 
+			TypeCode.Char => ElementType.Char, 
+			TypeCode.Int16 => ElementType.I2, 
+			TypeCode.UInt16 => ElementType.U2, 
+			TypeCode.Int32 => ElementType.I4, 
+			TypeCode.UInt32 => ElementType.U4, 
+			TypeCode.Int64 => ElementType.I8, 
+			TypeCode.UInt64 => ElementType.U8, 
+			TypeCode.Single => ElementType.R4, 
+			TypeCode.Double => ElementType.R8, 
+			TypeCode.String => ElementType.String, 
+			_ => throw new NotSupportedException(type.FullName), 
+		};
+	}
+
+	private void AddCustomAttributes(ICustomAttributeProvider owner)
+	{
+		Collection<CustomAttribute> customAttributes = owner.CustomAttributes;
+		for (int i = 0; i < customAttributes.Count; i++)
+		{
+			CustomAttribute customAttribute = customAttributes[i];
+			custom_attribute_table.AddRow(new Row<uint, uint, uint>(MakeCodedRID(owner, CodedIndex.HasCustomAttribute), MakeCodedRID(LookupToken(customAttribute.Constructor), CodedIndex.CustomAttributeType), GetBlobIndex(GetCustomAttributeSignature(customAttribute))));
+		}
+	}
+
+	private void AddSecurityDeclarations(ISecurityDeclarationProvider owner)
+	{
+		Collection<SecurityDeclaration> securityDeclarations = owner.SecurityDeclarations;
+		for (int i = 0; i < securityDeclarations.Count; i++)
+		{
+			SecurityDeclaration securityDeclaration = securityDeclarations[i];
+			declsec_table.AddRow(new Row<SecurityAction, uint, uint>(securityDeclaration.Action, MakeCodedRID(owner, CodedIndex.HasDeclSecurity), GetBlobIndex(GetSecurityDeclarationSignature(securityDeclaration))));
+		}
+	}
+
+	private MetadataToken GetMemberRefToken(MemberReference member)
+	{
+		Row<uint, uint, uint> row = CreateMemberRefRow(member);
+		if (member_ref_map.TryGetValue(row, out var value))
+		{
+			return value;
+		}
+		AddMemberReference(member, row);
+		return member.token;
+	}
+
+	private Row<uint, uint, uint> CreateMemberRefRow(MemberReference member)
+	{
+		return new Row<uint, uint, uint>(MakeCodedRID(GetTypeToken(member.DeclaringType), CodedIndex.MemberRefParent), GetStringIndex(member.Name), GetBlobIndex(GetMemberRefSignature(member)));
+	}
+
+	private void AddMemberReference(MemberReference member, Row<uint, uint, uint> row)
+	{
+		member.token = new MetadataToken(TokenType.MemberRef, member_ref_table.AddRow(row));
+		member_ref_map.Add(row, member.token);
+	}
+
+	private MetadataToken GetMethodSpecToken(MethodSpecification method_spec)
+	{
+		Row<uint, uint> row = CreateMethodSpecRow(method_spec);
+		if (method_spec_map.TryGetValue(row, out var value))
+		{
+			return value;
+		}
+		AddMethodSpecification(method_spec, row);
+		return method_spec.token;
+	}
+
+	private void AddMethodSpecification(MethodSpecification method_spec, Row<uint, uint> row)
+	{
+		method_spec.token = new MetadataToken(TokenType.MethodSpec, method_spec_table.AddRow(row));
+		method_spec_map.Add(row, method_spec.token);
+	}
+
+	private Row<uint, uint> CreateMethodSpecRow(MethodSpecification method_spec)
+	{
+		return new Row<uint, uint>(MakeCodedRID(LookupToken(method_spec.ElementMethod), CodedIndex.MethodDefOrRef), GetBlobIndex(GetMethodSpecSignature(method_spec)));
+	}
+
+	private SignatureWriter CreateSignatureWriter()
+	{
+		return new SignatureWriter(this);
+	}
+
+	private SignatureWriter GetMethodSpecSignature(MethodSpecification method_spec)
+	{
+		if (!method_spec.IsGenericInstance)
+		{
+			throw new NotSupportedException();
+		}
+		GenericInstanceMethod instance = (GenericInstanceMethod)method_spec;
+		SignatureWriter signatureWriter = CreateSignatureWriter();
+		signatureWriter.WriteByte(10);
+		signatureWriter.WriteGenericInstanceSignature(instance);
+		return signatureWriter;
+	}
+
+	public uint AddStandAloneSignature(uint signature)
+	{
+		return (uint)standalone_sig_table.AddRow(signature);
+	}
+
+	public uint GetLocalVariableBlobIndex(Collection<VariableDefinition> variables)
+	{
+		return GetBlobIndex(GetVariablesSignature(variables));
+	}
+
+	public uint GetCallSiteBlobIndex(CallSite call_site)
+	{
+		return GetBlobIndex(GetMethodSignature(call_site));
+	}
+
+	private SignatureWriter GetVariablesSignature(Collection<VariableDefinition> variables)
+	{
+		SignatureWriter signatureWriter = CreateSignatureWriter();
+		signatureWriter.WriteByte(7);
+		signatureWriter.WriteCompressedUInt32((uint)variables.Count);
+		for (int i = 0; i < variables.Count; i++)
+		{
+			signatureWriter.WriteTypeSignature(variables[i].VariableType);
+		}
+		return signatureWriter;
+	}
+
+	private SignatureWriter GetFieldSignature(FieldReference field)
+	{
+		SignatureWriter signatureWriter = CreateSignatureWriter();
+		signatureWriter.WriteByte(6);
+		signatureWriter.WriteTypeSignature(field.FieldType);
+		return signatureWriter;
+	}
+
+	private SignatureWriter GetMethodSignature(IMethodSignature method)
+	{
+		SignatureWriter signatureWriter = CreateSignatureWriter();
+		signatureWriter.WriteMethodSignature(method);
+		return signatureWriter;
+	}
+
+	private SignatureWriter GetMemberRefSignature(MemberReference member)
+	{
+		if (member is FieldReference field)
+		{
+			return GetFieldSignature(field);
+		}
+		if (member is MethodReference method)
+		{
+			return GetMethodSignature(method);
+		}
+		throw new NotSupportedException();
+	}
+
+	private SignatureWriter GetPropertySignature(PropertyDefinition property)
+	{
+		SignatureWriter signatureWriter = CreateSignatureWriter();
+		byte b = 8;
+		if (property.HasThis)
+		{
+			b |= 0x20;
+		}
+		uint num = 0u;
+		Collection<ParameterDefinition> collection = null;
+		if (property.HasParameters)
+		{
+			collection = property.Parameters;
+			num = (uint)collection.Count;
+		}
+		signatureWriter.WriteByte(b);
+		signatureWriter.WriteCompressedUInt32(num);
+		signatureWriter.WriteTypeSignature(property.PropertyType);
+		if (num == 0)
+		{
+			return signatureWriter;
+		}
+		for (int i = 0; i < num; i++)
+		{
+			signatureWriter.WriteTypeSignature(collection[i].ParameterType);
+		}
+		return signatureWriter;
+	}
+
+	private SignatureWriter GetTypeSpecSignature(TypeReference type)
+	{
+		SignatureWriter signatureWriter = CreateSignatureWriter();
+		signatureWriter.WriteTypeSignature(type);
+		return signatureWriter;
+	}
+
+	private SignatureWriter GetConstantSignature(ElementType type, object value)
+	{
+		SignatureWriter signatureWriter = CreateSignatureWriter();
+		switch (type)
+		{
+		case ElementType.Class:
+		case ElementType.Var:
+		case ElementType.Array:
+		case ElementType.Object:
+		case ElementType.SzArray:
+		case ElementType.MVar:
+			signatureWriter.WriteInt32(0);
+			break;
+		case ElementType.String:
+			signatureWriter.WriteConstantString((string)value);
+			break;
+		default:
+			signatureWriter.WriteConstantPrimitive(value);
+			break;
+		}
+		return signatureWriter;
+	}
+
+	private SignatureWriter GetCustomAttributeSignature(CustomAttribute attribute)
+	{
+		SignatureWriter signatureWriter = CreateSignatureWriter();
+		if (!attribute.resolved)
+		{
+			signatureWriter.WriteBytes(attribute.GetBlob());
+			return signatureWriter;
+		}
+		signatureWriter.WriteUInt16(1);
+		signatureWriter.WriteCustomAttributeConstructorArguments(attribute);
+		signatureWriter.WriteCustomAttributeNamedArguments(attribute);
+		return signatureWriter;
+	}
+
+	private SignatureWriter GetSecurityDeclarationSignature(SecurityDeclaration declaration)
+	{
+		SignatureWriter signatureWriter = CreateSignatureWriter();
+		if (!declaration.resolved)
+		{
+			signatureWriter.WriteBytes(declaration.GetBlob());
+		}
+		else if (module.Runtime < TargetRuntime.Net_2_0)
+		{
+			signatureWriter.WriteXmlSecurityDeclaration(declaration);
+		}
+		else
+		{
+			signatureWriter.WriteSecurityDeclaration(declaration);
+		}
+		return signatureWriter;
+	}
+
+	private SignatureWriter GetMarshalInfoSignature(IMarshalInfoProvider owner)
+	{
+		SignatureWriter signatureWriter = CreateSignatureWriter();
+		signatureWriter.WriteMarshalInfo(owner.MarshalInfo);
+		return signatureWriter;
+	}
+
+	private static Exception CreateForeignMemberException(MemberReference member)
+	{
+		return new ArgumentException($"Member '{member}' is declared in another module and needs to be imported");
+	}
+
+	public MetadataToken LookupToken(IMetadataTokenProvider provider)
+	{
+		if (provider == null)
+		{
+			throw new ArgumentNullException();
+		}
+		MemberReference memberReference = provider as MemberReference;
+		if (memberReference == null || memberReference.Module != module)
+		{
+			throw CreateForeignMemberException(memberReference);
+		}
+		MetadataToken metadataToken = provider.MetadataToken;
+		switch (metadataToken.TokenType)
+		{
+		case TokenType.TypeDef:
+		case TokenType.Field:
+		case TokenType.Method:
+		case TokenType.Event:
+		case TokenType.Property:
+			return metadataToken;
+		case TokenType.TypeRef:
+		case TokenType.TypeSpec:
+		case TokenType.GenericParam:
+			return GetTypeToken((TypeReference)provider);
+		case TokenType.MethodSpec:
+			return GetMethodSpecToken((MethodSpecification)provider);
+		case TokenType.MemberRef:
+			return GetMemberRefToken(memberReference);
+		default:
+			throw new NotSupportedException();
+		}
+	}
+}

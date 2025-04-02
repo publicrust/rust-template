@@ -1,0 +1,244 @@
+using System;
+using Network;
+using Steamworks;
+using Steamworks.Data;
+using UnityEngine;
+
+public class Client : global::Network.Client, IConnectionManager
+{
+	private ConnectionManager manager;
+
+	private const int bufferSize = 32;
+
+	public override bool IsConnected()
+	{
+		return manager != null;
+	}
+
+	public override bool Connect(string strURL, int port)
+	{
+		lock (readLock)
+		{
+			lock (writeLock)
+			{
+				lock (decryptLock)
+				{
+					base.Connect(strURL, port);
+					SteamNetworkingUtils.AllowWithoutAuth = 2;
+					SteamNetworkingUtils.Unencrypted = 2;
+					SteamNetworkingUtils.SendRateMax = 1048576;
+					SteamNetworkingUtils.SendRateMin = 1048576;
+					NetAddress address = NetAddress.From(strURL, (ushort)port);
+					manager = SteamNetworkingSockets.ConnectNormal(address, this);
+					if (manager == null)
+					{
+						return false;
+					}
+					base.ConnectedAddress = strURL;
+					base.ConnectedPort = port;
+					base.ServerName = "";
+					base.Connection = new global::Network.Connection();
+					MultithreadingInit(null);
+					return true;
+				}
+			}
+		}
+	}
+
+	protected override bool Receive()
+	{
+		if (manager.Receive(32, receiveToEnd: false) == 32)
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public override void Disconnect(string reason, bool sendReasonToServer)
+	{
+		lock (readLock)
+		{
+			lock (writeLock)
+			{
+				lock (decryptLock)
+				{
+					if (sendReasonToServer && manager != null)
+					{
+						NetWrite netWrite = StartWrite();
+						netWrite.PacketID(Message.Type.DisconnectReason);
+						netWrite.String(reason);
+						netWrite.SendImmediate(new SendInfo(base.Connection)
+						{
+							method = SendMethod.ReliableUnordered,
+							priority = Priority.Immediate
+						});
+						if (manager != null)
+						{
+							manager.Close(linger: true, 0, reason);
+							manager = null;
+						}
+					}
+					else if (manager != null)
+					{
+						manager.Close();
+						manager = null;
+					}
+					base.ConnectedAddress = "";
+					base.ConnectedPort = 0;
+					base.Connection = null;
+					OnDisconnected(reason);
+				}
+			}
+		}
+	}
+
+	public override void Flush()
+	{
+		if (manager != null && base.Connection != null)
+		{
+			((Steamworks.Data.Connection)(uint)base.Connection.guid).Flush();
+		}
+	}
+
+	public unsafe override void ProcessWrite(NetWrite write)
+	{
+		ArraySegment<byte> arraySegment = Encrypt(base.Connection, write);
+		fixed (byte* array = arraySegment.Array)
+		{
+			Result result = manager.Connection.SendMessage((IntPtr)array, arraySegment.Offset + arraySegment.Count, ToSteamSendType(write.method, write.priority), ToSteamLaneIndexClient(write.method, write.priority, write.channel));
+			if (result != Result.OK)
+			{
+				Debug.LogWarning("SendMessage failed (" + result.ToString() + ")");
+			}
+		}
+		write.RemoveReference();
+	}
+
+	void IConnectionManager.OnConnecting(ConnectionInfo info)
+	{
+	}
+
+	void IConnectionManager.OnConnected(ConnectionInfo info)
+	{
+		base.Connection.guid = manager.Connection.Id;
+	}
+
+	void IConnectionManager.OnDisconnected(ConnectionInfo info)
+	{
+		if (base.Connection != null)
+		{
+			Disconnect(global::Network.Client.disconnectReason, sendReasonToServer: false);
+		}
+	}
+
+	void IConnectionManager.OnMessage(IntPtr data, int datasize, long messageNum, long recvTime, int channel)
+	{
+		NetRead netRead = Pool.Get<NetRead>();
+		netRead.Start(base.Connection, data, datasize);
+		if (BaseNetwork.Multithreading)
+		{
+			EnqueueDecrypt(netRead);
+		}
+		else
+		{
+			ProcessDecrypt(netRead);
+		}
+	}
+
+	public override void ProcessRead(NetRead read)
+	{
+		RecordReadForConnection(read.connection, read);
+		byte b = read.PacketID();
+		b -= 140;
+		if (read.connection == null)
+		{
+			string[] obj = new string[5] { "Ignoring message (", null, null, null, null };
+			Message.Type type = (Message.Type)b;
+			obj[1] = type.ToString();
+			obj[2] = " ";
+			obj[3] = b.ToString();
+			obj[4] = " connection is null)";
+			Debug.LogWarning(string.Concat(obj));
+			read.RemoveReference();
+			return;
+		}
+		if (b > 26)
+		{
+			Debug.LogWarning("Invalid Packet (higher than " + Message.Type.QueueUpdate.ToString() + ")");
+			Disconnect("Invalid Packet (" + b + ") " + read.Length + "b", sendReasonToServer: true);
+			read.RemoveReference();
+			return;
+		}
+		Message obj2 = StartMessage((Message.Type)b, read);
+		if (callbackHandler != null)
+		{
+			try
+			{
+				using (TimeWarning.New("OnMessage"))
+				{
+					callbackHandler.OnNetworkMessage(obj2);
+				}
+			}
+			catch (Exception ex)
+			{
+				Debug.LogException(ex);
+				Disconnect(ex.Message + "\n" + ex.StackTrace, sendReasonToServer: true);
+			}
+		}
+		Pool.Free(ref obj2);
+		read.RemoveReference();
+	}
+
+	public override string GetDebug(global::Network.Connection connection)
+	{
+		if (connection == null)
+		{
+			connection = base.Connection;
+		}
+		if (connection == null)
+		{
+			return string.Empty;
+		}
+		return ((Steamworks.Data.Connection)(uint)connection.guid).DetailedStatus();
+	}
+
+	public override int GetLastPing()
+	{
+		global::Network.Connection connection = base.Connection;
+		if (connection == null)
+		{
+			return 1;
+		}
+		return ((Steamworks.Data.Connection)(uint)connection.guid).QuickStatus().Ping;
+	}
+
+	public override ulong GetStat(global::Network.Connection connection, StatTypeLong type)
+	{
+		if (connection == null)
+		{
+			connection = base.Connection;
+		}
+		if (connection == null)
+		{
+			return 0uL;
+		}
+		ConnectionStatus connectionStatus = ((Steamworks.Data.Connection)(uint)connection.guid).QuickStatus();
+		int num = 0;
+		switch (type)
+		{
+		case StatTypeLong.BytesSent_LastSecond:
+			num = Mathf.RoundToInt(connectionStatus.OutBytesPerSec);
+			break;
+		case StatTypeLong.BytesReceived_LastSecond:
+			num = Mathf.RoundToInt(connectionStatus.InBytesPerSec);
+			break;
+		case StatTypeLong.BytesInSendBuffer:
+			num = connectionStatus.PendingUnreliable + connectionStatus.PendingReliable;
+			break;
+		case StatTypeLong.PacketLossLastSecond:
+			num = Mathf.RoundToInt(connectionStatus.ConnectionQualityLocal * 100f);
+			break;
+		}
+		return (ulong)num;
+	}
+}

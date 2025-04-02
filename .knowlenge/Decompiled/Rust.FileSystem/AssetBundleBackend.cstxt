@@ -1,0 +1,189 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using UnityEngine;
+
+public class AssetBundleBackend : FileSystemBackend, IDisposable
+{
+	private AssetBundle rootBundle;
+
+	private AssetBundleManifest manifest;
+
+	private Dictionary<string, AssetBundle> bundles = new Dictionary<string, AssetBundle>(StringComparer.OrdinalIgnoreCase);
+
+	private Dictionary<string, AssetBundle> files = new Dictionary<string, AssetBundle>(StringComparer.OrdinalIgnoreCase);
+
+	private string assetPath;
+
+	public static bool Enabled => true;
+
+	public float LoadProgress { get; private set; }
+
+	public void Load(string assetRoot)
+	{
+		try
+		{
+			isError = false;
+			string directoryName = Path.GetDirectoryName(assetRoot);
+			char directorySeparatorChar = Path.DirectorySeparatorChar;
+			assetPath = directoryName + directorySeparatorChar;
+			rootBundle = AssetBundle.LoadFromFile(assetRoot);
+			if (rootBundle == null)
+			{
+				LoadError("Couldn't load root AssetBundle - " + assetRoot);
+				return;
+			}
+			AssetBundleManifest[] array = rootBundle.LoadAllAssets<AssetBundleManifest>();
+			if (array.Length != 1)
+			{
+				LoadError($"Couldn't find AssetBundleManifest - {array.Length}");
+				return;
+			}
+			manifest = array[0];
+			string[] allAssetBundles = manifest.GetAllAssetBundles();
+			foreach (string text in allAssetBundles)
+			{
+				Debug.Log("Loading " + text);
+				LoadBundle(text);
+			}
+		}
+		catch (Exception exception)
+		{
+			Debug.LogException(exception);
+		}
+	}
+
+	private AssetBundle LoadBundle(string bundleName)
+	{
+		if (bundles.ContainsKey(bundleName))
+		{
+			Debug.Log("LoadBundle " + bundleName + " already loaded");
+			return null;
+		}
+		string text = assetPath + bundleName;
+		if (!File.Exists(text))
+		{
+			return null;
+		}
+		AssetBundle assetBundle = AssetBundle.LoadFromFile(text);
+		if (assetBundle == null)
+		{
+			LoadError("Couldn't load AssetBundle - " + text);
+			return null;
+		}
+		bundles.Add(bundleName, assetBundle);
+		return assetBundle;
+	}
+
+	public void BuildFileIndex()
+	{
+		files.Clear();
+		foreach (KeyValuePair<string, AssetBundle> bundle in bundles)
+		{
+			if (!bundle.Key.StartsWith("content", StringComparison.InvariantCultureIgnoreCase))
+			{
+				string[] allAssetNames = bundle.Value.GetAllAssetNames();
+				foreach (string key in allAssetNames)
+				{
+					files.Add(key, bundle.Value);
+				}
+			}
+		}
+	}
+
+	public void Dispose()
+	{
+		manifest = null;
+		foreach (KeyValuePair<string, AssetBundle> bundle in bundles)
+		{
+			bundle.Value.Unload(unloadAllLoadedObjects: false);
+			UnityEngine.Object.DestroyImmediate(bundle.Value);
+		}
+		bundles.Clear();
+		if ((bool)rootBundle)
+		{
+			rootBundle.Unload(unloadAllLoadedObjects: false);
+			UnityEngine.Object.DestroyImmediate(rootBundle);
+			rootBundle = null;
+		}
+	}
+
+	public override List<string> UnloadBundles(string partialName)
+	{
+		List<string> list = new List<string>();
+		string[] array = bundles.Keys.ToArray();
+		foreach (string text in array)
+		{
+			if (text.IndexOf(partialName, StringComparison.InvariantCultureIgnoreCase) < 0)
+			{
+				continue;
+			}
+			AssetBundle assetBundle = bundles[text];
+			assetBundle.Unload(unloadAllLoadedObjects: false);
+			UnityEngine.Object.DestroyImmediate(assetBundle);
+			bundles.Remove(text);
+			assetBundle = LoadBundle(text);
+			string[] allAssetNames = assetBundle.GetAllAssetNames();
+			foreach (string text2 in allAssetNames)
+			{
+				files[text2] = assetBundle;
+				list.Add(text2);
+				if (cache.TryGetValue(text2, out var value))
+				{
+					cache.Remove(text2);
+					UnityEngine.Object.DestroyImmediate(value, allowDestroyingAssets: true);
+				}
+			}
+		}
+		return list;
+	}
+
+	protected override T LoadAsset<T>(string filePath)
+	{
+		AssetBundle value = null;
+		if (!files.TryGetValue(filePath, out value))
+		{
+			return null;
+		}
+		return value.LoadAsset<T>(filePath);
+	}
+
+	protected override LoadAssetsResult LoadAssetsAsync(List<string> filePaths, int maxConcurrency, int priority)
+	{
+		return new CompositeLoadAssetsResult((from p in filePaths
+			where files.ContainsKey(p)
+			group p by files[p]).Select((Func<IGrouping<AssetBundle, string>, LoadAssetsResult>)((IGrouping<AssetBundle, string> g) => new AssetBundleLoadAssetsResult(g.Key, g.OrderBy((string p) => p, StringComparer.OrdinalIgnoreCase).ToList(), maxConcurrency, priority))).ToList());
+	}
+
+	protected override string[] LoadAssetList(string folder, string search)
+	{
+		List<string> list = new List<string>();
+		foreach (KeyValuePair<string, AssetBundle> item in files.Where((KeyValuePair<string, AssetBundle> x) => x.Key.StartsWith(folder, StringComparison.InvariantCultureIgnoreCase)))
+		{
+			if (string.IsNullOrEmpty(search) || item.Key.IndexOf(search, StringComparison.InvariantCultureIgnoreCase) != -1)
+			{
+				list.Add(item.Key);
+			}
+		}
+		list.Sort(StringComparer.OrdinalIgnoreCase);
+		return list.ToArray();
+	}
+
+	public override T[] LoadAllFromBundle<T>(string bundleName, string editorSearch)
+	{
+		foreach (KeyValuePair<string, AssetBundle> bundle in bundles)
+		{
+			if (bundle.Key.EndsWith(bundleName))
+			{
+				return bundle.Value.LoadAllAssets<T>();
+			}
+		}
+		throw new Exception("LoadAllFromBundle found none");
+	}
+
+	public override bool HasAsset(string path)
+	{
+		return files.ContainsKey(path);
+	}
+}

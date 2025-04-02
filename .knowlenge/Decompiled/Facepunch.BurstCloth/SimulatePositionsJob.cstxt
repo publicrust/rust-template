@@ -1,0 +1,569 @@
+using Facepunch.BurstCloth;
+using Facepunch.BurstCloth.Jobs;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
+using UnityEngine;
+
+internal struct SimulatePositionsJob : IJob
+{
+	private struct LerpState
+	{
+		public float3 Start;
+
+		public float3 End;
+	}
+
+	private readonly struct Collision
+	{
+		public readonly bool Exists;
+
+		public readonly float3 TargetToResolve;
+
+		public Collision(bool exists, float3 targetToResolve)
+		{
+			Exists = exists;
+			TargetToResolve = targetToResolve;
+		}
+	}
+
+	[ReadOnly]
+	public NativeArray<SphereColliderData> ColliderData;
+
+	[ReadOnly]
+	public NativeArray<SphereColliderState> ColliderState;
+
+	[ReadOnly]
+	public NativeArray<RotationConstraint> RotationConstraints;
+
+	[ReadOnly]
+	public NativeArray<SkinConstraint> SkinConstraints;
+
+	[ReadOnly]
+	public NativeArray<BoneData> BoneData;
+
+	public NativeArray<BoneState> BoneStates;
+
+	public int TickRate;
+
+	public float DeltaTime;
+
+	public int IterationCount;
+
+	public int ConstraintIterationCount;
+
+	public quaternion OriginRotationDelta;
+
+	public float3 SimulationSpaceDelta;
+
+	public float3 OriginDelta;
+
+	public float3 Gravity;
+
+	public float LengthModifier;
+
+	public bool SiblingConstraints;
+
+	public bool EnableCollisions;
+
+	public float3 Origin;
+
+	public quaternion Rotation;
+
+	public float3 Up;
+
+	public float Radius;
+
+	public float CollisionProjectionYOffset;
+
+	public float CollisionFilteringScale;
+
+	public void Execute()
+	{
+		NativeArray<LerpState> nativeArray = new NativeArray<LerpState>(BoneStates.Length, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+		bool flag = EnableCollisions && ColliderData.Length > 0;
+		NativeArray<Collision> array = new NativeArray<Collision>(BoneStates.Length, Allocator.Temp);
+		AdjustSimulationSpace();
+		for (int i = 0; i < BoneStates.Length; i++)
+		{
+			ref readonly BoneState @readonly = ref BurstUtil.GetReadonly(in BoneStates, i);
+			nativeArray[i] = new LerpState
+			{
+				Start = @readonly.OldPosition,
+				End = @readonly.Position
+			};
+		}
+		for (int j = 0; j < IterationCount; j++)
+		{
+			float s = ((float)j + 1f) / (float)IterationCount;
+			for (int k = 0; k < BoneData.Length; k++)
+			{
+				ref readonly BoneData readonly2 = ref BurstUtil.GetReadonly(in BoneData, k);
+				ref BoneState reference = ref BurstUtil.Get(in BoneStates, k);
+				if (readonly2.Depth == 0)
+				{
+					reference.OldPosition = reference.Position;
+					reference.Position = math.lerp(nativeArray[k].Start, nativeArray[k].End, s);
+				}
+				else
+				{
+					VerletIntegrate(ref reference, Gravity, DeltaTime, readonly2.DampingInv);
+				}
+			}
+			if (flag)
+			{
+				PopulateCollisions(array);
+			}
+			for (int l = 0; l < ConstraintIterationCount; l++)
+			{
+				for (int m = 0; m < BoneData.Length; m++)
+				{
+					ApplyRotationConstraints(in BurstUtil.GetReadonly(in BoneData, m), ref BurstUtil.Get(in BoneStates, m));
+				}
+				for (int n = 0; n < BoneData.Length; n++)
+				{
+					ref readonly BoneData readonly3 = ref BurstUtil.GetReadonly(in BoneData, n);
+					ref BoneState state = ref BurstUtil.Get(in BoneStates, n);
+					ref readonly Collision readonly4 = ref BurstUtil.GetReadonly(in array, n);
+					ApplyLinearConstraints(in readonly3, ref state, in BoneStates, in readonly4);
+				}
+				for (int num = 0; num < BoneData.Length; num++)
+				{
+					if (BurstUtil.GetReadonly(in BoneData, num).Depth != 0)
+					{
+						ref BoneState reference2 = ref BurstUtil.Get(in BoneStates, num);
+						reference2.Position += reference2.Delta;
+						reference2.Delta = float3.zero;
+					}
+				}
+			}
+			for (int num2 = 0; num2 < BoneData.Length; num2++)
+			{
+				ApplyRotationConstraints(in BurstUtil.GetReadonly(in BoneData, num2), ref BurstUtil.Get(in BoneStates, num2));
+			}
+		}
+		nativeArray.Dispose();
+	}
+
+	private void AdjustSimulationSpace()
+	{
+		for (int i = 0; i < BoneData.Length; i++)
+		{
+			ref readonly BoneData @readonly = ref BurstUtil.GetReadonly(in BoneData, i);
+			ref BoneState reference = ref BurstUtil.Get(in BoneStates, i);
+			float3 @float = reference.Position - Origin;
+			float3 float2 = @float - math.rotate(OriginRotationDelta, @float);
+			if (@readonly.Depth > 0)
+			{
+				reference.Position += SimulationSpaceDelta + OriginDelta - float2;
+			}
+			reference.OldPosition += SimulationSpaceDelta + OriginDelta - float2;
+		}
+	}
+
+	private void ApplyLinearConstraints(in BoneData data, ref BoneState state, in NativeArray<BoneState> workBoneState, in Collision collision)
+	{
+		if (data.Depth == 0)
+		{
+			return;
+		}
+		ref BoneState reference = ref BurstUtil.Get(in workBoneState, data.Parent);
+		float3 zero = float3.zero;
+		int num = 0;
+		float3 zero2 = float3.zero;
+		int num2 = 0;
+		if (data.SkinConstraintIndex >= 0)
+		{
+			ref readonly SkinConstraint @readonly = ref BurstUtil.GetReadonly(in SkinConstraints, data.SkinConstraintIndex);
+			float3 @float = @readonly.WorldSkinPosition - @readonly.WorldSkinNormal * @readonly.BackstopInset;
+			if (math.distancesq(state.Position, @float) <= @readonly.BackstopRadius * @readonly.BackstopRadius)
+			{
+				float3 float2 = math.normalize(state.Position - @float);
+				float3 float3 = Slerp(float2, @readonly.WorldEscapeNormal, math.select(0.2f, 1f, math.dot(float2, @readonly.WorldEscapeNormal) >= 0f));
+				float3 float4 = @float + float3 * @readonly.BackstopRadius;
+				float3 float5 = state.Position - float4;
+				zero += 0.5f * data.LengthRelaxation * -float5;
+				num++;
+			}
+		}
+		if (EnableCollisions && collision.Exists)
+		{
+			float3 targetToResolve = collision.TargetToResolve;
+			float3 float6 = state.Position - targetToResolve;
+			zero += 0.5f * data.LengthRelaxation * -float6;
+			num++;
+		}
+		if (data.LengthRelaxation > 0f)
+		{
+			float num3 = math.clamp(math.distance(state.Position, reference.Position), data.LengthConstraint.x, data.LengthConstraint.y);
+			float3 float7 = reference.Position + math.rotate(reference.Rotation, data.NormalFromParent * num3 * LengthModifier);
+			float3 float8 = state.Position - float7;
+			float3 float9 = math.select(0.5f, 1f, data.Depth == 1) * data.LengthRelaxation * -float8;
+			zero += float9;
+			num++;
+			zero2 -= float9;
+			num2++;
+		}
+		state.Delta += zero / ((float)num + 1.1754944E-38f);
+		if (data.Depth > 1)
+		{
+			reference.Delta += zero2 / ((float)num2 + 1.1754944E-38f);
+		}
+		if (SiblingConstraints)
+		{
+			float3 zero3 = float3.zero;
+			int num4 = 0;
+			if (data.LeftSibling >= 0)
+			{
+				ref BoneState reference2 = ref BurstUtil.Get(in workBoneState, data.LeftSibling);
+				float3 float10 = reference2.Position + math.rotate(math.slerp(reference2.Rotation, state.Rotation, 0.5f), data.NormalFromLeft * data.LengthToLeft);
+				float3 float11 = state.Position - float10;
+				float3 float12 = 0.5f * data.SiblingRelaxation * -float11;
+				zero3 += float12;
+				num4++;
+				reference2.Delta -= float12;
+			}
+			state.Delta += zero3 / ((float)num4 + 1.1754944E-38f);
+		}
+	}
+
+	private static void VerletIntegrate(ref BoneState state, float3 acceleration, float dt, float damping)
+	{
+		float3 position = state.Position;
+		state.Position += (state.Position - state.OldPosition) * damping + acceleration * dt * dt;
+		state.OldPosition = position;
+	}
+
+	private void PopulateCollisions(NativeArray<Collision> collisions)
+	{
+		for (int i = 0; i < BoneStates.Length; i++)
+		{
+			ref readonly BoneState @readonly = ref BurstUtil.GetReadonly(in BoneStates, i);
+			ref readonly BoneData readonly2 = ref BurstUtil.GetReadonly(in BoneData, i);
+			float3 @float = math.project(@readonly.Position - Origin, Up) + Origin + Up * CollisionProjectionYOffset;
+			float3 float2 = math.normalizesafe(@readonly.Position - @float);
+			float3 float3 = math.mul(Rotation, readonly2.DirectionFromOrigin);
+			float3 float4 = Slerp(float3, float2, math.max(math.dot(float2, float3), 0f));
+			float3 origin = @float + float4 * Radius;
+			float3 x = @readonly.Position - origin;
+			float3 direction = math.normalizesafe(x);
+			float maxDistance = math.length(x);
+			bool hit;
+			float3 float5 = RayMarch(in origin, in direction, readonly2.CollisionRadius, maxDistance, out hit);
+			if (math.distancesq(float5, @readonly.Position) > readonly2.CollisionRadius * CollisionFilteringScale * readonly2.CollisionRadius * CollisionFilteringScale)
+			{
+				hit = false;
+			}
+			collisions[i] = new Collision(hit, float5);
+		}
+	}
+
+	private void ApplyRotationConstraints(in BoneData data, ref BoneState state)
+	{
+		if (data.Depth != 0 && data.Parent >= 0)
+		{
+			ref readonly BoneData @readonly = ref BurstUtil.GetReadonly(in BoneData, data.Parent);
+			ref BoneState reference = ref BurstUtil.Get(in BoneStates, data.Parent);
+			quaternion rotation = state.Rotation;
+			if (data.Child >= 0)
+			{
+				ref readonly BoneData readonly2 = ref BurstUtil.GetReadonly(in BoneData, data.Child);
+				ref BoneState reference2 = ref BurstUtil.Get(in BoneStates, data.Child);
+				rotation = math.mul(rotation, FromToRotation(readonly2.LocalPosition, math.mul(math.conjugate(rotation), reference2.Position - state.Position)));
+			}
+			else
+			{
+				rotation = math.mul(rotation, FromToRotation(@readonly.LocalPosition, math.mul(math.conjugate(rotation), state.Position - reference.Position)));
+			}
+			_ = SiblingConstraints;
+			quaternion q = math.mul(reference.Rotation, data.LocalRotation);
+			rotation = math.slerp(rotation, q, math.saturate(DeltaTime * data.ShapeRelaxation));
+			rotation = ApplyAngleLimitsConstraint(in data, in RotationConstraints, rotation, reference.Rotation);
+			state.Rotation = math.normalize(rotation);
+		}
+	}
+
+	private static quaternion ApplyAngleLimitsConstraint(in BoneData data, in NativeArray<RotationConstraint> rotationConstraints, quaternion rotation, quaternion parentRotation)
+	{
+		if (data.RotationConstraintIndex == -1)
+		{
+			return rotation;
+		}
+		ref readonly RotationConstraint @readonly = ref BurstUtil.GetReadonly(in rotationConstraints, data.RotationConstraintIndex);
+		float3 xyz = ToEuler(math.mul(math.conjugate(parentRotation), rotation));
+		if (@readonly.Constraints.x)
+		{
+			xyz.x = ClampAngle(xyz.x, @readonly.X.x, @readonly.X.y);
+		}
+		if (@readonly.Constraints.y)
+		{
+			xyz.y = ClampAngle(xyz.y, @readonly.Y.x, @readonly.Y.y);
+		}
+		if (@readonly.Constraints.z)
+		{
+			xyz.z = ClampAngle(xyz.z, @readonly.Z.x, @readonly.Z.y);
+		}
+		return math.mul(parentRotation, quaternion.Euler(xyz));
+	}
+
+	private float3 RayMarch(in float3 origin, in float3 direction, float radius, float maxDistance, out bool hit)
+	{
+		hit = false;
+		float num = 0f;
+		for (int i = 0; i < 8; i++)
+		{
+			float3 position = origin + direction * num;
+			float num2 = Scene(in position) - radius;
+			if (num2 < 0.0001f)
+			{
+				hit = true;
+				return position + direction * num2;
+			}
+			num += num2;
+			if (num > maxDistance)
+			{
+				break;
+			}
+		}
+		return origin + direction * maxDistance;
+	}
+
+	private float Scene(in float3 position)
+	{
+		float num = float.MaxValue;
+		for (int i = 0; i < ColliderData.Length; i++)
+		{
+			ref readonly SphereColliderData @readonly = ref BurstUtil.GetReadonly(in ColliderData, i);
+			num = Union(num, SphereSignedDistance(in position, in BurstUtil.GetReadonly(in ColliderState, i).Position, in @readonly.Radius));
+		}
+		return num;
+	}
+
+	private static float Union(float d1, float d2)
+	{
+		return math.min(d1, d2);
+	}
+
+	private static float SphereSignedDistance(in float3 p, in float3 pSphere, in float r)
+	{
+		return math.length(p - pSphere) - r;
+	}
+
+	private static float Capsule(in float3 p, in float3 a, in float3 b, float r)
+	{
+		float3 @float = p - a;
+		float3 float2 = b - a;
+		float num = math.clamp(math.dot(@float, float2) / math.dot(float2, float2), 0f, 1f);
+		return math.length(@float - float2 * num) - r;
+	}
+
+	private static float3 Slerp(float3 a, float3 b, float t)
+	{
+		return Vector3.Slerp(a, b, t);
+	}
+
+	private static quaternion FromToRotation(float3 from, float3 to)
+	{
+		float angle = math.acos(math.clamp(math.dot(math.normalizesafe(from), math.normalizesafe(to)), -1f, 1f));
+		return quaternion.AxisAngle(math.normalizesafe(math.cross(from, to)), angle);
+	}
+
+	private static float ClampAngle(float current, float min, float max)
+	{
+		float num = math.abs((min - max + 180f) % 360f - 180f) * 0.5f;
+		float target = min + num;
+		float num2 = math.abs(DeltaAngle(current, target)) - num;
+		if (num2 > 0f)
+		{
+			current = MoveTowardsAngle(current, target, num2);
+		}
+		return current;
+	}
+
+	private static float MoveTowardsAngle(float current, float target, float maxDelta)
+	{
+		float num = DeltaAngle(current, target);
+		if (0f - maxDelta < num && num < maxDelta)
+		{
+			return target;
+		}
+		target = current + num;
+		return MoveTowards(current, target, maxDelta);
+	}
+
+	private static float MoveTowards(float current, float target, float maxDelta)
+	{
+		if (!(math.abs(target - current) <= maxDelta))
+		{
+			return current + math.sign(target - current) * maxDelta;
+		}
+		return target;
+	}
+
+	private static float DeltaAngle(float current, float target)
+	{
+		float num = Repeat(target - current, 360f);
+		if ((double)num > 180.0)
+		{
+			num -= 360f;
+		}
+		return num;
+	}
+
+	private static float Repeat(float t, float length)
+	{
+		return math.clamp(t - math.floor(t / length) * length, 0f, length);
+	}
+
+	private static float3 ToEuler(quaternion q, math.RotationOrder order = math.RotationOrder.ZXY)
+	{
+		float4 value = q.value;
+		float4 @float = value * value.wwww * new float4(2f);
+		float4 float2 = value * value.yzxw * new float4(2f);
+		float4 float3 = value * value;
+		float3 euler = new float3(0f);
+		switch (order)
+		{
+		case math.RotationOrder.ZYX:
+		{
+			float num5 = float2.z + @float.y;
+			if (num5 * num5 < 0.99999595f)
+			{
+				float y13 = 0f - float2.x + @float.z;
+				float x13 = float3.x + float3.w - float3.y - float3.z;
+				float y14 = 0f - float2.y + @float.x;
+				float x14 = float3.z + float3.w - float3.y - float3.x;
+				euler = new float3(math.atan2(y13, x13), math.asin(num5), math.atan2(y14, x14));
+			}
+			else
+			{
+				num5 = math.clamp(num5, -1f, 1f);
+				float4 float8 = new float4(float2.z, @float.y, float2.y, @float.x);
+				float y15 = 2f * (float8.x * float8.w + float8.y * float8.z);
+				float x15 = math.csum(float8 * float8 * new float4(-1f, 1f, -1f, 1f));
+				euler = new float3(math.atan2(y15, x15), math.asin(num5), 0f);
+			}
+			break;
+		}
+		case math.RotationOrder.ZXY:
+		{
+			float num3 = float2.y - @float.x;
+			if (num3 * num3 < 0.99999595f)
+			{
+				float y7 = float2.x + @float.z;
+				float x7 = float3.y + float3.w - float3.x - float3.z;
+				float y8 = float2.z + @float.y;
+				float x8 = float3.z + float3.w - float3.x - float3.y;
+				euler = new float3(math.atan2(y7, x7), 0f - math.asin(num3), math.atan2(y8, x8));
+			}
+			else
+			{
+				num3 = math.clamp(num3, -1f, 1f);
+				float4 float6 = new float4(float2.z, @float.y, float2.y, @float.x);
+				float y9 = 2f * (float6.x * float6.w + float6.y * float6.z);
+				float x9 = math.csum(float6 * float6 * new float4(-1f, 1f, -1f, 1f));
+				euler = new float3(math.atan2(y9, x9), 0f - math.asin(num3), 0f);
+			}
+			break;
+		}
+		case math.RotationOrder.YXZ:
+		{
+			float num6 = float2.y + @float.x;
+			if (num6 * num6 < 0.99999595f)
+			{
+				float y16 = 0f - float2.z + @float.y;
+				float x16 = float3.z + float3.w - float3.x - float3.y;
+				float y17 = 0f - float2.x + @float.z;
+				float x17 = float3.y + float3.w - float3.z - float3.x;
+				euler = new float3(math.atan2(y16, x16), math.asin(num6), math.atan2(y17, x17));
+			}
+			else
+			{
+				num6 = math.clamp(num6, -1f, 1f);
+				float4 float9 = new float4(float2.x, @float.z, float2.y, @float.x);
+				float y18 = 2f * (float9.x * float9.w + float9.y * float9.z);
+				float x18 = math.csum(float9 * float9 * new float4(-1f, 1f, -1f, 1f));
+				euler = new float3(math.atan2(y18, x18), math.asin(num6), 0f);
+			}
+			break;
+		}
+		case math.RotationOrder.YZX:
+		{
+			float num2 = float2.x - @float.z;
+			if (num2 * num2 < 0.99999595f)
+			{
+				float y4 = float2.z + @float.y;
+				float x4 = float3.x + float3.w - float3.z - float3.y;
+				float y5 = float2.y + @float.x;
+				float x5 = float3.y + float3.w - float3.x - float3.z;
+				euler = new float3(math.atan2(y4, x4), 0f - math.asin(num2), math.atan2(y5, x5));
+			}
+			else
+			{
+				num2 = math.clamp(num2, -1f, 1f);
+				float4 float5 = new float4(float2.x, @float.z, float2.y, @float.x);
+				float y6 = 2f * (float5.x * float5.w + float5.y * float5.z);
+				float x6 = math.csum(float5 * float5 * new float4(-1f, 1f, -1f, 1f));
+				euler = new float3(math.atan2(y6, x6), 0f - math.asin(num2), 0f);
+			}
+			break;
+		}
+		case math.RotationOrder.XZY:
+		{
+			float num4 = float2.x + @float.z;
+			if (num4 * num4 < 0.99999595f)
+			{
+				float y10 = 0f - float2.y + @float.x;
+				float x10 = float3.y + float3.w - float3.z - float3.x;
+				float y11 = 0f - float2.z + @float.y;
+				float x11 = float3.x + float3.w - float3.y - float3.z;
+				euler = new float3(math.atan2(y10, x10), math.asin(num4), math.atan2(y11, x11));
+			}
+			else
+			{
+				num4 = math.clamp(num4, -1f, 1f);
+				float4 float7 = new float4(float2.x, @float.z, float2.z, @float.y);
+				float y12 = 2f * (float7.x * float7.w + float7.y * float7.z);
+				float x12 = math.csum(float7 * float7 * new float4(-1f, 1f, -1f, 1f));
+				euler = new float3(math.atan2(y12, x12), math.asin(num4), 0f);
+			}
+			break;
+		}
+		case math.RotationOrder.XYZ:
+		{
+			float num = float2.z - @float.y;
+			if (num * num < 0.99999595f)
+			{
+				float y = float2.y + @float.x;
+				float x = float3.z + float3.w - float3.y - float3.x;
+				float y2 = float2.x + @float.z;
+				float x2 = float3.x + float3.w - float3.y - float3.z;
+				euler = new float3(math.atan2(y, x), 0f - math.asin(num), math.atan2(y2, x2));
+			}
+			else
+			{
+				num = math.clamp(num, -1f, 1f);
+				float4 float4 = new float4(float2.z, @float.y, float2.x, @float.z);
+				float y3 = 2f * (float4.x * float4.w + float4.y * float4.z);
+				float x3 = math.csum(float4 * float4 * new float4(-1f, 1f, -1f, 1f));
+				euler = new float3(math.atan2(y3, x3), 0f - math.asin(num), 0f);
+			}
+			break;
+		}
+		}
+		return EulerReorderBack(euler, order);
+	}
+
+	private static float3 EulerReorderBack(float3 euler, math.RotationOrder order)
+	{
+		return order switch
+		{
+			math.RotationOrder.XZY => euler.xzy, 
+			math.RotationOrder.YZX => euler.zxy, 
+			math.RotationOrder.YXZ => euler.yxz, 
+			math.RotationOrder.ZXY => euler.yzx, 
+			math.RotationOrder.ZYX => euler.zyx, 
+			_ => euler, 
+		};
+	}
+}

@@ -1,0 +1,451 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using ConVar;
+using Network;
+using Oxide.Core;
+using Rust;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public abstract class BaseSiegeWeapon : GroundVehicle, IEngineControllerUser, IEntity, VehicleChassisVisuals<BaseSiegeWeapon>.IClientWheelUser, TriggerHurtNotChild.IHurtTriggerUser, CarPhysics<BaseSiegeWeapon>.ICar, ITowing
+{
+	[Header("Siege Weapon")]
+	[SerializeField]
+	protected Transform centreOfMassTransform;
+
+	[SerializeField]
+	protected CarSettings carSettings;
+
+	public VisualCarWheel[] wheels;
+
+	[Header("Towing")]
+	public Transform towAnchor;
+
+	[Header("Pulling")]
+	[SerializeField]
+	private List<ModifierDefintion> pullingPlayerModifiers;
+
+	public const Flags Flag_IsPulled = Flags.Reserved12;
+
+	private BasePlayer pullingPlayer;
+
+	private float _mass = -1f;
+
+	protected CarPhysics<BaseSiegeWeapon> carPhysics;
+
+	private bool disablePhysics;
+
+	[ServerVar(Help = "How many minutes before a siege weapon loses all its health while outside")]
+	public static float outsideDecayMinutes = 600f;
+
+	private const float DECAY_TICK_TIME = 60f;
+
+	private const float INSIDE_DECAY_MULTIPLIER = 0.1f;
+
+	private float lastUseTime;
+
+	private TimeSince timeSinceDragModSet;
+
+	private VehicleTerrainHandler terrainHandler;
+
+	private Vector3 localPullPosition;
+
+	private Vector3 lastPlayerPosition;
+
+	private float playerMovementThreshold = 0.01f;
+
+	public virtual float SteerAngle { get; }
+
+	public virtual float MaxSteerAngle { get; }
+
+	public SiegeWeaponVehicleAudio vehicleAudio => (SiegeWeaponVehicleAudio)gvAudio;
+
+	private float Mass
+	{
+		get
+		{
+			if (base.isServer)
+			{
+				return rigidBody.mass;
+			}
+			return _mass;
+		}
+	}
+
+	public bool IsTowing => HasFlag(Flags.Reserved14);
+
+	public bool IsTowingAllowed => CheckTowingAllowed();
+
+	public BaseEntity TowEntity => this;
+
+	public Transform TowAnchor => towAnchor;
+
+	public Rigidbody TowBody => rigidBody;
+
+	public VehicleTerrainHandler.Surface OnSurface
+	{
+		get
+		{
+			if (terrainHandler == null)
+			{
+				return VehicleTerrainHandler.Surface.Default;
+			}
+			return terrainHandler.OnSurface;
+		}
+	}
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("BaseSiegeWeapon.OnRpcMessage"))
+		{
+			if (rpc == 3106222818u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_StartPulling ");
+				}
+				using (TimeWarning.New("SERVER_StartPulling"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.MaxDistance.Test(3106222818u, "SERVER_StartPulling", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							SERVER_StartPulling(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						Debug.LogException(exception);
+						player.Kick("RPC Error in SERVER_StartPulling");
+					}
+				}
+				return true;
+			}
+			if (rpc == 1702315436 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_StopPulling ");
+				}
+				using (TimeWarning.New("SERVER_StopPulling"))
+				{
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg3 = rPCMessage;
+							SERVER_StopPulling(msg3);
+						}
+					}
+					catch (Exception exception2)
+					{
+						Debug.LogException(exception2);
+						player.Kick("RPC Error in SERVER_StopPulling");
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public override float GetThrottleInput()
+	{
+		return 0f;
+	}
+
+	public override float GetBrakeInput()
+	{
+		if (base.isServer)
+		{
+			if (!IsTowing)
+			{
+				return 1f;
+			}
+			return 0f;
+		}
+		return 1f;
+	}
+
+	public override float GetMaxForwardSpeed()
+	{
+		return GetMaxDriveForce() / Mass * 2f;
+	}
+
+	public virtual float GetMaxDriveForce()
+	{
+		return 100f;
+	}
+
+	public virtual float GetSteerInput()
+	{
+		return 0f;
+	}
+
+	public virtual bool IsWaterlogged()
+	{
+		if (waterloggedPoint != null)
+		{
+			return WaterLevel.Test(waterloggedPoint.position, waves: true, volumes: true, this);
+		}
+		return false;
+	}
+
+	protected override bool CanPushNow(BasePlayer pusher)
+	{
+		if (!base.CanPushNow(pusher))
+		{
+			return false;
+		}
+		if (HasFlag(Flags.Reserved12))
+		{
+			return false;
+		}
+		if (pusher.isMounted || pusher.IsSwimming())
+		{
+			return false;
+		}
+		return !pusher.IsStandingOnEntity(this, 8192);
+	}
+
+	protected virtual bool CanPullNow(BasePlayer puller)
+	{
+		if (HasFlag(Flags.Reserved12) || pullingPlayer != null)
+		{
+			return false;
+		}
+		if (puller.isMounted || puller.IsSwimming())
+		{
+			return false;
+		}
+		if (!puller.IsStandingOnEntity(this, 8192))
+		{
+			return puller.CanInteract();
+		}
+		return false;
+	}
+
+	public override void ServerInit()
+	{
+		base.ServerInit();
+		rigidBody.centerOfMass = centreOfMassTransform.localPosition;
+		carPhysics = new CarPhysics<BaseSiegeWeapon>(this, base.transform, rigidBody, carSettings);
+		terrainHandler = new VehicleTerrainHandler(this);
+		lastUseTime = UnityEngine.Time.realtimeSinceStartup;
+		if (!disablePhysics)
+		{
+			rigidBody.isKinematic = false;
+		}
+		InvokeRandomized(DecayTick, UnityEngine.Random.Range(30f, 60f), 60f, 6f);
+	}
+
+	private void DecayTick()
+	{
+		if (base.IsDestroyed)
+		{
+			return;
+		}
+		float num = 1f;
+		num /= outsideDecayMinutes;
+		if (!(UnityEngine.Time.time < lastUseTime + 300f))
+		{
+			if (!IsOutside())
+			{
+				num *= 0.1f;
+			}
+			Hurt(MaxHealth() * num, DamageType.Decay);
+		}
+	}
+
+	public void RefreshLastUseTime()
+	{
+		lastUseTime = UnityEngine.Time.time;
+	}
+
+	public void DisablePhysics()
+	{
+		disablePhysics = true;
+		rigidBody.isKinematic = true;
+	}
+
+	public void EnablePhysics()
+	{
+		disablePhysics = false;
+		rigidBody.isKinematic = false;
+		rigidBody.WakeUp();
+	}
+
+	public virtual bool CheckTowingAllowed()
+	{
+		return !IsTowing;
+	}
+
+	public virtual void OnTowAttach()
+	{
+		EnablePhysics();
+		carSettings.disableHandbrakes = true;
+		carSettings.canSleep = false;
+	}
+
+	public virtual void OnTowDetach()
+	{
+		carSettings.disableHandbrakes = false;
+		carSettings.canSleep = true;
+	}
+
+	public override void VehicleFixedUpdate()
+	{
+		base.VehicleFixedUpdate();
+		float speed = GetSpeed();
+		carPhysics.FixedUpdate(UnityEngine.Time.fixedDeltaTime, speed);
+		terrainHandler.FixedUpdate();
+	}
+
+	public virtual bool GetSteerSpeedMod(float speed)
+	{
+		return false;
+	}
+
+	public virtual float GetSteerMaxMult(float speed)
+	{
+		return 1f;
+	}
+
+	public virtual float GetAdjustedDriveForce(float absSpeed, float topSpeed)
+	{
+		float maxDriveForce = GetMaxDriveForce();
+		float num = MathEx.BiasedLerp(bias: Mathf.Lerp(0.3f, 0.75f, GetPerformanceFraction()), x: 1f - absSpeed / topSpeed);
+		return maxDriveForce * num;
+	}
+
+	public virtual float GetPerformanceFraction()
+	{
+		float t = Mathf.InverseLerp(0.25f, 0.5f, base.healthFraction);
+		return Mathf.Lerp(0.5f, 1f, t);
+	}
+
+	public virtual CarWheel[] GetWheels()
+	{
+		return wheels;
+	}
+
+	public virtual float GetWheelsMidPos()
+	{
+		return (wheels[0].wheelCollider.transform.localPosition.z - wheels[2].wheelCollider.transform.localPosition.z) * 0.5f;
+	}
+
+	public override void OnDied(HitInfo info = null)
+	{
+		if (HasFlag(Flags.Reserved12) && pullingPlayer != null)
+		{
+			StopPulling();
+		}
+		base.OnDied(info);
+	}
+
+	[RPC_Server]
+	[RPC_Server.MaxDistance(3f)]
+	public void SERVER_StartPulling(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (CanPullNow(player) && !(rigidBody == null) && Interface.CallHook("OnSiegeWeaponPull", this, msg.player) == null && (!OnlyOwnerAccessible() || !(player != creatorEntity)))
+		{
+			player.metabolism.calories.Subtract(3f);
+			player.metabolism.SendChangesToClient();
+			if (rigidBody.IsSleeping())
+			{
+				rigidBody.WakeUp();
+			}
+			StartPulling(player);
+		}
+	}
+
+	[RPC_Server]
+	public void SERVER_StopPulling(RPCMessage msg)
+	{
+		if (!(msg.player != pullingPlayer))
+		{
+			StopPulling();
+		}
+	}
+
+	private void StartPulling(BasePlayer player)
+	{
+		localPullPosition = base.transform.InverseTransformPoint(player.transform.position);
+		lastPlayerPosition = player.transform.position;
+		pullingPlayer = player;
+		if (pullingPlayer != null)
+		{
+			PlayerModifiers.AddToPlayer(pullingPlayer, pullingPlayerModifiers);
+		}
+		SetFlag(Flags.Reserved12, b: true);
+		carSettings.disableHandbrakes = true;
+		InvokeRepeating(DoPullAction, 0f, 0f);
+	}
+
+	private void StopPulling()
+	{
+		if (pullingPlayer != null)
+		{
+			pullingPlayer.modifiers.RemoveFromSource(Modifier.ModifierSource.Interaction);
+		}
+		ClientRPC(RpcTarget.NetworkGroup("CLIENT_StopPulling"));
+		pullingPlayer = null;
+		SetFlag(Flags.Reserved12, b: false);
+		carSettings.disableHandbrakes = false;
+		CancelInvoke(DoPullAction);
+	}
+
+	protected virtual void DoPullAction()
+	{
+		if (rigidBody == null || pullingPlayer == null)
+		{
+			StopPulling();
+			return;
+		}
+		Vector3 position = pullingPlayer.transform.position;
+		Vector3 vector = base.transform.TransformPoint(localPullPosition);
+		if (Vector3.Distance(position, vector) >= 1f || pullingPlayer.IsDead() || pullingPlayer.IsSleeping())
+		{
+			StopPulling();
+			return;
+		}
+		Vector3 vector2 = pullingPlayer.transform.position - lastPlayerPosition;
+		lastPlayerPosition = pullingPlayer.transform.position;
+		if (vector2.magnitude > playerMovementThreshold && rigidBody.velocity.magnitude < 1.5f)
+		{
+			Vector3 normalized = (position - vector).normalized;
+			float mass = rigidBody.mass;
+			rigidBody.AddForceAtPosition(normalized * mass, vector, ForceMode.Force);
+		}
+	}
+
+	void IEngineControllerUser.Invoke(Action action, float time)
+	{
+		Invoke(action, time);
+	}
+
+	void IEngineControllerUser.CancelInvoke(Action action)
+	{
+		CancelInvoke(action);
+	}
+}

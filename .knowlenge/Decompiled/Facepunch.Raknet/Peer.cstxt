@@ -1,0 +1,377 @@
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security;
+using Facepunch.Network.Raknet;
+using Network;
+using UnityEngine;
+
+[SuppressUnmanagedCodeSecurity]
+internal class Peer
+{
+	public enum PacketPriority
+	{
+		IMMEDIATE_PRIORITY,
+		HIGH_PRIORITY,
+		MEDIUM_PRIORITY,
+		LOW_PRIORITY
+	}
+
+	public enum PacketReliability
+	{
+		UNRELIABLE,
+		UNRELIABLE_SEQUENCED,
+		RELIABLE,
+		RELIABLE_ORDERED,
+		RELIABLE_SEQUENCED
+	}
+
+	private IntPtr ptr;
+
+	private static byte[] ByteBuffer = new byte[512];
+
+	public virtual ulong incomingGUID
+	{
+		get
+		{
+			Check();
+			return Native.NETRCV_GUID(ptr);
+		}
+	}
+
+	public virtual uint incomingAddressInt
+	{
+		get
+		{
+			Check();
+			return Native.NETRCV_Address(ptr);
+		}
+	}
+
+	public virtual uint incomingPort
+	{
+		get
+		{
+			Check();
+			return Native.NETRCV_Port(ptr);
+		}
+	}
+
+	public string incomingAddress => GetAddress(incomingGUID);
+
+	public virtual int incomingBits
+	{
+		get
+		{
+			Check();
+			return Native.NETRCV_LengthBits(ptr);
+		}
+	}
+
+	public virtual int incomingBitsUnread
+	{
+		get
+		{
+			Check();
+			return Native.NETRCV_UnreadBits(ptr);
+		}
+	}
+
+	public virtual int incomingBytes => incomingBits / 8;
+
+	public virtual int incomingBytesUnread => incomingBitsUnread / 8;
+
+	public static Peer CreateServer(string ip, int port, int maxConnections)
+	{
+		Peer peer = new Peer();
+		peer.ptr = Native.NET_Create();
+		if (Native.NET_StartServer(peer.ptr, ip, port, maxConnections) == 0)
+		{
+			return peer;
+		}
+		peer.Close();
+		string text = StringFromPointer(Native.NET_LastStartupError(peer.ptr));
+		Debug.LogWarning("Couldn't create server on port " + port + " (" + text + ")");
+		return null;
+	}
+
+	public static Peer CreateConnection(string hostname, int port, int retries, int retryDelay, int timeout)
+	{
+		Peer peer = new Peer();
+		peer.ptr = Native.NET_Create();
+		if (Native.NET_StartClient(peer.ptr, hostname, port, retries, retryDelay, timeout) == 0)
+		{
+			return peer;
+		}
+		string text = StringFromPointer(Native.NET_LastStartupError(peer.ptr));
+		Debug.LogWarning("Couldn't connect to server " + hostname + ":" + port + " (" + text + ")");
+		peer.Close();
+		peer = null;
+		return null;
+	}
+
+	public void Close()
+	{
+		if (ptr != IntPtr.Zero)
+		{
+			Native.NET_Close(ptr);
+			ptr = IntPtr.Zero;
+		}
+	}
+
+	public uint PendingReceiveCount()
+	{
+		if (ptr == IntPtr.Zero)
+		{
+			return 0u;
+		}
+		return Native.NET_GetReceiveBufferSize(ptr);
+	}
+
+	public bool Receive()
+	{
+		if (ptr == IntPtr.Zero)
+		{
+			return false;
+		}
+		return Native.NET_Receive(ptr);
+	}
+
+	public virtual void SetReadPos(int bitsOffset)
+	{
+		Check();
+		Native.NETRCV_SetReadPointer(ptr, bitsOffset);
+	}
+
+	protected unsafe virtual bool Read(byte* data, int length)
+	{
+		Check();
+		return Native.NETRCV_ReadBytes(ptr, data, length);
+	}
+
+	public unsafe int ReadBytes(byte[] buffer, int offset, int length)
+	{
+		fixed (byte* ptr = buffer)
+		{
+			if (!Read(ptr + offset, length))
+			{
+				return 0;
+			}
+		}
+		return length;
+	}
+
+	public unsafe byte ReadByte()
+	{
+		fixed (byte* byteBuffer = ByteBuffer)
+		{
+			if (!Read(byteBuffer, 1))
+			{
+				return 0;
+			}
+		}
+		return ByteBuffer[0];
+	}
+
+	public virtual IntPtr RawData()
+	{
+		Check();
+		return Native.NETRCV_RawData(ptr);
+	}
+
+	public unsafe int ReadBytes(MemoryStream memoryStream, int length)
+	{
+		if (memoryStream.Capacity < length)
+		{
+			memoryStream.Capacity = length + 32;
+		}
+		fixed (byte* buffer = memoryStream.GetBuffer())
+		{
+			memoryStream.SetLength(memoryStream.Capacity);
+			if (!Read(buffer, length))
+			{
+				return 0;
+			}
+			memoryStream.SetLength(length);
+		}
+		return length;
+	}
+
+	public virtual void SendStart()
+	{
+		Check();
+		Native.NETSND_Start(ptr);
+	}
+
+	public unsafe void WriteByte(byte val)
+	{
+		Write(&val, 1);
+	}
+
+	public unsafe void WriteBytes(byte[] val, int offset, int length)
+	{
+		fixed (byte* ptr = val)
+		{
+			Write(ptr + offset, length);
+		}
+	}
+
+	public unsafe void WriteBytes(byte[] val)
+	{
+		fixed (byte* data = val)
+		{
+			Write(data, val.Length);
+		}
+	}
+
+	public void WriteBytes(MemoryStream stream)
+	{
+		WriteBytes(stream.GetBuffer(), 0, (int)stream.Length);
+	}
+
+	protected unsafe virtual void Write(byte* data, int size)
+	{
+		if (size != 0 && data != null)
+		{
+			Check();
+			Native.NETSND_WriteBytes(ptr, data, size);
+		}
+	}
+
+	public virtual uint SendBroadcast(Priority priority, SendMethod reliability, sbyte channel)
+	{
+		Check();
+		return Native.NETSND_Broadcast(ptr, ToRaknetPriority(priority), ToRaknetPacketReliability(reliability), channel);
+	}
+
+	public virtual uint SendTo(ulong guid, Priority priority, SendMethod reliability, sbyte channel)
+	{
+		Check();
+		return Native.NETSND_Send(ptr, guid, ToRaknetPriority(priority), ToRaknetPacketReliability(reliability), channel);
+	}
+
+	public unsafe void SendUnconnectedMessage(byte* data, int length, uint adr, ushort port)
+	{
+		Check();
+		Native.NET_SendMessage(ptr, data, length, adr, port);
+	}
+
+	public string GetAddress(ulong guid)
+	{
+		Check();
+		return StringFromPointer(Native.NET_GetAddress(ptr, guid));
+	}
+
+	private static string StringFromPointer(IntPtr p)
+	{
+		if (p == IntPtr.Zero)
+		{
+			return string.Empty;
+		}
+		return Marshal.PtrToStringAnsi(p);
+	}
+
+	public int ToRaknetPriority(Priority priority)
+	{
+		return priority switch
+		{
+			Priority.Immediate => 0, 
+			Priority.Normal => 2, 
+			_ => 2, 
+		};
+	}
+
+	public int ToRaknetPacketReliability(SendMethod reliability)
+	{
+		return reliability switch
+		{
+			SendMethod.Reliable => 3, 
+			SendMethod.ReliableUnordered => 2, 
+			SendMethod.Unreliable => 0, 
+			_ => 3, 
+		};
+	}
+
+	public void Kick(Connection connection)
+	{
+		Check();
+		Native.NET_CloseConnection(ptr, connection.guid);
+	}
+
+	protected virtual void Check()
+	{
+		if (ptr == IntPtr.Zero)
+		{
+			throw new NullReferenceException("Peer has already shut down!");
+		}
+	}
+
+	public virtual string GetStatisticsString(ulong guid)
+	{
+		Check();
+		return $"Average Ping:\t\t{GetPingAverage(guid)}\nLast Ping:\t\t{GetPingLast(guid)}\nLowest Ping:\t\t{GetPingLowest(guid)}\n{StringFromPointer(Native.NET_GetStatisticsString(ptr, guid))}";
+	}
+
+	public virtual int GetPingAverage(ulong guid)
+	{
+		Check();
+		return Native.NET_GetAveragePing(ptr, guid);
+	}
+
+	public virtual int GetPingLast(ulong guid)
+	{
+		Check();
+		return Native.NET_GetLastPing(ptr, guid);
+	}
+
+	public virtual int GetPingLowest(ulong guid)
+	{
+		Check();
+		return Native.NET_GetLowestPing(ptr, guid);
+	}
+
+	public unsafe virtual Native.RaknetStats GetStatistics(ulong guid)
+	{
+		Check();
+		Native.RaknetStats data = default(Native.RaknetStats);
+		int dataLength = sizeof(Native.RaknetStats);
+		if (!Native.NET_GetStatistics(ptr, guid, ref data, dataLength))
+		{
+			Debug.Log("NET_GetStatistics:  Wrong size " + dataLength);
+		}
+		return data;
+	}
+
+	public unsafe virtual ulong GetStat(Connection connection, BaseNetwork.StatTypeLong type)
+	{
+		Check();
+		Native.RaknetStats raknetStats = ((connection == null) ? GetStatistics(0uL) : GetStatistics(connection.guid));
+		switch (type)
+		{
+		case BaseNetwork.StatTypeLong.BytesReceived:
+			return raknetStats.runningTotal[6];
+		case BaseNetwork.StatTypeLong.BytesReceived_LastSecond:
+			return raknetStats.valueOverLastSecond[6];
+		case BaseNetwork.StatTypeLong.BytesSent:
+			return raknetStats.runningTotal[5];
+		case BaseNetwork.StatTypeLong.BytesSent_LastSecond:
+			return raknetStats.valueOverLastSecond[5];
+		case BaseNetwork.StatTypeLong.BytesInSendBuffer:
+			return (ulong)raknetStats.bytesInSendBuffer;
+		case BaseNetwork.StatTypeLong.BytesInResendBuffer:
+			return raknetStats.bytesInResendBuffer;
+		case BaseNetwork.StatTypeLong.PacketLossAverage:
+			return (ulong)raknetStats.packetlossTotal * 10000;
+		case BaseNetwork.StatTypeLong.PacketLossLastSecond:
+			return (ulong)raknetStats.packetlossLastSecond * 10000;
+		case BaseNetwork.StatTypeLong.ThrottleBytes:
+			if (raknetStats.isLimitedByCongestionControl == 0)
+			{
+				return 0uL;
+			}
+			return raknetStats.BPSLimitByCongestionControl;
+		default:
+			return 0uL;
+		}
+	}
+}

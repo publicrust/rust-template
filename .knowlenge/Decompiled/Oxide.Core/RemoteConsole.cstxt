@@ -1,0 +1,191 @@
+using System;
+using System.Linq;
+using System.Net;
+using Oxide.Core;
+using Oxide.Core.Configuration;
+using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.RemoteConsole;
+using WebSocketSharp;
+using WebSocketSharp.Net.WebSockets;
+using WebSocketSharp.Server;
+
+public class RemoteConsole
+{
+	private struct RconPlayer
+	{
+		private string SteamID { get; }
+
+		private string OwnerSteamID { get; }
+
+		private string DisplayName { get; }
+
+		private string Address { get; }
+
+		private int Ping { get; }
+
+		private int ConnectedSeconds { get; }
+
+		private float VoiationLevel { get; }
+
+		private float CurrentLevel { get; }
+
+		private float UnspentXp { get; }
+
+		private float Health { get; }
+
+		public RconPlayer(IPlayer player)
+		{
+			SteamID = player.Id;
+			OwnerSteamID = "0";
+			DisplayName = player.Name;
+			Address = player.Address;
+			Ping = player.Ping;
+			ConnectedSeconds = 0;
+			VoiationLevel = 0f;
+			CurrentLevel = 0f;
+			UnspentXp = 0f;
+			Health = player.Health;
+		}
+	}
+
+	public class RconListener : WebSocketBehavior
+	{
+		private readonly RemoteConsole Parent;
+
+		private IPAddress Address;
+
+		public RconListener(RemoteConsole parent)
+		{
+			base.IgnoreExtensions = true;
+			Parent = parent;
+		}
+
+		public void SendMessage(RemoteMessage message)
+		{
+			base.Sessions.Broadcast(message.ToJSON());
+		}
+
+		protected override void OnClose(CloseEventArgs e)
+		{
+			string arg = (string.IsNullOrEmpty(e.Reason) ? "Unknown" : e.Reason);
+			Interface.Oxide.LogInfo($"[Rcon] Connection from {Address} closed: {arg} ({e.Code})");
+		}
+
+		protected override void OnError(ErrorEventArgs e)
+		{
+			Interface.Oxide.LogException(e.Message, e.Exception);
+		}
+
+		protected override void OnMessage(MessageEventArgs e)
+		{
+			Parent?.OnMessage(e, base.Context);
+		}
+
+		protected override void OnOpen()
+		{
+			Address = base.Context.UserEndPoint.Address;
+			Interface.Oxide.LogInfo($"[Rcon] New connection from {Address}");
+		}
+	}
+
+	private readonly Covalence covalence = Interface.Oxide.GetLibrary<Covalence>();
+
+	private readonly OxideConfig.OxideRcon config = Interface.Oxide.Config.Rcon;
+
+	private RconListener listener;
+
+	private WebSocketServer server;
+
+	public void Initalize()
+	{
+		if (!config.Enabled || listener != null || server != null)
+		{
+			return;
+		}
+		if (string.IsNullOrEmpty(config.Password))
+		{
+			Interface.Oxide.LogWarning("[Rcon] Remote console password is not set, disabling");
+			return;
+		}
+		try
+		{
+			server = new WebSocketServer(config.Port)
+			{
+				WaitTime = TimeSpan.FromSeconds(5.0),
+				ReuseAddress = true
+			};
+			server.AddWebSocketService("/" + config.Password, () => listener = new RconListener(this));
+			server.Start();
+			Interface.Oxide.LogInfo($"[Rcon] Server started successfully on port {server.Port}");
+		}
+		catch (Exception ex)
+		{
+			Interface.Oxide.LogException($"[Rcon] Failed to start server on port {server?.Port}", ex);
+			RemoteLogger.Exception($"Failed to start RCON server on port {server?.Port}", ex);
+		}
+	}
+
+	public void Shutdown(string reason = "Server shutting down", CloseStatusCode code = CloseStatusCode.Normal)
+	{
+		if (server != null)
+		{
+			server.Stop(code, reason);
+			server = null;
+			listener = null;
+			Interface.Oxide.LogInfo($"[Rcon] Service has stopped: {reason} ({code})");
+		}
+	}
+
+	public void SendMessage(RemoteMessage message)
+	{
+		if (message != null && server != null && server.IsListening && listener != null)
+		{
+			listener.SendMessage(message);
+		}
+	}
+
+	public void SendMessage(string message, int identifier)
+	{
+		if (!string.IsNullOrEmpty(message) && server != null && server.IsListening && listener != null)
+		{
+			listener.SendMessage(RemoteMessage.CreateMessage(message, identifier));
+		}
+	}
+
+	public void SendMessage(WebSocketContext connection, string message, int identifier)
+	{
+		if (!string.IsNullOrEmpty(message) && server != null && server.IsListening && listener != null)
+		{
+			connection?.WebSocket?.Send(RemoteMessage.CreateMessage(message, identifier).ToJSON());
+		}
+	}
+
+	private void OnMessage(MessageEventArgs e, WebSocketContext connection)
+	{
+		if (covalence == null)
+		{
+			Interface.Oxide.LogError("[Rcon] Failed to process command, Covalence is null");
+			return;
+		}
+		RemoteMessage message = RemoteMessage.GetMessage(e.Data);
+		if (message == null)
+		{
+			Interface.Oxide.LogError("[Rcon] Failed to process command, RemoteMessage is null");
+			return;
+		}
+		if (string.IsNullOrEmpty(message.Message))
+		{
+			Interface.Oxide.LogError("[Rcon] Failed to process command, RemoteMessage.Text is not set");
+			return;
+		}
+		string[] array = CommandLine.Split(message.Message);
+		string text = array[0].ToLower();
+		string[] array2 = array.Skip(1).ToArray();
+		if (Interface.CallHook("OnRconCommand", connection.UserEndPoint, text, array2) == null)
+		{
+			IServer obj = covalence.Server;
+			object[] args = array2;
+			obj.Command(text, args);
+		}
+	}
+}

@@ -1,0 +1,368 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using Network;
+using SilentOrbit.ProtocolBuffers;
+using UnityEngine;
+
+public class Connection
+{
+	public enum State
+	{
+		Unconnected,
+		Connecting,
+		InQueue,
+		Welcoming,
+		Connected,
+		Disconnected
+	}
+
+	public struct Validation
+	{
+		public uint entityUpdates;
+	}
+
+	public class ClientInfo
+	{
+		public Dictionary<string, string> info = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+		private int length;
+
+		public void Set(string k, string v)
+		{
+			if (info.TryGetValue(k, out var value))
+			{
+				length -= k.Length + value.Length;
+				info.Remove(v);
+			}
+			if (length + k.Length + v.Length <= MaxClientInfoSize)
+			{
+				length += k.Length + v.Length;
+				info[k] = v;
+			}
+		}
+
+		public string GetString(string k, string def = "")
+		{
+			if (info.TryGetValue(k, out var value))
+			{
+				return value;
+			}
+			return def;
+		}
+
+		public float GetFloat(string k, float def = 0f)
+		{
+			string @string = GetString(k, null);
+			if (@string == null)
+			{
+				return def;
+			}
+			if (float.TryParse(@string, out var result))
+			{
+				return result;
+			}
+			return def;
+		}
+
+		public int GetInt(string k, int def = 0)
+		{
+			string @string = GetString(k, null);
+			if (@string == null)
+			{
+				return def;
+			}
+			if (int.TryParse(@string, out var result))
+			{
+				return result;
+			}
+			return def;
+		}
+
+		public bool GetBool(string k, bool def = false)
+		{
+			string @string = GetString(k, null);
+			if (@string == null)
+			{
+				return def;
+			}
+			if (bool.TryParse(@string, out var result))
+			{
+				return result;
+			}
+			return def;
+		}
+	}
+
+	private static readonly object recordLock = new object();
+
+	private static MemoryStream reusableStream = new MemoryStream(4194304);
+
+	protected MemoryStream recordStream;
+
+	protected BinaryWriter recordWriter;
+
+	protected Stopwatch recordTime;
+
+	protected string recordFilename;
+
+	protected IDemoHeader recordHeader;
+
+	public static int MaxClientInfoSize = 1048576;
+
+	public State state;
+
+	public bool active;
+
+	public bool connected;
+
+	public uint authLevel;
+
+	public uint encryptionLevel;
+
+	public bool trusted;
+
+	public bool rejected;
+
+	public byte[] token;
+
+	public string anticheatId;
+
+	public string anticheatToken;
+
+	public bool hasRequestedWorld;
+
+	public bool globalNetworking;
+
+	public bool canReserveSlot = true;
+
+	public string authStatusSteam;
+
+	public string authStatusEAC;
+
+	public string authStatusNexus;
+
+	public string authStatusCentralizedBans;
+
+	public string authStatusPremiumServer;
+
+	public ulong guid;
+
+	public ulong userid;
+
+	public ulong ownerid;
+
+	public string username;
+
+	public string os;
+
+	public uint protocol;
+
+	public int clientChangeset;
+
+	public long clientBuildTime;
+
+	private TimeAverageValueData[] packetsPerSecond = new TimeAverageValueData[27];
+
+	public double connectionTime;
+
+	public double lastPremiumCheckTime;
+
+	public string ipaddress;
+
+	public MonoBehaviour player;
+
+	public Validation validate;
+
+	public ClientInfo info = new ClientInfo();
+
+	public TimeSpan RecordTimeElapsed
+	{
+		get
+		{
+			if (recordTime == null)
+			{
+				return TimeSpan.Zero;
+			}
+			return recordTime.Elapsed;
+		}
+	}
+
+	public string RecordFilename => recordFilename;
+
+	public int RecordFilesize => (int)recordStream.Length;
+
+	public bool IsRecording => recordStream != null;
+
+	public bool isAuthenticated
+	{
+		get
+		{
+			if (authStatusSteam == "ok" && authStatusEAC == "ok" && authStatusNexus == "ok" && authStatusCentralizedBans == "ok")
+			{
+				return authStatusPremiumServer == "ok";
+			}
+			return false;
+		}
+	}
+
+	public bool StartRecording(string targetFilename, IDemoHeader header)
+	{
+		lock (recordLock)
+		{
+			if (recordStream != null)
+			{
+				return false;
+			}
+			recordFilename = targetFilename;
+			recordHeader = header;
+			recordStream = new MemoryStream();
+			recordWriter = new BinaryWriter(recordStream);
+			recordTime = Stopwatch.StartNew();
+			return true;
+		}
+	}
+
+	public void StopRecording()
+	{
+		lock (recordLock)
+		{
+			if (recordStream == null)
+			{
+				return;
+			}
+			if (recordHeader != null)
+			{
+				Directory.CreateDirectory(Path.GetDirectoryName(recordFilename));
+				using (FileStream fileStream = new FileStream(recordFilename, FileMode.Create))
+				{
+					using BinaryWriter writer = new BinaryWriter(fileStream);
+					recordHeader.Length = (long)recordTime.Elapsed.TotalMilliseconds;
+					recordHeader.Write(writer);
+					recordStream.WriteTo(fileStream);
+				}
+				recordHeader = null;
+			}
+			recordTime = null;
+			recordWriter.Close();
+			recordWriter = null;
+			recordStream.Dispose();
+			recordStream = null;
+			recordFilename = null;
+		}
+	}
+
+	public void RecordPacket(byte packetId, IProto proto)
+	{
+		lock (recordLock)
+		{
+			if (IsRecording)
+			{
+				reusableStream.SetLength(0L);
+				proto.WriteToStream(reusableStream);
+				byte[] buffer = reusableStream.GetBuffer();
+				int num = (int)reusableStream.Length;
+				recordWriter.Write(num + 1);
+				recordWriter.Write((long)recordTime.Elapsed.TotalMilliseconds);
+				recordWriter.Write((byte)(packetId + 140));
+				recordWriter.Write(buffer, 0, num);
+				recordWriter.Write('\0');
+				recordWriter.Write('\0');
+			}
+		}
+	}
+
+	public void RecordPacket(Stream stream)
+	{
+		lock (recordLock)
+		{
+			if (IsRecording)
+			{
+				byte[] buffer = reusableStream.GetBuffer();
+				int num = (int)stream.Length;
+				long position = stream.Position;
+				stream.Position = 0L;
+				stream.Read(buffer, 0, num);
+				stream.Position = position;
+				recordWriter.Write(num);
+				recordWriter.Write((long)recordTime.Elapsed.TotalMilliseconds);
+				recordWriter.Write(buffer, 0, num);
+				recordWriter.Write('\0');
+				recordWriter.Write('\0');
+			}
+		}
+	}
+
+	public string IPAddressWithoutPort()
+	{
+		int num = ipaddress.LastIndexOf(':');
+		if (num != -1)
+		{
+			return ipaddress.Substring(0, num);
+		}
+		return ipaddress;
+	}
+
+	public virtual void OnDisconnected()
+	{
+		player = null;
+		guid = 0uL;
+		ResetPacketsPerSecond();
+		hasRequestedWorld = false;
+	}
+
+	public void ResetPacketsPerSecond()
+	{
+		for (int i = 0; i < packetsPerSecond.Length; i++)
+		{
+			packetsPerSecond[i].Reset();
+		}
+	}
+
+	public void AddPacketsPerSecond(Message.Type message)
+	{
+		AddPacketsPerSecond((int)message);
+	}
+
+	public void AddPacketsPerSecond(int index = 0)
+	{
+		if (index >= 0 && index < packetsPerSecond.Length)
+		{
+			packetsPerSecond[index].Increment();
+		}
+	}
+
+	public ulong GetPacketsPerSecond(Message.Type message)
+	{
+		return GetPacketsPerSecond((int)message);
+	}
+
+	public ulong GetPacketsPerSecond(int index = 0)
+	{
+		if (index < 0 || index >= packetsPerSecond.Length)
+		{
+			return 0uL;
+		}
+		return packetsPerSecond[index].Calculate();
+	}
+
+	public float GetSecondsConnected()
+	{
+		return (float)(TimeEx.realtimeSinceStartup - connectionTime);
+	}
+
+	public bool IsDevelopmentBuild()
+	{
+		if (authLevel >= 3)
+		{
+			return os == "editor";
+		}
+		return false;
+	}
+
+	public override string ToString()
+	{
+		return $"{ipaddress}/{userid}/{username}";
+	}
+}

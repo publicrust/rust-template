@@ -1,0 +1,237 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Rust.Platform.Common;
+using Rust.Platform.Steam;
+using Steamworks;
+using Steamworks.Data;
+using UnityEngine;
+
+public class SteamPlatform : IPlatformService
+{
+	private IPlatformHooks _hooks;
+
+	private bool _initialized;
+
+	public bool IsValid => SteamServer.IsValid;
+
+	public IReadOnlyList<IPlayerItemDefinition> ItemDefinitions { get; private set; }
+
+	public bool Initialize(IPlatformHooks hooks)
+	{
+		if (_hooks != null && _hooks != hooks)
+		{
+			throw new InvalidOperationException("SteamPlatform was initialized with two different platform hooks");
+		}
+		_hooks = hooks ?? throw new ArgumentNullException("hooks");
+		StartSteamServer();
+		if (!_initialized)
+		{
+			Steamworks.SteamInventory.OnDefinitionsUpdated += OnDefinitionsUpdated;
+			Steamworks.SteamInventory.LoadItemDefinitions();
+			Dispatch.OnException = delegate(Exception e)
+			{
+				Debug.LogException(e);
+			};
+			_initialized = true;
+		}
+		return true;
+	}
+
+	public void Shutdown()
+	{
+		using (TimeWarning.New("Steamworks.SteamServer.Shutdown"))
+		{
+			if (SteamServer.IsValid)
+			{
+				Debug.Log("Steamworks Shutting Down");
+				SteamServer.Shutdown();
+				Debug.Log("Okay");
+			}
+		}
+	}
+
+	public void Update()
+	{
+		if (SteamServer.IsValid)
+		{
+			SteamServer.RunCallbacks();
+		}
+	}
+
+	private static AuthResponse RemapAuthResponse(Steamworks.AuthResponse response)
+	{
+		return response switch
+		{
+			Steamworks.AuthResponse.OK => AuthResponse.OK, 
+			Steamworks.AuthResponse.VACBanned => AuthResponse.VACBanned, 
+			Steamworks.AuthResponse.PublisherIssuedBan => AuthResponse.PublisherBanned, 
+			Steamworks.AuthResponse.VACCheckTimedOut => AuthResponse.TimedOut, 
+			Steamworks.AuthResponse.AuthTicketCanceled => AuthResponse.AuthTicketCanceled, 
+			Steamworks.AuthResponse.AuthTicketInvalidAlreadyUsed => AuthResponse.AuthTicketAlreadyUsed, 
+			Steamworks.AuthResponse.AuthTicketInvalid => AuthResponse.InvalidAuthSession, 
+			Steamworks.AuthResponse.AuthTicketNetworkIdentityFailure => AuthResponse.NetworkIdentityFailure, 
+			_ => AuthResponse.Invalid, 
+		};
+	}
+
+	private static void DebugPrintSteamCallback(CallbackType type, string content, bool isServer)
+	{
+		string arg = (isServer ? "SteamServer" : "SteamClient");
+		Debug.Log($"[{arg}] {type}: {content}");
+	}
+
+	public bool PlayerOwnsDownloadableContent(ulong userId, int appId)
+	{
+		UserHasLicenseForAppResult userHasLicenseForAppResult = SteamServer.UserHasLicenseForApp(userId, appId);
+		if (userHasLicenseForAppResult == UserHasLicenseForAppResult.NoAuth)
+		{
+			Debug.LogWarning($"User tried to check DLC license but not authed ({userId})");
+			return false;
+		}
+		return userHasLicenseForAppResult == UserHasLicenseForAppResult.HasLicense;
+	}
+
+	public void RefreshItemDefinitions()
+	{
+		Steamworks.SteamInventory.LoadItemDefinitions();
+	}
+
+	public IPlayerItemDefinition GetItemDefinition(int definitionId)
+	{
+		if (ItemDefinitions == null)
+		{
+			return null;
+		}
+		foreach (IPlayerItemDefinition itemDefinition in ItemDefinitions)
+		{
+			if (itemDefinition.DefinitionId == definitionId)
+			{
+				return itemDefinition;
+			}
+		}
+		return null;
+	}
+
+	private void OnDefinitionsUpdated()
+	{
+		ItemDefinitions = Steamworks.SteamInventory.Definitions.Select((InventoryDef d) => new SteamItemDefinition(d)).ToList();
+		_hooks.OnItemDefinitionsChanged();
+	}
+
+	public async Task<IPlayerInventory> DeserializeInventory(byte[] data)
+	{
+		InventoryResult? inventoryResult = await Steamworks.SteamInventory.DeserializeAsync(data);
+		return inventoryResult.HasValue ? new Rust.Platform.Steam.SteamInventory(inventoryResult.Value) : null;
+	}
+
+	private void StartSteamServer()
+	{
+		if (SteamServer.IsValid)
+		{
+			return;
+		}
+		ServerParameters? serverParameters = _hooks.ServerParameters;
+		if (serverParameters.HasValue)
+		{
+			ServerParameters value = serverParameters.Value;
+			SteamServerInit init = new SteamServerInit(value.ShortName, value.FullName);
+			init.IpAddress = value.Address;
+			init.GamePort = value.GamePort;
+			init.Secure = value.IsSecure;
+			init.VersionString = value.Version;
+			if (value.QueryPort > 0)
+			{
+				init.QueryPort = value.QueryPort;
+			}
+			else
+			{
+				init = init.WithQueryShareGamePort();
+			}
+			try
+			{
+				SteamServer.Init(_hooks.SteamAppId, init, asyncCallbacks: false);
+			}
+			catch (Exception ex)
+			{
+				Debug.LogWarning("Couldn't initialize Steam Server (" + ex.Message + ")");
+				_hooks.Abort();
+				return;
+			}
+			SteamServer.OnSteamServerConnectFailure += OnSteamConnectionFailure;
+			SteamServer.OnSteamServersDisconnected += OnSteamServersDisconnected;
+			SteamServer.OnSteamServersConnected += OnSteamConnected;
+			SteamServer.DedicatedServer = true;
+			if (value.HideIP)
+			{
+				SteamNetworkingSockets.RequestFakeIP();
+			}
+			SteamServer.LogOnAnonymous();
+			SteamServer.OnValidateAuthTicketResponse += delegate(SteamId steamId, SteamId ownerSteamId, Steamworks.AuthResponse response)
+			{
+				_hooks.AuthSessionValidated(steamId, ownerSteamId, RemapAuthResponse(response), response.ToString());
+			};
+		}
+	}
+
+	private void OnSteamServersDisconnected(Result result)
+	{
+		Debug.LogWarning($"SteamServer Disconnected ({result})");
+	}
+
+	private void OnSteamConnected()
+	{
+		Debug.Log("SteamServer Connected");
+	}
+
+	private void OnSteamConnectionFailure(Result result, bool stilltrying)
+	{
+		Debug.LogWarning($"SteamServer Connection Failure ({result})");
+	}
+
+	public bool BeginPlayerSession(ulong userId, byte[] authToken)
+	{
+		return SteamServer.BeginAuthSession(authToken, userId);
+	}
+
+	public void UpdatePlayerSession(ulong userId, string userName)
+	{
+		SteamServer.UpdatePlayer(userId, userName, 0);
+	}
+
+	public void EndPlayerSession(ulong userId)
+	{
+		SteamServer.EndSession(userId);
+	}
+
+	internal static ServerInfo ToPlatformServer(Steamworks.Data.ServerInfo info)
+	{
+		return new ServerInfo(info.AppId, info.Name, info.Address, info.ConnectionPort, info.QueryPort, info.Map, info.TagString, info.Secure, info.Players, info.MaxPlayers, info.LastTimePlayed, info.Ping, info.SteamId);
+	}
+
+	internal static Steamworks.Data.ServerInfo ToSteamServer(ServerInfo server)
+	{
+		return new Steamworks.Data.ServerInfo(server.AddressRaw, (ushort)server.ConnectionPort, (ushort)server.QueryPort, 0u);
+	}
+
+	public async Task<bool> LoadPlayerStats(ulong userId)
+	{
+		return await SteamServerStats.RequestUserStatsAsync(userId) == Result.OK;
+	}
+
+	public async Task<bool> SavePlayerStats(ulong userId)
+	{
+		return await SteamServerStats.StoreUserStats(userId) == Result.OK;
+	}
+
+	public long GetPlayerStatInt(ulong userId, string key, long defaultValue = 0L)
+	{
+		return SteamServerStats.GetInt(userId, key, (int)defaultValue);
+	}
+
+	public bool SetPlayerStatInt(ulong userId, string key, long value)
+	{
+		return SteamServerStats.SetInt(userId, key, (int)value);
+	}
+}

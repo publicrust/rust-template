@@ -1,0 +1,534 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Facepunch;
+using Facepunch.Extend;
+using Facepunch.Utility;
+using Rust;
+using Rust.Components.Camera;
+using Rust.UI;
+using Rust.Workshop;
+using Rust.Workshop.Editor;
+using UnityEngine;
+using UnityEngine.UI;
+
+public class WorkshopItemEditor : SingletonComponent<WorkshopItemEditor>
+{
+	public static Action<bool, string> OnLoading;
+
+	public UnityEngine.UI.Dropdown ItemTypeSelector;
+
+	public InputField ItemTitleLabel;
+
+	public WorkshopViewmodelControls ViewmodelControls;
+
+	public GameObject MaterialTabHolder;
+
+	public GameObject FileDialogObject;
+
+	public GameObject[] EditorElements;
+
+	public GameObject[] ClothOnlyElements;
+
+	public GameObject[] DetailOnlyElements;
+
+	public GameObject[] DirtOnlyElements;
+
+	public Toggle[] MaterialTabs;
+
+	public int EditingMaterial;
+
+	public GameObject item_position_a;
+
+	public GameObject item_position_b;
+
+	private static readonly Regex ModelCleanup = new Regex("(_mesh)?(_LOD0)?$", RegexOptions.IgnoreCase);
+
+	internal GameObject Prefab { get; set; }
+
+	internal GameObject ViewModel { get; set; }
+
+	internal Skinnable Skinnable { get; set; }
+
+	internal Skin Skin { get; set; }
+
+	internal ulong ItemId { get; set; }
+
+	protected WorkshopInterface Interface => GetComponentInParent<WorkshopInterface>();
+
+	internal Publisher Publisher => GetComponentInChildren<Publisher>(includeInactive: true);
+
+	public FileDialog FileDialog => FileDialogObject.GetComponent<FileDialog>();
+
+	public string ItemTitle
+	{
+		get
+		{
+			return ItemTitleLabel.text;
+		}
+		set
+		{
+			ItemTitleLabel.text = value;
+		}
+	}
+
+	public string ChangeLog
+	{
+		get
+		{
+			return Publisher.ChangeLog.text;
+		}
+		set
+		{
+			Publisher.ChangeLog.text = value;
+		}
+	}
+
+	internal static void Loading(bool v1, string v2, string v3, float v4)
+	{
+		OnLoading?.Invoke(v1, v2);
+	}
+
+	private void OnEnable()
+	{
+		ItemTypeSelector.ClearOptions();
+		ItemTypeSelector.AddOptions((from x in Skinnable.All
+			where !x.HideInWorkshopUpload
+			select x.Name into x
+			orderby x
+			select x).ToList());
+		MaterialTabs = MaterialTabHolder.GetComponentsInChildren<Toggle>(includeInactive: true);
+	}
+
+	private void ClearEditor()
+	{
+		if (Prefab != null)
+		{
+			UnityEngine.Object.Destroy(Prefab);
+			Prefab = null;
+		}
+		if (ViewModel != null)
+		{
+			UnityEngine.Object.Destroy(ViewModel);
+			ViewModel = null;
+		}
+		ItemId = 0uL;
+		GetComponent<WorkshopPlayerPreview>().Cleanup();
+		ItemTitle = "";
+		Skinnable = null;
+		ChangeLog = "";
+		GetComponentInChildren<WorkshopView>(includeInactive: true).Clear();
+	}
+
+	public void StartNewItem(string type = "TShirt")
+	{
+		Skin = null;
+		ClearEditor();
+		LoadItemType(type);
+		OnImportFinished();
+		ShowEditor();
+	}
+
+	public IEnumerator StartViewingItem(IWorkshopContent item)
+	{
+		Skin = null;
+		ClearEditor();
+		HideEditor();
+		yield return StartCoroutine(OpenItem(item));
+		OnImportFinished();
+	}
+
+	public IEnumerator StartEditingItem(IWorkshopContent item)
+	{
+		Skin = null;
+		ClearEditor();
+		ShowEditor();
+		yield return StartCoroutine(OpenItem(item));
+		OnImportFinished();
+	}
+
+	private void HideEditor()
+	{
+		GameObject[] editorElements = EditorElements;
+		for (int i = 0; i < editorElements.Length; i++)
+		{
+			editorElements[i].SetActive(value: false);
+		}
+	}
+
+	private void ShowEditor()
+	{
+		GameObject[] editorElements = EditorElements;
+		for (int i = 0; i < editorElements.Length; i++)
+		{
+			editorElements[i].SetActive(value: true);
+		}
+	}
+
+	internal IEnumerator OpenItem(IWorkshopContent item)
+	{
+		if (!LoadItemType(item.Tags))
+		{
+			Debug.Log("Couldn't LoadItemType (" + string.Join(";", item.Tags) + ")");
+			ClearEditor();
+			Loading(v1: false, "", "", 0f);
+		}
+		yield break;
+	}
+
+	private void OnImportFinished()
+	{
+		if (Skin == null)
+		{
+			GetComponentInChildren<WorkshopView>(includeInactive: true).UpdateFrom(null);
+			return;
+		}
+		EditingMaterial = 0;
+		Skin.Skinnable = Skinnable;
+		Skin.Apply(Prefab);
+		UpdateMaterialRows();
+		InitScene();
+	}
+
+	internal Texture2D SetTexture(string paramName, string fullName, bool isNormalMap)
+	{
+		byte[] array = File.ReadAllBytes(fullName);
+		if (array == null)
+		{
+			throw new Exception("Couldn't Load Data");
+		}
+		Texture2D texture2D = new Texture2D(2, 2, TextureFormat.ARGB32, mipChain: true, isNormalMap);
+		if (!texture2D.LoadImage(array))
+		{
+			throw new Exception("Couldn't Load Image");
+		}
+		texture2D.name = fullName;
+		texture2D = Facepunch.Utility.Texture.LimitSize(texture2D, Skinnable.Groups[EditingMaterial].MaxTextureSize, Skinnable.Groups[EditingMaterial].MaxTextureSize);
+		texture2D.anisoLevel = 16;
+		texture2D.filterMode = FilterMode.Trilinear;
+		SetTexture(paramName, texture2D);
+		return texture2D;
+	}
+
+	internal void SetFloat(string paramName, float value)
+	{
+		Skin.Materials[EditingMaterial].SetFloat(paramName, value);
+		if (paramName == "_Cutoff")
+		{
+			if (value > 0.1f)
+			{
+				Skin.Materials[EditingMaterial].SetOverrideTag("RenderType", "TransparentCutout");
+				Skin.Materials[EditingMaterial].EnableKeyword("_ALPHATEST_ON");
+				Skin.Materials[EditingMaterial].renderQueue = 2450;
+			}
+			else
+			{
+				Skin.Materials[EditingMaterial].SetOverrideTag("RenderType", "");
+				Skin.Materials[EditingMaterial].DisableKeyword("_ALPHATEST_ON");
+				Skin.Materials[EditingMaterial].renderQueue = -1;
+			}
+		}
+		if (paramName == "_MicrofiberFuzzIntensity")
+		{
+			if (value > 0.1f)
+			{
+				Skin.Materials[EditingMaterial].EnableKeyword("_MICROFIBERFUZZLAYER_ON");
+			}
+			else
+			{
+				Skin.Materials[EditingMaterial].DisableKeyword("_MICROFIBERFUZZLAYER_ON");
+			}
+		}
+	}
+
+	internal void SetColor(string paramName, Color val)
+	{
+		Skin.Materials[EditingMaterial].SetColor(paramName, val);
+	}
+
+	internal void SetTexture(string paramName, UnityEngine.Texture tex)
+	{
+		Skin.Materials[EditingMaterial].SetTexture(paramName, tex);
+		if (paramName == "_EmissionMap" && tex != null)
+		{
+			Skin.Materials[EditingMaterial].EnableKeyword("_EMISSION");
+		}
+	}
+
+	private bool LoadItemType(IEnumerable<string> tags)
+	{
+		foreach (string tag in tags)
+		{
+			if (LoadItemType(tag))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private bool LoadItemType(string v)
+	{
+		ClearEditor();
+		Skinnable = Skinnable.FindForItem(v);
+		if (Skinnable == null)
+		{
+			return false;
+		}
+		ItemTypeSelector.value = ItemTypeSelector.options.IndexOf(ItemTypeSelector.options.First((UnityEngine.UI.Dropdown.OptionData x) => x.text == Skinnable.Name));
+		Prefab = LoadForPreview(Skinnable.EntityPrefabName);
+		Camera.main.FocusOnRenderer(Prefab, new Vector3(0.3f, 0.5f, 1f), Vector3.up);
+		if (Skin == null)
+		{
+			Skin = new Skin();
+		}
+		Skin.Skinnable = Skinnable;
+		Skin.ReadDefaults();
+		return true;
+	}
+
+	private GameObject LoadForPreview(string entityPrefabName, bool preprocess = true)
+	{
+		GameObject obj = (preprocess ? Global.CreatePrefab(entityPrefabName) : UnityEngine.Object.Instantiate(Global.LoadPrefab(entityPrefabName)));
+		RemoveLODs(obj);
+		RemoveComponents<Rigidbody>(obj);
+		obj.transform.position = item_position_a.transform.position;
+		obj.transform.rotation = item_position_a.transform.rotation;
+		obj.SetActive(value: true);
+		obj.AddComponent<DepthOfFieldFocusPoint>();
+		obj.BroadcastMessage("BuildRig", SendMessageOptions.DontRequireReceiver);
+		obj.BroadcastMessage("WorkshopMode", SendMessageOptions.DontRequireReceiver);
+		return obj;
+	}
+
+	public void OnChangedItemType(int type)
+	{
+		UnityEngine.UI.Dropdown.OptionData optionData = ItemTypeSelector.options[type];
+		if (!(Skinnable != null) || !(Skinnable.Name == optionData.text))
+		{
+			LoadItemType(optionData.text);
+			EditingMaterial = 0;
+			UpdateMaterialRows();
+			InitScene();
+		}
+	}
+
+	private void UpdateMaterialRows()
+	{
+		UpdateMaterialTabs();
+		Material material = Skin.Materials[EditingMaterial];
+		if (material == null)
+		{
+			return;
+		}
+		Material material2 = Skin.DefaultMaterials[EditingMaterial];
+		if (material2 == null)
+		{
+			return;
+		}
+		if (!material.IsKeywordEnabled("_ALPHATEST_ON"))
+		{
+			material.SetFloat("_Cutoff", 0f);
+		}
+		if (!material2.IsKeywordEnabled("_ALPHATEST_ON"))
+		{
+			material2.SetFloat("_Cutoff", 0f);
+		}
+		MaterialRow[] componentsInChildren = GetComponentsInChildren<MaterialRow>(includeInactive: true);
+		foreach (MaterialRow materialRow in componentsInChildren)
+		{
+			if (material.HasProperty(materialRow.ParamName))
+			{
+				materialRow.Read(material, material2);
+			}
+		}
+		bool active = material.shader.name.Contains("Cloth");
+		GameObject[] clothOnlyElements = ClothOnlyElements;
+		for (int i = 0; i < clothOnlyElements.Length; i++)
+		{
+			clothOnlyElements[i].SetActive(active);
+		}
+		bool active2 = material2.IsKeywordEnabled("_DETAILLAYER_ON");
+		clothOnlyElements = DetailOnlyElements;
+		for (int i = 0; i < clothOnlyElements.Length; i++)
+		{
+			clothOnlyElements[i].SetActive(active2);
+		}
+		bool active3 = material2.IsKeywordEnabled("_DIRTLAYER_ON");
+		clothOnlyElements = DirtOnlyElements;
+		for (int i = 0; i < clothOnlyElements.Length; i++)
+		{
+			clothOnlyElements[i].SetActive(active3);
+		}
+	}
+
+	private void UpdateMaterialTabs()
+	{
+		for (int i = 0; i < MaterialTabs.Length; i++)
+		{
+			if (Skinnable.Groups.Length < i + 1)
+			{
+				MaterialTabs[i].gameObject.SetActive(value: false);
+				continue;
+			}
+			MaterialTabs[i].gameObject.SetActive(value: true);
+			Text[] componentsInChildren = MaterialTabs[i].gameObject.GetComponentsInChildren<Text>(includeInactive: true);
+			for (int j = 0; j < componentsInChildren.Length; j++)
+			{
+				componentsInChildren[j].text = Skinnable.Groups[i].Name;
+			}
+		}
+	}
+
+	private void InitScene()
+	{
+		if (Skinnable.Category != Category.Deployable)
+		{
+			InitPlayerPreview(585364905uL, focus: true);
+			if (Prefab != null && Skinnable != null)
+			{
+				UnityEngine.Object.Destroy(Prefab);
+				Prefab = LoadForPreview(Skinnable.EntityPrefabName, preprocess: false);
+				Prefab.transform.position = new Vector3(0f, 500f, 0f);
+				Skin.Apply(Prefab);
+			}
+		}
+		else
+		{
+			Skin.Apply(Prefab);
+		}
+		if ((bool)Skinnable.ViewmodelPrefab)
+		{
+			ViewModel = Global.CreatePrefab(Skinnable.ViewmodelPrefabName);
+			ViewModel.transform.position = Camera.main.transform.position;
+			ViewModel.transform.rotation = Camera.main.transform.rotation;
+			ViewModel.SetActive(value: true);
+			ViewModel.BroadcastMessage("WorkshopMode", SendMessageOptions.DontRequireReceiver);
+			Skin.Apply(ViewModel);
+		}
+	}
+
+	private void InitPlayerPreview(ulong playerid, bool focus)
+	{
+		GameObject gameObject = Global.CreatePrefab(Skinnable.EntityPrefabName);
+		gameObject.AddComponent<DepthOfFieldFocusPoint>();
+		RemoveLODs(gameObject);
+		gameObject.SetActive(value: true);
+		Skin.Skinnable = Skinnable;
+		Skin.Apply(gameObject);
+		GetComponent<WorkshopPlayerPreview>().Setup(gameObject, playerid, focus, Skinnable.Category != Category.Weapon && Skinnable.Category != Category.Misc && Skinnable.Category != Category.Deployable);
+	}
+
+	public void RandomizePlayerPreview()
+	{
+		ulong playerid = (ulong)UnityEngine.Random.Range(0, int.MaxValue);
+		InitPlayerPreview(playerid, focus: false);
+	}
+
+	public void DownloadModel()
+	{
+		StartCoroutine(DoDownloadModel());
+	}
+
+	public static bool IsLesserLOD(string name)
+	{
+		if (name.EndsWith("lod01", StringComparison.InvariantCultureIgnoreCase))
+		{
+			return true;
+		}
+		if (name.EndsWith("lod02", StringComparison.InvariantCultureIgnoreCase))
+		{
+			return true;
+		}
+		if (name.EndsWith("lod03", StringComparison.InvariantCultureIgnoreCase))
+		{
+			return true;
+		}
+		if (name.EndsWith("lod04", StringComparison.InvariantCultureIgnoreCase))
+		{
+			return true;
+		}
+		if (name.EndsWith("lod1", StringComparison.InvariantCultureIgnoreCase))
+		{
+			return true;
+		}
+		if (name.EndsWith("lod2", StringComparison.InvariantCultureIgnoreCase))
+		{
+			return true;
+		}
+		if (name.EndsWith("lod3", StringComparison.InvariantCultureIgnoreCase))
+		{
+			return true;
+		}
+		if (name.EndsWith("lod4", StringComparison.InvariantCultureIgnoreCase))
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public static void RemoveLODs(GameObject prefab)
+	{
+		Renderer[] componentsInChildren = prefab.GetComponentsInChildren<Renderer>();
+		foreach (Renderer renderer in componentsInChildren)
+		{
+			if (IsLesserLOD(renderer.gameObject.name))
+			{
+				UnityEngine.Object.Destroy(renderer.gameObject);
+			}
+		}
+	}
+
+	private static void RemoveComponents<T>(GameObject prefab) where T : Component
+	{
+		T[] componentsInChildren = prefab.GetComponentsInChildren<T>();
+		for (int i = 0; i < componentsInChildren.Length; i++)
+		{
+			UnityEngine.Object.Destroy(componentsInChildren[i]);
+		}
+	}
+
+	private IEnumerator DoDownloadModel()
+	{
+		yield return StartCoroutine(FileDialog.Save(null, ".obj"));
+		if (string.IsNullOrEmpty(FileDialog.result))
+		{
+			yield break;
+		}
+		Debug.Log("Save Obj to " + FileDialog.result);
+		for (int i = 0; i < Skinnable.MeshDownloadPaths.Length; i++)
+		{
+			string text = Path.Combine(UnityEngine.Application.streamingAssetsPath, Skinnable.MeshDownloadPaths[i]);
+			string text2 = FileDialog.result;
+			if (Skinnable.MeshDownloadPaths.Length > 1)
+			{
+				string extension = Path.GetExtension(text);
+				string text3 = ModelCleanup.Replace(Path.GetFileNameWithoutExtension(text), "");
+				string directoryName = Path.GetDirectoryName(text2);
+				string fileNameWithoutExtension = Path.GetFileNameWithoutExtension(text2);
+				text2 = Path.Combine(directoryName, fileNameWithoutExtension + "_" + text3 + extension);
+			}
+			File.Copy(text, text2);
+		}
+	}
+
+	private void Update()
+	{
+		Input.Frame();
+		Input.Update();
+	}
+
+	private void LateUpdate()
+	{
+		ViewmodelControls.DoUpdate(ViewModel);
+	}
+
+	public void SwitchMaterial(int i)
+	{
+		EditingMaterial = i;
+		UpdateMaterialRows();
+	}
+}

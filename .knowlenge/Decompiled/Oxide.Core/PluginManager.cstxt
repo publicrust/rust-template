@@ -1,0 +1,289 @@
+using System;
+using System.Collections.Generic;
+using Oxide.Core;
+using Oxide.Core.Logging;
+using Oxide.Core.Plugins;
+using Oxide.Pooling;
+
+public sealed class PluginManager
+{
+	private enum SubscriptionChangeType : byte
+	{
+		Subscribe,
+		Unsubscribe
+	}
+
+	private struct SubscriptionChange
+	{
+		public Plugin Plugin { get; }
+
+		public SubscriptionChangeType Change { get; }
+
+		public SubscriptionChange(Plugin plugin, SubscriptionChangeType type)
+		{
+			Plugin = plugin;
+			Change = type;
+		}
+	}
+
+	private class HookSubscriptions
+	{
+		public IList<Plugin> Plugins { get; }
+
+		public int CallDepth { get; set; }
+
+		public Queue<SubscriptionChange> PendingChanges { get; }
+
+		public HookSubscriptions()
+		{
+			Plugins = new List<Plugin>();
+			PendingChanges = new Queue<SubscriptionChange>();
+			CallDepth = 0;
+		}
+	}
+
+	private readonly IDictionary<string, Plugin> loadedPlugins;
+
+	private readonly IDictionary<string, HookSubscriptions> hookSubscriptions;
+
+	private readonly Dictionary<string, float> lastDeprecatedWarningAt = new Dictionary<string, float>();
+
+	private readonly List<string> hookConflicts = new List<string>();
+
+	public Logger Logger { get; private set; }
+
+	public string ConfigPath { get; set; }
+
+	private IArrayPoolProvider<object> ObjectPool { get; }
+
+	public event PluginEvent OnPluginAdded;
+
+	public event PluginEvent OnPluginRemoved;
+
+	public PluginManager(Logger logger)
+	{
+		ObjectPool = Interface.Oxide.PoolFactory.GetArrayProvider<object>();
+		loadedPlugins = new Dictionary<string, Plugin>();
+		hookSubscriptions = new Dictionary<string, HookSubscriptions>();
+		Logger = logger;
+	}
+
+	public bool AddPlugin(Plugin plugin)
+	{
+		if (loadedPlugins.ContainsKey(plugin.Name))
+		{
+			return false;
+		}
+		loadedPlugins.Add(plugin.Name, plugin);
+		plugin.HandleAddedToManager(this);
+		this.OnPluginAdded?.Invoke(plugin);
+		return true;
+	}
+
+	public bool RemovePlugin(Plugin plugin)
+	{
+		if (!loadedPlugins.ContainsKey(plugin.Name))
+		{
+			return false;
+		}
+		loadedPlugins.Remove(plugin.Name);
+		lock (hookSubscriptions)
+		{
+			foreach (HookSubscriptions value in hookSubscriptions.Values)
+			{
+				if (value.Plugins.Contains(plugin))
+				{
+					value.Plugins.Remove(plugin);
+				}
+			}
+		}
+		plugin.HandleRemovedFromManager(this);
+		this.OnPluginRemoved?.Invoke(plugin);
+		return true;
+	}
+
+	public Plugin GetPlugin(string name)
+	{
+		if (!loadedPlugins.TryGetValue(name, out var value))
+		{
+			return null;
+		}
+		return value;
+	}
+
+	public IEnumerable<Plugin> GetPlugins()
+	{
+		return loadedPlugins.Values;
+	}
+
+	internal void SubscribeToHook(string hook, Plugin plugin)
+	{
+		if (!loadedPlugins.ContainsKey(plugin.Name) || (!plugin.IsCorePlugin && (hook.StartsWith("IOn") || hook.StartsWith("ICan"))))
+		{
+			return;
+		}
+		HookSubscriptions value;
+		lock (hookSubscriptions)
+		{
+			if (!hookSubscriptions.TryGetValue(hook, out value))
+			{
+				value = new HookSubscriptions();
+				hookSubscriptions[hook] = value;
+			}
+		}
+		if (value.CallDepth > 0)
+		{
+			value.PendingChanges.Enqueue(new SubscriptionChange(plugin, SubscriptionChangeType.Subscribe));
+		}
+		else if (!value.Plugins.Contains(plugin))
+		{
+			value.Plugins.Add(plugin);
+		}
+	}
+
+	internal void UnsubscribeToHook(string hook, Plugin plugin)
+	{
+		if (!loadedPlugins.ContainsKey(plugin.Name) || (!plugin.IsCorePlugin && (hook.StartsWith("IOn") || hook.StartsWith("ICan"))))
+		{
+			return;
+		}
+		HookSubscriptions value;
+		lock (hookSubscriptions)
+		{
+			if (!hookSubscriptions.TryGetValue(hook, out value))
+			{
+				return;
+			}
+		}
+		if (value.CallDepth > 0)
+		{
+			value.PendingChanges.Enqueue(new SubscriptionChange(plugin, SubscriptionChangeType.Unsubscribe));
+		}
+		else
+		{
+			value.Plugins.Remove(plugin);
+		}
+	}
+
+	public object CallHook(string hook, params object[] args)
+	{
+		HookSubscriptions value;
+		lock (hookSubscriptions)
+		{
+			if (!hookSubscriptions.TryGetValue(hook, out value))
+			{
+				return null;
+			}
+		}
+		if (value.Plugins.Count == 0)
+		{
+			return null;
+		}
+		object[] array = ObjectPool.Take(value.Plugins.Count);
+		int num = 0;
+		object obj = null;
+		Plugin plugin = null;
+		value.CallDepth++;
+		try
+		{
+			for (int i = 0; i < value.Plugins.Count; i++)
+			{
+				Plugin plugin2 = value.Plugins[i];
+				object obj2 = plugin2.CallHook(hook, args);
+				if (obj2 != null)
+				{
+					array[i] = obj2;
+					obj = obj2;
+					plugin = plugin2;
+					num++;
+				}
+			}
+			if (num == 0)
+			{
+				ObjectPool.Return(array);
+				return null;
+			}
+			if (num > 1 && obj != null)
+			{
+				hookConflicts.Clear();
+				for (int j = 0; j < value.Plugins.Count; j++)
+				{
+					Plugin plugin3 = value.Plugins[j];
+					object obj3 = array[j];
+					if (obj3 == null)
+					{
+						continue;
+					}
+					if (obj3.GetType().IsValueType)
+					{
+						if (!array[j].Equals(obj))
+						{
+							hookConflicts.Add($"{plugin3.Name} - {obj3} ({obj3.GetType().Name})");
+						}
+					}
+					else if (array[j] != obj)
+					{
+						hookConflicts.Add($"{plugin3.Name} - {obj3} ({obj3.GetType().Name})");
+					}
+				}
+				if (hookConflicts.Count > 0)
+				{
+					hookConflicts.Add($"{plugin.Name} ({obj} ({obj.GetType().Name}))");
+					Logger.Write(LogType.Warning, "Calling hook {0} resulted in a conflict between the following plugins: {1}", hook, string.Join(", ", hookConflicts.ToArray()));
+				}
+			}
+			ObjectPool.Return(array);
+			return obj;
+		}
+		finally
+		{
+			value.CallDepth--;
+			if (value.CallDepth == 0)
+			{
+				ProcessHookChanges(value);
+			}
+		}
+	}
+
+	private void ProcessHookChanges(HookSubscriptions subscriptions)
+	{
+		while (subscriptions.PendingChanges.Count != 0)
+		{
+			SubscriptionChange subscriptionChange = subscriptions.PendingChanges.Dequeue();
+			if (subscriptionChange.Change == SubscriptionChangeType.Subscribe)
+			{
+				if (!subscriptions.Plugins.Contains(subscriptionChange.Plugin))
+				{
+					subscriptions.Plugins.Add(subscriptionChange.Plugin);
+				}
+			}
+			else
+			{
+				subscriptions.Plugins.Remove(subscriptionChange.Plugin);
+			}
+		}
+	}
+
+	public object CallDeprecatedHook(string oldHook, string newHook, DateTime expireDate, params object[] args)
+	{
+		HookSubscriptions value;
+		lock (hookSubscriptions)
+		{
+			if (!hookSubscriptions.TryGetValue(oldHook, out value))
+			{
+				return null;
+			}
+		}
+		if (value.Plugins.Count == 0)
+		{
+			return null;
+		}
+		float now = Interface.Oxide.Now;
+		if (!lastDeprecatedWarningAt.TryGetValue(oldHook, out var value2) || now - value2 > 3600f)
+		{
+			lastDeprecatedWarningAt[oldHook] = now;
+			Interface.Oxide.LogWarning(string.Format("'{0} v{1}' is using deprecated hook '{2}', which will stop working on {3}. Please ask the author to update to '{4}'", value.Plugins[0].Name, value.Plugins[0].Version, oldHook, expireDate.ToString("D"), newHook));
+		}
+		return CallHook(oldHook, args);
+	}
+}

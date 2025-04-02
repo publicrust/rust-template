@@ -1,0 +1,454 @@
+using System;
+using System.Collections.Generic;
+using ConVar;
+using Facepunch;
+using Unity.Burst;
+using Unity.Collections;
+using Unity.Jobs;
+using UnityEngine;
+
+public class Hopper : IndustrialEntity, IIndustrialStorage
+{
+	public enum MountType
+	{
+		Flat,
+		Barrel
+	}
+
+	private struct HopperMove : IEqualityComparer<HopperMove>
+	{
+		public IHopperTarget Target;
+
+		public TimeSince Duration;
+
+		public bool Equals(HopperMove x, HopperMove y)
+		{
+			return object.Equals(x.Target, y.Target);
+		}
+
+		public int GetHashCode(HopperMove obj)
+		{
+			return HashCode.Combine(obj.Target);
+		}
+	}
+
+	[BurstCompile]
+	private struct FillRaycastJob : IJobParallelFor
+	{
+		[ReadOnly]
+		public NativeArray<Vector3> points;
+
+		public NativeArray<RaycastCommand> commands;
+
+		public Vector3 originPoint;
+
+		public int layerMask;
+
+		public void Execute(int index)
+		{
+			Vector3 vector = points[index];
+			if (!(vector == Vector3.zero))
+			{
+				commands[index] = new RaycastCommand(vector, (originPoint - vector).normalized, Vector3.Distance(vector, originPoint), layerMask);
+			}
+		}
+	}
+
+	public class HopperAnimationWorkQueue : PersistentObjectWorkQueue<Hopper>
+	{
+		protected override void RunJob(Hopper entity)
+		{
+			entity.MovingItemsTick();
+		}
+	}
+
+	public interface IHopperTarget
+	{
+		BaseEntity ToEntity { get; }
+
+		Rigidbody Rigidbody { get; }
+
+		int NumberOfItemsToTransfer { get; }
+
+		float EndPositionToleranceMultiplier { get; }
+
+		void PrepareForHopper();
+
+		void HopperCancelled();
+
+		void TransferAllItemsToContainer(ItemContainer itemContainer, Vector3 fallbackWorldPos);
+	}
+
+	public TriggerEnterTimer ItemTrigger;
+
+	public Transform ItemMoveTarget;
+
+	public float ItemMoveSpeed = 2f;
+
+	public AnimationCurve ItemHeightChangeSpeed;
+
+	private const float MoveRate = 1f / 60f;
+
+	public AnimationCurve ItemHeightCurve;
+
+	public AnimationCurve ItemSpeedMultiplierCurve;
+
+	public AnimationCurve ItemRotationSpeed;
+
+	public GameObjectRef BloodSpray;
+
+	public bool DebugMode;
+
+	public const Flags MovingItems = Flags.Reserved1;
+
+	public const Flags StandardMount = Flags.Reserved2;
+
+	public const Flags BarrelMount = Flags.Reserved3;
+
+	public Transform RaycastOriginPoint;
+
+	private Action queueScanAction;
+
+	private HashSet<HopperMove> movingItems = new HashSet<HopperMove>();
+
+	private BaseEntity _cachedParent;
+
+	private ItemContainer cachedContainer;
+
+	private Predicate<HopperMove> cachedCheckNull;
+
+	private Predicate<HopperMove> cachedRemove;
+
+	private IHopperTarget matchCheck;
+
+	public static HopperAnimationWorkQueue WorkQueue = new HopperAnimationWorkQueue();
+
+	public BaseEntity cachedParent
+	{
+		get
+		{
+			if (_cachedParent == null)
+			{
+				_cachedParent = GetParentEntity();
+			}
+			return _cachedParent;
+		}
+	}
+
+	public ItemContainer Container
+	{
+		get
+		{
+			if (cachedContainer == null)
+			{
+				cachedContainer = (cachedParent as StorageContainer)?.inventory;
+			}
+			return cachedContainer;
+		}
+	}
+
+	public BaseEntity IndustrialEntity => this;
+
+	public override int ConsumptionAmount()
+	{
+		return 8;
+	}
+
+	public override int DesiredPower(int inputIndex = 0)
+	{
+		return 8;
+	}
+
+	public Vector2i InputSlotRange(int slotIndex)
+	{
+		if (Container != null)
+		{
+			return new Vector2i(0, Container.capacity - 1);
+		}
+		return new Vector2i(0, 0);
+	}
+
+	public Vector2i OutputSlotRange(int slotIndex)
+	{
+		if (Container != null)
+		{
+			return new Vector2i(0, Container.capacity - 1);
+		}
+		return new Vector2i(0, 0);
+	}
+
+	public void OnStorageItemTransferBegin()
+	{
+	}
+
+	public void OnStorageItemTransferEnd()
+	{
+	}
+
+	private void ScanForItemsTick()
+	{
+		if (ItemTrigger.HasAnyEntityContents && (float)ItemTrigger.EnterTime > 0.5f)
+		{
+			Vector3 position = RaycastOriginPoint.position;
+			int num = 128;
+			NativeArray<RaycastCommand> commands = new NativeArray<RaycastCommand>(num, Allocator.TempJob);
+			NativeArray<RaycastHit> results = new NativeArray<RaycastHit>(num, Allocator.TempJob);
+			NativeArray<Vector3> points = new NativeArray<Vector3>(num, Allocator.TempJob);
+			List<IHopperTarget> obj = Facepunch.Pool.Get<List<IHopperTarget>>();
+			int num2 = 0;
+			int count = movingItems.Count;
+			foreach (BaseEntity entityContent in ItemTrigger.entityContents)
+			{
+				if (entityContent is IHopperTarget hopperTarget && hopperTarget.ToEntity.isServer)
+				{
+					if (entityContent is DroppedItem droppedItem && !droppedItem.HasFlag(Flags.Reserved3) && Container.QuickIndustrialPreCheck(droppedItem.item, new Vector2i(0, Container.capacity - 1), count, out var _))
+					{
+						Vector3 value = droppedItem.transform.position;
+						if (droppedItem.childCollider != null)
+						{
+							value = droppedItem.childCollider.bounds.center;
+						}
+						points[num2++] = value;
+						obj.Add(hopperTarget);
+					}
+					else if (entityContent is BaseCorpse baseCorpse && !baseCorpse.HasFlag(Flags.Reserved1))
+					{
+						Vector3 position2 = baseCorpse.transform.position;
+						points[num2++] = position2;
+						obj.Add(hopperTarget);
+					}
+				}
+				if (obj.Count == num)
+				{
+					break;
+				}
+			}
+			FillRaycastJob jobData = default(FillRaycastJob);
+			jobData.originPoint = position;
+			jobData.points = points;
+			jobData.commands = commands;
+			jobData.layerMask = 2097152;
+			JobHandle dependsOn = IJobParallelForExtensions.Schedule(jobData, num2, 6);
+			RaycastCommand.ScheduleBatch(commands, results, 1, 1, dependsOn).Complete();
+			for (int i = 0; i < num2; i++)
+			{
+				RaycastHit raycastHit = results[i];
+				IHopperTarget hopperTarget2 = obj[i];
+				if (raycastHit.collider == null && movingItems.Add(new HopperMove
+				{
+					Target = hopperTarget2,
+					Duration = 0f
+				}))
+				{
+					hopperTarget2.PrepareForHopper();
+					hopperTarget2.Rigidbody.useGravity = false;
+					hopperTarget2.Rigidbody.velocity = Vector3.zero;
+					hopperTarget2.Rigidbody.angularVelocity = Vector3.zero;
+					if (Server.hopperAnimationBudgetMs <= 0f)
+					{
+						IntakeItem(hopperTarget2);
+					}
+					break;
+				}
+			}
+			commands.Dispose();
+			results.Dispose();
+			points.Dispose();
+			Facepunch.Pool.FreeUnmanaged(ref obj);
+		}
+		SetFlag(Flags.Reserved1, movingItems.Count > 0);
+	}
+
+	public override void OnFlagsChanged(Flags old, Flags next)
+	{
+		base.OnFlagsChanged(old, next);
+		if (base.isServer)
+		{
+			bool flag = next.HasFlag(Flags.Reserved8) || DebugMode;
+			if (!IsInvoking(queueScanAction) && flag)
+			{
+				InvokeRepeating(queueScanAction, 0.5f, 0.5f);
+			}
+			else if (IsInvoking(queueScanAction) && !flag)
+			{
+				CancelInvoke(queueScanAction);
+			}
+			bool flag2 = next.HasFlag(Flags.Reserved1);
+			if (!WorkQueue.Contains(this) && flag2)
+			{
+				WorkQueue.Add(this);
+			}
+			else if (WorkQueue.Contains(this) && !flag2)
+			{
+				WorkQueue.Remove(this);
+			}
+		}
+	}
+
+	public override void ServerInit()
+	{
+		base.ServerInit();
+		queueScanAction = QueueScan;
+		if (DebugMode)
+		{
+			OnFlagsChanged(flags, flags);
+		}
+	}
+
+	internal override void DoServerDestroy()
+	{
+		if (HasFlag(Flags.Reserved1))
+		{
+			ResetAllMovingItems();
+		}
+		base.DoServerDestroy();
+	}
+
+	public override void OnPickedUp(Item createdItem, BasePlayer player)
+	{
+		if (HasFlag(Flags.Reserved1))
+		{
+			ResetAllMovingItems();
+		}
+		base.OnPickedUp(createdItem, player);
+	}
+
+	private void ResetAllMovingItems()
+	{
+		WorkQueue.Remove(this);
+		SetFlag(Flags.Reserved1, b: false, recursive: false, networkupdate: false);
+		foreach (HopperMove movingItem in movingItems)
+		{
+			if (movingItem.Target != null && movingItem.Target.ToEntity != null)
+			{
+				if (movingItem.Target.ToEntity.TryGetComponent<Rigidbody>(out var component))
+				{
+					component.useGravity = true;
+				}
+				movingItem.Target.HopperCancelled();
+			}
+		}
+	}
+
+	public override void OnParentChanging(BaseEntity oldParent, BaseEntity newParent)
+	{
+		base.OnParentChanging(oldParent, newParent);
+		MountType mountType = MountType.Flat;
+		if (newParent != null && newParent is BoxStorage boxStorage)
+		{
+			mountType = boxStorage.HopperMountType;
+		}
+		SetFlag(Flags.Reserved3, mountType == MountType.Barrel);
+		SetFlag(Flags.Reserved2, mountType == MountType.Flat);
+	}
+
+	private void QueueScan()
+	{
+		global::IndustrialEntity.Queue.Add(this);
+	}
+
+	protected override void RunJob()
+	{
+		base.RunJob();
+		if (IsPowered() || DebugMode)
+		{
+			ScanForItemsTick();
+		}
+	}
+
+	public override void IOStateChanged(int inputAmount, int inputSlot)
+	{
+		base.IOStateChanged(inputAmount, inputSlot);
+		if (inputSlot == 0)
+		{
+			bool b = inputAmount >= ConsumptionAmount() && inputAmount > 0;
+			SetFlag(Flags.Reserved8, b);
+			currentEnergy = inputAmount;
+			ensureOutputsUpdated = true;
+			MarkDirty();
+		}
+	}
+
+	private void MovingItemsTick()
+	{
+		if (movingItems.Count == 0)
+		{
+			return;
+		}
+		if (cachedCheckNull == null)
+		{
+			cachedCheckNull = CheckNull;
+		}
+		movingItems.RemoveWhere(cachedCheckNull);
+		using (PooledList<IHopperTarget> pooledList = Facepunch.Pool.Get<PooledList<IHopperTarget>>())
+		{
+			float num = ItemMoveSpeed * (1f / 60f * UnityEngine.Time.timeScale);
+			Vector3 position = ItemMoveTarget.position;
+			Quaternion rotation = ItemMoveTarget.rotation;
+			foreach (HopperMove movingItem in movingItems)
+			{
+				if (movingItem.Target != null && !(movingItem.Target.ToEntity == null))
+				{
+					Vector3 position2 = movingItem.Target.ToEntity.transform.position;
+					Quaternion rotation2 = movingItem.Target.ToEntity.transform.rotation;
+					float num2 = Mathf.Clamp01(Vector3.Distance(position2, position.WithY(position2.y)) / 3f);
+					float num3 = ItemHeightCurve.Evaluate(num2);
+					Vector3 vector = Vector3.MoveTowards(maxDistanceDelta: num * ItemSpeedMultiplierCurve.Evaluate(1f - num2), current: position2, target: position);
+					vector.y = Mathf.MoveTowards(vector.y, position.y + num3, UnityEngine.Time.deltaTime * ItemHeightChangeSpeed.Evaluate(1f - num2));
+					Quaternion rotation3 = Quaternion.RotateTowards(rotation2, rotation, UnityEngine.Time.deltaTime * ItemRotationSpeed.Evaluate(1f - num2));
+					movingItem.Target.ToEntity.transform.SetPositionAndRotation(vector, rotation3);
+					movingItem.Target.Rigidbody.velocity = Vector3.zero;
+					movingItem.Target.Rigidbody.angularVelocity = Vector3.zero;
+					float num4 = 0.015f * movingItem.Target.EndPositionToleranceMultiplier;
+					if ((vector - position).sqrMagnitude < num4 * num4)
+					{
+						pooledList.Add(movingItem.Target);
+					}
+				}
+			}
+			foreach (HopperMove movingItem2 in movingItems)
+			{
+				if ((float)movingItem2.Duration > 5f)
+				{
+					pooledList.Add(movingItem2.Target);
+				}
+			}
+			foreach (IHopperTarget item in pooledList)
+			{
+				IntakeItem(item);
+			}
+			if (movingItems.Count == 0)
+			{
+				SetFlag(Flags.Reserved1, b: false);
+			}
+		}
+		static bool CheckNull(HopperMove obj)
+		{
+			if (obj.Target != null)
+			{
+				return obj.Target.ToEntity == null;
+			}
+			return true;
+		}
+	}
+
+	private bool Match(HopperMove obj)
+	{
+		return obj.Target == matchCheck;
+	}
+
+	private void IntakeItem(IHopperTarget targetItem)
+	{
+		if (cachedRemove == null)
+		{
+			cachedRemove = Match;
+		}
+		matchCheck = targetItem;
+		movingItems.RemoveWhere(cachedRemove);
+		if (BloodSpray.isValid && targetItem.ToEntity is BaseCorpse)
+		{
+			Effect.server.Run(BloodSpray.resourcePath, base.transform.position);
+		}
+		targetItem.TransferAllItemsToContainer(Container, ItemMoveTarget.position);
+	}
+}

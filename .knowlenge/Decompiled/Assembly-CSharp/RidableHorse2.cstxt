@@ -1,0 +1,3247 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using ConVar;
+using Facepunch;
+using Facepunch.Rust;
+using FIMSpace.FProceduralAnimation;
+using Network;
+using Oxide.Core;
+using ProtoBuf;
+using Rust;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class RidableHorse2 : BaseVehicle, IInventoryProvider, IDetector, HitchTrough.IHitchable, TriggerHurtNotChild.IHurtTriggerUser, IAnimalRagdollCollisionReceiver, ITowing
+{
+	public enum GaitType : byte
+	{
+		Walk,
+		Trot,
+		Canter,
+		Gallop
+	}
+
+	[Serializable]
+	public struct Gait
+	{
+		public GaitType gaitType;
+
+		public float minSpeed;
+
+		public float maxSpeed;
+
+		public float accelerationForce;
+
+		public float brakingForce;
+
+		public float turnSpeed;
+
+		public float staminaReplenishRatio;
+
+		public bool equipmentScalesMaxSpeed;
+
+		public bool breedScalesMaxSpeed;
+	}
+
+	[Serializable]
+	public struct PurchaseOption
+	{
+		public ItemDefinition tokenItem;
+
+		public Translate.Phrase title;
+
+		public Translate.Phrase description;
+
+		public Sprite icon;
+
+		public int order;
+	}
+
+	public enum HorseAvoidanceState
+	{
+		Normal,
+		AvoidingObstacle
+	}
+
+	[Header("Breed")]
+	public HorseBreed[] breeds;
+
+	public SkinnedMeshRenderer[] bodyRenderers;
+
+	public SkinnedMeshRenderer[] hairRenderers;
+
+	private int currentBreedIndex = -1;
+
+	private HorseBreed currentBreed;
+
+	[Header("Container")]
+	public ItemDefinition onlyAllowedItem;
+
+	public ItemContainer.ContentsType allowedContents = ItemContainer.ContentsType.Generic;
+
+	[Space]
+	public int maxStackSize;
+
+	public int numStorageSlots;
+
+	public int equipmentSlots = 4;
+
+	public string lootPanelName = "animal";
+
+	public string storagePanelName = "animal-storage";
+
+	public bool needsBuildingPrivilegeToUse;
+
+	public bool isLootable = true;
+
+	public ItemContainer storageInventory;
+
+	public ItemContainer equipmentInventory;
+
+	private ProtectionProperties riderProtection;
+
+	private ProtectionProperties baseHorseProtection;
+
+	private float equipmentSpeedMod;
+
+	[SerializeField]
+	[Header("Horse")]
+	private Animator animator;
+
+	[SerializeField]
+	private Transform centreOfMassTransform;
+
+	[SerializeField]
+	private RidableHorseAudio horseAudio;
+
+	[SerializeField]
+	private RidableHorseAnimation horseAnimation;
+
+	[SerializeField]
+	private LegsAnimator serverLegsAnimator;
+
+	[SerializeField]
+	private ScaleBySpeed scaleBySpeedWater;
+
+	public WheelCollider wheelCollider;
+
+	public GameObjectRef corpsePrefab;
+
+	[Space]
+	public Collider playerServerCollider;
+
+	public Collider playerServerColliderRear;
+
+	public Gait[] gaits;
+
+	public GaitType currentGait;
+
+	public float gaitProgressionInterval = 1f;
+
+	public float gravity = 10f;
+
+	public float waterGravity = 1f;
+
+	public float groundAlignmentSpeed = 50f;
+
+	public float roadSpeedBonus = 1f;
+
+	[Space]
+	public float reverseSpeedFactor = 0.5f;
+
+	public float reverseAccelerationForce = 4000f;
+
+	[Space]
+	public float rotationResponsiveness = 1f;
+
+	[Tooltip("The factor applied to rotationResponsiveness, based on the current speed ratio (0 = stopped, 1 = full speed)")]
+	public AnimationCurve rotationResponsivenessCurve;
+
+	public Transform[] groundSampleOffsets;
+
+	public Vector2 minMaxSlopeAngle = new Vector2(10f, 60f);
+
+	public AnimationCurve slopeAngleSpeedFactor;
+
+	[Space]
+	[Header("Collision Damage")]
+	[SerializeField]
+	private GameObjectRef collisionEffect;
+
+	[Tooltip("Ignore low magnitude so e.g. Players running into stationary vehicles doesn't trigger damage or FX")]
+	[SerializeField]
+	private float minCollisionDamageForce = 20000f;
+
+	[Tooltip("Cap max magnitude so unusual events can't cause mega damage")]
+	[SerializeField]
+	private float maxCollisionDamageForce = 2500000f;
+
+	[SerializeField]
+	[Tooltip("Adjust this away from 1.0 if collision damage to this vehicle seems too high or low")]
+	private float collisionDamageMultiplier = 1f;
+
+	[SerializeField]
+	private float playerDamageThreshold = 40f;
+
+	[SerializeField]
+	private float playerRagdollThreshold = 75f;
+
+	[SerializeField]
+	private float maxAirTimeBeforeRagdoll = 1.5f;
+
+	[Header("Towing")]
+	public TriggerTowing towingTrigger;
+
+	public Transform towingPoint;
+
+	public TowingVisuals towingVisuals;
+
+	private NetworkableId towingEntityId;
+
+	public GameObjectRef towingAttachEffect;
+
+	public GameObjectRef towingDetachEffect;
+
+	[SerializeField]
+	private float towingAccelerationBoost = 2f;
+
+	[SerializeField]
+	private float towingMaxSpeedBoost = 1f;
+
+	[SerializeField]
+	private GaitType maxTowingGait = GaitType.Trot;
+
+	[Header("Stamina")]
+	public float currentStamina = 10f;
+
+	public float currentMaxStamina = 10f;
+
+	public float maxStamina = 20f;
+
+	public float staminaCoreLossRatio = 0.1f;
+
+	public float staminaCoreSpeedBonus = 3f;
+
+	public float calorieToStaminaRatio = 0.1f;
+
+	public float hydrationToStaminaRatio = 0.5f;
+
+	public float maxStaminaCoreFromWater = 0.5f;
+
+	[Header("Purchase")]
+	public List<PurchaseOption> PurchaseOptions;
+
+	[Header("Saddle")]
+	public Translate.Phrase SwapToSingleTitle;
+
+	public Translate.Phrase SwapToSingleDescription;
+
+	public Sprite SwapToSingleIcon;
+
+	public Translate.Phrase SwapToDoubleTitle;
+
+	public Translate.Phrase SwapToDoubleDescription;
+
+	public Sprite SwapToDoubleIcon;
+
+	[SerializeField]
+	[HideInInspector]
+	protected bool[] hasItemTokenCache;
+
+	[Space]
+	public SoundPlayer standSound;
+
+	public SoundPlayer slidingSound;
+
+	private TimeSince timeSinceSlidingSoundPlayed;
+
+	public ParticleSystemContainer skidDust;
+
+	public GameObjectRef ragdollPrefab;
+
+	[Header("Pulling")]
+	[SerializeField]
+	private List<ModifierDefintion> pullingPlayerModifiers;
+
+	[Header("Avoidance")]
+	public float avoidanceSphereRadius = 0.5f;
+
+	public Vector2 avoidanceDetectionDistance = new Vector2(3f, 8f);
+
+	public LayerMask avoidanceObstacleMask;
+
+	[Header("Sliding")]
+	public float groundAngleSlideThresholdForced = 50f;
+
+	public float groundAngleSlideThreshold = 37f;
+
+	public float groundAngleToRecoverFromSlide = 24f;
+
+	public float normalVariationSlideThreshold = 2.5f;
+
+	[HideInInspector]
+	public float normalVariation;
+
+	public const Flags Flag_ForSale = Flags.Reserved2;
+
+	public const Flags Flag_Hitched = Flags.Reserved3;
+
+	public const Flags Flag_HideHair = Flags.Reserved4;
+
+	public const Flags Flag_WoodArmor = Flags.Reserved5;
+
+	public const Flags Flag_RoadsignArmor = Flags.Reserved6;
+
+	public const Flags Flag_Lead = Flags.Reserved16;
+
+	public const Flags Flag_HasSingleSaddle = Flags.Reserved9;
+
+	public const Flags Flag_HasDoubleSaddle = Flags.Reserved10;
+
+	public const Flags Flag_IsRagdolling = Flags.Reserved12;
+
+	public const Flags Flag_IsSwimming = Flags.Reserved17;
+
+	public const Flags Flag_IsSliding = Flags.Reserved18;
+
+	public const Flags Flag_IsInWater = Flags.Reserved19;
+
+	private static readonly Translate.Phrase TowAngleErrorPhrase = new Translate.Phrase("horse_tow_error", "Straighten up to tow");
+
+	private NetworkableId playerLeadingId;
+
+	[ServerVar(Saved = true, ClientAdmin = true)]
+	public static bool debug = false;
+
+	[ServerVar(Saved = true, ClientAdmin = true)]
+	public static bool autoAvoidance = true;
+
+	[ServerVar(Saved = true, ClientAdmin = true, Default = "1")]
+	public static bool throttledGroundAngleUpdate = true;
+
+	[ServerVar(Saved = true, ClientAdmin = true, Default = "0.05")]
+	public static float groundAngleUpdateRate = 0.05f;
+
+	[ServerVar(Help = "How long before a horse dies unattended")]
+	public static float decayMinutes = 180f;
+
+	[ServerVar(Help = "Population active on the server, per square km", ShowInAdminUI = true)]
+	public static float Population = 2f;
+
+	public Transform rootBone;
+
+	public Transform[] allBones;
+
+	private static Vector3[] bonesInitialLocalPos;
+
+	[Header("Dung")]
+	public TriggerBase foodTrigger;
+
+	public ItemDefinition dungItem;
+
+	public Transform dungSpawnPoint;
+
+	public float caloriesToDigestPerHour = 100f;
+
+	public float dungProducedPerCalorie = 0.1f;
+
+	[NonSerialized]
+	public HorseModifiers modifiers;
+
+	[ServerVar]
+	[Help("Scale all rideable animal dung production rates by this value. 0 will disable dung production.")]
+	public static float dungTimeScale = 1f;
+
+	private float nextEatTime;
+
+	private float lastEatTime = float.NegativeInfinity;
+
+	private float pendingDungCalories;
+
+	private float dungProduction;
+
+	private HitchTrough currentHitch;
+
+	private VehicleTerrainHandler terrainHandler;
+
+	private readonly Dictionary<BaseEntity, float> damageSinceLastTick = new Dictionary<BaseEntity, float>();
+
+	private float nextCollisionDamageTime;
+
+	private float steerInput;
+
+	private float steerInputDownTime;
+
+	private float throttleInput;
+
+	private bool forwardInputDown;
+
+	private bool backwardInputDown;
+
+	private bool duckInputDown;
+
+	private float doubleTapTime = 0.25f;
+
+	private float lastDuckTapTime = -1f;
+
+	private bool duckDoubleTapped;
+
+	private float sprintInputHoldTime;
+
+	private bool sprintInputJustPressed;
+
+	private Vector3 targetUp = Vector3.up;
+
+	private Vector3 averagedUp = Vector3.up;
+
+	private float groundAngle;
+
+	protected bool onIdealTerrain;
+
+	protected bool onWaterTopology;
+
+	private float nextTerrainCheckTime;
+
+	private float nextAutoAvoidanceCheckTime;
+
+	private float nextGroundNormalCheckTime;
+
+	private TimeSince timeSinceWaterCheck;
+
+	private TimeSince timeSinceDrowningDamage;
+
+	private bool wasSleeping;
+
+	private float lastMovingTime;
+
+	private const float SLEEP_DELAY = 5f;
+
+	private const float SLEEP_SPEED = 0.5f;
+
+	private WaterLevel.WaterInfo lastWaterInfo;
+
+	private float currentWaterFactor;
+
+	private float airTime;
+
+	private float slidingTime;
+
+	private float lastCrashDamage;
+
+	private Vector3 lastPullerPosition;
+
+	private float lastYVelocity;
+
+	private float kmDistance;
+
+	private float tempDistanceTravelled;
+
+	private float lastRoughTerrainTime;
+
+	private bool wasGrounded;
+
+	private bool isSubmerged;
+
+	[HideInInspector]
+	[SerializeField]
+	private float baseDrag;
+
+	[SerializeField]
+	[HideInInspector]
+	private float baseAngularDrag;
+
+	private HorseAvoidanceState currentAvoidanceState;
+
+	private int avoidanceSteeringInput;
+
+	private Vector3 avoidanceScanDirection;
+
+	private float nextStandTime;
+
+	private IHorseInputProvider inputProvider;
+
+	private TowingAttachment<RidableHorse2> towingAttachment;
+
+	private ITowing towableEntity;
+
+	private float lastRiddenTime;
+
+	private float nextDecayTime;
+
+	public bool HasSingleSaddle => HasFlag(Flags.Reserved9);
+
+	public bool HasDoubleSaddle => HasFlag(Flags.Reserved10);
+
+	public bool HasSaddle
+	{
+		get
+		{
+			if (!HasSingleSaddle)
+			{
+				return HasDoubleSaddle;
+			}
+			return true;
+		}
+	}
+
+	public bool IsForSale => HasFlag(Flags.Reserved2);
+
+	public bool IsTowing => HasFlag(Flags.Reserved14);
+
+	public bool IsLeading => HasFlag(Flags.Reserved16);
+
+	public bool IsSwimming => HasFlag(Flags.Reserved17);
+
+	public bool IsSliding => HasFlag(Flags.Reserved18);
+
+	public BasePlayer leadingPlayer { get; private set; }
+
+	public override bool IsNpc => true;
+
+	public bool isGrounded { get; private set; }
+
+	public bool isStanding { get; private set; }
+
+	public bool isSkidding { get; private set; }
+
+	private VehicleTerrainHandler.Surface OnSurface
+	{
+		get
+		{
+			if (terrainHandler == null)
+			{
+				return VehicleTerrainHandler.Surface.Default;
+			}
+			return terrainHandler.OnSurface;
+		}
+	}
+
+	public override float PositionTickRate
+	{
+		protected get
+		{
+			return 0.05f;
+		}
+	}
+
+	public BaseEntity TowEntity => this;
+
+	public Transform TowAnchor => towingPoint;
+
+	public Rigidbody TowBody => rigidBody;
+
+	public bool IsTowingAllowed => !IsTowing;
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("RidableHorse2.OnRpcMessage"))
+		{
+			if (rpc == 2663053610u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_Claim ");
+				}
+				using (TimeWarning.New("SERVER_Claim"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(2663053610u, "SERVER_Claim", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							SERVER_Claim(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						Debug.LogException(exception);
+						player.Kick("RPC Error in SERVER_Claim");
+					}
+				}
+				return true;
+			}
+			if (rpc == 299778156 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_Lead ");
+				}
+				using (TimeWarning.New("SERVER_Lead"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.CallsPerSecond.Test(299778156u, "SERVER_Lead", this, player, 1uL))
+						{
+							return true;
+						}
+						if (!RPC_Server.IsVisible.Test(299778156u, "SERVER_Lead", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg3 = rPCMessage;
+							SERVER_Lead(msg3);
+						}
+					}
+					catch (Exception exception2)
+					{
+						Debug.LogException(exception2);
+						player.Kick("RPC Error in SERVER_Lead");
+					}
+				}
+				return true;
+			}
+			if (rpc == 3442949235u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_OpenLoot ");
+				}
+				using (TimeWarning.New("SERVER_OpenLoot"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(3442949235u, "SERVER_OpenLoot", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage rpc2 = rPCMessage;
+							SERVER_OpenLoot(rpc2);
+						}
+					}
+					catch (Exception exception3)
+					{
+						Debug.LogException(exception3);
+						player.Kick("RPC Error in SERVER_OpenLoot");
+					}
+				}
+				return true;
+			}
+			if (rpc == 3395302925u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_RequestDetach ");
+				}
+				using (TimeWarning.New("SERVER_RequestDetach"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.CallsPerSecond.Test(3395302925u, "SERVER_RequestDetach", this, player, 1uL))
+						{
+							return true;
+						}
+						if (!RPC_Server.IsVisible.Test(3395302925u, "SERVER_RequestDetach", this, player, 3f))
+						{
+							return true;
+						}
+						if (!RPC_Server.MaxDistance.Test(3395302925u, "SERVER_RequestDetach", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg4 = rPCMessage;
+							SERVER_RequestDetach(msg4);
+						}
+					}
+					catch (Exception exception4)
+					{
+						Debug.LogException(exception4);
+						player.Kick("RPC Error in SERVER_RequestDetach");
+					}
+				}
+				return true;
+			}
+			if (rpc == 294213070 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_RequestSaddleSwap ");
+				}
+				using (TimeWarning.New("SERVER_RequestSaddleSwap"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(294213070u, "SERVER_RequestSaddleSwap", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg5 = rPCMessage;
+							SERVER_RequestSaddleSwap(msg5);
+						}
+					}
+					catch (Exception exception5)
+					{
+						Debug.LogException(exception5);
+						player.Kick("RPC Error in SERVER_RequestSaddleSwap");
+					}
+				}
+				return true;
+			}
+			if (rpc == 3979037781u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SERVER_RequestTow ");
+				}
+				using (TimeWarning.New("SERVER_RequestTow"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.CallsPerSecond.Test(3979037781u, "SERVER_RequestTow", this, player, 1uL))
+						{
+							return true;
+						}
+						if (!RPC_Server.IsVisible.Test(3979037781u, "SERVER_RequestTow", this, player, 3f))
+						{
+							return true;
+						}
+						if (!RPC_Server.MaxDistance.Test(3979037781u, "SERVER_RequestTow", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg6 = rPCMessage;
+							SERVER_RequestTow(msg6);
+						}
+					}
+					catch (Exception exception6)
+					{
+						Debug.LogException(exception6);
+						player.Kick("RPC Error in SERVER_RequestTow");
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public void ApplyBreed(int index)
+	{
+		if (currentBreedIndex != index)
+		{
+			if (index >= breeds.Length || index < 0)
+			{
+				Debug.LogError("ApplyBreed issue! index is " + index + " breed length is : " + breeds.Length);
+				return;
+			}
+			ApplyBreedInternal(breeds[index]);
+			currentBreed = breeds[index];
+			currentBreedIndex = index;
+		}
+	}
+
+	protected void ApplyBreedInternal(HorseBreed breed)
+	{
+		if (base.isServer)
+		{
+			SetMaxHealth(StartHealth() * breed.maxHealth);
+			base.health = MaxHealth();
+		}
+	}
+
+	public HorseBreed GetBreed()
+	{
+		if (currentBreedIndex == -1 || currentBreedIndex >= breeds.Length)
+		{
+			return null;
+		}
+		return breeds[currentBreedIndex];
+	}
+
+	public void SetBreed(int index)
+	{
+		ApplyBreed(index);
+		SendNetworkUpdate();
+	}
+
+	private bool ItemIsSaddle(Item item)
+	{
+		if (item == null)
+		{
+			return false;
+		}
+		ItemModAnimalEquipment component = item.info.GetComponent<ItemModAnimalEquipment>();
+		if (component == null)
+		{
+			return false;
+		}
+		ItemModAnimalEquipment.SlotType slot = component.slot;
+		return slot == ItemModAnimalEquipment.SlotType.Saddle || slot == ItemModAnimalEquipment.SlotType.SaddleDouble;
+	}
+
+	private bool CanOpenStorage(BasePlayer player)
+	{
+		if (!AnyMounted() || PlayerIsMounted(player))
+		{
+			return true;
+		}
+		return false;
+	}
+
+	public int GetStorageSlotCount()
+	{
+		return numStorageSlots;
+	}
+
+	public void InitContainers()
+	{
+		if (storageInventory == null)
+		{
+			CreateStorageInventory(giveUID: true);
+		}
+		if (equipmentInventory == null)
+		{
+			CreateEquipmentInventory(giveUID: true);
+		}
+	}
+
+	private void CreateInventories(bool giveUID)
+	{
+		CreateStorageInventory(giveUID);
+		CreateEquipmentInventory(giveUID);
+	}
+
+	private void CreateStorageInventory(bool giveUID)
+	{
+		Debug.Assert(storageInventory == null, "Double init of inventory!");
+		storageInventory = CreateInventory(giveUID, 48);
+		storageInventory.canAcceptItem = StorageItemFilter;
+	}
+
+	private void CreateEquipmentInventory(bool giveUID)
+	{
+		Debug.Assert(equipmentInventory == null, "Double init of inventory!");
+		equipmentInventory = CreateInventory(giveUID, equipmentSlots);
+		equipmentInventory.canAcceptItem = EquipmentItemFilter;
+	}
+
+	private ItemContainer CreateInventory(bool giveUID, int slots)
+	{
+		ItemContainer itemContainer = Facepunch.Pool.Get<ItemContainer>();
+		itemContainer.entityOwner = this;
+		itemContainer.allowedContents = ((allowedContents == (ItemContainer.ContentsType)0) ? ItemContainer.ContentsType.Generic : allowedContents);
+		itemContainer.SetOnlyAllowedItem(onlyAllowedItem);
+		itemContainer.maxStackSize = maxStackSize;
+		itemContainer.ServerInitialize(null, slots);
+		if (giveUID)
+		{
+			itemContainer.GiveUID();
+		}
+		itemContainer.onItemAddedRemoved = OnItemAddedOrRemoved;
+		itemContainer.onDirty += OnInventoryDirty;
+		return itemContainer;
+	}
+
+	public bool StorageItemFilter(Item item, int targetSlot)
+	{
+		return true;
+	}
+
+	public bool EquipmentItemFilter(Item item, int targetSlot)
+	{
+		if (IsForSale && ItemIsSaddle(item))
+		{
+			return false;
+		}
+		ItemModAnimalEquipment component = item.info.GetComponent<ItemModAnimalEquipment>();
+		if (!component)
+		{
+			return false;
+		}
+		if (ItemIsSaddle(item) && HasSaddle)
+		{
+			return false;
+		}
+		if (component.slot == ItemModAnimalEquipment.SlotType.Basic)
+		{
+			return true;
+		}
+		for (int i = 0; i < equipmentInventory.capacity; i++)
+		{
+			Item slot = equipmentInventory.GetSlot(i);
+			if (slot != null)
+			{
+				ItemModAnimalEquipment component2 = slot.info.GetComponent<ItemModAnimalEquipment>();
+				if (!(component2 == null) && component2.slot == component.slot)
+				{
+					int slot2 = (int)component2.slot;
+					string text = slot2.ToString();
+					slot2 = (int)component.slot;
+					Debug.Log("Rejecting because slot same, found : " + text + " new : " + slot2);
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	private void OnInventoryDirty()
+	{
+		EquipmentUpdate();
+	}
+
+	private void OnItemAddedOrRemoved(Item arg1, bool arg2)
+	{
+	}
+
+	private void ReleaseInventories()
+	{
+		Facepunch.Pool.Free(ref equipmentInventory);
+		Facepunch.Pool.Free(ref storageInventory);
+	}
+
+	public void EquipmentUpdate()
+	{
+		SetFlag(Flags.Reserved4, b: false, recursive: false, networkupdate: false);
+		SetFlag(Flags.Reserved5, b: false, recursive: false, networkupdate: false);
+		SetFlag(Flags.Reserved6, b: false, recursive: false, networkupdate: false);
+		riderProtection.Clear();
+		baseProtection.Clear();
+		equipmentSpeedMod = 0f;
+		numStorageSlots = 0;
+		for (int i = 0; i < equipmentInventory.capacity; i++)
+		{
+			Item slot = equipmentInventory.GetSlot(i);
+			if (slot == null)
+			{
+				continue;
+			}
+			ItemModAnimalEquipment component = slot.info.GetComponent<ItemModAnimalEquipment>();
+			if (component != null)
+			{
+				SetFlag(component.WearableFlag, b: true, recursive: false, networkupdate: false);
+				if (component.hideHair)
+				{
+					SetFlag(Flags.Reserved4, b: true);
+				}
+				if ((bool)component.riderProtection)
+				{
+					riderProtection.Add(component.riderProtection, 1f);
+				}
+				if ((bool)component.animalProtection)
+				{
+					baseProtection.Add(component.animalProtection, 1f);
+				}
+				equipmentSpeedMod += component.speedModifier;
+				numStorageSlots += component.additionalInventorySlots;
+			}
+		}
+		for (int j = 0; j < storageInventory.capacity; j++)
+		{
+			if (j >= numStorageSlots)
+			{
+				Item slot2 = storageInventory.GetSlot(j);
+				if (slot2 != null)
+				{
+					slot2.RemoveFromContainer();
+					slot2.Drop(base.transform.position + Vector3.up + UnityEngine.Random.insideUnitSphere * 0.25f, Vector3.zero);
+				}
+			}
+		}
+		storageInventory.capacity = numStorageSlots;
+		SendNetworkUpdate();
+	}
+
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
+	private void SERVER_OpenLoot(RPCMessage rpc)
+	{
+		if (storageInventory == null)
+		{
+			return;
+		}
+		BasePlayer player = rpc.player;
+		string text = rpc.read.String();
+		if (!(player == null) && player.CanInteract() && CanOpenStorage(player) && (!needsBuildingPrivilegeToUse || player.CanBuild()) && Interface.CallHook("CanLootEntity", player, this) == null && player.inventory.loot.StartLootingEntity(this))
+		{
+			ItemContainer container = equipmentInventory;
+			string arg = lootPanelName;
+			if (text == "storage")
+			{
+				arg = storagePanelName;
+				container = storageInventory;
+			}
+			player.inventory.loot.AddContainer(container);
+			player.inventory.loot.SendImmediate();
+			player.ClientRPC(RpcTarget.Player("RPC_OpenLootPanel", player), arg);
+			SendNetworkUpdate();
+		}
+	}
+
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
+	public void SERVER_RequestSaddleSwap(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (!(player == null) && !IsForSale && HasSaddle && !AnyMounted())
+		{
+			int tokenItemID = msg.read.Int32();
+			Item purchaseToken = GetPurchaseToken(player, tokenItemID);
+			if (purchaseToken != null)
+			{
+				ItemDefinition template = (HasSingleSaddle ? PurchaseOptions[0].tokenItem : PurchaseOptions[1].tokenItem);
+				OnClaimedWithToken(purchaseToken);
+				purchaseToken.UseItem();
+				Item item = ItemManager.Create(template, 1, 0uL);
+				player.GiveItem(item);
+				SendNetworkUpdateImmediate();
+			}
+		}
+	}
+
+	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
+	public void SERVER_Claim(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (!(player == null) && IsForSale)
+		{
+			int tokenItemID = msg.read.Int32();
+			Item purchaseToken = GetPurchaseToken(player, tokenItemID);
+			if (purchaseToken != null && Interface.CallHook("OnRidableAnimalClaim", this, player, purchaseToken) == null)
+			{
+				SetFlag(Flags.Reserved2, b: false);
+				OnClaimedWithToken(purchaseToken);
+				purchaseToken.UseItem();
+				Facepunch.Rust.Analytics.Server.VehiclePurchased(base.ShortPrefabName);
+				Facepunch.Rust.Analytics.Azure.OnVehiclePurchased(msg.player, this);
+				AttemptMount(player, doMountChecks: false);
+				Interface.CallHook("OnRidableAnimalClaimed", this, player);
+			}
+		}
+	}
+
+	public void OnClaimedWithToken(Item tokenItem)
+	{
+		int saddleItemSeatCount = GetSaddleItemSeatCount(tokenItem);
+		SetSeatCount(saddleItemSeatCount);
+	}
+
+	public int GetSaddleItemSeatCount(Item item)
+	{
+		if (!ItemIsSaddle(item))
+		{
+			return 0;
+		}
+		ItemModAnimalEquipment component = item.info.GetComponent<ItemModAnimalEquipment>();
+		if (component != null)
+		{
+			if (component.slot == ItemModAnimalEquipment.SlotType.Saddle)
+			{
+				return 1;
+			}
+			if (component.slot == ItemModAnimalEquipment.SlotType.SaddleDouble)
+			{
+				return 2;
+			}
+		}
+		return 0;
+	}
+
+	public void GetAllInventories(List<ItemContainer> list)
+	{
+		list.Add(storageInventory);
+		list.Add(equipmentInventory);
+	}
+
+	public Item GetPurchaseToken(BasePlayer player, int tokenItemID)
+	{
+		return player.inventory.FindItemByItemID(tokenItemID);
+	}
+
+	public bool PlayerHasToken(BasePlayer player, int tokenItemID)
+	{
+		return GetPurchaseToken(player, tokenItemID) != null;
+	}
+
+	public void SaveContainer(SaveInfo info, Horse2 msgHorse2)
+	{
+		if (info.forDisk)
+		{
+			if (storageInventory != null)
+			{
+				msgHorse2.storageContainer = storageInventory.Save();
+			}
+			if (equipmentInventory != null)
+			{
+				msgHorse2.equipmentContainer = equipmentInventory.Save();
+			}
+		}
+	}
+
+	public void LoadContainer(LoadInfo info)
+	{
+		if (info.fromDisk && info.msg.horse2 != null)
+		{
+			if (equipmentInventory != null && info.msg.horse2.equipmentContainer != null)
+			{
+				equipmentInventory.Load(info.msg.horse2.equipmentContainer);
+				equipmentInventory.capacity = equipmentSlots;
+			}
+			else
+			{
+				Debug.LogWarning("Horse didn't have saved equipment inventory: " + ToString());
+			}
+			if (storageInventory != null && info.msg.horse2.storageContainer != null)
+			{
+				storageInventory.Load(info.msg.horse2.storageContainer);
+				storageInventory.capacity = numStorageSlots;
+			}
+			else
+			{
+				Debug.LogWarning("Horse didn't have savevd storage inventorry: " + ToString());
+			}
+		}
+	}
+
+	public override void PreInitShared()
+	{
+		base.PreInitShared();
+		modifiers = GetComponent<HorseModifiers>();
+	}
+
+	public bool HasSeatAvailable()
+	{
+		if (HasSaddle)
+		{
+			return !HasFlag(Flags.Reserved11);
+		}
+		return false;
+	}
+
+	public bool IsPlayerTooHeavy(BasePlayer player)
+	{
+		return player.Weight >= 10f;
+	}
+
+	public override void PreProcess(IPrefabProcessor preProcess, GameObject rootObj, string name, bool serverside, bool clientside, bool bundling)
+	{
+		base.PreProcess(preProcess, rootObj, name, serverside, clientside, bundling);
+		hasItemTokenCache = new bool[PurchaseOptions.Count];
+		baseDrag = rigidBody.drag;
+		baseAngularDrag = rigidBody.angularDrag;
+		bonesInitialLocalPos = new Vector3[allBones.Length];
+		for (int i = 0; i < allBones.Length; i++)
+		{
+			bonesInitialLocalPos[i] = allBones[i].localPosition;
+		}
+	}
+
+	public void ResetBonesPositions()
+	{
+		for (int i = 0; i < allBones.Length; i++)
+		{
+			allBones[i].localPosition = bonesInitialLocalPos[i];
+		}
+	}
+
+	public override void OnFlagsChanged(Flags old, Flags next)
+	{
+		base.OnFlagsChanged(old, next);
+		if (old != next && base.isServer)
+		{
+			ServerFlagsChanged(old, next);
+		}
+	}
+
+	public override bool AnyMounted()
+	{
+		return base.AnyMounted();
+	}
+
+	private bool CanPlayerSeeSaddlePoint(BasePlayer player)
+	{
+		if (!GamePhysics.CheckCapsule(player.eyes.position, mountAnchor.position, 0.25f, 2162688))
+		{
+			return !GamePhysics.CheckCapsule(player.eyes.position, mountAnchor.position + Vector3.up * 0.5f, 0.25f, 2162688);
+		}
+		return false;
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		info.msg.horse2 = Facepunch.Pool.Get<Horse2>();
+		SaveContainer(info, info.msg.horse2);
+		info.msg.horse2.stamina = currentStamina;
+		info.msg.horse2.maxStamina = currentMaxStamina;
+		info.msg.horse2.towEntityId = towingEntityId;
+		info.msg.horse2.breedIndex = currentBreedIndex;
+		info.msg.horse2.numStorageSlots = numStorageSlots;
+		if (!info.forDisk)
+		{
+			info.msg.horse2.gait = (int)currentGait;
+			info.msg.horse2.equipmentSpeedMod = equipmentSpeedMod;
+			info.msg.horse2.playerLeadingId = playerLeadingId;
+		}
+		info.msg.horse2.modifiers = null;
+		if (modifiers != null)
+		{
+			info.msg.horse2.modifiers = modifiers.Save(info.forDisk);
+		}
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (info.msg.horse2 != null)
+		{
+			LoadContainer(info);
+			currentStamina = info.msg.horse2.stamina;
+			currentMaxStamina = info.msg.horse2.maxStamina;
+			if (info.fromDisk)
+			{
+				towingEntityId = info.msg.horse2.towEntityId;
+				ValidateTowableEntity();
+				TowAttach();
+			}
+			if (info.msg.horse2.modifiers != null && modifiers != null)
+			{
+				modifiers.Load(info.msg.horse2.modifiers, info.fromDisk);
+			}
+			ApplyBreed(info.msg.horse2.breedIndex);
+		}
+	}
+
+	public bool ShouldTrigger()
+	{
+		if (IsStopped() && isGrounded && !IsSwimming)
+		{
+			return !HasFlag(Flags.Reserved19);
+		}
+		return false;
+	}
+
+	public void OnObjects()
+	{
+	}
+
+	public void OnObjectAdded(GameObject obj, Collider col)
+	{
+		if (ShouldTrigger() && !base.isClient)
+		{
+			BaseEntity baseEntity = GameObjectEx.ToBaseEntity(obj);
+			if (!(baseEntity == null) && !baseEntity.isClient && baseEntity is DroppedItem { item: not null } droppedItem && droppedItem.item.info.category == ItemCategory.Food)
+			{
+				OnFoodDetected(droppedItem);
+			}
+		}
+	}
+
+	public void OnEmpty()
+	{
+	}
+
+	private void OnFoodDetected(DroppedItem droppedItem)
+	{
+		Invoke(delegate
+		{
+			EatDroppedFood(droppedItem);
+		}, UnityEngine.Random.Range(1f, 2f));
+	}
+
+	private void EatDroppedFood(DroppedItem droppedItem)
+	{
+		if (droppedItem == null || !foodTrigger.HasAnyEntityContents || (GetMaxStaminaFraction() >= 1f && base.healthFraction >= 1f))
+		{
+			return;
+		}
+		if (UnityEngine.Time.time < nextEatTime)
+		{
+			Invoke(delegate
+			{
+				OnFoodDetected(droppedItem);
+			}, nextEatTime - UnityEngine.Time.time);
+		}
+		else
+		{
+			if (!foodTrigger.entityContents.Contains(droppedItem))
+			{
+				return;
+			}
+			ItemModConsumable component = droppedItem.item.info.GetComponent<ItemModConsumable>();
+			if (component == null)
+			{
+				return;
+			}
+			droppedItem.item.UseItem();
+			if (droppedItem.item.amount <= 0)
+			{
+				droppedItem.Kill();
+			}
+			else
+			{
+				Invoke(delegate
+				{
+					EatDroppedFood(droppedItem);
+				}, nextEatTime - UnityEngine.Time.time);
+			}
+			nextEatTime = UnityEngine.Time.time + UnityEngine.Random.Range(2f, 3f) + Mathf.InverseLerp(0.5f, 1f, GetMaxStaminaFraction()) * 4f;
+			ReplenishFromFood(component);
+		}
+	}
+
+	public void ReplenishFromFood(ItemModConsumable consumable)
+	{
+		if (!(consumable == null))
+		{
+			HorseModifiers.AddToHorse(this, consumable.modifiers);
+			lastEatTime = UnityEngine.Time.time;
+			float ifType = consumable.GetIfType(MetabolismAttribute.Type.Calories);
+			float ifType2 = consumable.GetIfType(MetabolismAttribute.Type.Hydration);
+			float num = consumable.GetIfType(MetabolismAttribute.Type.Health) + consumable.GetIfType(MetabolismAttribute.Type.HealthOverTime);
+			ApplyDungCalories(ifType);
+			ReplenishStaminaCore(ifType, ifType2);
+			Heal(num * 4f);
+			ClientRPC(RpcTarget.NetworkGroup("CLIENT_HorseEat"));
+		}
+	}
+
+	private void UpdateDung(float deltaTime)
+	{
+		if (pendingDungCalories < 0.01f || dungItem == null)
+		{
+			return;
+		}
+		deltaTime *= dungTimeScale;
+		float num = ((modifiers != null) ? modifiers.GetValue(Modifier.ModifierType.HorseDungProductionBoost, 1f) : 1f);
+		deltaTime *= num;
+		if (!(deltaTime < 0.01f))
+		{
+			float num2 = Mathf.Min(pendingDungCalories * deltaTime, caloriesToDigestPerHour / 3600f * deltaTime) * dungProducedPerCalorie;
+			dungProduction += num2;
+			pendingDungCalories -= num2;
+			if (dungProduction >= 1f)
+			{
+				DoDung();
+			}
+		}
+	}
+
+	public void ApplyDungCalories(float calories)
+	{
+		pendingDungCalories += calories;
+	}
+
+	private void DoDung()
+	{
+		dungProduction -= 1f;
+		if (Interface.CallHook("OnAnimalDungProduce", this) == null)
+		{
+			Quaternion rotation = Quaternion.Euler(UnityEngine.Random.Range(-180f, 180f), UnityEngine.Random.Range(-180f, 180f), UnityEngine.Random.Range(-180f, 180f));
+			Vector3 vVelocity = new Vector3(UnityEngine.Random.Range(-0.5f, 0.5f), UnityEngine.Random.Range(-1f, -3f), UnityEngine.Random.Range(-0.5f, 0.5f));
+			Item item = ItemManager.Create(dungItem, 1, 0uL);
+			item.SetItemOwnership(currentBreed.breedName.english, ItemOwnershipPhrases.Pooped);
+			item.Drop(dungSpawnPoint.position + UnityEngine.Random.insideUnitSphere * 0.1f, vVelocity, rotation);
+			Interface.CallHook("OnAnimalDungProduced", this, item);
+		}
+	}
+
+	public bool IsHitched()
+	{
+		return currentHitch != null;
+	}
+
+	public void TryToHitch()
+	{
+		List<HitchTrough> obj = Facepunch.Pool.Get<List<HitchTrough>>();
+		Vis.Entities(base.transform.position, 2.5f, obj, 256, QueryTriggerInteraction.Ignore);
+		foreach (HitchTrough item in obj)
+		{
+			if (!item.isClient && !(Vector3.Dot(Vector3Ex.Direction2D(item.transform.position, base.transform.position), base.transform.forward) < 0.4f) && item.HasSpace() && item.IsValidHitchPosition(base.transform.position) && item.AttemptToHitch(this))
+			{
+				break;
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	public void SetHitch(HitchTrough hitch, HitchTrough.HitchSpot spot)
+	{
+		currentHitch = hitch;
+		SetFlag(Flags.Reserved3, currentHitch != null);
+		if (hitch != null)
+		{
+			base.transform.SetPositionAndRotation(spot.tr.position, spot.tr.rotation);
+			DismountAllPlayers();
+		}
+	}
+
+	private void EatFromHitch()
+	{
+		if (!IsHitched())
+		{
+			CancelInvoke(EatFromHitch);
+		}
+		else
+		{
+			if (UnityEngine.Time.time < nextEatTime || (GetMaxStaminaFraction() >= 1f && base.healthFraction >= 1f))
+			{
+				return;
+			}
+			Item foodItem = currentHitch.GetFoodItem();
+			if (foodItem != null && foodItem.amount > 0)
+			{
+				ItemModConsumable component = foodItem.info.GetComponent<ItemModConsumable>();
+				if ((bool)component)
+				{
+					float time = component.GetIfType(MetabolismAttribute.Type.Calories) * currentHitch.caloriesToDecaySeconds;
+					AddDecayDelay(time);
+					ReplenishFromFood(component);
+					foodItem.UseItem();
+					nextEatTime = UnityEngine.Time.time + UnityEngine.Random.Range(2f, 3f) + Mathf.InverseLerp(0.5f, 1f, GetMaxStaminaFraction()) * 4f;
+				}
+			}
+		}
+	}
+
+	public void TryLeaveHitch()
+	{
+		if (currentHitch != null)
+		{
+			currentHitch.UnHitch(this);
+		}
+	}
+
+	public bool IsReversing()
+	{
+		Vector3 lhs = Vector3.zero;
+		if (base.isServer)
+		{
+			lhs = rigidBody.velocity;
+		}
+		return Vector3.Dot(lhs, base.transform.forward) < -0.1f;
+	}
+
+	private float GetCurrentSpeed()
+	{
+		if (base.isServer)
+		{
+			return rigidBody.velocity.magnitude;
+		}
+		return 0f;
+	}
+
+	public float GetCurrentGaitSpeedFraction()
+	{
+		return Mathf.Clamp01(GetCurrentSpeed() / GetCurrentMaxSpeed());
+	}
+
+	public float GetSpeedFraction()
+	{
+		return Mathf.Clamp01(GetCurrentSpeed() / GetTopSpeed());
+	}
+
+	private float GetTurnSpeed()
+	{
+		float turnSpeed = GetCurrentGait().turnSpeed;
+		if (IsSwimming)
+		{
+			return turnSpeed * 0.8f;
+		}
+		if (IsReversing())
+		{
+			return turnSpeed * 0.7f;
+		}
+		return turnSpeed;
+	}
+
+	private float GetCurrentAcceleration()
+	{
+		float num = GetCurrentGait().accelerationForce;
+		if (IsTowing)
+		{
+			num *= towingAccelerationBoost;
+		}
+		return num;
+	}
+
+	private float GetCurrentMaxSpeed()
+	{
+		Gait gait = GetCurrentGait();
+		float num = gait.maxSpeed;
+		if (onIdealTerrain && gait.gaitType == GaitType.Gallop)
+		{
+			num += roadSpeedBonus;
+		}
+		if (gait.equipmentScalesMaxSpeed)
+		{
+			num += equipmentSpeedMod;
+			float num2 = ((modifiers != null) ? modifiers.GetValue(Modifier.ModifierType.HorseGallopSpeed) : 0f);
+			num += num2;
+		}
+		if (gait.breedScalesMaxSpeed)
+		{
+			num *= currentBreed.maxSpeed;
+		}
+		if (IsTowing)
+		{
+			num *= towingMaxSpeedBoost;
+		}
+		return num;
+	}
+
+	public float GetTopSpeed()
+	{
+		float num = (gaits[gaits.Length - 1].maxSpeed + equipmentSpeedMod) * currentBreed.maxSpeed;
+		float num2 = ((modifiers != null) ? modifiers.GetValue(Modifier.ModifierType.HorseGallopSpeed) : 0f);
+		return num + num2;
+	}
+
+	private Gait GetCurrentGait()
+	{
+		return gaits[(uint)currentGait];
+	}
+
+	private bool IsStopped()
+	{
+		if (!IsSliding)
+		{
+			return GetSpeedFraction() < 0.05f;
+		}
+		return false;
+	}
+
+	public float GetMaxStaminaFraction()
+	{
+		return Mathf.InverseLerp(0f, maxStamina, currentMaxStamina);
+	}
+
+	public float GetStaminaFraction()
+	{
+		return Mathf.InverseLerp(0f, maxStamina, currentStamina);
+	}
+
+	public bool IsDrowning()
+	{
+		if (IsSwimming)
+		{
+			return GetStaminaFraction() < 0.02f;
+		}
+		return false;
+	}
+
+	public bool CanLead(BasePlayer player)
+	{
+		if (!AnyMounted() && NearMountPoint(player) && DirectlyMountable() && !HasFlag(Flags.Reserved12) && !player.isMounted && !IsLeading && !IsTowing)
+		{
+			return !IsForSale;
+		}
+		return false;
+	}
+
+	public bool CanStopLead(BasePlayer player)
+	{
+		if (IsLeading && leadingPlayer == player)
+		{
+			return NearMountPoint(player);
+		}
+		return false;
+	}
+
+	public override void PlayerServerInput(InputState inputState, BasePlayer player)
+	{
+		base.PlayerServerInput(inputState, player);
+		if (!IsDriver(player))
+		{
+			return;
+		}
+		if (inputProvider != null)
+		{
+			throttleInput = inputProvider.GetMoveInput();
+			steerInput = inputProvider.GetSteerInput();
+		}
+		float num = steerInput;
+		if (num == 1f || num == -1f)
+		{
+			if (steerInputDownTime == 0f)
+			{
+				steerInputDownTime = UnityEngine.Time.time;
+			}
+		}
+		else
+		{
+			steerInputDownTime = 0f;
+		}
+		forwardInputDown = throttleInput == 1f;
+		backwardInputDown = throttleInput == -1f;
+		sprintInputJustPressed = inputState.WasJustPressed(BUTTON.SPRINT);
+		bool flag = inputState.IsDown(BUTTON.SPRINT);
+		if (sprintInputJustPressed)
+		{
+			IncrementGait(flag);
+		}
+		if (inputState.WasJustReleased(BUTTON.SPRINT) && currentGait == GaitType.Gallop)
+		{
+			RetrogradeGait();
+		}
+		if (flag)
+		{
+			if (sprintInputHoldTime == 0f)
+			{
+				sprintInputHoldTime = UnityEngine.Time.time;
+			}
+			if (UnityEngine.Time.time - sprintInputHoldTime >= gaitProgressionInterval && (int)currentGait < 3)
+			{
+				sprintInputHoldTime = UnityEngine.Time.time;
+				IncrementGait(sprintHeld: true);
+			}
+		}
+		else
+		{
+			sprintInputHoldTime = 0f;
+		}
+		duckInputDown = inputState.IsDown(BUTTON.DUCK);
+		if (inputState.WasJustReleased(BUTTON.DUCK))
+		{
+			float time = UnityEngine.Time.time;
+			if (time - lastDuckTapTime <= doubleTapTime)
+			{
+				duckDoubleTapped = true;
+			}
+			else
+			{
+				duckDoubleTapped = false;
+			}
+			lastDuckTapTime = time;
+		}
+		else if (duckDoubleTapped)
+		{
+			duckDoubleTapped = false;
+		}
+	}
+
+	public override void VehicleFixedUpdate()
+	{
+		if (HasFlag(Flags.Reserved12))
+		{
+			return;
+		}
+		base.VehicleFixedUpdate();
+		using (TimeWarning.New("RidableHorse2.VehicleFixedUpdate"))
+		{
+			if (modifiers != null)
+			{
+				modifiers.ServerUpdate(this);
+			}
+			float fixedDeltaTime = UnityEngine.Time.fixedDeltaTime;
+			UpdateStamina(fixedDeltaTime);
+			UpdateDung(fixedDeltaTime);
+			if (IsDrowning() && (float)timeSinceDrowningDamage > 2f)
+			{
+				timeSinceDrowningDamage = 0f;
+				Hurt(75f, DamageType.Drowned, null, useProtection: false);
+			}
+			if (UnityEngine.Time.time >= nextCollisionDamageTime)
+			{
+				nextCollisionDamageTime = UnityEngine.Time.time + 0.33f;
+				foreach (KeyValuePair<BaseEntity, float> item in damageSinceLastTick)
+				{
+					DoCollisionDamage(item.Key, item.Value);
+				}
+				damageSinceLastTick.Clear();
+			}
+			bool flag = AnyMounted();
+			if ((!IsLeading && !HasDoubleSaddle && !flag) || (HasDoubleSaddle && !HasDriver()))
+			{
+				throttleInput = 0f;
+				steerInput = 0f;
+			}
+			if (IsLeading)
+			{
+				if (leadingPlayer == null || leadingPlayer.IsDead() || leadingPlayer.IsSleeping() || leadingPlayer.IsDestroyed)
+				{
+					SetLeading(null);
+				}
+				else
+				{
+					throttleInput = inputProvider.GetMoveInput();
+					steerInput = inputProvider.GetSteerInput();
+				}
+			}
+			if ((flag || IsLeading) && rigidBody.IsSleeping())
+			{
+				rigidBody.WakeUp();
+			}
+			if (rigidBody.IsSleeping())
+			{
+				wasSleeping = true;
+				serverLegsAnimator.enabled = false;
+				return;
+			}
+			serverLegsAnimator.enabled = true;
+			serverLegsAnimator.HipsHeightStepSpeed = Mathf.Lerp(0.7f, 0.05f, Mathf.InverseLerp(0f, 10f, normalVariation));
+			if (IsTowing)
+			{
+				towingAttachment.FixedUpdate();
+			}
+			if (wasSleeping || GetCurrentSpeed() > 0.5f || Mathf.Abs(rigidBody.angularVelocity.magnitude) > 0.5f)
+			{
+				lastMovingTime = UnityEngine.Time.time;
+			}
+			float num = GetCurrentSpeed() * UnityEngine.Time.fixedDeltaTime;
+			if (!flag && !IsLeading && !IsTowing && UnityEngine.Time.time > lastMovingTime + 5f)
+			{
+				airTime = 0f;
+				wheelCollider.motorTorque = 0f;
+				serverLegsAnimator.enabled = false;
+				rigidBody.Sleep();
+			}
+			else
+			{
+				if (autoAvoidance)
+				{
+					AutoAvoidObstacles();
+				}
+				MovementsUpdate();
+			}
+			wasSleeping = false;
+			tempDistanceTravelled += num;
+		}
+	}
+
+	public override float MaxVelocity()
+	{
+		return GetTopSpeed() * 1.3f;
+	}
+
+	private void MovementsUpdate()
+	{
+		if (currentGait == GaitType.Canter && !CanCanter())
+		{
+			RetrogradeGait();
+		}
+		else if (currentGait == GaitType.Gallop && !CanGallop())
+		{
+			RetrogradeGait();
+		}
+		CheckSpeedForRetrograde();
+		UpdateOnTerrain();
+		bool isSwimming = IsSwimming;
+		if (onWaterTopology)
+		{
+			if ((float)timeSinceWaterCheck > (isSwimming ? 0.05f : 0.25f))
+			{
+				Bounds bounds = WorldSpaceBounds().ToBounds();
+				lastWaterInfo = WaterLevel.GetWaterInfo(bounds, waves: true, volumes: true, this);
+				currentWaterFactor = (lastWaterInfo.isValid ? Mathf.InverseLerp(bounds.min.y, bounds.max.y, lastWaterInfo.surfaceLevel) : 0f);
+				isSubmerged = currentWaterFactor > 0.65f;
+				bool flag = (currentWaterFactor > 0.5f && !isGrounded) || isSubmerged;
+				if (isSwimming != flag)
+				{
+					SetFlag(Flags.Reserved17, flag);
+				}
+				bool flag2 = currentWaterFactor > 0.32f;
+				if (HasFlag(Flags.Reserved19) != flag2)
+				{
+					SetFlag(Flags.Reserved19, flag2);
+				}
+				rigidBody.drag = Mathf.Max(baseDrag, currentWaterFactor * 3f);
+				rigidBody.angularDrag = Mathf.Max(baseAngularDrag, currentWaterFactor * 2f);
+				timeSinceWaterCheck = 0f;
+			}
+		}
+		else
+		{
+			if (HasFlag(Flags.Reserved19))
+			{
+				SetFlag(Flags.Reserved19, b: false);
+			}
+			currentWaterFactor = 0f;
+		}
+		wasGrounded = isGrounded;
+		if (throttledGroundAngleUpdate)
+		{
+			if (UnityEngine.Time.time > nextGroundNormalCheckTime)
+			{
+				UpdateGroundNormal();
+				nextGroundNormalCheckTime = UnityEngine.Time.time + UnityEngine.Random.Range(groundAngleUpdateRate, groundAngleUpdateRate + 0.1f);
+			}
+		}
+		else
+		{
+			UpdateGroundNormal();
+		}
+		if (isGrounded || isSwimming)
+		{
+			if (!wasGrounded)
+			{
+				OnLanded(Mathf.Abs(lastYVelocity));
+			}
+			airTime = 0f;
+			bool flag3 = IsStopped();
+			if (rigidBody.velocity.magnitude > 0.5f && !isSwimming)
+			{
+				Vector3 force = -base.transform.up * rigidBody.velocity.magnitude * 20f;
+				rigidBody.AddForce(force, ForceMode.Force);
+			}
+			AlignWithNormal(averagedUp);
+			Vector3 forward = base.transform.forward;
+			Vector3 velocity = rigidBody.velocity;
+			if (ShouldSlide())
+			{
+				SetWheelStiffness(0.1f, 0f);
+				SetFlag(Flags.Reserved18, b: true);
+			}
+			float currentSpeed = GetCurrentSpeed();
+			if (IsSliding)
+			{
+				if ((groundAngle < groundAngleToRecoverFromSlide && currentSpeed < 7f) || (currentSpeed < 1f && slidingTime > UnityEngine.Time.fixedDeltaTime * 10f))
+				{
+					SetWheelStiffness(1f, 1f);
+					SetFlag(Flags.Reserved18, b: false);
+					slidingTime = 0f;
+				}
+				slidingTime += UnityEngine.Time.fixedDeltaTime;
+				float num = Vector3.Dot(rigidBody.velocity, -base.transform.forward);
+				if (slidingTime > UnityEngine.Time.fixedDeltaTime * 5f && num > 7f)
+				{
+					if (groundAngle > groundAngleToRecoverFromSlide + 5f)
+					{
+						RagdollAllRiders();
+					}
+					RagdollHorse();
+				}
+			}
+			Vector3 vector = Vector3.Project(velocity, forward);
+			Vector3 vector2 = velocity - vector;
+			if (vector2.magnitude > 1f)
+			{
+				Vector3 vector3 = -vector2 * (isSkidding ? 1f : 3f);
+				rigidBody.AddForce(vector3 * rigidBody.mass, ForceMode.Force);
+			}
+			float num2 = Mathf.Clamp01(currentSpeed / GetTopSpeed());
+			if (num2 > 0.9f && duckInputDown && !isSkidding && currentWaterFactor < 0.1f && groundAngle < 10f)
+			{
+				isSkidding = true;
+				SetWheelStiffness(0.1f, 0.3f);
+				ClientRPC(RpcTarget.NetworkGroup("CLIENT_Skid"));
+			}
+			if (isSkidding)
+			{
+				SetWheelStiffness(0f, 0f);
+				Brake(1.25f);
+				if (num2 <= 0.01f || Vector3.Dot(forward, velocity.normalized) < 0.2f)
+				{
+					isSkidding = false;
+				}
+			}
+			else if (!IsSliding)
+			{
+				SetWheelStiffness(1f, 1f);
+			}
+			if (Mathf.Abs(steerInput) > 0f && num2 < 0.3f && !IsReversing() && !backwardInputDown && !forwardInputDown && !isSkidding && !duckInputDown && UnityEngine.Time.time - steerInputDownTime > 1f)
+			{
+				throttleInput = 1f;
+			}
+			if (!isStanding && !IsSliding && !isSkidding)
+			{
+				if (duckInputDown && !flag3)
+				{
+					float multiplier = (((int)currentGait <= 1) ? 0.15f : 1f);
+					Brake(multiplier);
+				}
+				if (throttleInput != 0f && !duckInputDown)
+				{
+					wheelCollider.motorTorque = 1E-05f * Mathf.Sign(throttleInput);
+					if (throttleInput < 0f)
+					{
+						if (Vector3.Dot(velocity, forward) < -0.1f || flag3)
+						{
+							float num3 = GetCurrentMaxSpeed() * reverseSpeedFactor;
+							float num4 = Mathf.Max(num3 - currentSpeed, 0f);
+							Vector3 force2 = -forward * (reverseAccelerationForce * (num4 / num3));
+							rigidBody.AddForce(force2, ForceMode.Force);
+						}
+						else
+						{
+							Brake();
+						}
+					}
+					else if (throttleInput > 0f)
+					{
+						float currentMaxSpeed = GetCurrentMaxSpeed();
+						float currentAcceleration = GetCurrentAcceleration();
+						if (velocity.magnitude < currentMaxSpeed)
+						{
+							Vector3 force3 = forward * currentAcceleration;
+							if (currentGait != 0 || IsTowing)
+							{
+								float num5 = slopeAngleSpeedFactor.Evaluate(Mathf.InverseLerp(minMaxSlopeAngle.x, minMaxSlopeAngle.y, groundAngle));
+								if (IsTowing)
+								{
+									num5 += 1f;
+								}
+								force3 *= num5;
+							}
+							rigidBody.AddForce(force3, ForceMode.Force);
+						}
+						else
+						{
+							Vector3 force4 = (forward * currentMaxSpeed - velocity).normalized * (currentAcceleration * 0.2f);
+							rigidBody.AddForce(force4, ForceMode.Force);
+						}
+					}
+				}
+				else
+				{
+					float num6 = 0.1f;
+					if (rigidBody.velocity.sqrMagnitude < num6 * num6)
+					{
+						rigidBody.velocity = Vector3.zero;
+					}
+					else
+					{
+						Vector3 force5 = -velocity.normalized * (rigidBody.mass * (AnyMounted() ? 1.1f : 3f));
+						rigidBody.AddForce(force5, ForceMode.Force);
+					}
+				}
+			}
+			if (!isStanding && !IsSliding)
+			{
+				float num7 = GetTurnSpeed();
+				if (duckInputDown && (int)currentGait < 2)
+				{
+					num7 *= 1.5f;
+				}
+				float y = ((steerInput + (float)avoidanceSteeringInput) * num7 * (MathF.PI / 180f) - rigidBody.angularVelocity.y) * rotationResponsiveness * rotationResponsivenessCurve.Evaluate(num2);
+				rigidBody.AddRelativeTorque(0f, y, 0f, ForceMode.Acceleration);
+			}
+			if ((Mathf.Abs(throttleInput) <= 0f && rigidBody.velocity.magnitude < 2.5f && groundAngle < minMaxSlopeAngle.y && !isSwimming && !IsSliding) || (IsLeading && currentSpeed > 6f))
+			{
+				ApplyHandBrake();
+			}
+			else
+			{
+				wheelCollider.brakeTorque = 0f;
+			}
+			if (IsLeading)
+			{
+				Vector3 vector4 = base.transform.TransformPoint(Vector3.up * 1.8f + Vector3.forward);
+				float num8 = Vector3.Distance(leadingPlayer.transform.position, vector4);
+				if (num8 > 3.5f)
+				{
+					Vector3 position = leadingPlayer.transform.position;
+					Vector3 vector5 = leadingPlayer.transform.position - lastPullerPosition;
+					lastPullerPosition = leadingPlayer.transform.position;
+					Vector3 normalized = (position - base.transform.position).normalized;
+					Vector3 normalized2 = vector5.normalized;
+					if (Vector3.Dot(normalized, normalized2) > 0.5f)
+					{
+						float value = Mathf.Lerp(0f, -0.9f, Mathf.Clamp01(Mathf.InverseLerp(3.5f, 7f, num8)));
+						leadingPlayer.modifiers.SetValue(Modifier.ModifierSource.Interaction, Modifier.ModifierType.MoveSpeed, value);
+						if (num8 > 5f)
+						{
+							Vector3 normalized3 = (position - vector4).normalized;
+							rigidBody.AddForceAtPosition(normalized3 * 5000f, vector4, ForceMode.Force);
+						}
+					}
+					else
+					{
+						leadingPlayer.modifiers.SetValue(Modifier.ModifierSource.Interaction, Modifier.ModifierType.MoveSpeed, 0f);
+					}
+				}
+				else
+				{
+					leadingPlayer.modifiers.SetValue(Modifier.ModifierSource.Interaction, Modifier.ModifierType.MoveSpeed, 0f);
+				}
+				if (num8 > 7f)
+				{
+					leadingPlayer.modifiers.RemoveFromSource(Modifier.ModifierSource.Interaction);
+					SetLeading(null);
+				}
+			}
+			if (flag3 && duckDoubleTapped && CanStand())
+			{
+				ClientRPC(RpcTarget.NetworkGroup("CLIENT_Stand"));
+				nextStandTime = UnityEngine.Time.time + 4f;
+				isStanding = true;
+			}
+			if (isStanding && nextStandTime < UnityEngine.Time.time)
+			{
+				isStanding = false;
+			}
+		}
+		else
+		{
+			airTime += UnityEngine.Time.fixedDeltaTime;
+			if (airTime > maxAirTimeBeforeRagdoll)
+			{
+				RagdollAllRiders();
+				RagdollHorse();
+			}
+			float num9 = ((currentWaterFactor != 0f) ? waterGravity : gravity);
+			Vector3 force6 = Vector3.down * (rigidBody.mass * num9);
+			rigidBody.AddForce(force6, ForceMode.Force);
+		}
+		if (isSwimming)
+		{
+			AlignWithNormal(Vector3.up);
+			ApplyBuoyancy();
+		}
+		float num10 = 10000f;
+		if (rigidBody.velocity.magnitude > num10)
+		{
+			rigidBody.velocity = rigidBody.velocity.normalized * num10;
+		}
+		float num11 = -1.3f;
+		float num12 = Vector3.Dot(rigidBody.velocity, base.transform.forward);
+		if (num12 <= num11)
+		{
+			float num13 = num11 - num12;
+			float num14 = Mathf.Lerp(1f, 0.2f, Mathf.InverseLerp(10f, 40f, groundAngle));
+			rigidBody.AddForce(base.transform.forward * num13 * num14, ForceMode.Acceleration);
+		}
+		if (Mathf.Abs(steerInput) == 0f && !rigidBody.isKinematic && rigidBody.angularVelocity.magnitude < 0.2f)
+		{
+			rigidBody.angularVelocity = Vector3.zero;
+		}
+		lastYVelocity = rigidBody.velocity.y;
+	}
+
+	private void Brake(float multiplier = 1f)
+	{
+		Vector3 force = (Vector3.zero - rigidBody.velocity).normalized * GetCurrentGait().brakingForce * multiplier;
+		rigidBody.AddForce(force, ForceMode.Force);
+	}
+
+	private bool ShouldSlide()
+	{
+		if ((IsSliding || !(groundAngle > groundAngleSlideThreshold) || !(normalVariation < normalVariationSlideThreshold)) && !(groundAngle > groundAngleSlideThresholdForced))
+		{
+			return Vector3.Dot(rigidBody.velocity, -base.transform.forward) > 4f;
+		}
+		return true;
+	}
+
+	private void ApplyBuoyancy()
+	{
+		float value = lastWaterInfo.surfaceLevel - (IsDrowning() ? (centreOfMassTransform.position.y + 3f) : (centreOfMassTransform.position.y - 0.5f));
+		value = Mathf.Clamp(value, 0f, 5f);
+		if (value > 0f)
+		{
+			float num = Mathf.Sin(UnityEngine.Time.time * 2f) * 0.3f;
+			float num2 = 1f + num;
+			Vector3 force = Vector3.up * (10f * value * num2);
+			rigidBody.AddForce(force, ForceMode.Acceleration);
+			Vector3 vector = Vector3.ProjectOnPlane(rigidBody.velocity, Vector3.up);
+			Vector3 vector2 = Vector3.Project(rigidBody.velocity, Vector3.up);
+			vector2 *= 1f - UnityEngine.Time.fixedDeltaTime * 6f;
+			rigidBody.velocity = vector + vector2;
+		}
+	}
+
+	private void CheckSpeedForRetrograde()
+	{
+		float currentSpeed = GetCurrentSpeed();
+		Gait gait = GetCurrentGait();
+		if ((int)currentGait > 0 && currentSpeed < gait.minSpeed)
+		{
+			RetrogradeGait();
+		}
+		if (IsSwimming && currentGait != 0)
+		{
+			RetrogradeGait();
+		}
+	}
+
+	public void IncrementGait(bool sprintHeld)
+	{
+		if (!IsTowing || currentGait != maxTowingGait)
+		{
+			GaitType gaitType = currentGait + 1;
+			if ((gaitType != GaitType.Gallop || (sprintHeld && CanStartGalloping())) && (gaitType != GaitType.Trot || !IsSwimming) && (int)currentGait < 3)
+			{
+				currentGait++;
+			}
+		}
+	}
+
+	private bool CanGallop()
+	{
+		if (GetStaminaFraction() > 0f)
+		{
+			return UnityEngine.Time.time - lastRoughTerrainTime > 2.5f;
+		}
+		return false;
+	}
+
+	private bool CanCanter()
+	{
+		return UnityEngine.Time.time - lastRoughTerrainTime > 1.5f;
+	}
+
+	private bool CanStartGalloping()
+	{
+		return GetStaminaFraction() > 0.04f;
+	}
+
+	public void RetrogradeGait()
+	{
+		if ((int)currentGait > 0)
+		{
+			currentGait--;
+		}
+	}
+
+	private void ApplyHandBrake()
+	{
+		Vector3 vector = Vector3.ProjectOnPlane(Vector3.down, averagedUp);
+		rigidBody.AddForce(-vector * rigidBody.mass * 10f, ForceMode.Force);
+		wheelCollider.brakeTorque = 10000f;
+		wheelCollider.motorTorque = 0f;
+	}
+
+	private void AlignWithNormal(Vector3 normal, bool force = false)
+	{
+		Vector3 normalized = normal.normalized;
+		Vector3 vector = Vector3.ProjectOnPlane(base.transform.forward, normalized).normalized;
+		if (vector == Vector3.zero)
+		{
+			vector = base.transform.forward;
+		}
+		Quaternion quaternion = Quaternion.LookRotation(vector, Vector3.up);
+		Quaternion rot = (force ? quaternion : Quaternion.Slerp(rigidBody.rotation, quaternion, 5f * UnityEngine.Time.fixedDeltaTime));
+		rigidBody.MoveRotation(rot);
+	}
+
+	public void UpdateGroundNormal()
+	{
+		using (TimeWarning.New("RidableHorse2.UpdateGroundNormal"))
+		{
+			int num = 0;
+			bool flag = false;
+			List<Vector3> obj = Facepunch.Pool.Get<List<Vector3>>();
+			Vector3 zero = Vector3.zero;
+			Vector3 rhs = averagedUp;
+			for (int i = 0; i < groundSampleOffsets.Length; i++)
+			{
+				Vector3 origin = groundSampleOffsets[i].position + Vector3.up;
+				if (GamePhysics.Trace(new Ray(origin, Vector3.down), 0f, out var hitInfo, 1.2f, 429989889, QueryTriggerInteraction.Ignore, this))
+				{
+					Vector3 normal = hitInfo.normal;
+					num++;
+					if (i == groundSampleOffsets.Length - 1)
+					{
+						flag = true;
+					}
+					rhs += normal;
+					obj.Add(normal);
+					zero += normal;
+				}
+				else
+				{
+					rhs += Vector3.up;
+					obj.Add(Vector3.up);
+					zero += Vector3.up;
+				}
+			}
+			isGrounded = num >= 2;
+			if (!IsSwimming && !flag && throttleInput == 0f)
+			{
+				throttleInput = 1f;
+			}
+			Vector3 normalized = (zero / obj.Count).normalized;
+			float num2 = 0f;
+			for (int j = 0; j < obj.Count; j++)
+			{
+				float num3 = Vector3.Angle(obj[j], normalized);
+				num2 += num3;
+			}
+			normalVariation = num2 / (float)obj.Count;
+			if (normalVariation > 25f && !onIdealTerrain)
+			{
+				lastRoughTerrainTime = UnityEngine.Time.time;
+			}
+			rhs += Vector3.up;
+			rhs /= (float)(groundSampleOffsets.Length + 1);
+			rhs.Normalize();
+			if (normalVariation < 10f || Vector3.Dot(targetUp, rhs) < 0.99f)
+			{
+				targetUp = rhs;
+			}
+			averagedUp = Vector3.Lerp(averagedUp, targetUp, UnityEngine.Time.fixedDeltaTime * groundAlignmentSpeed);
+			groundAngle = Vector3.Angle(normalized, Vector3.up);
+			Facepunch.Pool.FreeUnmanaged(ref obj);
+		}
+	}
+
+	private void SetWheelStiffness(float forward, float sideways)
+	{
+		WheelFrictionCurve forwardFriction = wheelCollider.forwardFriction;
+		WheelFrictionCurve sidewaysFriction = wheelCollider.sidewaysFriction;
+		forwardFriction.stiffness = forward;
+		sidewaysFriction.stiffness = sideways;
+		wheelCollider.forwardFriction = forwardFriction;
+		wheelCollider.sidewaysFriction = sidewaysFriction;
+	}
+
+	private void AutoAvoidObstacles()
+	{
+		if (currentAvoidanceState == HorseAvoidanceState.Normal && GetSpeedFraction() < 0.1f)
+		{
+			avoidanceSteeringInput = 0;
+			return;
+		}
+		float num = Mathf.Lerp(avoidanceDetectionDistance.x, avoidanceDetectionDistance.y, GetSpeedFraction());
+		Vector3 obj = ((rigidBody.velocity.sqrMagnitude > 0.01f) ? rigidBody.velocity.normalized : base.transform.forward);
+		Vector3 vector = base.transform.right * steerInput * 0.4f;
+		Vector3 normalized = (obj + vector * 0.4f).normalized;
+		avoidanceScanDirection = Vector3.Lerp(avoidanceScanDirection, normalized, UnityEngine.Time.deltaTime * 5f).normalized;
+		if (currentAvoidanceState == HorseAvoidanceState.Normal && UnityEngine.Time.time < nextAutoAvoidanceCheckTime)
+		{
+			return;
+		}
+		nextAutoAvoidanceCheckTime = UnityEngine.Time.time + UnityEngine.Random.Range(0.1f, 0.2f);
+		switch (currentAvoidanceState)
+		{
+		case HorseAvoidanceState.Normal:
+		{
+			if (DetectObstacleAhead(num, avoidanceScanDirection, out var _))
+			{
+				currentAvoidanceState = HorseAvoidanceState.AvoidingObstacle;
+			}
+			avoidanceSteeringInput = 0;
+			break;
+		}
+		case HorseAvoidanceState.AvoidingObstacle:
+		{
+			int num2 = DetermineAvoidanceDirection(num);
+			avoidanceSteeringInput = num2;
+			if (!DetectObstacleAhead(num, base.transform.forward, out var _))
+			{
+				if (steerInput != 0f && steerInput != (float)avoidanceSteeringInput)
+				{
+					currentAvoidanceState = HorseAvoidanceState.Normal;
+					avoidanceSteeringInput = 0;
+				}
+				else
+				{
+					currentAvoidanceState = HorseAvoidanceState.Normal;
+					avoidanceSteeringInput = 0;
+				}
+			}
+			break;
+		}
+		}
+	}
+
+	private bool DetectObstacleAhead(float distance, Vector3 direction, out BaseEntity avoidedEnt)
+	{
+		avoidedEnt = null;
+		if (UnityEngine.Physics.SphereCast(base.transform.position + base.transform.forward + Vector3.up * 1f, avoidanceSphereRadius, direction, out var hitInfo, distance, avoidanceObstacleMask))
+		{
+			BaseEntity baseEntity = GameObjectEx.ToBaseEntity(hitInfo.collider);
+			if (baseEntity is TreeEntity)
+			{
+				avoidedEnt = baseEntity;
+				return true;
+			}
+			if (baseEntity is ResourceEntity)
+			{
+				UnityEngine.Physics.IgnoreCollision(wheelCollider, hitInfo.collider);
+			}
+		}
+		return false;
+	}
+
+	private int DetermineAvoidanceDirection(float detectDistance)
+	{
+		Vector3 normalized = (base.transform.forward + base.transform.right * 0.5f).normalized;
+		Vector3 normalized2 = (base.transform.forward - base.transform.right * 0.5f).normalized;
+		float num = CheckSideClearance(normalized, detectDistance);
+		float num2 = CheckSideClearance(normalized2, detectDistance);
+		if (!(num > num2))
+		{
+			return -1;
+		}
+		return 1;
+	}
+
+	private float CheckSideClearance(Vector3 direction, float distance)
+	{
+		if (UnityEngine.Physics.SphereCast(base.transform.position + Vector3.up * 1f, avoidanceSphereRadius, direction, out var hitInfo, distance, avoidanceObstacleMask))
+		{
+			if (GameObjectEx.ToBaseEntity(hitInfo.collider) is TreeEntity)
+			{
+				return hitInfo.distance;
+			}
+			return distance;
+		}
+		return distance;
+	}
+
+	public void OnRagdollCollisionEnter(Collision collision)
+	{
+		OnLanded(Mathf.Abs(collision.relativeVelocity.y));
+	}
+
+	protected void OnCollisionEnter(Collision collision)
+	{
+		if (base.isServer)
+		{
+			ProcessCollision(collision, rigidBody);
+		}
+	}
+
+	protected void ProcessCollision(Collision collision, Rigidbody ourRigidbody)
+	{
+		if (!base.isClient && collision != null && !(collision.gameObject == null) && !(collision.gameObject == null))
+		{
+			float num = collision.relativeVelocity.magnitude * rigidBody.mass;
+			float value = Vector3.Dot(-collision.contacts[0].normal, base.transform.forward);
+			float num2 = Mathf.Lerp(0.2f, 1f, Mathf.Clamp01(value));
+			num *= num2;
+			if (QueueCollisionDamage(this, num) > 0f)
+			{
+				TryShowCollisionFX(collision);
+			}
+		}
+	}
+
+	private float QueueCollisionDamage(BaseEntity hitEntity, float forceMagnitude)
+	{
+		float num = Mathf.InverseLerp(minCollisionDamageForce, maxCollisionDamageForce, forceMagnitude);
+		if (num > 0f)
+		{
+			float num2 = Mathf.Lerp(1f, 200f, num) * collisionDamageMultiplier;
+			if (damageSinceLastTick.TryGetValue(hitEntity, out var value))
+			{
+				if (value < num2)
+				{
+					damageSinceLastTick[hitEntity] = num2;
+				}
+			}
+			else
+			{
+				damageSinceLastTick[hitEntity] = num2;
+			}
+		}
+		return num;
+	}
+
+	protected virtual void DoCollisionDamage(BaseEntity hitEntity, float damage)
+	{
+		lastCrashDamage = damage;
+		if (damage > playerDamageThreshold)
+		{
+			float damage2 = (damage - playerDamageThreshold) / 4f;
+			DamageAllRiders(damage2);
+		}
+		if (damage > playerRagdollThreshold)
+		{
+			Vector3 mountRagdollVelocity = GetMountRagdollVelocity(GetDriver());
+			RagdollAllRiders(mountRagdollVelocity);
+		}
+		Hurt(damage, DamageType.Collision, this, useProtection: false);
+		if (damage > playerRagdollThreshold && !IsDead() && !HasFlag(Flags.Reserved12))
+		{
+			RagdollHorse();
+		}
+	}
+
+	private void OnLanded(float impactSpeed)
+	{
+		float num = DamageFromFalling(impactSpeed, checkAirtime: true);
+		if (num != 0f)
+		{
+			Hurt(num, DamageType.Fall, this, useProtection: false);
+			TryShowCollisionFX(base.transform.position);
+			if (num > playerDamageThreshold)
+			{
+				float damage = (num - playerDamageThreshold) / 4f;
+				DamageAllRiders(damage);
+			}
+			if (num > 100f)
+			{
+				RagdollAllRiders();
+			}
+		}
+	}
+
+	private float DamageFromFalling(float impactSpeed, bool checkAirtime)
+	{
+		float result = 0f;
+		if (impactSpeed > 5f && (!checkAirtime || airTime > 0.4f))
+		{
+			result = (impactSpeed - 5f) * 10f;
+		}
+		return result;
+	}
+
+	private void DamageAllRiders(float damage)
+	{
+		BasePlayer driver = GetDriver();
+		if (driver != null && !driver.IsDead())
+		{
+			driver.Hurt(damage, DamageType.Collision, this, useProtection: false);
+		}
+		BasePlayer passenger = GetPassenger();
+		if (passenger != null && !passenger.IsDead())
+		{
+			passenger.Hurt(damage, DamageType.Collision, this, useProtection: false);
+		}
+	}
+
+	private void RagdollAllRiders(Vector3 force = default(Vector3))
+	{
+		BasePlayer driver = GetDriver();
+		if (driver != null && !driver.IsDead())
+		{
+			driver.Ragdoll(force);
+		}
+		BasePlayer passenger = GetPassenger();
+		if (passenger != null && !passenger.IsDead())
+		{
+			passenger.Ragdoll(force);
+		}
+	}
+
+	public override GameObjectRef GetCollisionFX()
+	{
+		return collisionEffect;
+	}
+
+	public override Vector3 GetMountRagdollVelocity(BasePlayer player)
+	{
+		float num = Mathf.Clamp(lastCrashDamage, 0f, 75f);
+		return base.transform.forward * num * 0.25f;
+	}
+
+	public float GetDamageMultiplier(BaseEntity ent)
+	{
+		return Mathf.Abs(GetSpeed()) * 1f;
+	}
+
+	public void OnHurtTriggerOccupant(BaseEntity hurtEntity, DamageType damageType, float damageTotal)
+	{
+	}
+
+	[ServerVar]
+	public static void Ragdoll(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer == null)
+		{
+			return;
+		}
+		List<RidableHorse2> obj = Facepunch.Pool.Get<List<RidableHorse2>>();
+		Vis.Entities(basePlayer.eyes.position, basePlayer.eyes.position + basePlayer.eyes.HeadForward() * 5f, 0f, obj);
+		foreach (RidableHorse2 item in obj)
+		{
+			item.RagdollHorse();
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	public void RagdollHorse()
+	{
+		if (!ConVar.Physics.allowhorsetempragdoll)
+		{
+			DismountAllPlayers();
+		}
+		else if (!HasFlag(Flags.Reserved12))
+		{
+			DismountAllPlayers();
+			CreateRagdoll(base.transform.position, base.transform.rotation);
+			SetFlag(Flags.Reserved12, b: true);
+			SendNetworkUpdateImmediate();
+		}
+	}
+
+	private void CreateRagdoll(Vector3 position, Quaternion rotation)
+	{
+		BaseAnimalRagdoll baseAnimalRagdoll = GameManager.server.CreateEntity(ragdollPrefab.resourcePath) as BaseAnimalRagdoll;
+		baseAnimalRagdoll?.transform.SetPositionAndRotation(position, rotation);
+		Ragdoll ragdoll = baseAnimalRagdoll?.GetComponent<Ragdoll>();
+		if (ragdoll != null)
+		{
+			ragdoll.simOnServer = true;
+		}
+		baseAnimalRagdoll?.InitFromEnt(this);
+		baseAnimalRagdoll?.Spawn();
+		base.gameObject.SetIgnoreCollisions(baseAnimalRagdoll.gameObject, ignore: true);
+	}
+
+	private void OnRagdollStartServer()
+	{
+		TowDetach();
+		SetLeading(null);
+		rigidBody.isKinematic = true;
+		wheelCollider.enabled = false;
+		SetWorldColliders(enabled: false);
+		serverLegsAnimator.enabled = false;
+	}
+
+	private void OnRagdollEndServer()
+	{
+		rigidBody.isKinematic = false;
+		wheelCollider.enabled = true;
+		currentGait = GaitType.Walk;
+		UpdateGroundNormal();
+		averagedUp = targetUp;
+		AlignWithNormal(targetUp, force: true);
+		isGrounded = true;
+		airTime = 0f;
+		lastMovingTime = UnityEngine.Time.time;
+		SetWorldColliders(enabled: true);
+		ResetBonesPositions();
+		serverLegsAnimator.enabled = true;
+		damageSinceLastTick.Clear();
+		rigidBody.WakeUp();
+	}
+
+	private void SetWorldColliders(bool enabled)
+	{
+		List<Collider> obj = Facepunch.Pool.Get<List<Collider>>();
+		GetComponentsInChildren(obj);
+		foreach (Collider item in obj)
+		{
+			if (ColliderEx.IsOnLayer(item, Rust.Layer.Vehicle_World))
+			{
+				item.enabled = enabled;
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	private void UpdateOnTerrain()
+	{
+		if (UnityEngine.Time.time < nextTerrainCheckTime)
+		{
+			return;
+		}
+		nextTerrainCheckTime = UnityEngine.Time.time + UnityEngine.Random.Range(0.5f, 1f);
+		onIdealTerrain = false;
+		onWaterTopology = false;
+		if (TerrainMeta.TopologyMap != null)
+		{
+			int topology = TerrainMeta.TopologyMap.GetTopology(base.transform.position);
+			if ((topology & 0x80800) != 0)
+			{
+				onIdealTerrain = true;
+			}
+			if ((topology & 0x14080) != 0)
+			{
+				onWaterTopology = true;
+			}
+		}
+	}
+
+	public void UpdateStamina(float delta)
+	{
+		if (currentGait == GaitType.Gallop)
+		{
+			UseStamina(delta);
+		}
+		else if (IsSwimming)
+		{
+			UseStamina(delta * 0.5f);
+		}
+		else if (currentStamina != currentMaxStamina)
+		{
+			ReplenishStamina(GetStaminaReplenishRatio() * delta);
+		}
+	}
+
+	public void UseStamina(float amount)
+	{
+		if (onIdealTerrain)
+		{
+			amount *= 0.5f;
+		}
+		currentStamina -= amount;
+		if (currentStamina <= 0f)
+		{
+			currentStamina = 0f;
+		}
+	}
+
+	private float GetStaminaReplenishRatio()
+	{
+		return GetCurrentGait().staminaReplenishRatio;
+	}
+
+	public void ReplenishStamina(float amount)
+	{
+		float num = 1f + Mathf.InverseLerp(maxStamina * 0.5f, maxStamina, currentMaxStamina);
+		amount *= num;
+		amount = Mathf.Min(currentMaxStamina - currentStamina, amount);
+		float num2 = Mathf.Min(currentMaxStamina - staminaCoreLossRatio * amount, amount * staminaCoreLossRatio);
+		currentMaxStamina = Mathf.Clamp(currentMaxStamina - num2, 0f, maxStamina);
+		currentStamina = Mathf.Clamp(currentStamina + num2 / staminaCoreLossRatio, 0f, currentMaxStamina);
+		if (currentStamina == currentMaxStamina)
+		{
+			OnStaminaReplenished();
+		}
+	}
+
+	private void OnStaminaReplenished()
+	{
+		UpdateClients(force: true);
+	}
+
+	public void ReplenishStaminaCore(float calories, float hydration)
+	{
+		float num = calories * calorieToStaminaRatio;
+		float num2 = Mathf.Min(b: hydration * hydrationToStaminaRatio, a: maxStaminaCoreFromWater - currentMaxStamina);
+		if (num2 < 0f)
+		{
+			num2 = 0f;
+		}
+		float num3 = num + num2;
+		currentMaxStamina = Mathf.Clamp(currentMaxStamina + num3, 0f, maxStamina);
+		currentStamina = Mathf.Clamp(currentStamina + num3, 0f, currentMaxStamina);
+	}
+
+	public void SetLeading(BasePlayer target)
+	{
+		SetFlag(Flags.Reserved16, target != null);
+		if (!(target == leadingPlayer))
+		{
+			if (target != null)
+			{
+				playerLeadingId = target.net.ID;
+				inputProvider = new AIHorseInputProvider(this, target.transform, 3f);
+				PlayerModifiers.AddToPlayer(target, pullingPlayerModifiers);
+			}
+			else
+			{
+				leadingPlayer.modifiers.RemoveFromSource(Modifier.ModifierSource.Interaction);
+				playerLeadingId = default(NetworkableId);
+			}
+			leadingPlayer = target;
+			SendNetworkUpdateImmediate();
+			LeadingChanged();
+			if (leadingPlayer == null)
+			{
+				ClientRPC(RpcTarget.NetworkGroup("CLIENT_StopLeading"));
+			}
+			else
+			{
+				ClientRPC(RpcTarget.NetworkGroup("CLIENT_StartLeading"));
+			}
+		}
+	}
+
+	public void LeadingChanged()
+	{
+		if (!IsLeading)
+		{
+			TryToHitch();
+		}
+	}
+
+	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server.CallsPerSecond(1uL)]
+	public void SERVER_Lead(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		if (player == null)
+		{
+			return;
+		}
+		bool flag = msg.read.Bool();
+		if (flag)
+		{
+			if (!CanLead(player))
+			{
+				return;
+			}
+		}
+		else if (!CanStopLead(player))
+		{
+			return;
+		}
+		if (Interface.CallHook("OnHorseLead", this, player) == null)
+		{
+			SetLeading(flag ? player : null);
+		}
+	}
+
+	public bool CanStand()
+	{
+		if (nextStandTime > UnityEngine.Time.time)
+		{
+			return false;
+		}
+		if (mountPoints[0].mountable == null)
+		{
+			return false;
+		}
+		return IsStandCollisionClear();
+	}
+
+	public virtual bool IsStandCollisionClear()
+	{
+		List<Collider> obj = Facepunch.Pool.Get<List<Collider>>();
+		Vis.Colliders(mountPoints[0].mountable.eyePositionOverride.transform.position - base.transform.forward * 1f, 2f, obj, 2162689);
+		bool num = obj.Count > 0;
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+		return !num;
+	}
+
+	public override float GetNetworkTime()
+	{
+		return UnityEngine.Time.fixedTime;
+	}
+
+	public override void ServerInit()
+	{
+		InitContainers();
+		SetBreed(UnityEngine.Random.Range(0, breeds.Length));
+		SetFlag(Flags.Reserved16, b: false);
+		baseHorseProtection = baseProtection;
+		riderProtection = ScriptableObject.CreateInstance<ProtectionProperties>();
+		baseProtection = ScriptableObject.CreateInstance<ProtectionProperties>();
+		baseProtection.Add(baseHorseProtection, 1f);
+		rigidBody.centerOfMass = centreOfMassTransform.localPosition;
+		terrainHandler = new VehicleTerrainHandler(this);
+		towingTrigger.OnEntityEnterTrigger = HandleTowTrigger;
+		towingTrigger.OnEntityLeaveTrigger = HandleTowTriggerLeave;
+		towingAttachment = new TowingAttachment<RidableHorse2>(this);
+		base.ServerInit();
+		InvokeRandomized(UpdateClients, 0f, 0.333f, 0.1f);
+		InvokeRandomized(HorseDecay, UnityEngine.Random.Range(30f, 60f), 60f, 6f);
+		SpawnWildSaddle();
+		EquipmentUpdate();
+		if (modifiers != null)
+		{
+			modifiers.ServerInit(this);
+		}
+	}
+
+	public override void PreServerLoad()
+	{
+		base.PreServerLoad();
+		CreateInventories(giveUID: false);
+	}
+
+	internal override void DoServerDestroy()
+	{
+		base.DoServerDestroy();
+		ReleaseInventories();
+	}
+
+	private void ServerFlagsChanged(Flags old, Flags next)
+	{
+		if ((old & Flags.Reserved3) != 0 && (next & Flags.Reserved3) != 0)
+		{
+			InvokeRepeating(EatFromHitch, UnityEngine.Random.Range(1f, 2f), 2f);
+		}
+		if ((next & Flags.Reserved17) != 0 && (next & Flags.Reserved14) != 0)
+		{
+			TowDetach();
+		}
+		bool flag = (old & Flags.Reserved12) != 0;
+		bool flag2 = (next & Flags.Reserved12) != 0;
+		if (!flag && flag2)
+		{
+			OnRagdollStartServer();
+		}
+		else if (flag && !flag2)
+		{
+			OnRagdollEndServer();
+		}
+	}
+
+	private void SpawnWildSaddle()
+	{
+		SetSeatCount(1);
+	}
+
+	public void SetForSale()
+	{
+		SetFlag(Flags.Reserved2, b: true);
+		SetSeatCount(0);
+	}
+
+	protected override int GetClipCheckMask()
+	{
+		return base.GetClipCheckMask() & -1073741825;
+	}
+
+	public override void AttemptMount(BasePlayer player, bool doMountChecks = true)
+	{
+		if (IsForSale || !MountEligable(player) || HasFlag(Flags.Reserved12) || !CanPlayerSeeSaddlePoint(player))
+		{
+			return;
+		}
+		BaseMountable baseMountable = null;
+		if (HasSingleSaddle && !player.IsRestrained)
+		{
+			baseMountable = mountPoints[0].mountable;
+		}
+		else
+		{
+			if (!HasDoubleSaddle)
+			{
+				return;
+			}
+			baseMountable = ((HasDriver() || player.IsRestrained) ? mountPoints[2].mountable : mountPoints[1].mountable);
+		}
+		if (baseMountable != null)
+		{
+			baseMountable.AttemptMount(player, doMountChecks);
+		}
+	}
+
+	public override void PlayerMounted(BasePlayer player, BaseMountable seat)
+	{
+		base.PlayerMounted(player, seat);
+		UpdateClients();
+		TryLeaveHitch();
+		if (IsLeading)
+		{
+			SetLeading(null);
+		}
+		if (IsDriver(player))
+		{
+			playerServerCollider.gameObject.SetActive(value: true);
+			inputProvider = new PlayerHorseInputProvider(player);
+		}
+		if (IsPassenger(player))
+		{
+			playerServerColliderRear.gameObject.SetActive(value: true);
+		}
+		InvokeRepeating(SaveTraveledDistance, 10f, 10f);
+		InvokeRepeating(PostPlayerLateUpdate, 0f, 0f);
+	}
+
+	public override void PlayerDismounted(BasePlayer player, BaseMountable seat)
+	{
+		base.PlayerDismounted(player, seat);
+		UpdateClients(force: true);
+		if (NumMounted() == 0)
+		{
+			TryToHitch();
+		}
+		if (GetDriver() == null)
+		{
+			playerServerCollider.gameObject.SetActive(value: false);
+			inputProvider = null;
+		}
+		if (GetPassenger() == null)
+		{
+			playerServerColliderRear.gameObject.SetActive(value: false);
+		}
+		CancelInvoke(SaveTraveledDistance);
+		CancelInvoke(PostPlayerLateUpdate);
+		lastRiddenTime = UnityEngine.Time.time;
+	}
+
+	private void PostPlayerLateUpdate()
+	{
+		if (!AnyMounted())
+		{
+			return;
+		}
+		foreach (MountPointInfo allMountPoint in base.allMountPoints)
+		{
+			if (!(allMountPoint.mountable == null) && !(allMountPoint.mountable.GetMounted() == null))
+			{
+				allMountPoint.mountable.MountedPlayerSync();
+			}
+		}
+	}
+
+	private void SetSeatCount(int count)
+	{
+		SetFlag(Flags.Reserved9, b: false, recursive: false, networkupdate: false);
+		SetFlag(Flags.Reserved10, b: false, recursive: false, networkupdate: false);
+		switch (count)
+		{
+		case 1:
+			SetFlag(Flags.Reserved9, b: true, recursive: false, networkupdate: false);
+			break;
+		case 2:
+			SetFlag(Flags.Reserved10, b: true, recursive: false, networkupdate: false);
+			break;
+		}
+		UpdateMountFlags();
+	}
+
+	public override bool IsPlayerSeatSwapValid(BasePlayer player, int fromIndex, int toIndex, bool ignoreRestraint)
+	{
+		if (!base.IsPlayerSeatSwapValid(player, fromIndex, toIndex, ignoreRestraint))
+		{
+			return false;
+		}
+		if (!HasSaddle)
+		{
+			return false;
+		}
+		if (HasSingleSaddle)
+		{
+			return false;
+		}
+		if (HasDoubleSaddle && toIndex == 0)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public override int MaxMounted()
+	{
+		return GetSeatCapacity();
+	}
+
+	public int GetSeatCapacity()
+	{
+		if (HasDoubleSaddle)
+		{
+			return 2;
+		}
+		if (HasSingleSaddle)
+		{
+			return 1;
+		}
+		return 0;
+	}
+
+	public override int NumSwappableSeats()
+	{
+		return mountPoints.Count;
+	}
+
+	public override void OnDied(HitInfo hitInfo)
+	{
+		BaseCorpse baseCorpse = DropCorpse(corpsePrefab.resourcePath);
+		if ((bool)baseCorpse)
+		{
+			SetupCorpse(baseCorpse);
+			baseCorpse.Spawn();
+			baseCorpse.TakeChildren(this);
+		}
+		SaveTraveledDistance();
+		TryLeaveHitch();
+		TowDetach();
+		RagdollAllRiders();
+		Invoke(base.KillMessage, 0.5f);
+		base.OnDied(hitInfo);
+	}
+
+	public override void AdminKill()
+	{
+		SaveTraveledDistance();
+		TryLeaveHitch();
+		TowDetach();
+		RagdollAllRiders();
+		Invoke(base.KillMessage, 0.5f);
+		base.AdminKill();
+	}
+
+	public virtual void SetupCorpse(BaseCorpse corpse)
+	{
+		corpse.flags = flags;
+		LootableCorpse component = corpse.GetComponent<LootableCorpse>();
+		if ((bool)component)
+		{
+			component.TakeFrom(this, storageInventory);
+		}
+		HorseCorpse component2 = corpse.GetComponent<HorseCorpse>();
+		if ((bool)component2)
+		{
+			component2.breedIndex = currentBreedIndex;
+		}
+	}
+
+	private void UpdateClients()
+	{
+		UpdateClients(force: true);
+	}
+
+	private void UpdateClients(bool force = false)
+	{
+		if (force || AnyMounted() || IsLeading)
+		{
+			byte num = (byte)((duckInputDown ? (-1f) : throttleInput) + 1f);
+			byte b = (byte)(steerInput + 1f);
+			byte b2 = (byte)(avoidanceSteeringInput + 1);
+			byte arg = (byte)(num | (b << 2) | (b2 << 4));
+			byte arg2 = (byte)Mathf.Clamp(normalVariation / 100f * 255f, 0f, 255f);
+			ClientRPC(RpcTarget.NetworkGroup("CLIENT_HorseUpdate"), currentStamina, currentMaxStamina, (byte)currentGait, arg, arg2);
+		}
+	}
+
+	public override void OnMountedPlayerWeightChanged(BasePlayer player)
+	{
+		base.OnMountedPlayerWeightChanged(player);
+		if (IsPlayerTooHeavy(player))
+		{
+			player.EnsureDismounted();
+		}
+	}
+
+	private void SaveTraveledDistance()
+	{
+		BasePlayer driver = GetDriver();
+		if (driver == null)
+		{
+			tempDistanceTravelled = 0f;
+			return;
+		}
+		kmDistance += tempDistanceTravelled / 1000f;
+		if (kmDistance >= 1f)
+		{
+			driver.stats.Add("horse_distance_ridden_km", 1, (Stats)5);
+			kmDistance -= 1f;
+		}
+		driver.stats.Add("horse_distance_ridden", Mathf.FloorToInt(tempDistanceTravelled));
+		driver.stats.Save();
+		tempDistanceTravelled = 0f;
+	}
+
+	public override void ScaleDamageForPlayer(BasePlayer player, HitInfo info)
+	{
+		base.ScaleDamageForPlayer(player, info);
+		riderProtection.Scale(info.damageTypes);
+	}
+
+	public void OnTowAttach()
+	{
+		Invoke(delegate
+		{
+			towingTrigger.SetActive(active: false);
+		}, 0f);
+	}
+
+	public void OnTowDetach()
+	{
+		Invoke(delegate
+		{
+			towingTrigger.SetActive(active: true);
+		}, 1f);
+	}
+
+	[RPC_Server]
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server.MaxDistance(3f)]
+	[RPC_Server.CallsPerSecond(1uL)]
+	public void SERVER_RequestTow(RPCMessage msg)
+	{
+		if (towableEntity != null && !IsTowing && !HasFlag(Flags.Reserved12))
+		{
+			TowAttach(msg.player);
+			Effect.server.Run(towingAttachEffect.resourcePath, this, 0u, Vector3.zero, Vector3.zero);
+		}
+	}
+
+	[RPC_Server.CallsPerSecond(1uL)]
+	[RPC_Server]
+	[RPC_Server.MaxDistance(3f)]
+	[RPC_Server.IsVisible(3f)]
+	public void SERVER_RequestDetach(RPCMessage msg)
+	{
+		if (IsTowing)
+		{
+			BasePlayer player = msg.player;
+			if (!(player == null) && (!AnyMounted() || !(player.GetMounted().VehicleParent() != this)))
+			{
+				TowDetach();
+				Effect.server.Run(towingDetachEffect.resourcePath, this, 0u, Vector3.zero, Vector3.zero);
+			}
+		}
+	}
+
+	private void TowAttach(BasePlayer requester = null)
+	{
+		if (towableEntity == null || !towableEntity.IsTowingAllowed)
+		{
+			return;
+		}
+		if (Vector3.Dot(TowAnchor.forward, towableEntity.TowAnchor.transform.forward) <= 0.5f)
+		{
+			if (requester != null)
+			{
+				requester.ShowToast(GameTip.Styles.Error, TowAngleErrorPhrase, false);
+			}
+			return;
+		}
+		towingEntityId = towableEntity.TowEntity.net.ID;
+		ClientRPC(RpcTarget.NetworkGroup("CLIENT_SetTowId"), towableEntity.TowEntity.net.ID);
+		towingAttachment.AttachTo(towableEntity);
+		Invoke(delegate
+		{
+			towingTrigger.SetActive(active: false);
+		}, 0f);
+	}
+
+	private void TowDetach()
+	{
+		if (IsTowing)
+		{
+			towingEntityId = default(NetworkableId);
+			ClientRPC(RpcTarget.NetworkGroup("CLIENT_SetTowId"), 0);
+			ClientRPC(RpcTarget.NetworkGroup("CLIENT_CanTow"), arg1: false);
+			towableEntity = null;
+			towingAttachment.Detach();
+		}
+	}
+
+	private void ValidateTowableEntity()
+	{
+		if (towableEntity != null)
+		{
+			towingEntityId = towableEntity.TowEntity.net.ID;
+		}
+		else
+		{
+			towableEntity = BaseNetworkable.serverEntities.Find(towingEntityId) as ITowing;
+		}
+	}
+
+	private void HandleTowTrigger(BaseNetworkable networkable)
+	{
+		if (networkable is ITowing { IsTowing: false } towing)
+		{
+			towableEntity = towing;
+			ClientRPC(RpcTarget.NetworkGroup("CLIENT_CanTow"), arg1: true);
+		}
+		else
+		{
+			towableEntity = null;
+			ClientRPC(RpcTarget.NetworkGroup("CLIENT_CanTow"), arg1: false);
+		}
+	}
+
+	private void HandleTowTriggerLeave(BaseNetworkable networkable)
+	{
+		ClientRPC(RpcTarget.NetworkGroup("CLIENT_CanTow"), arg1: false);
+		towableEntity = null;
+	}
+
+	public void OnJointBreak(float breakForce)
+	{
+		TowDetach();
+	}
+
+	private void HorseDecay()
+	{
+		if (base.healthFraction != 0f && !base.IsDestroyed && !(UnityEngine.Time.time < lastRiddenTime + 600f) && !(UnityEngine.Time.time < lastEatTime + 600f) && !IsForSale && !(UnityEngine.Time.time < nextDecayTime))
+		{
+			float num = 1f / decayMinutes;
+			float num2 = ((!IsOutside()) ? 1f : 0.5f);
+			Hurt(MaxHealth() * num * num2, DamageType.Decay, this, useProtection: false);
+		}
+	}
+
+	private void AddDecayDelay(float time)
+	{
+		if (nextDecayTime < UnityEngine.Time.time)
+		{
+			nextDecayTime = UnityEngine.Time.time + 5f;
+		}
+		nextDecayTime += time;
+	}
+
+	[ServerVar]
+	public static void SetHorseBreed(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer == null)
+		{
+			return;
+		}
+		int @int = arg.GetInt(0);
+		List<RidableHorse2> obj = Facepunch.Pool.Get<List<RidableHorse2>>();
+		Vis.Entities(basePlayer.eyes.position, basePlayer.eyes.position + basePlayer.eyes.HeadForward() * 5f, 0f, obj);
+		foreach (RidableHorse2 item in obj)
+		{
+			item.SetBreed(@int);
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	[ServerVar]
+	public static void SetForSale(ConsoleSystem.Arg arg)
+	{
+		BasePlayer basePlayer = ArgEx.Player(arg);
+		if (basePlayer == null)
+		{
+			return;
+		}
+		List<RidableHorse2> obj = Facepunch.Pool.Get<List<RidableHorse2>>();
+		Vis.Entities(basePlayer.eyes.position, basePlayer.eyes.position + basePlayer.eyes.HeadForward() * 5f, 0f, obj);
+		foreach (RidableHorse2 item in obj)
+		{
+			item.SetForSale();
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	public override bool AdminFixUp(int tier)
+	{
+		if (IsDead())
+		{
+			return false;
+		}
+		ReplenishStamina(1000f);
+		ReplenishStaminaCore(10000f, 10000f);
+		return base.AdminFixUp(tier);
+	}
+}

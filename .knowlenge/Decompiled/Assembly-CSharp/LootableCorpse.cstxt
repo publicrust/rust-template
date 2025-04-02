@@ -1,0 +1,396 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using ConVar;
+using Facepunch;
+using Facepunch.Rust;
+using Network;
+using Oxide.Core;
+using ProtoBuf;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class LootableCorpse : BaseCorpse, LootPanel.IHasLootPanel, IInventoryProvider
+{
+	public string lootPanelName = "generic";
+
+	[NonSerialized]
+	public ulong playerSteamID;
+
+	[NonSerialized]
+	public string _playerName;
+
+	[NonSerialized]
+	public ItemContainer[] containers;
+
+	[NonSerialized]
+	private bool firstLooted;
+
+	public virtual string playerName
+	{
+		get
+		{
+			return NameHelper.Get(playerSteamID, _playerName, base.isClient);
+		}
+		set
+		{
+			_playerName = value;
+		}
+	}
+
+	public virtual string streamerName { get; set; }
+
+	public Translate.Phrase LootPanelTitle => playerName;
+
+	public Translate.Phrase LootPanelName => "N/A";
+
+	public bool blockBagDrop { get; set; }
+
+	public override int NumberOfItemsToTransfer
+	{
+		get
+		{
+			int num = base.NumberOfItemsToTransfer;
+			for (int i = 0; i < containers.Length; i++)
+			{
+				ItemContainer itemContainer = containers[i];
+				if (CanLootContainer(itemContainer, i))
+				{
+					num += itemContainer.itemList.Count;
+				}
+			}
+			return num;
+		}
+	}
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("LootableCorpse.OnRpcMessage"))
+		{
+			if (rpc == 2278459738u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - RPC_LootCorpse ");
+				}
+				using (TimeWarning.New("RPC_LootCorpse"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.IsVisible.Test(2278459738u, "RPC_LootCorpse", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage rpc2 = rPCMessage;
+							RPC_LootCorpse(rpc2);
+						}
+					}
+					catch (Exception exception)
+					{
+						Debug.LogException(exception);
+						player.Kick("RPC Error in RPC_LootCorpse");
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public override void ResetState()
+	{
+		firstLooted = false;
+		base.ResetState();
+	}
+
+	internal override void DoServerDestroy()
+	{
+		base.DoServerDestroy();
+		if (!blockBagDrop)
+		{
+			PreDropItems();
+			DropItems();
+		}
+		blockBagDrop = false;
+		if (containers != null)
+		{
+			ItemContainer[] array = containers;
+			for (int i = 0; i < array.Length; i++)
+			{
+				ItemContainer obj = array[i];
+				Facepunch.Pool.Free(ref obj);
+			}
+		}
+		containers = null;
+	}
+
+	public void TakeFrom(BaseEntity fromEntity, params ItemContainer[] source)
+	{
+		Assert.IsTrue(containers == null, "Initializing Twice");
+		using (TimeWarning.New("Corpse.TakeFrom"))
+		{
+			containers = new ItemContainer[source.Length];
+			for (int i = 0; i < source.Length; i++)
+			{
+				containers[i] = SetUpContainerFromSource(source[i]);
+			}
+			ResetRemovalTime();
+		}
+		SetupLootableHeadDispenser(fromEntity);
+	}
+
+	public void TakeFrom(BaseEntity fromEntity, ItemContainer containerA, ItemContainer containerB, ItemContainer containerC)
+	{
+		Assert.IsTrue(containers == null, "Initializing Twice");
+		using (TimeWarning.New("Corpse.TakeFrom"))
+		{
+			containers = new ItemContainer[3];
+			containers[0] = SetUpContainerFromSource(containerA);
+			containers[1] = SetUpContainerFromSource(containerB);
+			containers[2] = SetUpContainerFromSource(containerC);
+			ResetRemovalTime();
+		}
+		SetupLootableHeadDispenser(fromEntity);
+	}
+
+	public void TakeFrom(BaseEntity fromEntity, ItemContainer containerA)
+	{
+		Assert.IsTrue(containers == null, "Initializing Twice");
+		using (TimeWarning.New("Corpse.TakeFrom"))
+		{
+			containers = new ItemContainer[1];
+			containers[0] = SetUpContainerFromSource(containerA);
+			ResetRemovalTime();
+		}
+		SetupLootableHeadDispenser(fromEntity);
+	}
+
+	private ItemContainer SetUpContainerFromSource(ItemContainer source)
+	{
+		ItemContainer itemContainer = Facepunch.Pool.Get<ItemContainer>();
+		itemContainer.ServerInitialize(null, source.capacity);
+		itemContainer.GiveUID();
+		itemContainer.entityOwner = this;
+		itemContainer.containerVolume = source.containerVolume;
+		Item[] array = source.itemList.ToArray();
+		foreach (Item item in array)
+		{
+			if (!item.MoveToContainer(itemContainer))
+			{
+				item.DropAndTossUpwards(base.transform.position);
+			}
+		}
+		return itemContainer;
+	}
+
+	private void SetupLootableHeadDispenser(BaseEntity fromEntity)
+	{
+		if (base.gameObject.TryGetComponent<HeadDispenser>(out var component))
+		{
+			GameObject gameObject = GameManager.server.FindPrefab(fromEntity.prefabID);
+			if (gameObject != null && gameObject.TryGetComponent<BasePlayer>(out var component2))
+			{
+				component.overrideEntity = component2;
+			}
+		}
+	}
+
+	public void CreateEmptyContainer(int capacity)
+	{
+		Assert.IsTrue(containers == null, "Initializing Twice");
+		containers = new ItemContainer[1];
+		ItemContainer itemContainer = new ItemContainer();
+		itemContainer.ServerInitialize(null, capacity);
+		itemContainer.GiveUID();
+		itemContainer.entityOwner = this;
+		containers[0] = itemContainer;
+	}
+
+	public override bool CanRemove()
+	{
+		return !IsOpen();
+	}
+
+	public virtual bool CanLoot()
+	{
+		return true;
+	}
+
+	public override bool OnStartBeingLooted(BasePlayer baseEntity)
+	{
+		if (!firstLooted)
+		{
+			if (playerSteamID <= 10000000)
+			{
+				Facepunch.Rust.Analytics.Azure.OnFirstLooted(this, baseEntity);
+				ItemContainer[] array = containers;
+				for (int i = 0; i < array.Length; i++)
+				{
+					foreach (Item item in array[i].itemList)
+					{
+						item.SetItemOwnership(baseEntity, ItemOwnershipPhrases.LootedPhrase);
+					}
+				}
+			}
+			firstLooted = true;
+		}
+		return base.OnStartBeingLooted(baseEntity);
+	}
+
+	protected virtual bool CanLootContainer(ItemContainer c, int index)
+	{
+		return true;
+	}
+
+	public float GetRadsInCorpse()
+	{
+		float num = 0f;
+		ItemContainer[] array = containers;
+		foreach (ItemContainer itemContainer in array)
+		{
+			num += itemContainer.GetRadioactiveMaterialInContainer();
+		}
+		return num;
+	}
+
+	[RPC_Server.IsVisible(3f)]
+	[RPC_Server]
+	private void RPC_LootCorpse(RPCMessage rpc)
+	{
+		BasePlayer player = rpc.player;
+		if (!player || !player.CanInteract() || !CanLoot() || containers == null || Interface.CallHook("CanLootEntity", player, this) != null || !player.inventory.loot.StartLootingEntity(this))
+		{
+			return;
+		}
+		SetFlag(Flags.Open, b: true);
+		for (int i = 0; i < containers.Length; i++)
+		{
+			ItemContainer itemContainer = containers[i];
+			if (CanLootContainer(itemContainer, i))
+			{
+				player.inventory.loot.AddContainer(itemContainer);
+			}
+		}
+		player.inventory.loot.SendImmediate();
+		player.RadioactiveLootCheck(player.inventory.loot.containers);
+		ClientRPC(RpcTarget.Player("RPC_ClientLootCorpse", player));
+		SendNetworkUpdate();
+	}
+
+	public void PlayerStoppedLooting(BasePlayer player)
+	{
+		Interface.CallHook("OnLootEntityEnd", player, this);
+		ResetRemovalTime();
+		SetFlag(Flags.Open, b: false);
+		SendNetworkUpdate();
+	}
+
+	protected virtual void PreDropItems()
+	{
+	}
+
+	public void DropItems()
+	{
+		if (!Global.disableBagDropping && containers != null)
+		{
+			DroppedItemContainer droppedItemContainer = ItemContainer.Drop("assets/prefabs/misc/item drop/item_drop_backpack.prefab", base.transform.position, Quaternion.identity, containers);
+			if (droppedItemContainer != null)
+			{
+				droppedItemContainer.playerName = playerName;
+				droppedItemContainer.playerSteamID = playerSteamID;
+			}
+		}
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		info.msg.lootableCorpse = Facepunch.Pool.Get<ProtoBuf.LootableCorpse>();
+		info.msg.lootableCorpse.playerName = playerName;
+		info.msg.lootableCorpse.playerID = playerSteamID;
+		info.msg.lootableCorpse.streamerName = streamerName;
+		if (!info.forDisk || containers == null)
+		{
+			return;
+		}
+		info.msg.lootableCorpse.privateData = Facepunch.Pool.Get<ProtoBuf.LootableCorpse.Private>();
+		info.msg.lootableCorpse.privateData.container = Facepunch.Pool.Get<List<ProtoBuf.ItemContainer>>();
+		ItemContainer[] array = containers;
+		foreach (ItemContainer itemContainer in array)
+		{
+			if (itemContainer != null)
+			{
+				ProtoBuf.ItemContainer itemContainer2 = itemContainer.Save();
+				if (itemContainer2 != null)
+				{
+					info.msg.lootableCorpse.privateData.container.Add(itemContainer2);
+				}
+			}
+		}
+	}
+
+	public void GetAllInventories(List<ItemContainer> list)
+	{
+		if (containers != null)
+		{
+			list.AddRange(containers);
+		}
+	}
+
+	public override void TransferAllItemsToContainer(ItemContainer itemContainer, Vector3 itemFallbackPosition)
+	{
+		for (int i = 0; i < containers.Length; i++)
+		{
+			ItemContainer itemContainer2 = containers[i];
+			if (!CanLootContainer(itemContainer2, i))
+			{
+				continue;
+			}
+			for (int j = 0; j < itemContainer2.capacity; j++)
+			{
+				Item slot = itemContainer2.GetSlot(j);
+				if (slot != null && !slot.MoveToContainer(itemContainer))
+				{
+					slot.DropAndTossUpwards(itemFallbackPosition);
+				}
+			}
+		}
+		base.TransferAllItemsToContainer(itemContainer, itemFallbackPosition);
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (info.msg.lootableCorpse == null)
+		{
+			return;
+		}
+		playerName = info.msg.lootableCorpse.playerName;
+		streamerName = info.msg.lootableCorpse.streamerName;
+		playerSteamID = info.msg.lootableCorpse.playerID;
+		if (info.fromDisk && info.msg.lootableCorpse.privateData != null && info.msg.lootableCorpse.privateData.container != null)
+		{
+			int count = info.msg.lootableCorpse.privateData.container.Count;
+			Debug.Assert(containers == null, "Double init of containers!");
+			containers = new ItemContainer[count];
+			for (int i = 0; i < count; i++)
+			{
+				containers[i] = Facepunch.Pool.Get<ItemContainer>();
+				containers[i].ServerInitialize(null, info.msg.lootableCorpse.privateData.container[i].slots);
+				containers[i].GiveUID();
+				containers[i].entityOwner = this;
+				containers[i].Load(info.msg.lootableCorpse.privateData.container[i]);
+			}
+		}
+	}
+}

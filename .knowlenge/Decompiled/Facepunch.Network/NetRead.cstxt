@@ -1,0 +1,483 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Threading;
+using Facepunch;
+using Facepunch.Extend;
+using Network;
+using SilentOrbit.ProtocolBuffers;
+using UnityEngine;
+
+public class NetRead : Stream, Pool.IPooled, IStreamReader
+{
+	public byte[] Data;
+
+	private int _length;
+
+	private int _position;
+
+	public int refCount;
+
+	public ulong guid;
+
+	public string ipaddress;
+
+	public Connection connection;
+
+	private const int bufferSize = 8388608;
+
+	private static byte[] byteBuffer = new byte[8388608];
+
+	private static char[] charBuffer = new char[8388608];
+
+	public int Unread => (int)(Length - Position);
+
+	public override bool CanRead => true;
+
+	public override bool CanWrite => false;
+
+	public override long Length => _length;
+
+	public override long Position
+	{
+		get
+		{
+			return _position;
+		}
+		set
+		{
+			_position = (int)value;
+		}
+	}
+
+	public override bool CanSeek => true;
+
+	public void AddReference()
+	{
+		Interlocked.Increment(ref refCount);
+	}
+
+	public void RemoveReference()
+	{
+		if (Interlocked.Decrement(ref refCount) == 0)
+		{
+			NetRead obj = this;
+			Pool.Free(ref obj);
+		}
+	}
+
+	private unsafe bool Init(IntPtr data, int length)
+	{
+		if (length > 6291456)
+		{
+			throw new Exception($"Packet was too large (max is {6291456})");
+		}
+		EnsureCapacity(length);
+		SetLength(length);
+		Position = 0L;
+		fixed (byte* data2 = Data)
+		{
+			Buffer.MemoryCopy((void*)data, data2, Data.Length, length);
+		}
+		return true;
+	}
+
+	public void EnterPool()
+	{
+		connection = null;
+		if (Data != null)
+		{
+			BaseNetwork.ArrayPool.Return(Data);
+			Data = null;
+		}
+	}
+
+	public void LeavePool()
+	{
+		refCount = 1;
+	}
+
+	public bool Start(ulong guid, string ipaddress, IntPtr data, int length)
+	{
+		connection = null;
+		this.guid = guid;
+		this.ipaddress = ipaddress;
+		return Init(data, length);
+	}
+
+	public bool Start(Connection connection, IntPtr data, int length)
+	{
+		this.connection = connection;
+		guid = connection.guid;
+		ipaddress = connection.ipaddress;
+		return Init(data, length);
+	}
+
+	public bool Start(Connection connection, ulong guid, IntPtr data, int length)
+	{
+		this.connection = connection;
+		this.guid = guid;
+		ipaddress = connection.ipaddress;
+		return Init(data, length);
+	}
+
+	public bool Start(Connection connection, ulong guid, string ipaddress, IntPtr data, int length)
+	{
+		this.connection = connection;
+		this.guid = guid;
+		this.ipaddress = ipaddress;
+		return Init(data, length);
+	}
+
+	public string String(int maxLength = 256, bool variableLength = false)
+	{
+		return StringInternal(maxLength, allowNewLine: false, variableLength);
+	}
+
+	public string StringMultiLine(int maxLength = 2048, bool variableLength = false)
+	{
+		return StringInternal(maxLength, allowNewLine: true, variableLength);
+	}
+
+	private string StringInternal(int maxLength, bool allowNewLine, bool variableLength = false)
+	{
+		int num = BytesWithSize(byteBuffer, 8388608u, variableLength);
+		if (num <= 0)
+		{
+			return string.Empty;
+		}
+		int num2 = Encoding.UTF8.GetChars(byteBuffer, 0, num, charBuffer, 0);
+		if (num2 > maxLength)
+		{
+			num2 = maxLength;
+		}
+		for (int i = 0; i < num2; i++)
+		{
+			char c = charBuffer[i];
+			if (char.IsControl(c) && (!allowNewLine || c != '\n'))
+			{
+				charBuffer[i] = ' ';
+			}
+		}
+		return new string(charBuffer, 0, num2);
+	}
+
+	public string StringRaw(int maxLength = 8388608, bool variableLength = false)
+	{
+		int num = (int)(variableLength ? VarUInt32() : UInt32());
+		if (num <= 0 || num > maxLength)
+		{
+			return string.Empty;
+		}
+		string @string = Encoding.UTF8.GetString(Data, (int)Position, num);
+		Position += num;
+		return @string;
+	}
+
+	public bool TemporaryBytesWithSize(out byte[] buffer, out int size)
+	{
+		buffer = byteBuffer;
+		size = 0;
+		uint num = UInt32();
+		if (num == 0)
+		{
+			return false;
+		}
+		if (num > byteBuffer.Length)
+		{
+			return false;
+		}
+		size = Read(byteBuffer, 0, (int)num);
+		if (size != num)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public NetworkableId EntityID()
+	{
+		return new NetworkableId(UInt64());
+	}
+
+	public ItemContainerId ItemContainerID()
+	{
+		return new ItemContainerId(UInt64());
+	}
+
+	public ItemId ItemID()
+	{
+		return new ItemId(UInt64());
+	}
+
+	public uint GroupID()
+	{
+		return UInt32();
+	}
+
+	public int BytesWithSize(byte[] buffer, uint maxLength = uint.MaxValue, bool variableLength = false)
+	{
+		uint num = (variableLength ? VarUInt32() : UInt32());
+		if (num == 0)
+		{
+			return 0;
+		}
+		if (num > buffer.Length || num > maxLength)
+		{
+			return -1;
+		}
+		if (Read(buffer, 0, (int)num) != num)
+		{
+			return -1;
+		}
+		return (int)num;
+	}
+
+	public byte[] BytesWithSize(uint maxSize = 10485760u, bool variableLength = false)
+	{
+		uint num = (variableLength ? VarUInt32() : UInt32());
+		if (num == 0)
+		{
+			return null;
+		}
+		if (num > maxSize)
+		{
+			return null;
+		}
+		byte[] array = new byte[num];
+		if (Read(array, 0, (int)num) != num)
+		{
+			return null;
+		}
+		return array;
+	}
+
+	public ArraySegment<byte> PooledBytes(uint maxSize = 6291456u, bool variableLength = false)
+	{
+		uint num = (variableLength ? VarUInt32() : UInt32());
+		if (num == 0)
+		{
+			return default(ArraySegment<byte>);
+		}
+		int num2 = (int)Position;
+		if (num > maxSize || num2 + num > Data.Length)
+		{
+			return default(ArraySegment<byte>);
+		}
+		Seek(num, SeekOrigin.Current);
+		return new ArraySegment<byte>(Data, num2, (int)num);
+	}
+
+	public override int ReadByte()
+	{
+		if (_position == Length)
+		{
+			return -1;
+		}
+		byte result = Data[_position];
+		_position++;
+		return result;
+	}
+
+	private void EnsureCapacity(int spaceRequired)
+	{
+		if (Data == null)
+		{
+			int num = ((spaceRequired <= 2048) ? 2048 : spaceRequired);
+			int num2 = Mathf.NextPowerOfTwo(num);
+			if (num2 > 8388608)
+			{
+				throw new Exception($"Preventing NetWrite buffer from growing too large (requiredLength={num})");
+			}
+			Data = BaseNetwork.ArrayPool.Rent(num2);
+		}
+		else if (Data.Length - _position < spaceRequired)
+		{
+			int num3 = _position + spaceRequired;
+			int num4 = Mathf.NextPowerOfTwo(Math.Max(num3, Data.Length));
+			if (num4 > 8388608)
+			{
+				throw new Exception($"Preventing NetWrite buffer from growing too large (requiredLength={num3})");
+			}
+			byte[] array = BaseNetwork.ArrayPool.Rent(num4);
+			Buffer.BlockCopy(Data, 0, array, 0, _length);
+			BaseNetwork.ArrayPool.Return(Data);
+			Data = array;
+		}
+	}
+
+	public override void SetLength(long value)
+	{
+		_length = (int)value;
+	}
+
+	public byte PacketID()
+	{
+		return Read<byte>();
+	}
+
+	public byte PeekPacketID()
+	{
+		return Peek<byte>();
+	}
+
+	public bool Bool()
+	{
+		return UInt8() != 0;
+	}
+
+	public bool Bit()
+	{
+		return UInt8() != 0;
+	}
+
+	public byte UInt8()
+	{
+		return Read<byte>();
+	}
+
+	public ushort UInt16()
+	{
+		return Read<ushort>();
+	}
+
+	public uint UInt32()
+	{
+		return Read<uint>();
+	}
+
+	public ulong UInt64()
+	{
+		return Read<ulong>();
+	}
+
+	public sbyte Int8()
+	{
+		return Read<sbyte>();
+	}
+
+	public short Int16()
+	{
+		return Read<short>();
+	}
+
+	public int Int32()
+	{
+		return Read<int>();
+	}
+
+	public long Int64()
+	{
+		return Read<long>();
+	}
+
+	public float Float()
+	{
+		return Read<float>();
+	}
+
+	public double Double()
+	{
+		return Read<double>();
+	}
+
+	public uint VarUInt32()
+	{
+		int length;
+		uint result = ProtocolParser.ReadUInt32(Data, (int)Position, out length);
+		_position += length;
+		return result;
+	}
+
+	public Vector3 Vector3()
+	{
+		return Read<Vector3>();
+	}
+
+	public Vector4 Vector4()
+	{
+		return Read<Vector4>();
+	}
+
+	public Quaternion Quaternion()
+	{
+		return Read<Quaternion>();
+	}
+
+	public Ray Ray()
+	{
+		return Read<Ray>();
+	}
+
+	public Color Color()
+	{
+		return Read<Color>();
+	}
+
+	public Color32 Color32()
+	{
+		return Read<Color32>();
+	}
+
+	public unsafe override int Read(byte[] buffer, int offset, int count)
+	{
+		if (_position + count > _length)
+		{
+			count = _length - _position;
+		}
+		fixed (byte* data = Data)
+		{
+			fixed (byte* ptr = buffer)
+			{
+				Buffer.MemoryCopy(data + _position, ptr + offset, count, count);
+			}
+		}
+		_position += count;
+		return count;
+	}
+
+	public override long Seek(long offset, SeekOrigin origin)
+	{
+		if (origin == SeekOrigin.Current)
+		{
+			_position += (int)offset;
+			return _position;
+		}
+		throw new NotImplementedException();
+	}
+
+	public unsafe T Read<T>() where T : unmanaged
+	{
+		if (Unread < sizeof(T))
+		{
+			return default(T);
+		}
+		T result = Data.ReadUnsafe<T>(_position);
+		_position += sizeof(T);
+		return result;
+	}
+
+	public unsafe T Peek<T>() where T : unmanaged
+	{
+		if (Unread < sizeof(T))
+		{
+			return default(T);
+		}
+		return Data.ReadUnsafe<T>(_position);
+	}
+
+	public override void Flush()
+	{
+		throw new NotImplementedException();
+	}
+
+	public override void Write(byte[] buffer, int offset, int count)
+	{
+		throw new NotImplementedException();
+	}
+
+	public override void WriteByte(byte value)
+	{
+		throw new NotImplementedException();
+	}
+}

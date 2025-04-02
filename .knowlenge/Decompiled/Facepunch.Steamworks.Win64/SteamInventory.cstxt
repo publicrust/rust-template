@@ -1,0 +1,288 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using Steamworks;
+using Steamworks.Data;
+
+public class SteamInventory : SteamSharedClass<SteamInventory>
+{
+	private static Dictionary<int, InventoryDef> _defMap;
+
+	internal static ISteamInventory Internal => SteamSharedClass<SteamInventory>.Interface as ISteamInventory;
+
+	public static string Currency { get; internal set; }
+
+	public static InventoryItem[] Items { get; internal set; }
+
+	public static InventoryDef[] Definitions { get; internal set; }
+
+	public static event Action<InventoryResult> OnInventoryUpdated;
+
+	public static event Action OnDefinitionsUpdated;
+
+	internal override bool InitializeInterface(bool server)
+	{
+		SetInterface(server, new ISteamInventory(server));
+		if (SteamSharedClass<SteamInventory>.Interface.Self == IntPtr.Zero)
+		{
+			return false;
+		}
+		InstallEvents(server);
+		return true;
+	}
+
+	internal static void InstallEvents(bool server)
+	{
+		if (!server)
+		{
+			Dispatch.Install(delegate(SteamInventoryFullUpdate_t x)
+			{
+				InventoryUpdated(x);
+			});
+		}
+		Dispatch.Install<SteamInventoryDefinitionUpdate_t>(delegate
+		{
+			LoadDefinitions();
+		}, server);
+	}
+
+	private static void InventoryUpdated(SteamInventoryFullUpdate_t x)
+	{
+		InventoryResult obj = new InventoryResult(x.Handle, expired: false);
+		Items = obj.GetItems();
+		SteamInventory.OnInventoryUpdated?.Invoke(obj);
+	}
+
+	private static void LoadDefinitions()
+	{
+		Definitions = GetDefinitions();
+		if (Definitions != null)
+		{
+			_defMap = new Dictionary<int, InventoryDef>();
+			InventoryDef[] definitions = Definitions;
+			foreach (InventoryDef inventoryDef in definitions)
+			{
+				_defMap[inventoryDef.Id] = inventoryDef;
+			}
+			SteamInventory.OnDefinitionsUpdated?.Invoke();
+		}
+	}
+
+	public static void LoadItemDefinitions()
+	{
+		if (Definitions == null)
+		{
+			LoadDefinitions();
+		}
+		Internal.LoadItemDefinitions();
+	}
+
+	public static async Task<bool> WaitForDefinitions(float timeoutSeconds = 30f)
+	{
+		if (Definitions != null)
+		{
+			return true;
+		}
+		LoadDefinitions();
+		LoadItemDefinitions();
+		if (Definitions != null)
+		{
+			return true;
+		}
+		Stopwatch sw = Stopwatch.StartNew();
+		while (Definitions == null)
+		{
+			if (sw.Elapsed.TotalSeconds > (double)timeoutSeconds)
+			{
+				return false;
+			}
+			await Task.Delay(10);
+		}
+		return true;
+	}
+
+	public static InventoryDef FindDefinition(InventoryDefId defId)
+	{
+		if (_defMap == null)
+		{
+			return null;
+		}
+		if (_defMap.TryGetValue(defId, out var value))
+		{
+			return value;
+		}
+		return null;
+	}
+
+	public static async Task<InventoryDef[]> GetDefinitionsWithPricesAsync()
+	{
+		SteamInventoryRequestPricesResult_t? steamInventoryRequestPricesResult_t = await Internal.RequestPrices();
+		if (!steamInventoryRequestPricesResult_t.HasValue || steamInventoryRequestPricesResult_t.Value.Result != Result.OK)
+		{
+			return null;
+		}
+		Currency = steamInventoryRequestPricesResult_t?.CurrencyUTF8();
+		uint numItemsWithPrices = Internal.GetNumItemsWithPrices();
+		if (numItemsWithPrices == 0)
+		{
+			return null;
+		}
+		InventoryDefId[] array = new InventoryDefId[numItemsWithPrices];
+		ulong[] pCurrentPrices = new ulong[numItemsWithPrices];
+		ulong[] pBasePrices = new ulong[numItemsWithPrices];
+		if (!Internal.GetItemsWithPrices(array, pCurrentPrices, pBasePrices, numItemsWithPrices))
+		{
+			return null;
+		}
+		return array.Select((InventoryDefId x) => new InventoryDef(x)).ToArray();
+	}
+
+	internal static InventoryDef[] GetDefinitions()
+	{
+		uint punItemDefIDsArraySize = 0u;
+		if (!Internal.GetItemDefinitionIDs(null, ref punItemDefIDsArraySize))
+		{
+			return null;
+		}
+		InventoryDefId[] array = new InventoryDefId[punItemDefIDsArraySize];
+		if (!Internal.GetItemDefinitionIDs(array, ref punItemDefIDsArraySize))
+		{
+			return null;
+		}
+		return array.Select((InventoryDefId x) => new InventoryDef(x)).ToArray();
+	}
+
+	public static bool GetAllItems()
+	{
+		SteamInventoryResult_t pResultHandle = Defines.k_SteamInventoryResultInvalid;
+		return Internal.GetAllItems(ref pResultHandle);
+	}
+
+	public static async Task<InventoryResult?> GetAllItemsAsync()
+	{
+		SteamInventoryResult_t pResultHandle = Defines.k_SteamInventoryResultInvalid;
+		if (!Internal.GetAllItems(ref pResultHandle))
+		{
+			return null;
+		}
+		return await InventoryResult.GetAsync(pResultHandle);
+	}
+
+	public static async Task<InventoryResult?> GenerateItemAsync(InventoryDef target, int amount)
+	{
+		SteamInventoryResult_t pResultHandle = Defines.k_SteamInventoryResultInvalid;
+		InventoryDefId[] pArrayItemDefs = new InventoryDefId[1] { target.Id };
+		uint[] punArrayQuantity = new uint[1] { (uint)amount };
+		if (!Internal.GenerateItems(ref pResultHandle, pArrayItemDefs, punArrayQuantity, 1u))
+		{
+			return null;
+		}
+		return await InventoryResult.GetAsync(pResultHandle);
+	}
+
+	public static async Task<InventoryResult?> CraftItemAsync(InventoryItem[] list, InventoryDef target)
+	{
+		SteamInventoryResult_t pResultHandle = Defines.k_SteamInventoryResultInvalid;
+		InventoryDefId[] pArrayGenerate = new InventoryDefId[1] { target.Id };
+		uint[] punArrayGenerateQuantity = new uint[1] { 1u };
+		InventoryItemId[] array = list.Select((InventoryItem x) => x.Id).ToArray();
+		uint[] punArrayDestroyQuantity = list.Select((InventoryItem x) => 1u).ToArray();
+		if (!Internal.ExchangeItems(ref pResultHandle, pArrayGenerate, punArrayGenerateQuantity, 1u, array, punArrayDestroyQuantity, (uint)array.Length))
+		{
+			return null;
+		}
+		return await InventoryResult.GetAsync(pResultHandle);
+	}
+
+	public static async Task<InventoryResult?> CraftItemAsync(InventoryItem.Amount[] list, InventoryDef target)
+	{
+		SteamInventoryResult_t pResultHandle = Defines.k_SteamInventoryResultInvalid;
+		InventoryDefId[] pArrayGenerate = new InventoryDefId[1] { target.Id };
+		uint[] punArrayGenerateQuantity = new uint[1] { 1u };
+		InventoryItemId[] array = list.Select((InventoryItem.Amount x) => x.Item.Id).ToArray();
+		uint[] punArrayDestroyQuantity = list.Select((InventoryItem.Amount x) => (uint)x.Quantity).ToArray();
+		if (!Internal.ExchangeItems(ref pResultHandle, pArrayGenerate, punArrayGenerateQuantity, 1u, array, punArrayDestroyQuantity, (uint)array.Length))
+		{
+			return null;
+		}
+		return await InventoryResult.GetAsync(pResultHandle);
+	}
+
+	public static async Task<InventoryResult?> DeserializeAsync(byte[] data, int dataLength = -1)
+	{
+		if (data == null)
+		{
+			throw new ArgumentException("data should not be null");
+		}
+		if (dataLength == -1)
+		{
+			dataLength = data.Length;
+		}
+		IntPtr ptr = Marshal.AllocHGlobal(dataLength);
+		try
+		{
+			Marshal.Copy(data, 0, ptr, dataLength);
+			SteamInventoryResult_t pOutResultHandle = Defines.k_SteamInventoryResultInvalid;
+			if (!Internal.DeserializeResult(ref pOutResultHandle, ptr, (uint)dataLength, bRESERVED_MUST_BE_FALSE: false))
+			{
+				return null;
+			}
+			return await InventoryResult.GetAsync(pOutResultHandle.Value);
+		}
+		finally
+		{
+			Marshal.FreeHGlobal(ptr);
+		}
+	}
+
+	public static async Task<InventoryResult?> GrantPromoItemsAsync()
+	{
+		SteamInventoryResult_t pResultHandle = Defines.k_SteamInventoryResultInvalid;
+		if (!Internal.GrantPromoItems(ref pResultHandle))
+		{
+			return null;
+		}
+		return await InventoryResult.GetAsync(pResultHandle);
+	}
+
+	public static async Task<InventoryResult?> TriggerItemDropAsync(InventoryDefId id)
+	{
+		SteamInventoryResult_t pResultHandle = Defines.k_SteamInventoryResultInvalid;
+		if (!Internal.TriggerItemDrop(ref pResultHandle, id))
+		{
+			return null;
+		}
+		return await InventoryResult.GetAsync(pResultHandle);
+	}
+
+	public static async Task<InventoryResult?> AddPromoItemAsync(InventoryDefId id)
+	{
+		SteamInventoryResult_t pResultHandle = Defines.k_SteamInventoryResultInvalid;
+		if (!Internal.AddPromoItem(ref pResultHandle, id))
+		{
+			return null;
+		}
+		return await InventoryResult.GetAsync(pResultHandle);
+	}
+
+	public static async Task<InventoryPurchaseResult?> StartPurchaseAsync(InventoryDef[] items)
+	{
+		Dictionary<InventoryDefId, uint> dictionary = (from x in items
+			group x by x._id).ToDictionary((IGrouping<InventoryDefId, InventoryDef> x) => x.Key, (IGrouping<InventoryDefId, InventoryDef> x) => (uint)x.Count());
+		InventoryDefId[] array = dictionary.Keys.ToArray();
+		uint[] punArrayQuantity = dictionary.Values.ToArray();
+		SteamInventoryStartPurchaseResult_t? steamInventoryStartPurchaseResult_t = await Internal.StartPurchase(array, punArrayQuantity, (uint)array.Length);
+		if (!steamInventoryStartPurchaseResult_t.HasValue)
+		{
+			return null;
+		}
+		InventoryPurchaseResult value = default(InventoryPurchaseResult);
+		value.Result = steamInventoryStartPurchaseResult_t.Value.Result;
+		value.OrderID = steamInventoryStartPurchaseResult_t.Value.OrderID;
+		value.TransID = steamInventoryStartPurchaseResult_t.Value.TransID;
+		return value;
+	}
+}

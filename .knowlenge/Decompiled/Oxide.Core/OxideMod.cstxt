@@ -1,0 +1,698 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Threading;
+using Newtonsoft.Json;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.Configuration;
+using Oxide.Core.Extensions;
+using Oxide.Core.Libraries;
+using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Logging;
+using Oxide.Core.Plugins;
+using Oxide.Core.Plugins.Watchers;
+using Oxide.Core.RemoteConsole;
+using Oxide.Core.ServerConsole;
+using Oxide.Pooling;
+
+public sealed class OxideMod
+{
+	internal static readonly Version AssemblyVersion = Assembly.GetExecutingAssembly().GetName().Version;
+
+	public static readonly VersionNumber Version = new VersionNumber(AssemblyVersion.Major, AssemblyVersion.Minor, AssemblyVersion.Build);
+
+	public static readonly string Branch = Assembly.GetExecutingAssembly().Metadata("GitBranch").FirstOrDefault() ?? "unknown";
+
+	private ExtensionManager extensionManager;
+
+	public CommandLine CommandLine;
+
+	private Covalence covalence;
+
+	private Permission libperm;
+
+	private Oxide.Core.Libraries.Timer libtimer;
+
+	private Func<float> getTimeSinceStartup;
+
+	private List<Action> nextTickQueue = new List<Action>();
+
+	private List<Action> lastTickQueue = new List<Action>();
+
+	private readonly object nextTickLock = new object();
+
+	private Action<float> onFrame;
+
+	internal bool init_called;
+
+	private bool isInitialized;
+
+	public RemoteConsole RemoteConsole;
+
+	public ServerConsole ServerConsole;
+
+	private Stopwatch timer;
+
+	private NativeDebugCallback debugCallback;
+
+	public IPoolFactory PoolFactory { get; }
+
+	public CompoundLogger RootLogger { get; private set; }
+
+	public PluginManager RootPluginManager { get; private set; }
+
+	public DataFileSystem DataFileSystem { get; private set; }
+
+	public string RootDirectory { get; private set; }
+
+	public string ExtensionDirectory { get; private set; }
+
+	public string InstanceDirectory { get; private set; }
+
+	public string PluginDirectory { get; private set; }
+
+	public string ConfigDirectory { get; private set; }
+
+	public string DataDirectory { get; private set; }
+
+	public string LangDirectory { get; private set; }
+
+	public string LogDirectory { get; private set; }
+
+	public float Now => getTimeSinceStartup();
+
+	public bool IsShuttingDown { get; private set; }
+
+	public OxideConfig Config { get; private set; }
+
+	public bool HasLoadedCorePlugins { get; private set; }
+
+	public OxideMod()
+	{
+		init_called = false;
+		CorePoolFactory corePoolFactory = new CorePoolFactory();
+		PoolFactory = corePoolFactory;
+	}
+
+	public void Load()
+	{
+		debugCallback = Interface.DebugCallback;
+		RootDirectory = Environment.CurrentDirectory;
+		if (RootDirectory.StartsWith(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)))
+		{
+			RootDirectory = AppDomain.CurrentDomain.BaseDirectory;
+		}
+		if (RootDirectory == null)
+		{
+			throw new Exception("RootDirectory is null");
+		}
+		InstanceDirectory = Path.Combine(RootDirectory, "oxide");
+		Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
+		JsonConvert.DefaultSettings = () => new JsonSerializerSettings
+		{
+			Culture = CultureInfo.InvariantCulture
+		};
+		CommandLine = new CommandLine(Environment.GetCommandLineArgs());
+		if (CommandLine.HasVariable("oxide.directory"))
+		{
+			CommandLine.GetArgument("oxide.directory", out var varname, out var format);
+			if (string.IsNullOrEmpty(varname) || CommandLine.HasVariable(varname))
+			{
+				InstanceDirectory = Path.Combine(RootDirectory, Utility.CleanPath(string.Format(format, CommandLine.GetVariable(varname))));
+			}
+		}
+		ExtensionDirectory = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+		if (ExtensionDirectory == null || !Directory.Exists(ExtensionDirectory))
+		{
+			throw new Exception("Could not identify extension directory");
+		}
+		if (!Directory.Exists(InstanceDirectory))
+		{
+			Directory.CreateDirectory(InstanceDirectory);
+		}
+		ConfigDirectory = Path.Combine(InstanceDirectory, Utility.CleanPath("config"));
+		if (!Directory.Exists(ConfigDirectory))
+		{
+			Directory.CreateDirectory(ConfigDirectory);
+		}
+		DataDirectory = Path.Combine(InstanceDirectory, Utility.CleanPath("data"));
+		if (!Directory.Exists(DataDirectory))
+		{
+			Directory.CreateDirectory(DataDirectory);
+		}
+		LangDirectory = Path.Combine(InstanceDirectory, Utility.CleanPath("lang"));
+		if (!Directory.Exists(LangDirectory))
+		{
+			Directory.CreateDirectory(LangDirectory);
+		}
+		LogDirectory = Path.Combine(InstanceDirectory, Utility.CleanPath("logs"));
+		if (!Directory.Exists(LogDirectory))
+		{
+			Directory.CreateDirectory(LogDirectory);
+		}
+		PluginDirectory = Path.Combine(InstanceDirectory, Utility.CleanPath("plugins"));
+		if (!Directory.Exists(PluginDirectory))
+		{
+			Directory.CreateDirectory(PluginDirectory);
+		}
+		RegisterLibrarySearchPath(Path.Combine(ExtensionDirectory, (IntPtr.Size == 8) ? "x64" : "x86"));
+		string text = Path.Combine(InstanceDirectory, "oxide.config.json");
+		if (File.Exists(text))
+		{
+			Config = ConfigFile.Load<OxideConfig>(text);
+		}
+		else
+		{
+			Config = new OxideConfig(text);
+			Config.Save();
+		}
+		if (CommandLine.HasVariable("web.ip"))
+		{
+			Config.Options.WebRequestIP = CommandLine.GetVariable("web.ip");
+		}
+		if (CommandLine.HasVariable("rcon.port"))
+		{
+			Config.Rcon.Port = Utility.GetNumbers(CommandLine.GetVariable("rcon.port"));
+		}
+		if (CommandLine.HasVariable("rcon.password"))
+		{
+			Config.Rcon.Password = CommandLine.GetVariable("rcon.password");
+		}
+		RootLogger = new CompoundLogger();
+		RootLogger.AddLogger(new RotatingFileLogger
+		{
+			Directory = LogDirectory
+		});
+		if (debugCallback != null)
+		{
+			RootLogger.AddLogger(new CallbackLogger(debugCallback));
+		}
+		if (CommandLine.HasVariable("nolog"))
+		{
+			LogWarning("Usage of the 'nolog' variable will prevent logging");
+		}
+		LogInfo("Loading Oxide Core v{0}...", Version);
+		RootPluginManager = new PluginManager(RootLogger)
+		{
+			ConfigPath = ConfigDirectory
+		};
+		extensionManager = new ExtensionManager(RootLogger);
+		DataFileSystem = new DataFileSystem(DataDirectory);
+		extensionManager.RegisterLibrary("Covalence", covalence = new Covalence());
+		extensionManager.RegisterLibrary("Global", new Global());
+		extensionManager.RegisterLibrary("Lang", new Lang());
+		extensionManager.RegisterLibrary("Permission", libperm = new Permission());
+		extensionManager.RegisterLibrary("Plugins", new Plugins(RootPluginManager));
+		extensionManager.RegisterLibrary("Time", new Time());
+		extensionManager.RegisterLibrary("Timer", libtimer = new Oxide.Core.Libraries.Timer());
+		extensionManager.RegisterLibrary("WebRequests", new WebRequests());
+		LogInfo("Loading extensions...");
+		extensionManager.LoadAllExtensions(ExtensionDirectory);
+		Cleanup.Run();
+		covalence.Initialize();
+		RemoteConsole = new RemoteConsole();
+		RemoteConsole?.Initalize();
+		if (getTimeSinceStartup == null)
+		{
+			timer = new Stopwatch();
+			timer.Start();
+			getTimeSinceStartup = () => (float)timer.Elapsed.TotalSeconds;
+			LogWarning("A reliable clock is not available, falling back to a clock which may be unreliable on certain hardware");
+		}
+		foreach (Extension allExtension in extensionManager.GetAllExtensions())
+		{
+			allExtension.LoadPluginWatchers(PluginDirectory);
+		}
+		LogInfo("Loading plugins...");
+		LoadAllPlugins(init: true);
+		foreach (PluginChangeWatcher pluginChangeWatcher in extensionManager.GetPluginChangeWatchers())
+		{
+			pluginChangeWatcher.OnPluginSourceChanged += watcher_OnPluginSourceChanged;
+			pluginChangeWatcher.OnPluginAdded += watcher_OnPluginAdded;
+			pluginChangeWatcher.OnPluginRemoved += watcher_OnPluginRemoved;
+		}
+	}
+
+	public T GetLibrary<T>(string name = null) where T : Library
+	{
+		return extensionManager.GetLibrary(name ?? typeof(T).Name) as T;
+	}
+
+	public IEnumerable<Extension> GetAllExtensions()
+	{
+		return extensionManager.GetAllExtensions();
+	}
+
+	public Extension GetExtension(string name)
+	{
+		return extensionManager.GetExtension(name);
+	}
+
+	public T GetExtension<T>() where T : Extension
+	{
+		return extensionManager.GetExtension<T>();
+	}
+
+	public IEnumerable<PluginLoader> GetPluginLoaders()
+	{
+		return extensionManager.GetPluginLoaders();
+	}
+
+	public void LogDebug(string format, params object[] args)
+	{
+		RootLogger.Write(LogType.Warning, "[DEBUG] " + format, args);
+	}
+
+	public void LogError(string format, params object[] args)
+	{
+		RootLogger.Write(LogType.Error, format, args);
+	}
+
+	public void LogException(string message, Exception ex)
+	{
+		RootLogger.WriteException(message, ex);
+	}
+
+	public void LogInfo(string format, params object[] args)
+	{
+		RootLogger.Write(LogType.Info, format, args);
+	}
+
+	public void LogWarning(string format, params object[] args)
+	{
+		RootLogger.Write(LogType.Warning, format, args);
+	}
+
+	public void LoadAllPlugins(bool init = false)
+	{
+		IEnumerable<PluginLoader> enumerable = extensionManager.GetPluginLoaders().ToArray();
+		if (!HasLoadedCorePlugins)
+		{
+			foreach (PluginLoader item in enumerable)
+			{
+				Type[] corePlugins = item.CorePlugins;
+				foreach (Type type in corePlugins)
+				{
+					try
+					{
+						Plugin plugin = (Plugin)Activator.CreateInstance(type);
+						plugin.IsCorePlugin = true;
+						PluginLoaded(plugin);
+					}
+					catch (Exception ex)
+					{
+						LogException("Could not load core plugin " + type.Name, ex);
+					}
+				}
+			}
+			HasLoadedCorePlugins = true;
+		}
+		foreach (PluginLoader item2 in enumerable)
+		{
+			foreach (string item3 in item2.ScanDirectory(PluginDirectory))
+			{
+				LoadPlugin(item3);
+			}
+		}
+		if (!init)
+		{
+			return;
+		}
+		float now = Now;
+		foreach (PluginLoader pluginLoader in extensionManager.GetPluginLoaders())
+		{
+			while (pluginLoader.LoadingPlugins.Count > 0)
+			{
+				Thread.Sleep(25);
+				OnFrame(Now - now);
+				now = Now;
+			}
+		}
+		isInitialized = true;
+	}
+
+	public void UnloadAllPlugins(IList<string> skip = null)
+	{
+		Plugin[] array = (from p in RootPluginManager.GetPlugins()
+			where !p.IsCorePlugin && (skip == null || !skip.Contains(p.Name))
+			select p).ToArray();
+		foreach (Plugin plugin in array)
+		{
+			UnloadPlugin(plugin.Name);
+		}
+	}
+
+	public void ReloadAllPlugins(IList<string> skip = null)
+	{
+		Plugin[] array = (from p in RootPluginManager.GetPlugins()
+			where !p.IsCorePlugin && (skip == null || !skip.Contains(p.Name))
+			select p).ToArray();
+		foreach (Plugin plugin in array)
+		{
+			ReloadPlugin(plugin.Name);
+		}
+	}
+
+	public bool LoadPlugin(string name)
+	{
+		if (RootPluginManager.GetPlugin(name) != null)
+		{
+			return false;
+		}
+		HashSet<PluginLoader> hashSet = new HashSet<PluginLoader>(from l in extensionManager.GetPluginLoaders()
+			where l.ScanDirectory(PluginDirectory).Contains(name)
+			select l);
+		if (hashSet.Count == 0)
+		{
+			LogError("Could not load plugin '{0}' (no plugin found with that file name)", name);
+			return false;
+		}
+		if (hashSet.Count > 1)
+		{
+			LogError("Could not load plugin '{0}' (multiple plugin with that name)", name);
+			return false;
+		}
+		PluginLoader pluginLoader = hashSet.First();
+		try
+		{
+			Plugin plugin = pluginLoader.Load(PluginDirectory, name);
+			if (plugin == null)
+			{
+				return true;
+			}
+			plugin.Loader = pluginLoader;
+			PluginLoaded(plugin);
+			return true;
+		}
+		catch (Exception ex)
+		{
+			LogException("Could not load plugin " + name, ex);
+			return false;
+		}
+	}
+
+	public bool PluginLoaded(Plugin plugin)
+	{
+		plugin.OnError += plugin_OnError;
+		try
+		{
+			plugin.Loader?.PluginErrors.Remove(plugin.Name);
+			RootPluginManager.AddPlugin(plugin);
+			if (plugin.Loader != null && plugin.Loader.PluginErrors.ContainsKey(plugin.Name))
+			{
+				UnloadPlugin(plugin.Name);
+				return false;
+			}
+			plugin.IsLoaded = true;
+			CallHook("OnPluginLoaded", plugin);
+			LogInfo("Loaded plugin {0} v{1} by {2}", plugin.Title, plugin.Version, plugin.Author);
+			return true;
+		}
+		catch (Exception ex)
+		{
+			if (plugin.Loader != null)
+			{
+				plugin.Loader.PluginErrors[plugin.Name] = ex.Message;
+			}
+			LogException($"Could not initialize plugin '{plugin.Name} v{plugin.Version}'", ex);
+			return false;
+		}
+	}
+
+	public bool UnloadPlugin(string name)
+	{
+		Plugin plugin = RootPluginManager.GetPlugin(name);
+		if (plugin == null || (plugin.IsCorePlugin && !IsShuttingDown))
+		{
+			return false;
+		}
+		extensionManager.GetPluginLoaders().SingleOrDefault((PluginLoader l) => l.LoadedPlugins.ContainsKey(name))?.Unloading(plugin);
+		RootPluginManager.RemovePlugin(plugin);
+		if (plugin.IsLoaded)
+		{
+			CallHook("OnPluginUnloaded", plugin);
+		}
+		plugin.IsLoaded = false;
+		LogInfo("Unloaded plugin {0} v{1} by {2}", plugin.Title, plugin.Version, plugin.Author);
+		return true;
+	}
+
+	public bool ReloadPlugin(string name)
+	{
+		bool flag = false;
+		string directory = PluginDirectory;
+		if (name.Contains("\\"))
+		{
+			flag = true;
+			string directoryName = Path.GetDirectoryName(name);
+			if (directoryName != null)
+			{
+				directory = Path.Combine(directory, directoryName);
+				name = name.Substring(directoryName.Length + 1);
+			}
+		}
+		PluginLoader pluginLoader = extensionManager.GetPluginLoaders().FirstOrDefault((PluginLoader l) => l.ScanDirectory(directory).Contains(name));
+		if (pluginLoader != null)
+		{
+			pluginLoader.Reload(directory, name);
+			return true;
+		}
+		if (flag)
+		{
+			return false;
+		}
+		UnloadPlugin(name);
+		LoadPlugin(name);
+		return true;
+	}
+
+	private void plugin_OnError(Plugin sender, string message)
+	{
+		LogError("{0} v{1}: {2}", sender.Name, sender.Version, message);
+	}
+
+	public bool LoadExtension(string name)
+	{
+		string path = ((!name.EndsWith(".dll")) ? (name + ".dll") : name);
+		string text = Path.Combine(ExtensionDirectory, path);
+		if (!File.Exists(text))
+		{
+			LogError("Could not load extension '" + name + "' (file not found)");
+			return false;
+		}
+		extensionManager.LoadExtension(text);
+		return true;
+	}
+
+	public bool UnloadExtension(string name)
+	{
+		string path = ((!name.EndsWith(".dll")) ? (name + ".dll") : name);
+		string text = Path.Combine(ExtensionDirectory, path);
+		if (!File.Exists(text))
+		{
+			LogError("Could not unload extension '" + name + "' (file not found)");
+			return false;
+		}
+		extensionManager.UnloadExtension(text);
+		return true;
+	}
+
+	public bool ReloadExtension(string name)
+	{
+		string path = ((!name.EndsWith(".dll")) ? (name + ".dll") : name);
+		string text = Path.Combine(ExtensionDirectory, path);
+		if (!File.Exists(text))
+		{
+			LogError("Could not reload extension '" + name + "' (file not found)");
+			return false;
+		}
+		extensionManager.ReloadExtension(text);
+		return true;
+	}
+
+	public object CallHook(string hookname, params object[] args)
+	{
+		return RootPluginManager?.CallHook(hookname, args);
+	}
+
+	public object CallDeprecatedHook(string oldHook, string newHook, DateTime expireDate, params object[] args)
+	{
+		return RootPluginManager?.CallDeprecatedHook(oldHook, newHook, expireDate, args);
+	}
+
+	public void NextTick(Action callback)
+	{
+		lock (nextTickLock)
+		{
+			nextTickQueue.Add(callback);
+		}
+	}
+
+	public void OnFrame(Action<float> callback)
+	{
+		onFrame = (Action<float>)Delegate.Combine(onFrame, callback);
+	}
+
+	public void OnFrame(float delta)
+	{
+		if (nextTickQueue.Count > 0)
+		{
+			List<Action> list;
+			lock (nextTickLock)
+			{
+				list = nextTickQueue;
+				nextTickQueue = lastTickQueue;
+				lastTickQueue = list;
+			}
+			for (int i = 0; i < list.Count; i++)
+			{
+				try
+				{
+					list[i]();
+				}
+				catch (Exception ex)
+				{
+					LogException("Exception while calling NextTick callback", ex);
+				}
+			}
+			list.Clear();
+		}
+		libtimer.Update(delta);
+		if (isInitialized)
+		{
+			ServerConsole?.Update();
+			try
+			{
+				onFrame?.Invoke(delta);
+			}
+			catch (Exception ex2)
+			{
+				LogException(ex2.GetType().Name + " while invoke OnFrame in extensions", ex2);
+			}
+		}
+	}
+
+	public void OnSave()
+	{
+		libperm.SaveData();
+	}
+
+	public void OnShutdown()
+	{
+		if (IsShuttingDown)
+		{
+			return;
+		}
+		IsShuttingDown = true;
+		UnloadAllPlugins();
+		foreach (Extension allExtension in extensionManager.GetAllExtensions())
+		{
+			allExtension.OnShutdown();
+		}
+		foreach (string library in extensionManager.GetLibraries())
+		{
+			extensionManager.GetLibrary(library).Shutdown();
+		}
+		libperm.SaveData();
+		RemoteConsole?.Shutdown();
+		ServerConsole?.OnDisable();
+		RootLogger.Shutdown();
+	}
+
+	public void RegisterEngineClock(Func<float> method)
+	{
+		getTimeSinceStartup = method;
+	}
+
+	public bool CheckConsole(bool force = false)
+	{
+		if (ConsoleWindow.Check(force))
+		{
+			return Config.Console.Enabled;
+		}
+		return false;
+	}
+
+	public bool EnableConsole(bool force = false)
+	{
+		if (CheckConsole(force))
+		{
+			ServerConsole = new ServerConsole();
+			ServerConsole.OnEnable();
+			return true;
+		}
+		return false;
+	}
+
+	private void watcher_OnPluginSourceChanged(string name)
+	{
+		ReloadPlugin(name);
+	}
+
+	private void watcher_OnPluginAdded(string name)
+	{
+		LoadPlugin(name);
+	}
+
+	private void watcher_OnPluginRemoved(string name)
+	{
+		UnloadPlugin(name);
+	}
+
+	private static void RegisterLibrarySearchPath(string path)
+	{
+		switch (Environment.OSVersion.Platform)
+		{
+		case PlatformID.Win32S:
+		case PlatformID.Win32Windows:
+		case PlatformID.Win32NT:
+		{
+			string text3 = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+			string text4;
+			if (!string.IsNullOrEmpty(text3))
+			{
+				char pathSeparator = Path.PathSeparator;
+				text4 = text3 + pathSeparator + path;
+			}
+			else
+			{
+				text4 = path;
+			}
+			string value2 = text4;
+			Environment.SetEnvironmentVariable("PATH", value2);
+			SetDllDirectory(path);
+			break;
+		}
+		case PlatformID.Unix:
+		case PlatformID.MacOSX:
+		{
+			string text = Environment.GetEnvironmentVariable("LD_LIBRARY_PATH") ?? string.Empty;
+			string text2;
+			if (!string.IsNullOrEmpty(text))
+			{
+				char pathSeparator = Path.PathSeparator;
+				text2 = text + pathSeparator + path;
+			}
+			else
+			{
+				text2 = path;
+			}
+			string value = text2;
+			Environment.SetEnvironmentVariable("LD_LIBRARY_PATH", value);
+			break;
+		}
+		case PlatformID.WinCE:
+		case PlatformID.Xbox:
+			break;
+		}
+	}
+
+	[DllImport("kernel32", SetLastError = true)]
+	private static extern bool SetDllDirectory(string lpPathName);
+}

@@ -1,0 +1,218 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Threading;
+using Oxide.Core.Plugins;
+
+public class WebRequest
+{
+	private HttpWebRequest request;
+
+	private WaitHandle waitHandle;
+
+	private RegisteredWaitHandle registeredWaitHandle;
+
+	private Event.Callback<Plugin, PluginManager> removedFromManager;
+
+	public Action<int, string> Callback { get; }
+
+	public float Timeout { get; set; }
+
+	public string Method { get; set; }
+
+	public string Url { get; }
+
+	public string Body { get; set; }
+
+	public int ResponseCode { get; protected set; }
+
+	public string ResponseText { get; protected set; }
+
+	public Plugin Owner { get; protected set; }
+
+	public Dictionary<string, string> RequestHeaders { get; set; }
+
+	public WebRequest(string url, Action<int, string> callback, Plugin owner)
+	{
+		Url = url;
+		Callback = callback;
+		Owner = owner;
+		removedFromManager = Owner?.OnRemovedFromManager.Add(owner_OnRemovedFromManager);
+	}
+
+	public void Start()
+	{
+		try
+		{
+			request = (HttpWebRequest)System.Net.WebRequest.Create(Url);
+			request.Method = Method;
+			request.Credentials = CredentialCache.DefaultCredentials;
+			request.Proxy = null;
+			request.KeepAlive = false;
+			request.Timeout = (int)Math.Round((Timeout.Equals(0f) ? WebRequests.Timeout : Timeout) * 1000f);
+			request.AutomaticDecompression = (AllowDecompression ? (DecompressionMethods.GZip | DecompressionMethods.Deflate) : DecompressionMethods.None);
+			request.ServicePoint.MaxIdleTime = request.Timeout;
+			request.ServicePoint.Expect100Continue = ServicePointManager.Expect100Continue;
+			request.ServicePoint.ConnectionLimit = ServicePointManager.DefaultConnectionLimit;
+			request.UserAgent = $"Oxide Mod (v{OxideMod.Version}; https://umod.org)";
+			if (!request.RequestUri.IsLoopback && IPAddress.TryParse(Interface.Oxide.Config.Options.WebRequestIP, out var address))
+			{
+				request.ServicePoint.BindIPEndPointDelegate = (ServicePoint servicePoint, IPEndPoint remoteEndPoint, int retryCount) => new IPEndPoint(address, 0);
+			}
+			byte[] data = new byte[0];
+			if (Body != null)
+			{
+				data = Encoding.UTF8.GetBytes(Body);
+				request.ContentLength = data.Length;
+				request.ContentType = "application/x-www-form-urlencoded";
+			}
+			if (RequestHeaders != null)
+			{
+				request.SetRawHeaders(RequestHeaders);
+			}
+			if (data.Length != 0)
+			{
+				request.BeginGetRequestStream(delegate(IAsyncResult result)
+				{
+					if (request != null)
+					{
+						try
+						{
+							using Stream stream = request.EndGetRequestStream(result);
+							stream.Write(data, 0, data.Length);
+						}
+						catch (Exception exception)
+						{
+							ResponseText = FormatWebException(exception, ResponseText ?? string.Empty);
+							request?.Abort();
+							OnComplete();
+							return;
+						}
+						WaitForResponse();
+					}
+				}, null);
+			}
+			else
+			{
+				WaitForResponse();
+			}
+		}
+		catch (Exception ex)
+		{
+			ResponseText = FormatWebException(ex, ResponseText ?? string.Empty);
+			string text = "Web request produced exception (Url: " + Url + ")";
+			if ((bool)Owner)
+			{
+				text += $" in '{Owner.Name} v{Owner.Version}' plugin";
+			}
+			Interface.Oxide.LogException(text, ex);
+			request?.Abort();
+			OnComplete();
+		}
+	}
+
+	private void WaitForResponse()
+	{
+		IAsyncResult asyncResult = request.BeginGetResponse(delegate(IAsyncResult res)
+		{
+			try
+			{
+				using HttpWebResponse httpWebResponse = (HttpWebResponse)request.EndGetResponse(res);
+				using (Stream stream = httpWebResponse.GetResponseStream())
+				{
+					using StreamReader streamReader = new StreamReader(stream);
+					ResponseText = streamReader.ReadToEnd();
+				}
+				ResponseCode = (int)httpWebResponse.StatusCode;
+			}
+			catch (WebException ex)
+			{
+				ResponseText = FormatWebException(ex, ResponseText ?? string.Empty);
+				if (ex.Response is HttpWebResponse httpWebResponse2)
+				{
+					try
+					{
+						using Stream stream2 = httpWebResponse2.GetResponseStream();
+						using StreamReader streamReader2 = new StreamReader(stream2);
+						ResponseText = streamReader2.ReadToEnd();
+					}
+					catch (Exception)
+					{
+					}
+					ResponseCode = (int)httpWebResponse2.StatusCode;
+				}
+			}
+			catch (Exception ex3)
+			{
+				ResponseText = FormatWebException(ex3, ResponseText ?? string.Empty);
+				string text = "Web request produced exception (Url: " + Url + ")";
+				if ((bool)Owner)
+				{
+					text += $" in '{Owner.Name} v{Owner.Version}' plugin";
+				}
+				Interface.Oxide.LogException(text, ex3);
+			}
+			if (request != null)
+			{
+				request.Abort();
+				OnComplete();
+			}
+		}, null);
+		waitHandle = asyncResult.AsyncWaitHandle;
+		registeredWaitHandle = ThreadPool.RegisterWaitForSingleObject(waitHandle, OnTimeout, null, request.Timeout, executeOnlyOnce: true);
+	}
+
+	private void OnTimeout(object state, bool timedOut)
+	{
+		if (timedOut)
+		{
+			request?.Abort();
+		}
+		if (Owner != null)
+		{
+			Event.Remove(ref removedFromManager);
+			Owner = null;
+		}
+	}
+
+	private void OnComplete()
+	{
+		Event.Remove(ref removedFromManager);
+		registeredWaitHandle?.Unregister(waitHandle);
+		Interface.Oxide.NextTick(delegate
+		{
+			if (request != null)
+			{
+				request = null;
+				Owner?.TrackStart();
+				try
+				{
+					Callback(ResponseCode, ResponseText);
+				}
+				catch (Exception ex)
+				{
+					string text = "Web request callback raised an exception";
+					if ((bool)Owner && Owner != null)
+					{
+						text += $" in '{Owner.Name} v{Owner.Version}' plugin";
+					}
+					Interface.Oxide.LogException(text, ex);
+				}
+				Owner?.TrackEnd();
+				Owner = null;
+			}
+		});
+	}
+
+	private void owner_OnRemovedFromManager(Plugin sender, PluginManager manager)
+	{
+		if (request != null)
+		{
+			HttpWebRequest httpWebRequest = request;
+			request = null;
+			httpWebRequest.Abort();
+		}
+	}
+}

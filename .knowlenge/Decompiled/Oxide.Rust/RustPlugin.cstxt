@@ -1,0 +1,203 @@
+using System;
+using System.Reflection;
+using Oxide.Core;
+using Oxide.Core.Plugins;
+using Oxide.Game.Rust.Libraries;
+using Oxide.Plugins;
+using UnityEngine;
+
+public abstract class RustPlugin : CSharpPlugin
+{
+	protected Command cmd = Interface.Oxide.GetLibrary<Command>();
+
+	protected Oxide.Game.Rust.Libraries.Rust rust = Interface.Oxide.GetLibrary<Oxide.Game.Rust.Libraries.Rust>();
+
+	protected Oxide.Game.Rust.Libraries.Item Item = Interface.Oxide.GetLibrary<Oxide.Game.Rust.Libraries.Item>();
+
+	protected Player Player = Interface.Oxide.GetLibrary<Player>();
+
+	protected Server Server = Interface.Oxide.GetLibrary<Server>();
+
+	public override void HandleAddedToManager(PluginManager manager)
+	{
+		FieldInfo[] fields = GetType().GetFields(BindingFlags.Instance | BindingFlags.NonPublic);
+		foreach (FieldInfo fieldInfo in fields)
+		{
+			if (fieldInfo.GetCustomAttributes(typeof(OnlinePlayersAttribute), inherit: true).Length != 0)
+			{
+				PluginFieldInfo pluginFieldInfo = new PluginFieldInfo(this, fieldInfo);
+				if (pluginFieldInfo.GenericArguments.Length != 2 || pluginFieldInfo.GenericArguments[0] != typeof(BasePlayer))
+				{
+					Puts("The " + fieldInfo.Name + " field is not a Hash with a BasePlayer key! (online players will not be tracked)");
+				}
+				else if (!pluginFieldInfo.LookupMethod("Add", pluginFieldInfo.GenericArguments))
+				{
+					Puts("The " + fieldInfo.Name + " field does not support adding BasePlayer keys! (online players will not be tracked)");
+				}
+				else if (!pluginFieldInfo.LookupMethod("Remove", typeof(BasePlayer)))
+				{
+					Puts("The " + fieldInfo.Name + " field does not support removing BasePlayer keys! (online players will not be tracked)");
+				}
+				else if (pluginFieldInfo.GenericArguments[1].GetField("Player") == null)
+				{
+					Puts("The " + pluginFieldInfo.GenericArguments[1].Name + " class does not have a public Player field! (online players will not be tracked)");
+				}
+				else if (!pluginFieldInfo.HasValidConstructor(typeof(BasePlayer)))
+				{
+					Puts("The " + fieldInfo.Name + " field is using a class which contains no valid constructor (online players will not be tracked)");
+				}
+				else
+				{
+					onlinePlayerFields.Add(pluginFieldInfo);
+				}
+			}
+		}
+		MethodInfo[] methods = GetType().GetMethods(BindingFlags.Instance | BindingFlags.NonPublic);
+		foreach (MethodInfo methodInfo in methods)
+		{
+			object[] customAttributes = methodInfo.GetCustomAttributes(typeof(ConsoleCommandAttribute), inherit: true);
+			if (customAttributes.Length != 0)
+			{
+				if (customAttributes[0] is ConsoleCommandAttribute consoleCommandAttribute)
+				{
+					cmd.AddConsoleCommand(consoleCommandAttribute.Command, this, methodInfo.Name);
+				}
+				continue;
+			}
+			customAttributes = methodInfo.GetCustomAttributes(typeof(ChatCommandAttribute), inherit: true);
+			if (customAttributes.Length != 0 && customAttributes[0] is ChatCommandAttribute chatCommandAttribute)
+			{
+				cmd.AddChatCommand(chatCommandAttribute.Command, this, methodInfo.Name);
+			}
+		}
+		if (onlinePlayerFields.Count > 0)
+		{
+			foreach (BasePlayer activePlayer in BasePlayer.activePlayerList)
+			{
+				AddOnlinePlayer(activePlayer);
+			}
+		}
+		base.HandleAddedToManager(manager);
+	}
+
+	[HookMethod("OnPlayerConnected")]
+	private void base_OnPlayerConnected(BasePlayer player)
+	{
+		AddOnlinePlayer(player);
+	}
+
+	[HookMethod("OnPlayerDisconnected")]
+	private void base_OnPlayerDisconnected(BasePlayer player, string reason)
+	{
+		NextTick(delegate
+		{
+			foreach (PluginFieldInfo onlinePlayerField in onlinePlayerFields)
+			{
+				onlinePlayerField.Call("Remove", player);
+			}
+		});
+	}
+
+	private void AddOnlinePlayer(BasePlayer player)
+	{
+		foreach (PluginFieldInfo onlinePlayerField in onlinePlayerFields)
+		{
+			Type type = onlinePlayerField.GenericArguments[1];
+			object obj = ((type.GetConstructor(new Type[1] { typeof(BasePlayer) }) == null) ? Activator.CreateInstance(type) : Activator.CreateInstance(type, new object[1] { player }));
+			type.GetField("Player").SetValue(obj, player);
+			onlinePlayerField.Call("Add", player, obj);
+		}
+	}
+
+	protected void PrintToConsole(BasePlayer player, string format, params object[] args)
+	{
+		if (player?.net != null)
+		{
+			player.SendConsoleCommand("echo " + ((args.Length != 0) ? string.Format(format, args) : format));
+		}
+	}
+
+	protected void PrintToConsole(string format, params object[] args)
+	{
+		if (BasePlayer.activePlayerList.Count >= 1)
+		{
+			ConsoleNetwork.BroadcastToAllClients("echo " + ((args.Length != 0) ? string.Format(format, args) : format));
+		}
+	}
+
+	protected void PrintToChat(BasePlayer player, string format, params object[] args)
+	{
+		if (player?.net != null)
+		{
+			player.SendConsoleCommand("chat.add", 2, 0, (args.Length != 0) ? string.Format(format, args) : format);
+		}
+	}
+
+	protected void PrintToChat(string format, params object[] args)
+	{
+		if (BasePlayer.activePlayerList.Count >= 1)
+		{
+			ConsoleNetwork.BroadcastToAllClients("chat.add", 2, 0, (args.Length != 0) ? string.Format(format, args) : format);
+		}
+	}
+
+	protected void SendReply(ConsoleSystem.Arg arg, string format, params object[] args)
+	{
+		BasePlayer basePlayer = arg.Connection?.player as BasePlayer;
+		string text = ((args.Length != 0) ? string.Format(format, args) : format);
+		if (basePlayer?.net != null)
+		{
+			basePlayer.SendConsoleCommand("echo " + text);
+		}
+		else
+		{
+			Puts(text);
+		}
+	}
+
+	protected void SendReply(BasePlayer player, string format, params object[] args)
+	{
+		PrintToChat(player, format, args);
+	}
+
+	protected void SendWarning(ConsoleSystem.Arg arg, string format, params object[] args)
+	{
+		BasePlayer basePlayer = arg.Connection?.player as BasePlayer;
+		string text = ((args.Length != 0) ? string.Format(format, args) : format);
+		if (basePlayer?.net != null)
+		{
+			basePlayer.SendConsoleCommand("echo " + text);
+		}
+		else
+		{
+			Debug.LogWarning(text);
+		}
+	}
+
+	protected void SendError(ConsoleSystem.Arg arg, string format, params object[] args)
+	{
+		BasePlayer basePlayer = arg.Connection?.player as BasePlayer;
+		string text = ((args.Length != 0) ? string.Format(format, args) : format);
+		if (basePlayer?.net != null)
+		{
+			basePlayer.SendConsoleCommand("echo " + text);
+		}
+		else
+		{
+			Debug.LogError(text);
+		}
+	}
+
+	protected void ForcePlayerPosition(BasePlayer player, Vector3 destination)
+	{
+		player.MovePosition(destination);
+		if (!player.IsSpectating() || (double)Vector3.Distance(player.transform.position, destination) > 25.0)
+		{
+			player.ClientRPC(RpcTarget.Player("ForcePositionTo", player), destination);
+		}
+		else
+		{
+			player.SendNetworkUpdate(BasePlayer.NetworkQueue.UpdateDistance);
+		}
+	}
+}

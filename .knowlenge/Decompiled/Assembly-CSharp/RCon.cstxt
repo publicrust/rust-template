@@ -1,0 +1,809 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using ConVar;
+using Facepunch;
+using Facepunch.Rcon;
+using Facepunch.Rust.Profiling;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Converters;
+using Oxide.Core;
+using UnityEngine;
+
+public class RCon
+{
+	public struct Command
+	{
+		public IPAddress Ip;
+
+		public int ConnectionId;
+
+		public string Name;
+
+		public string Message;
+
+		public int Identifier;
+	}
+
+	public enum LogType
+	{
+		Generic,
+		Error,
+		Warning,
+		Chat,
+		Report,
+		ClientPerf,
+		Subscription
+	}
+
+	public struct Response
+	{
+		public string Message;
+
+		public int Identifier;
+
+		[JsonConverter(typeof(StringEnumConverter))]
+		public LogType Type;
+
+		public string Stacktrace;
+	}
+
+	internal struct BannedAddresses
+	{
+		public IPAddress addr;
+
+		public float banTime;
+	}
+
+	public static class ReservedIdentifiers
+	{
+		public const int PlayerPostionsUpdate = -64001;
+
+		public const int FoundationsUpdate = -64002;
+	}
+
+	internal class RConClient
+	{
+		private Socket socket;
+
+		private bool isAuthorised;
+
+		private string connectionName;
+
+		private int lastMessageID = -1;
+
+		private bool runningConsoleCommand;
+
+		private bool utf8Mode;
+
+		internal RConClient(Socket cl)
+		{
+			socket = cl;
+			socket.NoDelay = true;
+			connectionName = socket.RemoteEndPoint.ToString();
+		}
+
+		internal bool IsValid()
+		{
+			return socket != null;
+		}
+
+		internal void Update()
+		{
+			if (socket == null)
+			{
+				return;
+			}
+			if (!socket.Connected)
+			{
+				Close("Disconnected");
+				return;
+			}
+			int available = socket.Available;
+			if (available < 14)
+			{
+				return;
+			}
+			if (available > 4096)
+			{
+				Close("overflow");
+				return;
+			}
+			byte[] buffer = new byte[available];
+			socket.Receive(buffer);
+			using BinaryReader binaryReader = new BinaryReader(new MemoryStream(buffer, writable: false), utf8Mode ? Encoding.UTF8 : Encoding.ASCII);
+			int num = binaryReader.ReadInt32();
+			if (available < num)
+			{
+				Close("invalid packet");
+				return;
+			}
+			lastMessageID = binaryReader.ReadInt32();
+			int type = binaryReader.ReadInt32();
+			string msg = ReadNullTerminatedString(binaryReader);
+			ReadNullTerminatedString(binaryReader);
+			if (!HandleMessage(type, msg))
+			{
+				Close("invalid packet");
+			}
+			else
+			{
+				lastMessageID = -1;
+			}
+		}
+
+		internal bool HandleMessage(int type, string msg)
+		{
+			if (!isAuthorised)
+			{
+				return HandleMessage_UnAuthed(type, msg);
+			}
+			if (type == SERVERDATA_SWITCH_UTF8)
+			{
+				utf8Mode = true;
+				return true;
+			}
+			if (type == SERVERDATA_EXECCOMMAND)
+			{
+				UnityEngine.Debug.Log("[RCON][" + connectionName + "] " + msg);
+				runningConsoleCommand = true;
+				ConsoleSystem.Run(ConsoleSystem.Option.Server, msg);
+				runningConsoleCommand = false;
+				Reply(-1, SERVERDATA_RESPONSE_VALUE, "");
+				return true;
+			}
+			if (type == SERVERDATA_RESPONSE_VALUE)
+			{
+				Reply(lastMessageID, SERVERDATA_RESPONSE_VALUE, "");
+				return true;
+			}
+			UnityEngine.Debug.Log("[RCON][" + connectionName + "] Unhandled: " + lastMessageID + " -> " + type + " -> " + msg);
+			return false;
+		}
+
+		internal bool HandleMessage_UnAuthed(int type, string msg)
+		{
+			if (type != SERVERDATA_AUTH)
+			{
+				BanIP((socket.RemoteEndPoint as IPEndPoint).Address, 60f);
+				Close("Invalid Command - Not Authed");
+				return false;
+			}
+			Reply(lastMessageID, SERVERDATA_RESPONSE_VALUE, "");
+			isAuthorised = Password == msg;
+			if (!isAuthorised)
+			{
+				Reply(-1, SERVERDATA_AUTH_RESPONSE, "");
+				BanIP((socket.RemoteEndPoint as IPEndPoint).Address, 60f);
+				Close("Invalid Password");
+				return true;
+			}
+			Reply(lastMessageID, SERVERDATA_AUTH_RESPONSE, "");
+			UnityEngine.Debug.Log("[RCON] Auth: " + connectionName);
+			Output.OnMessage += Output_OnMessage;
+			return true;
+		}
+
+		private void Output_OnMessage(string message, string stacktrace, UnityEngine.LogType type)
+		{
+			if (isAuthorised && IsValid())
+			{
+				if (lastMessageID != -1 && runningConsoleCommand)
+				{
+					Reply(lastMessageID, SERVERDATA_RESPONSE_VALUE, message);
+				}
+				Reply(0, SERVERDATA_CONSOLE_LOG, message);
+			}
+		}
+
+		internal void Reply(int id, int type, string msg)
+		{
+			MemoryStream memoryStream = new MemoryStream(1024);
+			using BinaryWriter binaryWriter = new BinaryWriter(memoryStream);
+			if (utf8Mode)
+			{
+				byte[] bytes = Encoding.UTF8.GetBytes(msg);
+				int value = 10 + bytes.Length;
+				binaryWriter.Write(value);
+				binaryWriter.Write(id);
+				binaryWriter.Write(type);
+				binaryWriter.Write(bytes);
+			}
+			else
+			{
+				int value2 = 10 + msg.Length;
+				binaryWriter.Write(value2);
+				binaryWriter.Write(id);
+				binaryWriter.Write(type);
+				foreach (char c in msg)
+				{
+					binaryWriter.Write((sbyte)c);
+				}
+			}
+			binaryWriter.Write((sbyte)0);
+			binaryWriter.Write((sbyte)0);
+			binaryWriter.Flush();
+			try
+			{
+				socket.Send(memoryStream.GetBuffer(), (int)memoryStream.Position, SocketFlags.None);
+			}
+			catch (Exception ex)
+			{
+				UnityEngine.Debug.LogWarning("Error sending rcon reply: " + ex);
+				Close("Exception");
+			}
+		}
+
+		internal void Close(string strReasn)
+		{
+			Output.OnMessage -= Output_OnMessage;
+			if (socket != null)
+			{
+				UnityEngine.Debug.Log("[RCON][" + connectionName + "] Disconnected: " + strReasn);
+				socket.Close();
+				socket = null;
+			}
+		}
+
+		internal string ReadNullTerminatedString(BinaryReader read)
+		{
+			string text = "";
+			do
+			{
+				if (read.BaseStream.Position == read.BaseStream.Length)
+				{
+					return "";
+				}
+				char c = read.ReadChar();
+				if (c == '\0')
+				{
+					return text;
+				}
+				text += c;
+			}
+			while (text.Length <= 8192);
+			return string.Empty;
+		}
+	}
+
+	internal class RConListener
+	{
+		private TcpListener server;
+
+		private List<RConClient> clients = new List<RConClient>();
+
+		internal RConListener()
+		{
+			IPAddress address = IPAddress.Any;
+			if (!IPAddress.TryParse(Ip, out address))
+			{
+				address = IPAddress.Any;
+			}
+			server = new TcpListener(address, Port);
+			try
+			{
+				server.Start();
+			}
+			catch (Exception ex)
+			{
+				UnityEngine.Debug.LogWarning("Couldn't start RCON Listener: " + ex.Message);
+				server = null;
+			}
+		}
+
+		internal void Shutdown()
+		{
+			if (server != null)
+			{
+				server.Stop();
+				server = null;
+			}
+		}
+
+		internal void Cycle()
+		{
+			if (server != null)
+			{
+				ProcessConnections();
+				RemoveDeadClients();
+				UpdateClients();
+			}
+		}
+
+		private void ProcessConnections()
+		{
+			if (!server.Pending())
+			{
+				return;
+			}
+			Socket socket = server.AcceptSocket();
+			if (socket != null)
+			{
+				IPEndPoint iPEndPoint = socket.RemoteEndPoint as IPEndPoint;
+				if (Interface.CallHook("OnRconConnection", iPEndPoint.Address) != null)
+				{
+					socket.Close();
+				}
+				else if (IsBanned(iPEndPoint.Address))
+				{
+					UnityEngine.Debug.Log("[RCON] Ignoring connection - banned. " + iPEndPoint.Address.ToString());
+					socket.Close();
+				}
+				else
+				{
+					clients.Add(new RConClient(socket));
+				}
+			}
+		}
+
+		private void UpdateClients()
+		{
+			foreach (RConClient client in clients)
+			{
+				client.Update();
+			}
+		}
+
+		private void RemoveDeadClients()
+		{
+			clients.RemoveAll((RConClient x) => !x.IsValid());
+		}
+	}
+
+	public static string Password = "";
+
+	[ServerVar(Help = "Port to listen for RCON connections")]
+	public static int Port = 0;
+
+	[ServerVar(Help = "IP Address to listen for RCON connections")]
+	public static string Ip = "";
+
+	[ServerVar(Help = "If set to true, use websocket RCON. If set to false use legacy, source engine RCON. Source engine RCON is DEPRECATED")]
+	public static bool Web = true;
+
+	[ServerVar(Help = "If true, RCON commands will be printed in the console")]
+	public static bool Print = false;
+
+	private static bool _enableSubscriptions;
+
+	internal static RConListener listener = null;
+
+	public static Listener listenerNew = null;
+
+	private static ConcurrentQueue<Command> Commands = new ConcurrentQueue<Command>();
+
+	private static float lastRunTime = 0f;
+
+	internal static List<BannedAddresses> bannedAddresses = new List<BannedAddresses>();
+
+	private static int responseIdentifier;
+
+	private static int responseConnection = -1;
+
+	private static bool isInput;
+
+	private static Stopwatch timer = new Stopwatch();
+
+	internal static int SERVERDATA_AUTH = 3;
+
+	internal static int SERVERDATA_EXECCOMMAND = 2;
+
+	internal static int SERVERDATA_AUTH_RESPONSE = 2;
+
+	internal static int SERVERDATA_RESPONSE_VALUE = 0;
+
+	internal static int SERVERDATA_CONSOLE_LOG = 4;
+
+	internal static int SERVERDATA_SWITCH_UTF8 = 5;
+
+	public static bool HasSubscribers
+	{
+		get
+		{
+			if (EnableSubscriptions)
+			{
+				return listenerNew.HasSubscribers;
+			}
+			return false;
+		}
+	}
+
+	[ServerVar(Help = "If true, allow RCON connections to subscribe to server events. This could be a performance hit and should only be used if you need it.", Saved = true, ShowInAdminUI = true)]
+	public static bool EnableSubscriptions
+	{
+		get
+		{
+			return _enableSubscriptions;
+		}
+		set
+		{
+			if (_enableSubscriptions != value)
+			{
+				_enableSubscriptions = value;
+				if (value)
+				{
+					ServerSubscriptions.StartSubscribeFeed();
+				}
+				else
+				{
+					ServerSubscriptions.StopSubscribeFeed();
+				}
+			}
+		}
+	}
+
+	[ServerVar(Help = "Ban an IP address from RCON, preventing it from connecting and kick any clients from this IP, this is permanent and persistent")]
+	public static void ban_ip(ConsoleSystem.Arg arg)
+	{
+		if (listenerNew == null)
+		{
+			arg.ReplyWith("No RCON server running");
+		}
+		else if (arg.Args.Length < 1)
+		{
+			arg.ReplyWith("Usage: rcon.ban_ip <ip or cidr network>");
+		}
+		else
+		{
+			arg.ReplyWith(listenerNew.BanIP(arg.Args[0]) ? ("Banned " + arg.Args[0]) : (arg.Args[0] + " is not a valid IP address or CIDR formatted network."));
+		}
+	}
+
+	[ServerVar(Help = "Unban an IP address from connecting to RCON, will also remove all attempt history")]
+	public static void unban_ip(ConsoleSystem.Arg arg)
+	{
+		if (listenerNew == null)
+		{
+			arg.ReplyWith("No RCON server running");
+			return;
+		}
+		if (arg.Args.Length < 1)
+		{
+			arg.ReplyWith("Usage: rcon.unban_ip <ip>");
+			return;
+		}
+		try
+		{
+			bool flag = listenerNew.UnbanIP(arg.Args[0]);
+			arg.ReplyWith(flag ? ("Unbanned IP " + arg.Args[0]) : ("IP " + arg.Args[0] + " was not banned"));
+		}
+		catch
+		{
+			arg.ReplyWith("Invalid IP address");
+		}
+	}
+
+	[ServerVar(Help = "Clear all failed login attempts")]
+	public static void clear_rcon_failed_logins(ConsoleSystem.Arg arg)
+	{
+		if (listenerNew == null)
+		{
+			arg.ReplyWith("No RCON server running");
+			return;
+		}
+		listenerNew.ClearFailedIPData();
+		arg.ReplyWith("Cleared failed login attempts");
+	}
+
+	[ServerVar(Help = "Print a table of permanently banned IPs and networks. Use '--json' to return a JSON object")]
+	public static void print_rcon_bans(ConsoleSystem.Arg arg)
+	{
+		if (listenerNew == null)
+		{
+			arg.ReplyWith("No RCON server running");
+			return;
+		}
+		bool flag = arg.HasArg("--json", remove: true);
+		IList<Listener.IPNetwork> bannedNetworks = listenerNew.GetBannedNetworks();
+		TextTable textTable = new TextTable();
+		textTable.AddColumns("address", "prefix", "netmask", "cidr");
+		foreach (Listener.IPNetwork item in bannedNetworks)
+		{
+			string[] obj = new string[4]
+			{
+				item.NetworkAddress().ToString(),
+				null,
+				null,
+				null
+			};
+			byte prefixLength = item.PrefixLength;
+			obj[1] = prefixLength.ToString();
+			obj[2] = item.Netmask().ToString();
+			obj[3] = item.ToString();
+			textTable.AddRow(obj);
+		}
+		arg.ReplyWith(flag ? textTable.ToJson() : textTable.ToString());
+	}
+
+	[ServerVar(Help = "Print a table of clients with failed passwords.  Use '--json' to return a JSON object")]
+	public static void print_rcon_failed_logins(ConsoleSystem.Arg arg)
+	{
+		if (listenerNew == null)
+		{
+			arg.ReplyWith("No RCON server running");
+			return;
+		}
+		bool flag = arg.HasArg("--json", remove: true);
+		Dictionary<IPAddress, Listener.FailedIPData> failedIPs = listenerNew.GetFailedIPs();
+		TextTable textTable = new TextTable();
+		textTable.AddColumns("ip", "attempts", "banned", "ban_time");
+		foreach (KeyValuePair<IPAddress, Listener.FailedIPData> item in failedIPs)
+		{
+			textTable.AddRow(item.Key.ToString(), item.Value.Attempts.ToString(), item.Value.IsBanned.ToString(), ((int)item.Value.BanTime).ToString());
+		}
+		arg.ReplyWith(flag ? textTable.ToJson() : textTable.ToString());
+	}
+
+	[ServerVar(Help = "Print a table of connected RCON clients. Use '--json' to return a JSON object")]
+	public static void print_rcon_clients(ConsoleSystem.Arg arg)
+	{
+		if (listenerNew == null)
+		{
+			arg.ReplyWith("No RCON server running");
+			return;
+		}
+		bool flag = arg.HasArg("--json", remove: true);
+		IList<RconClientStats> clientStats = listenerNew.GetClientStats();
+		TextTable textTable = new TextTable();
+		textTable.AddColumns("index", "connection_id", "ip", "port", "connected_time", "inbound_messages", "outbound_messages", "broadcast_messages", "subscribed");
+		for (int i = 0; i < clientStats.Count; i++)
+		{
+			RconClientStats rconClientStats = clientStats[i];
+			TimeSpan timeSpan = DateTime.UtcNow.Subtract(rconClientStats.ConnectedAt);
+			textTable.AddRow(i.ToString(), rconClientStats.ConnectionId.ToString(), rconClientStats.IP.ToString(), rconClientStats.Port.ToString(), Math.Floor(timeSpan.TotalSeconds).ToString(), rconClientStats.RecievedMessages.ToString(), rconClientStats.SentMessages.ToString(), rconClientStats.BroadcastedMessages.ToString(), rconClientStats.IsSubscribed.ToString());
+		}
+		arg.ReplyWith(flag ? textTable.ToJson() : textTable.ToString());
+	}
+
+	[ServerVar(Help = "Clears all subscribers from the server.")]
+	public static void clear_subscribers(ConsoleSystem.Arg arg)
+	{
+		listenerNew.ClearSubscribers();
+		arg.ReplyWith("Cleared subscribers");
+	}
+
+	[ServerVar(Help = "Un/Subscribes the current RCON connection to changes in server state. This could be a performance hit and should only be used if you need it.")]
+	public static void subscribe(ConsoleSystem.Arg arg)
+	{
+		if (!EnableSubscriptions)
+		{
+			arg.ReplyWith("Subscriptions are disabled. Enable them with enablesubscriptions");
+			return;
+		}
+		if (!arg.IsRcon || arg.Option.RconConnectionId == 0)
+		{
+			arg.ReplyWith("Must be an RCON connection to subscribe to server state");
+			return;
+		}
+		bool flag = SetEventSubscriber(arg.Option.RconConnectionId);
+		arg.ReplyWith(flag ? "Subscribed" : "Unsubscribed");
+	}
+
+	public static void Initialize()
+	{
+		if (Interface.CallHook("IOnRconInitialize") != null)
+		{
+			return;
+		}
+		if (Port == 0)
+		{
+			Port = Server.port;
+		}
+		Password = Facepunch.CommandLine.GetSwitch("-rcon.password", Facepunch.CommandLine.GetSwitch("+rcon.password", ""));
+		if (Password.Length < 8)
+		{
+			UnityEngine.Debug.Log("\r\n*******************************************************\r\n**                                                   **\r\n** RCON password length is very insecure.            **\r\n** Support for passwords less than 8 characters may  **\r\n** be removed in the future.                         **\r\n**                                                   **\r\n*******************************************************\r\n");
+		}
+		switch (Password.ToLower())
+		{
+		case "changeme":
+		case "abc123":
+		case "qwerty":
+		case "qwerty123":
+		case "123456":
+		case "000000":
+		case "password123":
+		case "password":
+		case "":
+			UnityEngine.Debug.Log("\r\n*******************************************************\r\n**                                                   **\r\n** RCON password is very insecure, RCON is disabled. **\r\n**                                                   **\r\n*******************************************************\r\n");
+			return;
+		}
+		Output.OnMessage += OnMessage;
+		if (Web)
+		{
+			listenerNew = new Listener();
+			string serverFolder = Server.GetServerFolder("cfg");
+			listenerNew.BansFile = serverFolder + "/rcon-bans.cfg";
+			if (!string.IsNullOrEmpty(Ip))
+			{
+				listenerNew.Address = Ip;
+			}
+			listenerNew.Password = Password;
+			listenerNew.Port = Port;
+			listenerNew.SslCertificate = Facepunch.CommandLine.GetSwitch("-rcon.ssl", Facepunch.CommandLine.GetSwitch("+rcon.ssl", null));
+			listenerNew.SslCertificatePassword = Facepunch.CommandLine.GetSwitch("-rcon.sslpwd", Facepunch.CommandLine.GetSwitch("+rcon.sslpwd", null));
+			listenerNew.OnMessage = delegate(IPAddress ip, int id, string msg)
+			{
+				Command item = JsonConvert.DeserializeObject<Command>(msg);
+				item.Ip = ip;
+				item.ConnectionId = id;
+				Commands.Enqueue(item);
+			};
+			listenerNew.Start();
+			UnityEngine.Debug.Log($"WebSocket RCON Started on {Ip}:{Port}");
+		}
+		else
+		{
+			listener = new RConListener();
+			UnityEngine.Debug.Log("RCON Started on " + Port);
+			UnityEngine.Debug.Log("\r\n*********************************************************************\r\n**                                                                 **\r\n** Source engine style TCP RCON is deprecated and will be removed. **\r\n** Please switch to Websocket RCON by setting rcon.web to true     **\r\n**                                                                 **\r\n*********************************************************************");
+		}
+	}
+
+	public static void Shutdown()
+	{
+		if (listenerNew != null)
+		{
+			listenerNew.Shutdown();
+			listenerNew = null;
+		}
+		if (listener != null)
+		{
+			listener.Shutdown();
+			listener = null;
+		}
+	}
+
+	public static void SendMessageToSubscribers(string message, int identifier = -1)
+	{
+		if (listenerNew != null)
+		{
+			Response response = default(Response);
+			response.Identifier = identifier;
+			response.Message = message;
+			response.Type = LogType.Subscription;
+			string message2 = JsonConvert.SerializeObject((object)response, (Formatting)1);
+			listenerNew.SendMessageToSubscribers(message2);
+		}
+	}
+
+	public static void Broadcast(LogType type, object obj)
+	{
+		if (listenerNew != null)
+		{
+			string message = JsonConvert.SerializeObject(obj, (Formatting)1);
+			Broadcast(type, message);
+		}
+	}
+
+	public static void Broadcast(LogType type, string message)
+	{
+		if (listenerNew != null && !string.IsNullOrWhiteSpace(message))
+		{
+			Response response = default(Response);
+			response.Identifier = -1;
+			response.Message = message;
+			response.Type = type;
+			if (responseConnection < 0)
+			{
+				listenerNew.BroadcastMessage(JsonConvert.SerializeObject((object)response, (Formatting)1));
+			}
+			else
+			{
+				listenerNew.SendMessage(responseConnection, JsonConvert.SerializeObject((object)response, (Formatting)1));
+			}
+		}
+	}
+
+	public static void Update()
+	{
+		Command result;
+		while (Commands.TryDequeue(out result))
+		{
+			OnCommand(result);
+		}
+		if (listener == null || lastRunTime + 0.02f >= UnityEngine.Time.realtimeSinceStartup)
+		{
+			return;
+		}
+		lastRunTime = UnityEngine.Time.realtimeSinceStartup;
+		try
+		{
+			bannedAddresses.RemoveAll((BannedAddresses x) => x.banTime < UnityEngine.Time.realtimeSinceStartup);
+			listener.Cycle();
+		}
+		catch (Exception exception)
+		{
+			UnityEngine.Debug.LogWarning("Rcon Exception");
+			UnityEngine.Debug.LogException(exception);
+		}
+	}
+
+	public static void BanIP(IPAddress addr, float seconds)
+	{
+		RCon.bannedAddresses.RemoveAll((BannedAddresses x) => x.addr == addr);
+		BannedAddresses bannedAddresses = default(BannedAddresses);
+		bannedAddresses.addr = addr;
+		bannedAddresses.banTime = UnityEngine.Time.realtimeSinceStartup + seconds;
+	}
+
+	public static bool IsBanned(IPAddress addr)
+	{
+		return bannedAddresses.Count((BannedAddresses x) => x.addr == addr && x.banTime > UnityEngine.Time.realtimeSinceStartup) > 0;
+	}
+
+	private static void OnCommand(Command cmd)
+	{
+		try
+		{
+			responseIdentifier = cmd.Identifier;
+			responseConnection = cmd.ConnectionId;
+			isInput = true;
+			if (Print)
+			{
+				UnityEngine.Debug.Log("[rcon] " + cmd.Ip?.ToString() + ": " + cmd.Message);
+			}
+			isInput = false;
+			timer.Restart();
+			string text = ConsoleSystem.Run(ConsoleSystem.Option.Server.Quiet().WithRconId(cmd.ConnectionId), cmd.Message);
+			timer.Stop();
+			TimeSpan elapsed = timer.Elapsed;
+			if (RconProfiler.mode > 0)
+			{
+				RconProfiler.ExecutionTime += elapsed;
+			}
+			if (elapsed > RuntimeProfiler.RconCommandWarningThreshold)
+			{
+				LagSpikeProfiler.RconCommand(timer.Elapsed, cmd.Message);
+			}
+			if (text != null)
+			{
+				OnMessage(text, string.Empty, UnityEngine.LogType.Log);
+			}
+		}
+		finally
+		{
+			responseIdentifier = 0;
+			responseConnection = -1;
+		}
+	}
+
+	private static void OnMessage(string message, string stacktrace, UnityEngine.LogType type)
+	{
+		if (!isInput && listenerNew != null)
+		{
+			Response response = default(Response);
+			response.Identifier = responseIdentifier;
+			response.Message = message;
+			response.Stacktrace = stacktrace;
+			response.Type = LogType.Generic;
+			if (type == UnityEngine.LogType.Error || type == UnityEngine.LogType.Exception)
+			{
+				response.Type = LogType.Error;
+			}
+			if (type == UnityEngine.LogType.Assert || type == UnityEngine.LogType.Warning)
+			{
+				response.Type = LogType.Warning;
+			}
+			if (responseConnection < 0)
+			{
+				listenerNew.BroadcastMessage(JsonConvert.SerializeObject((object)response, (Formatting)1));
+			}
+			else
+			{
+				listenerNew.SendMessage(responseConnection, JsonConvert.SerializeObject((object)response, (Formatting)1));
+			}
+		}
+	}
+
+	public static bool SetEventSubscriber(int optionRconConnectionId)
+	{
+		return listenerNew.AddOrRemoveEventListener(optionRconConnectionId);
+	}
+}

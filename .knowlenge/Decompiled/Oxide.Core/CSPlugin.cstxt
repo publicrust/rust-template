@@ -1,0 +1,273 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using HarmonyLib;
+using Oxide.Core;
+using Oxide.Core.Libraries;
+using Oxide.Core.Plugins;
+using Oxide.Pooling;
+
+public abstract class CSPlugin : Plugin
+{
+	protected Dictionary<string, List<HookMethod>> Hooks = new Dictionary<string, List<HookMethod>>();
+
+	private Harmony _harmonyInstance;
+
+	protected HookCache HooksCache = new HookCache();
+
+	protected string HarmonyId => "com.oxidemod." + base.Name;
+
+	protected Harmony HarmonyInstance
+	{
+		get
+		{
+			if (_harmonyInstance == null)
+			{
+				_harmonyInstance = new Harmony(HarmonyId);
+			}
+			return _harmonyInstance;
+		}
+	}
+
+	protected IArrayPoolProvider<object> ObjectArrayPool { get; }
+
+	public static T GetLibrary<T>(string name = null) where T : Library
+	{
+		return Interface.Oxide.GetLibrary<T>(name);
+	}
+
+	public CSPlugin()
+	{
+		ObjectArrayPool = Interface.Oxide.PoolFactory.GetArrayProvider<object>();
+		Type type = GetType();
+		List<Type> list = new List<Type> { type };
+		while (type != typeof(CSPlugin))
+		{
+			list.Add(type = type.BaseType);
+		}
+		for (int num = list.Count - 1; num >= 0; num--)
+		{
+			MethodInfo[] methods = list[num].GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+			foreach (MethodInfo methodInfo in methods)
+			{
+				object[] customAttributes = methodInfo.GetCustomAttributes(typeof(HookMethodAttribute), inherit: true);
+				if (customAttributes.Length >= 1)
+				{
+					AddHookMethod((customAttributes[0] as HookMethodAttribute)?.Name, methodInfo);
+				}
+			}
+		}
+	}
+
+	public override void HandleAddedToManager(PluginManager manager)
+	{
+		base.HandleAddedToManager(manager);
+		foreach (string key in Hooks.Keys)
+		{
+			Subscribe(key);
+		}
+		try
+		{
+			OnCallHook("Init", null);
+		}
+		catch (Exception ex)
+		{
+			Interface.Oxide.LogException($"Failed to initialize plugin '{base.Name} v{base.Version}'", ex);
+			if (base.Loader != null)
+			{
+				base.Loader.PluginErrors[base.Name] = ex.Message;
+			}
+		}
+		Type[] nestedTypes = GetType().GetNestedTypes(BindingFlags.DeclaredOnly | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+		foreach (Type type in nestedTypes)
+		{
+			if (type.GetCustomAttributes(typeof(AutoPatchAttribute), inherit: false).Length < 1)
+			{
+				continue;
+			}
+			try
+			{
+				List<MethodInfo> list = HarmonyInstance.CreateClassProcessor(type)?.Patch();
+				if (list == null || list.Count == 0)
+				{
+					Interface.Oxide.LogWarning("[" + base.Title + "] AutoPatch attribute found on '" + type.Name + "' but no HarmonyPatch methods found. Skipping.");
+					continue;
+				}
+				foreach (MethodInfo item in list)
+				{
+					Interface.Oxide.LogInfo("[" + base.Title + "] Automatically Harmony patched '" + (item?.Name ?? "unknown") + "' method. (" + type.Name + ")");
+				}
+			}
+			catch (Exception ex2)
+			{
+				Interface.Oxide.LogException("[" + base.Title + "] Failed to automatically Harmony patch '" + type.Name + "'", ex2);
+			}
+		}
+	}
+
+	public override void HandleRemovedFromManager(PluginManager manager)
+	{
+		_harmonyInstance?.UnpatchAll(HarmonyId);
+		base.HandleRemovedFromManager(manager);
+	}
+
+	protected void AddHookMethod(string name, MethodInfo method)
+	{
+		if (!Hooks.TryGetValue(name, out var value))
+		{
+			value = new List<HookMethod>();
+			Hooks[name] = value;
+		}
+		value.Add(new HookMethod(method));
+	}
+
+	protected sealed override object OnCallHook(string name, object[] args)
+	{
+		object result = null;
+		bool flag = false;
+		foreach (HookMethod item in FindHooks(name, args))
+		{
+			int num = ((args != null) ? args.Length : 0);
+			object[] array;
+			if (num != item.Parameters.Length)
+			{
+				array = ObjectArrayPool.Take(item.Parameters.Length);
+				flag = true;
+				if (num > 0 && array.Length != 0)
+				{
+					Array.Copy(args, array, Math.Min(num, array.Length));
+				}
+				if (array.Length > num)
+				{
+					for (int i = num; i < array.Length; i++)
+					{
+						ParameterInfo parameterInfo = item.Parameters[i];
+						if (parameterInfo.DefaultValue != null && parameterInfo.DefaultValue != DBNull.Value)
+						{
+							array[i] = parameterInfo.DefaultValue;
+						}
+						else if (parameterInfo.ParameterType.IsValueType)
+						{
+							array[i] = Activator.CreateInstance(parameterInfo.ParameterType);
+						}
+					}
+				}
+			}
+			else
+			{
+				array = args;
+			}
+			try
+			{
+				result = InvokeMethod(item, array);
+			}
+			catch (TargetInvocationException ex)
+			{
+				if (flag)
+				{
+					ObjectArrayPool.Return(array);
+				}
+				throw ex.InnerException ?? ex;
+			}
+			if (num != item.Parameters.Length)
+			{
+				for (int j = 0; j < item.Parameters.Length; j++)
+				{
+					if (item.Parameters[j].IsOut || item.Parameters[j].ParameterType.IsByRef)
+					{
+						args[j] = array[j];
+					}
+				}
+			}
+			if (flag)
+			{
+				ObjectArrayPool.Return(array);
+			}
+		}
+		return result;
+	}
+
+	protected List<HookMethod> FindHooks(string name, object[] args)
+	{
+		HookCache cache;
+		List<HookMethod> value = HooksCache.GetHookMethod(name, args, out cache);
+		if (value != null)
+		{
+			return value;
+		}
+		List<HookMethod> list = new List<HookMethod>();
+		if (!Hooks.TryGetValue(name, out value))
+		{
+			return list;
+		}
+		HookMethod hookMethod = null;
+		HookMethod hookMethod2 = null;
+		foreach (HookMethod item in value)
+		{
+			if (item.IsBaseHook)
+			{
+				list.Add(item);
+				continue;
+			}
+			int num = ((args != null) ? args.Length : 0);
+			bool flag = false;
+			object[] array;
+			if (num != item.Parameters.Length)
+			{
+				array = ObjectArrayPool.Take(item.Parameters.Length);
+				flag = true;
+				if (num > 0 && array.Length != 0)
+				{
+					Array.Copy(args, array, Math.Min(num, array.Length));
+				}
+				if (array.Length > num)
+				{
+					for (int i = num; i < array.Length; i++)
+					{
+						ParameterInfo parameterInfo = item.Parameters[i];
+						if (parameterInfo.DefaultValue != null && parameterInfo.DefaultValue != DBNull.Value)
+						{
+							array[i] = parameterInfo.DefaultValue;
+						}
+						else if (parameterInfo.ParameterType.IsValueType)
+						{
+							array[i] = Activator.CreateInstance(parameterInfo.ParameterType);
+						}
+					}
+				}
+			}
+			else
+			{
+				array = args;
+			}
+			if (item.HasMatchingSignature(array, out var exact))
+			{
+				if (exact)
+				{
+					hookMethod = item;
+					break;
+				}
+				hookMethod2 = item;
+			}
+			if (flag)
+			{
+				ObjectArrayPool.Return(array);
+			}
+		}
+		if (hookMethod != null)
+		{
+			list.Add(hookMethod);
+		}
+		else if (hookMethod2 != null)
+		{
+			list.Add(hookMethod2);
+		}
+		cache.SetupMethods(list);
+		return list;
+	}
+
+	protected virtual object InvokeMethod(HookMethod method, object[] args)
+	{
+		return method.Method.Invoke(this, args);
+	}
+}

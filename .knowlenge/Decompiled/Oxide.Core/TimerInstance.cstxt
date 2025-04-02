@@ -1,0 +1,199 @@
+using System;
+using System.Collections.Generic;
+using Oxide.Core.Plugins;
+
+public class TimerInstance
+{
+	public const int MaxPooled = 5000;
+
+	internal static Queue<TimerInstance> Pool = new Queue<TimerInstance>();
+
+	internal float ExpiresAt;
+
+	internal TimeSlot TimeSlot;
+
+	internal TimerInstance NextInstance;
+
+	internal TimerInstance PreviousInstance;
+
+	private Event.Callback<Plugin, PluginManager> removedFromManager;
+
+	private Timer timer;
+
+	public int Repetitions { get; private set; }
+
+	public float Delay { get; private set; }
+
+	public Action Callback { get; private set; }
+
+	public bool Destroyed { get; private set; }
+
+	public Plugin Owner { get; private set; }
+
+	internal TimerInstance(Timer timer, int repetitions, float delay, Action callback, Plugin owner)
+	{
+		Load(timer, repetitions, delay, callback, owner);
+	}
+
+	internal void Load(Timer timer, int repetitions, float delay, Action callback, Plugin owner)
+	{
+		this.timer = timer;
+		Repetitions = repetitions;
+		Delay = delay;
+		Callback = callback;
+		ExpiresAt = Oxide.Now + delay;
+		Owner = owner;
+		Destroyed = false;
+		if (owner != null)
+		{
+			removedFromManager = owner.OnRemovedFromManager.Add(OnRemovedFromManager);
+		}
+	}
+
+	public void Reset(float delay = -1f, int repetitions = 1)
+	{
+		lock (Lock)
+		{
+			if (delay < 0f)
+			{
+				delay = Delay;
+			}
+			else
+			{
+				Delay = delay;
+			}
+			Repetitions = repetitions;
+			ExpiresAt = Oxide.Now + delay;
+			if (Destroyed)
+			{
+				Destroyed = false;
+				Plugin owner = Owner;
+				if (owner != null)
+				{
+					removedFromManager = owner.OnRemovedFromManager.Add(OnRemovedFromManager);
+				}
+			}
+			else
+			{
+				Remove();
+			}
+			timer.InsertTimer(this);
+		}
+	}
+
+	public bool Destroy()
+	{
+		lock (Lock)
+		{
+			if (Destroyed)
+			{
+				return false;
+			}
+			Destroyed = true;
+			Remove();
+			Event.Remove(ref removedFromManager);
+		}
+		return true;
+	}
+
+	public bool DestroyToPool()
+	{
+		lock (Lock)
+		{
+			if (Destroyed)
+			{
+				return false;
+			}
+			Destroyed = true;
+			Callback = null;
+			Remove();
+			Event.Remove(ref removedFromManager);
+			Queue<TimerInstance> pool = Pool;
+			if (pool.Count < 5000)
+			{
+				pool.Enqueue(this);
+			}
+		}
+		return true;
+	}
+
+	internal void Added(TimeSlot time_slot)
+	{
+		time_slot.Count++;
+		Count++;
+		TimeSlot = time_slot;
+	}
+
+	internal void Invoke(float now)
+	{
+		if (Repetitions > 0 && --Repetitions == 0)
+		{
+			Destroy();
+			FireCallback();
+			return;
+		}
+		Remove();
+		float num = (ExpiresAt += Delay);
+		timer.InsertTimer(this, num < now);
+		FireCallback();
+	}
+
+	internal void Remove()
+	{
+		TimeSlot timeSlot = TimeSlot;
+		if (timeSlot != null)
+		{
+			timeSlot.Count--;
+			Count--;
+			TimerInstance previousInstance = PreviousInstance;
+			TimerInstance nextInstance = NextInstance;
+			if (nextInstance == null)
+			{
+				timeSlot.LastInstance = previousInstance;
+			}
+			else
+			{
+				nextInstance.PreviousInstance = previousInstance;
+			}
+			if (previousInstance == null)
+			{
+				timeSlot.FirstInstance = nextInstance;
+			}
+			else
+			{
+				previousInstance.NextInstance = nextInstance;
+			}
+			TimeSlot = null;
+			PreviousInstance = null;
+			NextInstance = null;
+		}
+	}
+
+	private void FireCallback()
+	{
+		Owner?.TrackStart();
+		try
+		{
+			Callback();
+		}
+		catch (Exception ex)
+		{
+			Destroy();
+			string text = $"Failed to run a {Delay:0.00} timer";
+			if ((bool)Owner && Owner != null)
+			{
+				text += $" in '{Owner.Name} v{Owner.Version}'";
+			}
+			Interface.Oxide.LogException(text, ex);
+		}
+		finally
+		{
+			Owner?.TrackEnd();
+		}
+	}
+
+	private void OnRemovedFromManager(Plugin sender, PluginManager manager)
+	{
+		Destroy();
+	}
+}

@@ -1,0 +1,253 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Facepunch.Extend;
+using Oxide.Core;
+using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Plugins;
+using Oxide.Game.Rust;
+using Oxide.Game.Rust.Libraries;
+using Oxide.Game.Rust.Libraries.Covalence;
+using UnityEngine;
+
+public class RustCommandSystem : ICommandSystem
+{
+	internal class RegisteredCommand
+	{
+		public readonly Plugin Source;
+
+		public readonly string Command;
+
+		public readonly CommandCallback Callback;
+
+		public ConsoleSystem.Command RustCommand;
+
+		public ConsoleSystem.Command OriginalRustCommand;
+
+		public Action<ConsoleSystem.Arg> OriginalCallback;
+
+		public RegisteredCommand(Plugin source, string command, CommandCallback callback)
+		{
+			Source = source;
+			Command = command;
+			Callback = callback;
+		}
+	}
+
+	private readonly Command cmdlib = Interface.Oxide.GetLibrary<Command>();
+
+	private readonly RustConsolePlayer consolePlayer;
+
+	private readonly CommandHandler commandHandler;
+
+	internal IDictionary<string, RegisteredCommand> registeredCommands;
+
+	public RustCommandSystem()
+	{
+		registeredCommands = new Dictionary<string, RegisteredCommand>();
+		commandHandler = new CommandHandler(CommandCallback, registeredCommands.ContainsKey);
+		consolePlayer = new RustConsolePlayer();
+	}
+
+	private bool CommandCallback(IPlayer caller, string cmd, string[] args)
+	{
+		if (registeredCommands.TryGetValue(cmd, out var value))
+		{
+			return value.Callback(caller, cmd, args);
+		}
+		return false;
+	}
+
+	public void RegisterCommand(string command, Plugin plugin, CommandCallback callback)
+	{
+		command = command.ToLowerInvariant().Trim();
+		string[] array = command.Split(new char[1] { '.' });
+		string text = ((array.Length >= 2) ? array[0].Trim() : "global");
+		string text2 = ((array.Length >= 2) ? string.Join(".", array.Skip(1).ToArray()) : array[0].Trim());
+		string text3 = text + "." + text2;
+		if (text == "global")
+		{
+			command = text2;
+		}
+		RegisteredCommand registeredCommand = new RegisteredCommand(plugin, command, callback);
+		if (!CanOverrideCommand(command))
+		{
+			throw new CommandAlreadyExistsException(command);
+		}
+		if (registeredCommands.TryGetValue(command, out var value))
+		{
+			if (value.OriginalCallback != null)
+			{
+				registeredCommand.OriginalCallback = value.OriginalCallback;
+			}
+			string text4 = value.Source?.Name ?? "an unknown plugin";
+			string text5 = plugin?.Name ?? "An unknown plugin";
+			string format = text5 + " has replaced the '" + command + "' command previously registered by " + text4;
+			Interface.Oxide.LogWarning(format);
+			ConsoleSystem.Index.Server.Dict.Remove(text3);
+			if (text == "global")
+			{
+				ConsoleSystem.Index.Server.GlobalDict.Remove(text2);
+			}
+			ConsoleSystem.Index.All = ConsoleSystem.Index.Server.Dict.Values.ToArray();
+		}
+		if (cmdlib.chatCommands.TryGetValue(command, out var value2))
+		{
+			string text6 = value2.Plugin?.Name ?? "an unknown plugin";
+			string text7 = plugin?.Name ?? "An unknown plugin";
+			string format2 = text7 + " has replaced the '" + command + "' chat command previously registered by " + text6;
+			Interface.Oxide.LogWarning(format2);
+			cmdlib.chatCommands.Remove(command);
+		}
+		if (cmdlib.consoleCommands.TryGetValue(text3, out var value3))
+		{
+			if (value3.OriginalCallback != null)
+			{
+				registeredCommand.OriginalCallback = value3.OriginalCallback;
+			}
+			string text8 = value3.Callback.Plugin?.Name ?? "an unknown plugin";
+			string text9 = plugin?.Name ?? "An unknown plugin";
+			string format3 = text9 + " has replaced the '" + text3 + "' console command previously registered by " + text8;
+			Interface.Oxide.LogWarning(format3);
+			ConsoleSystem.Index.Server.Dict.Remove(value3.RustCommand.FullName);
+			if (text == "global")
+			{
+				ConsoleSystem.Index.Server.GlobalDict.Remove(value3.RustCommand.Name);
+			}
+			ConsoleSystem.Index.All = ConsoleSystem.Index.Server.Dict.Values.ToArray();
+			cmdlib.consoleCommands.Remove(value3.RustCommand.FullName);
+		}
+		if (ConsoleSystem.Index.Server.Dict.TryGetValue(text3, out var value4))
+		{
+			if (value4.Variable)
+			{
+				string text10 = plugin?.Name ?? "An unknown plugin";
+				Interface.Oxide.LogError(text10 + " tried to register the " + text3 + " console variable as a command!");
+				return;
+			}
+			registeredCommand.OriginalCallback = value4.Call;
+			registeredCommand.OriginalRustCommand = value4;
+		}
+		registeredCommand.RustCommand = new ConsoleSystem.Command
+		{
+			Name = text2,
+			Parent = text,
+			FullName = command,
+			ServerUser = true,
+			ServerAdmin = true,
+			Client = true,
+			ClientInfo = false,
+			Variable = false,
+			Call = delegate(ConsoleSystem.Arg arg)
+			{
+				if (arg != null)
+				{
+					BasePlayer basePlayer = arg.Player();
+					if (arg.Connection != null && basePlayer != null)
+					{
+						if (basePlayer.IPlayer is RustPlayer rustPlayer)
+						{
+							rustPlayer.LastCommand = CommandType.Console;
+							callback(rustPlayer, command, ExtractArgs(arg));
+						}
+					}
+					else if (arg.Connection == null)
+					{
+						consolePlayer.LastCommand = CommandType.Console;
+						callback(consolePlayer, command, ExtractArgs(arg));
+					}
+				}
+			}
+		};
+		ConsoleSystem.Index.Server.Dict[text3] = registeredCommand.RustCommand;
+		if (text == "global")
+		{
+			ConsoleSystem.Index.Server.GlobalDict[text2] = registeredCommand.RustCommand;
+		}
+		ConsoleSystem.Index.All = ConsoleSystem.Index.Server.Dict.Values.ToArray();
+		registeredCommands[command] = registeredCommand;
+	}
+
+	public void UnregisterCommand(string command, Plugin plugin)
+	{
+		if (!registeredCommands.TryGetValue(command, out var value) || plugin != value.Source)
+		{
+			return;
+		}
+		string[] array = command.Split(new char[1] { '.' });
+		string obj = ((array.Length >= 2) ? array[0].Trim() : "global");
+		string text = ((array.Length >= 2) ? string.Join(".", array.Skip(1).ToArray()) : array[0].Trim());
+		string text2 = obj + "." + text;
+		registeredCommands.Remove(command);
+		if (value.OriginalCallback != null)
+		{
+			if (ConsoleSystem.Index.Server.Dict.ContainsKey(text2))
+			{
+				ConsoleSystem.Index.Server.Dict[text2].Call = value.OriginalCallback;
+			}
+			if (text2.StartsWith("global.") && ConsoleSystem.Index.Server.GlobalDict.ContainsKey(text))
+			{
+				ConsoleSystem.Index.Server.GlobalDict[text].Call = value.OriginalCallback;
+			}
+			if (value.OriginalRustCommand != null)
+			{
+				if (ConsoleSystem.Index.Server.Dict.ContainsKey(text2))
+				{
+					ConsoleSystem.Index.Server.Dict[text2] = value.OriginalRustCommand;
+				}
+				if (text2.StartsWith("global.") && ConsoleSystem.Index.Server.GlobalDict.ContainsKey(text))
+				{
+					ConsoleSystem.Index.Server.GlobalDict[text] = value.OriginalRustCommand;
+				}
+			}
+		}
+		else
+		{
+			ConsoleSystem.Index.Server.Dict.Remove(text2);
+			if (text2.StartsWith("global."))
+			{
+				ConsoleSystem.Index.Server.GlobalDict.Remove(text);
+			}
+		}
+		ConsoleSystem.Index.All = ConsoleSystem.Index.Server.Dict.Values.ToArray();
+	}
+
+	public bool HandleChatMessage(IPlayer player, string message)
+	{
+		return commandHandler.HandleChatMessage(player, message);
+	}
+
+	private bool CanOverrideCommand(string command)
+	{
+		string[] array = command.Split(new char[1] { '.' });
+		string obj = ((array.Length >= 2) ? array[0].Trim() : "global");
+		string text = ((array.Length >= 2) ? string.Join(".", array.Skip(1).ToArray()) : array[0].Trim());
+		string text2 = obj + "." + text;
+		if (registeredCommands.TryGetValue(command, out var value) && value.Source.IsCorePlugin)
+		{
+			return false;
+		}
+		if (cmdlib.chatCommands.TryGetValue(command, out var value2) && value2.Plugin.IsCorePlugin)
+		{
+			return false;
+		}
+		if (cmdlib.consoleCommands.TryGetValue(text2, out var value3) && value3.Callback.Plugin.IsCorePlugin)
+		{
+			return false;
+		}
+		if (!RustCore.RestrictedCommands.Contains(command))
+		{
+			return !RustCore.RestrictedCommands.Contains(text2);
+		}
+		return false;
+	}
+
+	public static string[] ExtractArgs(ConsoleSystem.Arg arg)
+	{
+		if (arg == null || !arg.HasArgs())
+		{
+			return new string[0];
+		}
+		return arg.FullString.SplitQuotesStrings();
+	}
+}

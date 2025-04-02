@@ -1,0 +1,1885 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+using Mono.Collections.Generic;
+using MonoMod.Cil;
+using MonoMod.SourceGen.Attributes;
+using MonoMod.Utils;
+
+[EmitILOverloads("ILOpcodes.txt", "ILCursor")]
+internal sealed class ILCursor
+{
+	private Instruction? _next;
+
+	private ILLabel[]? _afterLabels;
+
+	private bool _afterHandlerStarts;
+
+	private bool _afterHandlerEnds;
+
+	private SearchTarget _searchTarget;
+
+	public ILContext Context { get; }
+
+	public Instruction? Next
+	{
+		get
+		{
+			return _next;
+		}
+		set
+		{
+			Goto(value);
+		}
+	}
+
+	public Instruction Prev
+	{
+		get
+		{
+			if (Next != null)
+			{
+				return Next.Previous;
+			}
+			return Instrs[Instrs.Count - 1];
+		}
+		set
+		{
+			Goto(value, MoveType.After);
+		}
+	}
+
+	public Instruction Previous
+	{
+		get
+		{
+			return Prev;
+		}
+		set
+		{
+			Prev = value;
+		}
+	}
+
+	public int Index
+	{
+		get
+		{
+			return Context.IndexOf(Next);
+		}
+		set
+		{
+			Goto(value);
+		}
+	}
+
+	public SearchTarget SearchTarget
+	{
+		get
+		{
+			return _searchTarget;
+		}
+		set
+		{
+			if ((value == SearchTarget.Next && Next == null) || (value == SearchTarget.Prev && Prev == null))
+			{
+				value = SearchTarget.None;
+			}
+			_searchTarget = value;
+		}
+	}
+
+	public IEnumerable<ILLabel> IncomingLabels => Context.GetIncomingLabels(Next);
+
+	public MethodDefinition Method => Context.Method;
+
+	public ILProcessor IL => Context.IL;
+
+	public Mono.Cecil.Cil.MethodBody Body => Context.Body;
+
+	public ModuleDefinition Module => Context.Module;
+
+	public Collection<Instruction> Instrs => Context.Instrs;
+
+	public ILCursor(ILContext context)
+	{
+		Context = context;
+		Index = 0;
+	}
+
+	public ILCursor(ILCursor c)
+	{
+		Helpers.ThrowIfArgumentNull(c, "c");
+		Context = c.Context;
+		_next = c._next;
+		_searchTarget = c._searchTarget;
+		_afterLabels = c._afterLabels;
+		_afterHandlerStarts = c._afterHandlerStarts;
+		_afterHandlerEnds = c._afterHandlerEnds;
+	}
+
+	public ILCursor Clone()
+	{
+		return new ILCursor(this);
+	}
+
+	public bool IsBefore(Instruction instr)
+	{
+		return Index <= Context.IndexOf(instr);
+	}
+
+	public bool IsAfter(Instruction instr)
+	{
+		return Index > Context.IndexOf(instr);
+	}
+
+	public override string ToString()
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+		stringBuilder.AppendLine($"// ILCursor: {Method}, {Index}, {SearchTarget}");
+		ILContext.ToString(stringBuilder, Prev);
+		ILContext.ToString(stringBuilder, Next);
+		return stringBuilder.ToString();
+	}
+
+	public ILCursor Goto(Instruction? insn, MoveType moveType = MoveType.Before, bool setTarget = false)
+	{
+		if (moveType == MoveType.After)
+		{
+			_next = insn?.Next;
+		}
+		else
+		{
+			_next = insn;
+		}
+		if (setTarget)
+		{
+			_searchTarget = ((moveType != MoveType.After) ? SearchTarget.Next : SearchTarget.Prev);
+		}
+		else
+		{
+			_searchTarget = SearchTarget.None;
+		}
+		if (moveType == MoveType.AfterLabel)
+		{
+			MoveAfterLabels();
+		}
+		else
+		{
+			MoveBeforeLabels();
+		}
+		return this;
+	}
+
+	public ILCursor MoveAfterLabels()
+	{
+		MoveAfterLabels(intoEHRanges: true);
+		return this;
+	}
+
+	public ILCursor MoveAfterLabels(bool intoEHRanges)
+	{
+		_afterLabels = IncomingLabels.ToArray();
+		_afterHandlerStarts = intoEHRanges;
+		_afterHandlerEnds = true;
+		return this;
+	}
+
+	public ILCursor MoveBeforeLabels()
+	{
+		_afterLabels = null;
+		_afterHandlerStarts = false;
+		_afterHandlerEnds = false;
+		return this;
+	}
+
+	public ILCursor Goto(int index, MoveType moveType = MoveType.Before, bool setTarget = false)
+	{
+		if (index < 0)
+		{
+			index += Instrs.Count;
+		}
+		return Goto((index == Instrs.Count) ? null : Instrs[index], moveType, setTarget);
+	}
+
+	public ILCursor GotoLabel(ILLabel label, MoveType moveType = MoveType.AfterLabel, bool setTarget = false)
+	{
+		return Goto(Helpers.ThrowIfNull(label, "label").Target, moveType, setTarget);
+	}
+
+	public ILCursor GotoNext(MoveType moveType = MoveType.Before, params Func<Instruction, bool>[] predicates)
+	{
+		if (!TryGotoNext(moveType, predicates))
+		{
+			throw new KeyNotFoundException();
+		}
+		return this;
+	}
+
+	public bool TryGotoNext(MoveType moveType = MoveType.Before, params Func<Instruction, bool>[] predicates)
+	{
+		Helpers.ThrowIfArgumentNull(predicates, "predicates");
+		Collection<Instruction> instrs = Instrs;
+		int i = Index;
+		if (SearchTarget == SearchTarget.Next)
+		{
+			i++;
+		}
+		for (; i + predicates.Length <= instrs.Count; i++)
+		{
+			int num = 0;
+			while (true)
+			{
+				if (num < predicates.Length)
+				{
+					Func<Instruction, bool> obj = predicates[num];
+					if (obj != null && !obj(instrs[i + num]))
+					{
+						break;
+					}
+					num++;
+					continue;
+				}
+				Goto((moveType == MoveType.After) ? (i + predicates.Length - 1) : i, moveType, setTarget: true);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public ILCursor GotoPrev(MoveType moveType = MoveType.Before, params Func<Instruction, bool>[] predicates)
+	{
+		if (!TryGotoPrev(moveType, predicates))
+		{
+			throw new KeyNotFoundException();
+		}
+		return this;
+	}
+
+	public bool TryGotoPrev(MoveType moveType = MoveType.Before, params Func<Instruction, bool>[] predicates)
+	{
+		Helpers.ThrowIfArgumentNull(predicates, "predicates");
+		Collection<Instruction> instrs = Instrs;
+		int num = Index - 1;
+		if (SearchTarget == SearchTarget.Prev)
+		{
+			num--;
+		}
+		for (num = Math.Min(num, instrs.Count - predicates.Length); num >= 0; num--)
+		{
+			int num2 = 0;
+			while (true)
+			{
+				if (num2 < predicates.Length)
+				{
+					Func<Instruction, bool> obj = predicates[num2];
+					if (obj != null && !obj(instrs[num + num2]))
+					{
+						break;
+					}
+					num2++;
+					continue;
+				}
+				Goto((moveType == MoveType.After) ? (num + predicates.Length - 1) : num, moveType, setTarget: true);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public ILCursor GotoNext(params Func<Instruction, bool>[] predicates)
+	{
+		return GotoNext(MoveType.Before, predicates);
+	}
+
+	public bool TryGotoNext(params Func<Instruction, bool>[] predicates)
+	{
+		return TryGotoNext(MoveType.Before, predicates);
+	}
+
+	public ILCursor GotoPrev(params Func<Instruction, bool>[] predicates)
+	{
+		return GotoPrev(MoveType.Before, predicates);
+	}
+
+	public bool TryGotoPrev(params Func<Instruction, bool>[] predicates)
+	{
+		return TryGotoPrev(MoveType.Before, predicates);
+	}
+
+	public void FindNext(out ILCursor[] cursors, params Func<Instruction, bool>[] predicates)
+	{
+		if (!TryFindNext(out cursors, predicates))
+		{
+			throw new KeyNotFoundException();
+		}
+	}
+
+	public bool TryFindNext(out ILCursor[] cursors, params Func<Instruction, bool>[] predicates)
+	{
+		Helpers.ThrowIfArgumentNull(predicates, "predicates");
+		cursors = new ILCursor[predicates.Length];
+		ILCursor iLCursor = this;
+		for (int i = 0; i < predicates.Length; i++)
+		{
+			iLCursor = iLCursor.Clone();
+			if (!iLCursor.TryGotoNext(predicates[i]))
+			{
+				return false;
+			}
+			cursors[i] = iLCursor;
+		}
+		return true;
+	}
+
+	public void FindPrev(out ILCursor[] cursors, params Func<Instruction, bool>[] predicates)
+	{
+		if (!TryFindPrev(out cursors, predicates))
+		{
+			throw new KeyNotFoundException();
+		}
+	}
+
+	public bool TryFindPrev(out ILCursor[] cursors, params Func<Instruction, bool>[] predicates)
+	{
+		Helpers.ThrowIfArgumentNull(predicates, "predicates");
+		cursors = new ILCursor[predicates.Length];
+		ILCursor iLCursor = this;
+		for (int num = predicates.Length - 1; num >= 0; num--)
+		{
+			iLCursor = iLCursor.Clone();
+			if (!iLCursor.TryGotoPrev(predicates[num]))
+			{
+				return false;
+			}
+			cursors[num] = iLCursor;
+		}
+		return true;
+	}
+
+	public void MarkLabel(ILLabel? label)
+	{
+		if (label == null)
+		{
+			label = new ILLabel(Context);
+		}
+		label.Target = Next;
+		if (_afterLabels != null)
+		{
+			Array.Resize(ref _afterLabels, _afterLabels.Length + 1);
+			_afterLabels[_afterLabels.Length - 1] = label;
+		}
+		else
+		{
+			_afterLabels = new ILLabel[1] { label };
+		}
+	}
+
+	public ILLabel MarkLabel(Instruction inst)
+	{
+		ILLabel iLLabel = Context.DefineLabel();
+		if (inst == Next)
+		{
+			MarkLabel(iLLabel);
+			return iLLabel;
+		}
+		iLLabel.Target = inst;
+		return iLLabel;
+	}
+
+	public ILLabel MarkLabel()
+	{
+		ILLabel iLLabel = DefineLabel();
+		MarkLabel(iLLabel);
+		return iLLabel;
+	}
+
+	public ILLabel DefineLabel()
+	{
+		return Context.DefineLabel();
+	}
+
+	private ILCursor _Insert(Instruction instr)
+	{
+		if (_afterLabels != null)
+		{
+			ILLabel[] afterLabels = _afterLabels;
+			for (int i = 0; i < afterLabels.Length; i++)
+			{
+				afterLabels[i].Target = instr;
+			}
+		}
+		if (_afterHandlerStarts)
+		{
+			foreach (ExceptionHandler exceptionHandler in Body.ExceptionHandlers)
+			{
+				if (exceptionHandler.TryStart == Next)
+				{
+					exceptionHandler.TryStart = instr;
+				}
+				if (exceptionHandler.HandlerStart == Next)
+				{
+					exceptionHandler.HandlerStart = instr;
+				}
+				if (exceptionHandler.FilterStart == Next)
+				{
+					exceptionHandler.FilterStart = instr;
+				}
+			}
+		}
+		if (_afterHandlerEnds)
+		{
+			foreach (ExceptionHandler exceptionHandler2 in Body.ExceptionHandlers)
+			{
+				if (exceptionHandler2.TryEnd == Next)
+				{
+					exceptionHandler2.TryEnd = instr;
+				}
+				if (exceptionHandler2.HandlerEnd == Next)
+				{
+					exceptionHandler2.HandlerEnd = instr;
+				}
+			}
+		}
+		Instrs.Insert(Index, instr);
+		Goto(instr, MoveType.After);
+		return this;
+	}
+
+	public ILCursor Remove()
+	{
+		return RemoveRange(1);
+	}
+
+	public ILCursor RemoveRange(int num)
+	{
+		int index = Index;
+		Instruction instruction = ((index + num < Instrs.Count) ? Instrs[index + num] : null);
+		foreach (ILLabel incomingLabel in IncomingLabels)
+		{
+			incomingLabel.Target = instruction;
+		}
+		foreach (ExceptionHandler exceptionHandler in Body.ExceptionHandlers)
+		{
+			if (exceptionHandler.TryStart == Next)
+			{
+				exceptionHandler.TryStart = instruction;
+			}
+			if (exceptionHandler.TryEnd == Next)
+			{
+				exceptionHandler.TryEnd = instruction;
+			}
+			if (exceptionHandler.HandlerStart == Next)
+			{
+				exceptionHandler.HandlerStart = instruction;
+			}
+			if (exceptionHandler.FilterStart == Next)
+			{
+				exceptionHandler.FilterStart = instruction;
+			}
+			if (exceptionHandler.HandlerEnd == Next)
+			{
+				exceptionHandler.HandlerEnd = instruction;
+			}
+		}
+		while (num-- > 0)
+		{
+			Instrs.RemoveAt(index);
+		}
+		_searchTarget = SearchTarget.None;
+		_next = instruction;
+		return this;
+	}
+
+	public ILCursor Emit(OpCode opcode, ParameterDefinition parameter)
+	{
+		return _Insert(IL.Create(opcode, parameter));
+	}
+
+	public ILCursor Emit(OpCode opcode, VariableDefinition variable)
+	{
+		return _Insert(IL.Create(opcode, variable));
+	}
+
+	public ILCursor Emit(OpCode opcode, Instruction[] targets)
+	{
+		return _Insert(IL.Create(opcode, targets));
+	}
+
+	public ILCursor Emit(OpCode opcode, Instruction target)
+	{
+		return _Insert(IL.Create(opcode, target));
+	}
+
+	public ILCursor Emit(OpCode opcode, double value)
+	{
+		return _Insert(IL.Create(opcode, value));
+	}
+
+	public ILCursor Emit(OpCode opcode, float value)
+	{
+		return _Insert(IL.Create(opcode, value));
+	}
+
+	public ILCursor Emit(OpCode opcode, long value)
+	{
+		return _Insert(IL.Create(opcode, value));
+	}
+
+	public ILCursor Emit(OpCode opcode, sbyte value)
+	{
+		return _Insert(IL.Create(opcode, value));
+	}
+
+	public ILCursor Emit(OpCode opcode, byte value)
+	{
+		return _Insert(IL.Create(opcode, value));
+	}
+
+	public ILCursor Emit(OpCode opcode, string value)
+	{
+		return _Insert(IL.Create(opcode, value));
+	}
+
+	public ILCursor Emit(OpCode opcode, FieldReference field)
+	{
+		return _Insert(IL.Create(opcode, field));
+	}
+
+	public ILCursor Emit(OpCode opcode, CallSite site)
+	{
+		return _Insert(IL.Create(opcode, site));
+	}
+
+	public ILCursor Emit(OpCode opcode, TypeReference type)
+	{
+		return _Insert(IL.Create(opcode, type));
+	}
+
+	public ILCursor Emit(OpCode opcode)
+	{
+		return _Insert(IL.Create(opcode));
+	}
+
+	public ILCursor Emit(OpCode opcode, int value)
+	{
+		return _Insert(IL.Create(opcode, value));
+	}
+
+	public ILCursor Emit(OpCode opcode, MethodReference method)
+	{
+		return _Insert(IL.Create(opcode, method));
+	}
+
+	public ILCursor Emit(OpCode opcode, FieldInfo field)
+	{
+		return _Insert(IL.Create(opcode, field));
+	}
+
+	public ILCursor Emit(OpCode opcode, MethodBase method)
+	{
+		return _Insert(IL.Create(opcode, method));
+	}
+
+	public ILCursor Emit(OpCode opcode, Type type)
+	{
+		return _Insert(IL.Create(opcode, type));
+	}
+
+	public ILCursor Emit(OpCode opcode, object operand)
+	{
+		return _Insert(IL.Create(opcode, operand));
+	}
+
+	public ILCursor Emit<T>(OpCode opcode, string memberName)
+	{
+		return _Insert(IL.Create(opcode, typeof(T).GetMember(memberName, (BindingFlags)(-1)).First()));
+	}
+
+	public int AddReference<T>(in T t)
+	{
+		return Context.AddReference(in t);
+	}
+
+	public void EmitGetReference<T>(int id)
+	{
+		this.EmitLoadTypedReference(Context.GetReferenceCell(id), typeof(T));
+	}
+
+	public int EmitReference<T>(in T? t)
+	{
+		int num = AddReference(in t);
+		this.EmitLoadTypedReferenceUnsafe(Context.GetReferenceCell(num), typeof(T));
+		return num;
+	}
+
+	public int EmitDelegate<T>(T cb) where T : Delegate
+	{
+		Helpers.ThrowIfArgumentNull(cb, "cb");
+		if (cb.GetInvocationList().Length == 1 && cb.Target == null)
+		{
+			Emit(OpCodes.Call, cb.Method);
+			return -1;
+		}
+		(MethodInfo, Type)? delegateInvoker = FastDelegateInvokers.GetDelegateInvoker(typeof(T));
+		int result;
+		if (delegateInvoker.HasValue)
+		{
+			(MethodInfo, Type) valueOrDefault = delegateInvoker.GetValueOrDefault();
+			result = EmitReference<Delegate>(cb.CastDelegate(valueOrDefault.Item2));
+			AddReference(in valueOrDefault.Item1);
+			Emit(OpCodes.Call, valueOrDefault.Item1);
+		}
+		else
+		{
+			result = EmitReference(in cb);
+			MethodInfo method = typeof(T).GetMethod("Invoke");
+			Emit(OpCodes.Callvirt, method);
+		}
+		return result;
+	}
+
+	public ILCursor EmitAdd()
+	{
+		return _Insert(IL.Create(OpCodes.Add));
+	}
+
+	public ILCursor EmitAddOvf()
+	{
+		return _Insert(IL.Create(OpCodes.Add_Ovf));
+	}
+
+	public ILCursor EmitAddOvfUn()
+	{
+		return _Insert(IL.Create(OpCodes.Add_Ovf_Un));
+	}
+
+	public ILCursor EmitAnd()
+	{
+		return _Insert(IL.Create(OpCodes.And));
+	}
+
+	public ILCursor EmitArglist()
+	{
+		return _Insert(IL.Create(OpCodes.Arglist));
+	}
+
+	public ILCursor EmitBeq(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Beq, operand));
+	}
+
+	public ILCursor EmitBeq(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Beq, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBge(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Bge, operand));
+	}
+
+	public ILCursor EmitBge(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Bge, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBgeUn(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Bge_Un, operand));
+	}
+
+	public ILCursor EmitBgeUn(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Bge_Un, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBgt(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Bgt, operand));
+	}
+
+	public ILCursor EmitBgt(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Bgt, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBgtUn(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Bgt_Un, operand));
+	}
+
+	public ILCursor EmitBgtUn(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Bgt_Un, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBle(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ble, operand));
+	}
+
+	public ILCursor EmitBle(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ble, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBleUn(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ble_Un, operand));
+	}
+
+	public ILCursor EmitBleUn(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ble_Un, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBlt(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Blt, operand));
+	}
+
+	public ILCursor EmitBlt(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Blt, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBltUn(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Blt_Un, operand));
+	}
+
+	public ILCursor EmitBltUn(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Blt_Un, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBneUn(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Bne_Un, operand));
+	}
+
+	public ILCursor EmitBneUn(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Bne_Un, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBox(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Box, operand));
+	}
+
+	public ILCursor EmitBox(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Box, Context.Import(operand)));
+	}
+
+	public ILCursor EmitBr(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Br, operand));
+	}
+
+	public ILCursor EmitBr(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Br, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBreak()
+	{
+		return _Insert(IL.Create(OpCodes.Break));
+	}
+
+	public ILCursor EmitBrfalse(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Brfalse, operand));
+	}
+
+	public ILCursor EmitBrfalse(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Brfalse, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitBrtrue(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Brtrue, operand));
+	}
+
+	public ILCursor EmitBrtrue(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Brtrue, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitCall(MethodReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Call, operand));
+	}
+
+	public ILCursor EmitCall(MethodBase operand)
+	{
+		return _Insert(IL.Create(OpCodes.Call, Context.Import(operand)));
+	}
+
+	public ILCursor EmitCalli(IMethodSignature operand)
+	{
+		return _Insert(IL.Create(OpCodes.Calli, operand));
+	}
+
+	public ILCursor EmitCallvirt(MethodReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Callvirt, operand));
+	}
+
+	public ILCursor EmitCallvirt(MethodBase operand)
+	{
+		return _Insert(IL.Create(OpCodes.Callvirt, Context.Import(operand)));
+	}
+
+	public ILCursor EmitCastclass(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Castclass, operand));
+	}
+
+	public ILCursor EmitCastclass(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Castclass, Context.Import(operand)));
+	}
+
+	public ILCursor EmitCeq()
+	{
+		return _Insert(IL.Create(OpCodes.Ceq));
+	}
+
+	public ILCursor EmitCgt()
+	{
+		return _Insert(IL.Create(OpCodes.Cgt));
+	}
+
+	public ILCursor EmitCgtUn()
+	{
+		return _Insert(IL.Create(OpCodes.Cgt_Un));
+	}
+
+	public ILCursor EmitCkfinite()
+	{
+		return _Insert(IL.Create(OpCodes.Ckfinite));
+	}
+
+	public ILCursor EmitClt()
+	{
+		return _Insert(IL.Create(OpCodes.Clt));
+	}
+
+	public ILCursor EmitCltUn()
+	{
+		return _Insert(IL.Create(OpCodes.Clt_Un));
+	}
+
+	public ILCursor EmitConstrained(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Constrained, operand));
+	}
+
+	public ILCursor EmitConstrained(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Constrained, Context.Import(operand)));
+	}
+
+	public ILCursor EmitConvI()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_I));
+	}
+
+	public ILCursor EmitConvI1()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_I1));
+	}
+
+	public ILCursor EmitConvI2()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_I2));
+	}
+
+	public ILCursor EmitConvI4()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_I4));
+	}
+
+	public ILCursor EmitConvI8()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_I8));
+	}
+
+	public ILCursor EmitConvOvfI()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_I));
+	}
+
+	public ILCursor EmitConvOvfIUn()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_I_Un));
+	}
+
+	public ILCursor EmitConvOvfI1()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_I1));
+	}
+
+	public ILCursor EmitConvOvfI1Un()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_I1_Un));
+	}
+
+	public ILCursor EmitConvOvfI2()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_I2));
+	}
+
+	public ILCursor EmitConvOvfI2Un()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_I2_Un));
+	}
+
+	public ILCursor EmitConvOvfI4()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_I4));
+	}
+
+	public ILCursor EmitConvOvfI4Un()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_I4_Un));
+	}
+
+	public ILCursor EmitConvOvfI8()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_I8));
+	}
+
+	public ILCursor EmitConvOvfI8Un()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_I8_Un));
+	}
+
+	public ILCursor EmitConvOvfU()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_U));
+	}
+
+	public ILCursor EmitConvOvfUUn()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_U_Un));
+	}
+
+	public ILCursor EmitConvOvfU1()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_U1));
+	}
+
+	public ILCursor EmitConvOvfU1Un()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_U1_Un));
+	}
+
+	public ILCursor EmitConvOvfU2()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_U2));
+	}
+
+	public ILCursor EmitConvOvfU2Un()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_U2_Un));
+	}
+
+	public ILCursor EmitConvOvfU4()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_U4));
+	}
+
+	public ILCursor EmitConvOvfU4Un()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_U4_Un));
+	}
+
+	public ILCursor EmitConvOvfU8()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_U8));
+	}
+
+	public ILCursor EmitConvOvfU8Un()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_Ovf_U8_Un));
+	}
+
+	public ILCursor EmitConvRUn()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_R_Un));
+	}
+
+	public ILCursor EmitConvR4()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_R4));
+	}
+
+	public ILCursor EmitConvR8()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_R8));
+	}
+
+	public ILCursor EmitConvU()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_U));
+	}
+
+	public ILCursor EmitConvU1()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_U1));
+	}
+
+	public ILCursor EmitConvU2()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_U2));
+	}
+
+	public ILCursor EmitConvU4()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_U4));
+	}
+
+	public ILCursor EmitConvU8()
+	{
+		return _Insert(IL.Create(OpCodes.Conv_U8));
+	}
+
+	public ILCursor EmitCpblk()
+	{
+		return _Insert(IL.Create(OpCodes.Cpblk));
+	}
+
+	public ILCursor EmitCpobj(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Cpobj, operand));
+	}
+
+	public ILCursor EmitCpobj(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Cpobj, Context.Import(operand)));
+	}
+
+	public ILCursor EmitDiv()
+	{
+		return _Insert(IL.Create(OpCodes.Div));
+	}
+
+	public ILCursor EmitDivUn()
+	{
+		return _Insert(IL.Create(OpCodes.Div_Un));
+	}
+
+	public ILCursor EmitDup()
+	{
+		return _Insert(IL.Create(OpCodes.Dup));
+	}
+
+	public ILCursor EmitEndfilter()
+	{
+		return _Insert(IL.Create(OpCodes.Endfilter));
+	}
+
+	public ILCursor EmitEndfinally()
+	{
+		return _Insert(IL.Create(OpCodes.Endfinally));
+	}
+
+	public ILCursor EmitInitblk()
+	{
+		return _Insert(IL.Create(OpCodes.Initblk));
+	}
+
+	public ILCursor EmitInitobj(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Initobj, operand));
+	}
+
+	public ILCursor EmitInitobj(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Initobj, Context.Import(operand)));
+	}
+
+	public ILCursor EmitIsinst(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Isinst, operand));
+	}
+
+	public ILCursor EmitIsinst(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Isinst, Context.Import(operand)));
+	}
+
+	public ILCursor EmitJmp(MethodReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Jmp, operand));
+	}
+
+	public ILCursor EmitJmp(MethodBase operand)
+	{
+		return _Insert(IL.Create(OpCodes.Jmp, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdarg0()
+	{
+		return _Insert(IL.Create(OpCodes.Ldarg_0));
+	}
+
+	public ILCursor EmitLdarg1()
+	{
+		return _Insert(IL.Create(OpCodes.Ldarg_1));
+	}
+
+	public ILCursor EmitLdarg2()
+	{
+		return _Insert(IL.Create(OpCodes.Ldarg_2));
+	}
+
+	public ILCursor EmitLdarg3()
+	{
+		return _Insert(IL.Create(OpCodes.Ldarg_3));
+	}
+
+	public ILCursor EmitLdarg(int operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldarg, operand));
+	}
+
+	public ILCursor EmitLdarg(uint operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldarg, (int)operand));
+	}
+
+	public ILCursor EmitLdarg(ParameterReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldarg, operand));
+	}
+
+	public ILCursor EmitLdarga(int operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldarga, operand));
+	}
+
+	public ILCursor EmitLdarga(uint operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldarga, (int)operand));
+	}
+
+	public ILCursor EmitLdarga(ParameterReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldarga, operand));
+	}
+
+	public ILCursor EmitLdcI4(int operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldc_I4, operand));
+	}
+
+	public ILCursor EmitLdcI4(uint operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldc_I4, (int)operand));
+	}
+
+	public ILCursor EmitLdcI8(long operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldc_I8, operand));
+	}
+
+	public ILCursor EmitLdcI8(ulong operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldc_I8, (long)operand));
+	}
+
+	public ILCursor EmitLdcR4(float operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldc_R4, operand));
+	}
+
+	public ILCursor EmitLdcR8(double operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldc_R8, operand));
+	}
+
+	public ILCursor EmitLdelemAny(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_Any, operand));
+	}
+
+	public ILCursor EmitLdelemAny(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_Any, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdelemI()
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_I));
+	}
+
+	public ILCursor EmitLdelemI1()
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_I1));
+	}
+
+	public ILCursor EmitLdelemI2()
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_I2));
+	}
+
+	public ILCursor EmitLdelemI4()
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_I4));
+	}
+
+	public ILCursor EmitLdelemI8()
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_I8));
+	}
+
+	public ILCursor EmitLdelemR4()
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_R4));
+	}
+
+	public ILCursor EmitLdelemR8()
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_R8));
+	}
+
+	public ILCursor EmitLdelemRef()
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_Ref));
+	}
+
+	public ILCursor EmitLdelemU1()
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_U1));
+	}
+
+	public ILCursor EmitLdelemU2()
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_U2));
+	}
+
+	public ILCursor EmitLdelemU4()
+	{
+		return _Insert(IL.Create(OpCodes.Ldelem_U4));
+	}
+
+	public ILCursor EmitLdelema(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldelema, operand));
+	}
+
+	public ILCursor EmitLdelema(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldelema, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdfld(FieldReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldfld, operand));
+	}
+
+	public ILCursor EmitLdfld(FieldInfo operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldfld, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdflda(FieldReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldflda, operand));
+	}
+
+	public ILCursor EmitLdflda(FieldInfo operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldflda, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdftn(MethodReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldftn, operand));
+	}
+
+	public ILCursor EmitLdftn(MethodBase operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldftn, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdindI()
+	{
+		return _Insert(IL.Create(OpCodes.Ldind_I));
+	}
+
+	public ILCursor EmitLdindI1()
+	{
+		return _Insert(IL.Create(OpCodes.Ldind_I1));
+	}
+
+	public ILCursor EmitLdindI2()
+	{
+		return _Insert(IL.Create(OpCodes.Ldind_I2));
+	}
+
+	public ILCursor EmitLdindI4()
+	{
+		return _Insert(IL.Create(OpCodes.Ldind_I4));
+	}
+
+	public ILCursor EmitLdindI8()
+	{
+		return _Insert(IL.Create(OpCodes.Ldind_I8));
+	}
+
+	public ILCursor EmitLdindR4()
+	{
+		return _Insert(IL.Create(OpCodes.Ldind_R4));
+	}
+
+	public ILCursor EmitLdindR8()
+	{
+		return _Insert(IL.Create(OpCodes.Ldind_R8));
+	}
+
+	public ILCursor EmitLdindRef()
+	{
+		return _Insert(IL.Create(OpCodes.Ldind_Ref));
+	}
+
+	public ILCursor EmitLdindU1()
+	{
+		return _Insert(IL.Create(OpCodes.Ldind_U1));
+	}
+
+	public ILCursor EmitLdindU2()
+	{
+		return _Insert(IL.Create(OpCodes.Ldind_U2));
+	}
+
+	public ILCursor EmitLdindU4()
+	{
+		return _Insert(IL.Create(OpCodes.Ldind_U4));
+	}
+
+	public ILCursor EmitLdlen()
+	{
+		return _Insert(IL.Create(OpCodes.Ldlen));
+	}
+
+	public ILCursor EmitLdloc0()
+	{
+		return _Insert(IL.Create(OpCodes.Ldloc_0));
+	}
+
+	public ILCursor EmitLdloc1()
+	{
+		return _Insert(IL.Create(OpCodes.Ldloc_1));
+	}
+
+	public ILCursor EmitLdloc2()
+	{
+		return _Insert(IL.Create(OpCodes.Ldloc_2));
+	}
+
+	public ILCursor EmitLdloc3()
+	{
+		return _Insert(IL.Create(OpCodes.Ldloc_3));
+	}
+
+	public ILCursor EmitLdloc(int operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldloc, operand));
+	}
+
+	public ILCursor EmitLdloc(uint operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldloc, (int)operand));
+	}
+
+	public ILCursor EmitLdloc(VariableReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldloc, operand));
+	}
+
+	public ILCursor EmitLdloca(int operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldloca, operand));
+	}
+
+	public ILCursor EmitLdloca(uint operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldloca, (int)operand));
+	}
+
+	public ILCursor EmitLdloca(VariableReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldloca, operand));
+	}
+
+	public ILCursor EmitLdnull()
+	{
+		return _Insert(IL.Create(OpCodes.Ldnull));
+	}
+
+	public ILCursor EmitLdobj(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldobj, operand));
+	}
+
+	public ILCursor EmitLdobj(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldobj, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdsfld(FieldReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldsfld, operand));
+	}
+
+	public ILCursor EmitLdsfld(FieldInfo operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldsfld, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdsflda(FieldReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldsflda, operand));
+	}
+
+	public ILCursor EmitLdsflda(FieldInfo operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldsflda, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdstr(string operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldstr, operand));
+	}
+
+	public ILCursor EmitLdtoken(IMetadataTokenProvider operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldtoken, operand));
+	}
+
+	public ILCursor EmitLdtoken(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldtoken, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdtoken(FieldInfo operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldtoken, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdtoken(MethodBase operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldtoken, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLdvirtftn(MethodReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldvirtftn, operand));
+	}
+
+	public ILCursor EmitLdvirtftn(MethodBase operand)
+	{
+		return _Insert(IL.Create(OpCodes.Ldvirtftn, Context.Import(operand)));
+	}
+
+	public ILCursor EmitLeave(ILLabel operand)
+	{
+		return _Insert(IL.Create(OpCodes.Leave, operand));
+	}
+
+	public ILCursor EmitLeave(Instruction operand)
+	{
+		return _Insert(IL.Create(OpCodes.Leave, MarkLabel(operand)));
+	}
+
+	public ILCursor EmitLocalloc()
+	{
+		return _Insert(IL.Create(OpCodes.Localloc));
+	}
+
+	public ILCursor EmitMkrefany(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Mkrefany, operand));
+	}
+
+	public ILCursor EmitMkrefany(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Mkrefany, Context.Import(operand)));
+	}
+
+	public ILCursor EmitMul()
+	{
+		return _Insert(IL.Create(OpCodes.Mul));
+	}
+
+	public ILCursor EmitMulOvf()
+	{
+		return _Insert(IL.Create(OpCodes.Mul_Ovf));
+	}
+
+	public ILCursor EmitMulOvfUn()
+	{
+		return _Insert(IL.Create(OpCodes.Mul_Ovf_Un));
+	}
+
+	public ILCursor EmitNeg()
+	{
+		return _Insert(IL.Create(OpCodes.Neg));
+	}
+
+	public ILCursor EmitNewarr(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Newarr, operand));
+	}
+
+	public ILCursor EmitNewarr(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Newarr, Context.Import(operand)));
+	}
+
+	public ILCursor EmitNewobj(MethodReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Newobj, operand));
+	}
+
+	public ILCursor EmitNewobj(MethodBase operand)
+	{
+		return _Insert(IL.Create(OpCodes.Newobj, Context.Import(operand)));
+	}
+
+	public ILCursor EmitNop()
+	{
+		return _Insert(IL.Create(OpCodes.Nop));
+	}
+
+	public ILCursor EmitNot()
+	{
+		return _Insert(IL.Create(OpCodes.Not));
+	}
+
+	public ILCursor EmitOr()
+	{
+		return _Insert(IL.Create(OpCodes.Or));
+	}
+
+	public ILCursor EmitPop()
+	{
+		return _Insert(IL.Create(OpCodes.Pop));
+	}
+
+	public ILCursor EmitReadonly()
+	{
+		return _Insert(IL.Create(OpCodes.Readonly));
+	}
+
+	public ILCursor EmitRefanytype()
+	{
+		return _Insert(IL.Create(OpCodes.Refanytype));
+	}
+
+	public ILCursor EmitRefanyval(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Refanyval, operand));
+	}
+
+	public ILCursor EmitRefanyval(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Refanyval, Context.Import(operand)));
+	}
+
+	public ILCursor EmitRem()
+	{
+		return _Insert(IL.Create(OpCodes.Rem));
+	}
+
+	public ILCursor EmitRemUn()
+	{
+		return _Insert(IL.Create(OpCodes.Rem_Un));
+	}
+
+	public ILCursor EmitRet()
+	{
+		return _Insert(IL.Create(OpCodes.Ret));
+	}
+
+	public ILCursor EmitRethrow()
+	{
+		return _Insert(IL.Create(OpCodes.Rethrow));
+	}
+
+	public ILCursor EmitShl()
+	{
+		return _Insert(IL.Create(OpCodes.Shl));
+	}
+
+	public ILCursor EmitShr()
+	{
+		return _Insert(IL.Create(OpCodes.Shr));
+	}
+
+	public ILCursor EmitShrUn()
+	{
+		return _Insert(IL.Create(OpCodes.Shr_Un));
+	}
+
+	public ILCursor EmitSizeof(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Sizeof, operand));
+	}
+
+	public ILCursor EmitSizeof(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Sizeof, Context.Import(operand)));
+	}
+
+	public ILCursor EmitStarg(int operand)
+	{
+		return _Insert(IL.Create(OpCodes.Starg, operand));
+	}
+
+	public ILCursor EmitStarg(uint operand)
+	{
+		return _Insert(IL.Create(OpCodes.Starg, (int)operand));
+	}
+
+	public ILCursor EmitStarg(ParameterReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Starg, operand));
+	}
+
+	public ILCursor EmitStelemAny(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Stelem_Any, operand));
+	}
+
+	public ILCursor EmitStelemAny(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Stelem_Any, Context.Import(operand)));
+	}
+
+	public ILCursor EmitStelemI()
+	{
+		return _Insert(IL.Create(OpCodes.Stelem_I));
+	}
+
+	public ILCursor EmitStelemI1()
+	{
+		return _Insert(IL.Create(OpCodes.Stelem_I1));
+	}
+
+	public ILCursor EmitStelemI2()
+	{
+		return _Insert(IL.Create(OpCodes.Stelem_I2));
+	}
+
+	public ILCursor EmitStelemI4()
+	{
+		return _Insert(IL.Create(OpCodes.Stelem_I4));
+	}
+
+	public ILCursor EmitStelemI8()
+	{
+		return _Insert(IL.Create(OpCodes.Stelem_I8));
+	}
+
+	public ILCursor EmitStelemR4()
+	{
+		return _Insert(IL.Create(OpCodes.Stelem_R4));
+	}
+
+	public ILCursor EmitStelemR8()
+	{
+		return _Insert(IL.Create(OpCodes.Stelem_R8));
+	}
+
+	public ILCursor EmitStelemRef()
+	{
+		return _Insert(IL.Create(OpCodes.Stelem_Ref));
+	}
+
+	public ILCursor EmitStfld(FieldReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Stfld, operand));
+	}
+
+	public ILCursor EmitStfld(FieldInfo operand)
+	{
+		return _Insert(IL.Create(OpCodes.Stfld, Context.Import(operand)));
+	}
+
+	public ILCursor EmitStindI()
+	{
+		return _Insert(IL.Create(OpCodes.Stind_I));
+	}
+
+	public ILCursor EmitStindI1()
+	{
+		return _Insert(IL.Create(OpCodes.Stind_I1));
+	}
+
+	public ILCursor EmitStindI2()
+	{
+		return _Insert(IL.Create(OpCodes.Stind_I2));
+	}
+
+	public ILCursor EmitStindI4()
+	{
+		return _Insert(IL.Create(OpCodes.Stind_I4));
+	}
+
+	public ILCursor EmitStindI8()
+	{
+		return _Insert(IL.Create(OpCodes.Stind_I8));
+	}
+
+	public ILCursor EmitStindR4()
+	{
+		return _Insert(IL.Create(OpCodes.Stind_R4));
+	}
+
+	public ILCursor EmitStindR8()
+	{
+		return _Insert(IL.Create(OpCodes.Stind_R8));
+	}
+
+	public ILCursor EmitStindRef()
+	{
+		return _Insert(IL.Create(OpCodes.Stind_Ref));
+	}
+
+	public ILCursor EmitStloc0()
+	{
+		return _Insert(IL.Create(OpCodes.Stloc_0));
+	}
+
+	public ILCursor EmitStloc1()
+	{
+		return _Insert(IL.Create(OpCodes.Stloc_1));
+	}
+
+	public ILCursor EmitStloc2()
+	{
+		return _Insert(IL.Create(OpCodes.Stloc_2));
+	}
+
+	public ILCursor EmitStloc3()
+	{
+		return _Insert(IL.Create(OpCodes.Stloc_3));
+	}
+
+	public ILCursor EmitStloc(int operand)
+	{
+		return _Insert(IL.Create(OpCodes.Stloc, operand));
+	}
+
+	public ILCursor EmitStloc(uint operand)
+	{
+		return _Insert(IL.Create(OpCodes.Stloc, (int)operand));
+	}
+
+	public ILCursor EmitStloc(VariableReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Stloc, operand));
+	}
+
+	public ILCursor EmitStobj(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Stobj, operand));
+	}
+
+	public ILCursor EmitStobj(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Stobj, Context.Import(operand)));
+	}
+
+	public ILCursor EmitStsfld(FieldReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Stsfld, operand));
+	}
+
+	public ILCursor EmitStsfld(FieldInfo operand)
+	{
+		return _Insert(IL.Create(OpCodes.Stsfld, Context.Import(operand)));
+	}
+
+	public ILCursor EmitSub()
+	{
+		return _Insert(IL.Create(OpCodes.Sub));
+	}
+
+	public ILCursor EmitSubOvf()
+	{
+		return _Insert(IL.Create(OpCodes.Sub_Ovf));
+	}
+
+	public ILCursor EmitSubOvfUn()
+	{
+		return _Insert(IL.Create(OpCodes.Sub_Ovf_Un));
+	}
+
+	public ILCursor EmitSwitch(ILLabel[] operand)
+	{
+		return _Insert(IL.Create(OpCodes.Switch, operand));
+	}
+
+	public ILCursor EmitSwitch(Instruction[] operand)
+	{
+		return _Insert(IL.Create(OpCodes.Switch, operand.Select(MarkLabel).ToArray()));
+	}
+
+	public ILCursor EmitTail()
+	{
+		return _Insert(IL.Create(OpCodes.Tail));
+	}
+
+	public ILCursor EmitThrow()
+	{
+		return _Insert(IL.Create(OpCodes.Throw));
+	}
+
+	public ILCursor EmitUnaligned(byte operand)
+	{
+		return _Insert(IL.Create(OpCodes.Unaligned, operand));
+	}
+
+	public ILCursor EmitUnbox(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Unbox, operand));
+	}
+
+	public ILCursor EmitUnbox(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Unbox, Context.Import(operand)));
+	}
+
+	public ILCursor EmitUnboxAny(TypeReference operand)
+	{
+		return _Insert(IL.Create(OpCodes.Unbox_Any, operand));
+	}
+
+	public ILCursor EmitUnboxAny(Type operand)
+	{
+		return _Insert(IL.Create(OpCodes.Unbox_Any, Context.Import(operand)));
+	}
+
+	public ILCursor EmitVolatile()
+	{
+		return _Insert(IL.Create(OpCodes.Volatile));
+	}
+
+	public ILCursor EmitXor()
+	{
+		return _Insert(IL.Create(OpCodes.Xor));
+	}
+}

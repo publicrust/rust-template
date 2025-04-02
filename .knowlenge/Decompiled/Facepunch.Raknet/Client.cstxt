@@ -1,0 +1,242 @@
+using System;
+using Facepunch;
+using Facepunch.Network.Raknet;
+using Network;
+using UnityEngine;
+
+public class Client : Network.Client
+{
+	private Peer peer;
+
+	public override bool IsConnected()
+	{
+		return peer != null;
+	}
+
+	public override bool Connect(string strURL, int port)
+	{
+		lock (readLock)
+		{
+			lock (writeLock)
+			{
+				lock (decryptLock)
+				{
+					base.Connect(strURL, port);
+					peer = Peer.CreateConnection(strURL, port, 12, 400, 0);
+					if (peer == null)
+					{
+						return false;
+					}
+					base.ConnectedAddress = strURL;
+					base.ConnectedPort = port;
+					base.ServerName = "";
+					base.Connection = new Connection();
+					MultithreadingInit(null);
+					return true;
+				}
+			}
+		}
+	}
+
+	internal bool HandleRaknetPacket(byte type, NetRead read)
+	{
+		if (type >= 140)
+		{
+			return false;
+		}
+		switch (type)
+		{
+		case 16:
+			if (base.Connection.guid != 0L)
+			{
+				Console.WriteLine("Multiple PacketType.CONNECTION_REQUEST_ACCEPTED");
+			}
+			base.Connection.guid = read.guid;
+			IncomingStats.Add("Unconnected", "RequestAccepted", read.Length);
+			return true;
+		case 17:
+			Disconnect("Connection Attempt Failed", sendReasonToServer: false);
+			return true;
+		case 20:
+			Disconnect("Server is Full", sendReasonToServer: false);
+			return true;
+		case 21:
+			if (base.Connection != null && base.Connection.guid != read.guid)
+			{
+				return true;
+			}
+			Disconnect(Network.Client.disconnectReason, sendReasonToServer: false);
+			return true;
+		case 22:
+			if (base.Connection != null && base.Connection.guid != read.guid)
+			{
+				return true;
+			}
+			Disconnect("Timed Out", sendReasonToServer: false);
+			return true;
+		case 23:
+			if (base.Connection != null && base.Connection.guid != read.guid)
+			{
+				return true;
+			}
+			Disconnect("Connection Banned", sendReasonToServer: false);
+			return true;
+		default:
+			IncomingStats.Add("Unconnected", "Unhandled", read.Length);
+			if (base.Connection != null && read.guid != base.Connection.guid)
+			{
+				Debug.LogWarning("[CLIENT] Unhandled Raknet packet " + type + " from unknown source");
+				return true;
+			}
+			Debug.LogWarning("Unhandled Raknet packet " + type);
+			return true;
+		}
+	}
+
+	protected void HandleMessage()
+	{
+		NetRead netRead = Pool.Get<NetRead>();
+		if (netRead.Data != null)
+		{
+			Debug.LogError("NETREAD NOT POOLED CORRECTLY");
+		}
+		netRead.Start(base.Connection, peer.incomingGUID, peer.RawData(), peer.incomingBytesUnread);
+		if (BaseNetwork.Multithreading)
+		{
+			EnqueueDecrypt(netRead);
+		}
+		else
+		{
+			ProcessDecrypt(netRead);
+		}
+	}
+
+	public override void ProcessRead(NetRead read)
+	{
+		RecordReadForConnection(read.connection, read);
+		byte b = read.PacketID();
+		if (HandleRaknetPacket(b, read))
+		{
+			read.RemoveReference();
+			return;
+		}
+		if (read.connection != null)
+		{
+			b -= 140;
+			if (read.guid != read.connection.guid)
+			{
+				IncomingStats.Add("Error", "WrongGuid", read.Length);
+				read.RemoveReference();
+				return;
+			}
+			if (b > 26)
+			{
+				Debug.LogWarning("Invalid Packet (higher than " + Message.Type.QueueUpdate.ToString() + ")");
+				Disconnect("Invalid Packet (" + b + ") " + read.Length + "b", sendReasonToServer: true);
+				read.RemoveReference();
+				return;
+			}
+			Message obj = StartMessage((Message.Type)b, read);
+			if (callbackHandler != null)
+			{
+				try
+				{
+					using (TimeWarning.New("OnMessage"))
+					{
+						callbackHandler.OnNetworkMessage(obj);
+					}
+				}
+				catch (Exception ex)
+				{
+					Debug.LogException(ex);
+					Disconnect(ex.Message + "\n" + ex.StackTrace, sendReasonToServer: true);
+				}
+			}
+			Pool.Free(ref obj);
+		}
+		read.RemoveReference();
+	}
+
+	protected override bool Receive()
+	{
+		if (peer.Receive())
+		{
+			HandleMessage();
+			return true;
+		}
+		return false;
+	}
+
+	public override void Disconnect(string reason, bool sendReasonToServer)
+	{
+		lock (readLock)
+		{
+			lock (writeLock)
+			{
+				lock (decryptLock)
+				{
+					if (sendReasonToServer && peer != null)
+					{
+						NetWrite netWrite = StartWrite();
+						netWrite.PacketID(Message.Type.DisconnectReason);
+						netWrite.String(reason);
+						netWrite.SendImmediate(new SendInfo(base.Connection)
+						{
+							method = SendMethod.ReliableUnordered,
+							priority = Priority.Immediate
+						});
+					}
+					if (peer != null)
+					{
+						peer.Close();
+						peer = null;
+					}
+					base.ConnectedAddress = "";
+					base.ConnectedPort = 0;
+					base.Connection = null;
+					OnDisconnected(reason);
+				}
+			}
+		}
+	}
+
+	public override string GetDebug(Connection connection)
+	{
+		if (peer == null)
+		{
+			return "";
+		}
+		if (connection == null)
+		{
+			return peer.GetStatisticsString(0uL);
+		}
+		return peer.GetStatisticsString(connection.guid);
+	}
+
+	public override ulong GetStat(Connection connection, StatTypeLong type)
+	{
+		if (peer == null)
+		{
+			return 0uL;
+		}
+		return peer.GetStat(connection, type);
+	}
+
+	public override int GetLastPing()
+	{
+		if (base.Connection == null)
+		{
+			return 1;
+		}
+		return peer.GetPingLast(base.Connection.guid);
+	}
+
+	public override void ProcessWrite(NetWrite write)
+	{
+		ArraySegment<byte> arraySegment = Encrypt(base.Connection, write);
+		peer.SendStart();
+		peer.WriteBytes(arraySegment.Array, 0, arraySegment.Offset + arraySegment.Count);
+		peer.SendTo(base.Connection.guid, write.priority, write.method, write.channel);
+		write.RemoveReference();
+	}
+}

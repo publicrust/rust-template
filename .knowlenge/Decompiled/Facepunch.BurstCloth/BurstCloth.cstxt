@@ -1,0 +1,744 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Facepunch.BurstCloth;
+using Facepunch.BurstCloth.Jobs;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Jobs.LowLevel.Unsafe;
+using Unity.Mathematics;
+using UnityEngine;
+using UnityEngine.Jobs;
+
+public class BurstCloth : MonoBehaviour
+{
+	[Serializable]
+	internal struct Chain
+	{
+		public List<Transform> Transforms;
+	}
+
+	internal const int TickRateMultiplier = 30;
+
+	internal const int MaximumTickRate = 120;
+
+	private static readonly List<SphereParams> SphereParamsShared = new List<SphereParams>(32);
+
+	[Header("Structure")]
+	public Transform[] RootBones;
+
+	[Tooltip("You only need to set this value if this is a ViewModel prefab")]
+	public Transform ViewModelRootTransform;
+
+	public bool SiblingConstraints = true;
+
+	[Range(0f, 1f)]
+	public float LengthModifier = 1f;
+
+	[Header("Simulation")]
+	public BurstClothMaterial Material;
+
+	public Vector3 Gravity = Vector3.down;
+
+	public Transform SimulationSpace;
+
+	[Range(0f, 1f)]
+	public float RootMotionStrength = 1f;
+
+	public float MaxOriginDelta = 1f;
+
+	[Tooltip("This will be used as the default for all bones without a length constraint given by BurstClothConstraint")]
+	public Vector2 DefaultLengthConstraint = new Vector2(0f, 1f);
+
+	[Tooltip("If the controller becomes culled, bones will return to their original rigged positions")]
+	public bool ResetBonesOnDisable;
+
+	[Header("Collision")]
+	public bool EnableCollisions = true;
+
+	public float CollisionRadius;
+
+	public float CollisionDirectionAdjustment;
+
+	public float CollisionFilteringScale = 3f;
+
+	[BurstClothCurveRect(0f, 0f, 1f, 1f)]
+	public AnimationCurve CollisionRadiusCurve = AnimationCurve.Linear(0f, 1f, 1f, 1f);
+
+	[Header("Performance")]
+	public bool EnableSimulation = true;
+
+	[Range(30f, 120f)]
+	public int TickRate = 120;
+
+	[Range(1f, 16f)]
+	public int MaxTicksPerFrame = 4;
+
+	[Range(1f, 16f)]
+	public int ConstraintIterationCount = 2;
+
+	[SerializeField]
+	[HideInInspector]
+	internal List<Chain> _chains;
+
+	[SerializeField]
+	[HideInInspector]
+	internal List<BoneData> _boneDataOriginal;
+
+	[SerializeField]
+	[HideInInspector]
+	internal List<RotationConstraint> _rotationConstraintsDataOriginal;
+
+	private Vector3 _origin;
+
+	private Quaternion _rotation;
+
+	private Quaternion _prevRotation;
+
+	private Quaternion _rotationDelta;
+
+	private Vector3 _up;
+
+	private Vector3 _simulationSpaceDelta;
+
+	private Transform _prevSimulationSpace;
+
+	private Vector3? _prevSimulationOrigin;
+
+	private Vector3 _originDelta;
+
+	private Vector3? _prevOrigin;
+
+	private bool _originDirty;
+
+	private float _accumulator;
+
+	private int _boneCount;
+
+	private int _maxBoneDepth;
+
+	private Dictionary<Transform, int> _boneToIndex;
+
+	private TransformAccessArray _boneTransforms;
+
+	private NativeArray<BoneData> _boneData;
+
+	private NativeArray<BoneState> _boneState;
+
+	private NativeArray<RotationConstraint> _rotationConstraints;
+
+	[SerializeField]
+	[HideInInspector]
+	private List<string> _skinConstraintTargetsIds;
+
+	private Transform[] _skinConstraintTargetCache;
+
+	[SerializeField]
+	[HideInInspector]
+	internal List<SkinConstraint> _skinConstraintsOriginal;
+
+	private NativeArray<SkinConstraint> _skinConstraints;
+
+	private bool _skinAccessArrayDirty;
+
+	private TransformAccessArray _skinConstraintsTransformAccessArray;
+
+	private TransformAccessArray _sphereColliderTransforms;
+
+	private NativeArray<SphereColliderData> _sphereColliderData;
+
+	private NativeArray<SphereColliderState> _sphereColliderState;
+
+	protected virtual Transform GetSkeletonBone(string boneId)
+	{
+		return null;
+	}
+
+	protected void Initialize()
+	{
+		if (Material == null)
+		{
+			Material = BurstClothMaterial.DefaultMaterial;
+		}
+		if (_chains == null || _chains.Count == 0)
+		{
+			_chains = new List<Chain>();
+			Transform[] rootBones = RootBones;
+			foreach (Transform obj in rootBones)
+			{
+				List<Transform> list = new List<Transform>();
+				Transform transform = obj;
+				while (transform != null)
+				{
+					list.Add(transform);
+					if (transform.childCount == 0)
+					{
+						break;
+					}
+					transform = transform.GetChild(0);
+				}
+				if (list.Count >= 2)
+				{
+					_chains.Add(new Chain
+					{
+						Transforms = list
+					});
+				}
+			}
+		}
+		SetupManagedData();
+		if (_boneDataOriginal != null && _boneDataOriginal.Count != 0)
+		{
+			return;
+		}
+		_boneDataOriginal = new List<BoneData>();
+		_rotationConstraintsDataOriginal = new List<RotationConstraint>();
+		_skinConstraintTargetsIds = new List<string>();
+		_skinConstraintsOriginal = new List<SkinConstraint>();
+		Vector3 localScale = Vector3.one;
+		if (ViewModelRootTransform != null)
+		{
+			localScale = ViewModelRootTransform.localScale;
+			ViewModelRootTransform.localScale = Vector3.one;
+		}
+		(Vector3 Origin, Quaternion Rotation, Vector3 Up) originTransform = GetOriginTransform();
+		Vector3 item = originTransform.Origin;
+		Quaternion item2 = originTransform.Rotation;
+		Vector3 item3 = originTransform.Up;
+		Quaternion quaternion = Quaternion.Inverse(item2);
+		int num = 0;
+		for (int j = 0; j < _chains.Count; j++)
+		{
+			List<Transform> transforms = _chains[j].Transforms;
+			for (int k = 0; k < transforms.Count; k++)
+			{
+				Transform transform2 = transforms[k];
+				Vector3 position = transform2.position;
+				Vector3 vector = Vector3.Project(position - item, item3) + item;
+				(Transform, int) siblingAndIndex = GetSiblingAndIndex(j - 1, k);
+				Transform item4 = siblingAndIndex.Item1;
+				int item5 = siblingAndIndex.Item2;
+				(Vector3, float) boneLocalPositionAndLength = GetBoneLocalPositionAndLength(transform2, item4);
+				Vector3 item6 = boneLocalPositionAndLength.Item1;
+				float item7 = boneLocalPositionAndLength.Item2;
+				(Transform, int) siblingAndIndex2 = GetSiblingAndIndex(j + 1, k);
+				Transform item8 = siblingAndIndex2.Item1;
+				int item9 = siblingAndIndex2.Item2;
+				(Vector3, float) boneLocalPositionAndLength2 = GetBoneLocalPositionAndLength(transform2, item8);
+				Vector3 item10 = boneLocalPositionAndLength2.Item1;
+				float item11 = boneLocalPositionAndLength2.Item2;
+				float num2 = (float)k / (float)_maxBoneDepth;
+				BurstClothConstraint component;
+				BurstClothConstraint burstClothConstraint = (transform2.TryGetComponent<BurstClothConstraint>(out component) ? component : null);
+				float magnitude = (position - transform2.parent.position).magnitude;
+				int rotationConstraintIndex = -1;
+				int skinConstraintIndex = -1;
+				if (burstClothConstraint != null)
+				{
+					bool constrainRotateX = burstClothConstraint.ConstrainRotateX;
+					bool constrainRotateY = burstClothConstraint.ConstrainRotateY;
+					bool constrainRotateZ = burstClothConstraint.ConstrainRotateZ;
+					if (constrainRotateX || constrainRotateY || constrainRotateZ)
+					{
+						RotationConstraint item12 = new RotationConstraint(new bool3(constrainRotateX, constrainRotateY, constrainRotateZ), math.radians(burstClothConstraint.RotateX), math.radians(burstClothConstraint.RotateY), math.radians(burstClothConstraint.RotateZ));
+						_rotationConstraintsDataOriginal.Add(item12);
+						rotationConstraintIndex = _rotationConstraintsDataOriginal.Count - 1;
+					}
+					if (burstClothConstraint.ExtraSkinConstraint && !string.IsNullOrEmpty(burstClothConstraint.SkeletonBoneName))
+					{
+						_skinConstraintTargetsIds.Add(burstClothConstraint.SkeletonBoneName);
+						SkinConstraint skinConstraint = default(SkinConstraint);
+						skinConstraint.LocalSkinPosition = float3.zero;
+						skinConstraint.LocalSkinNormal = burstClothConstraint.SkinNormal;
+						skinConstraint.LocalEscapeNormal = burstClothConstraint.EscapeNormal;
+						skinConstraint.BackstopRadius = burstClothConstraint.BackstopRadius;
+						skinConstraint.BackstopInset = burstClothConstraint.BackstopInset;
+						SkinConstraint item13 = skinConstraint;
+						_skinConstraintsOriginal.Add(item13);
+						skinConstraintIndex = _skinConstraintsOriginal.Count - 1;
+					}
+				}
+				_boneDataOriginal.Add(new BoneData
+				{
+					Depth = k,
+					Parent = ((k > 0) ? (num - 1) : (-1)),
+					Child = ((k < transforms.Count - 1) ? (num + 1) : (-1)),
+					Length = magnitude,
+					NormalFromParent = transform2.parent.InverseTransformPoint(position).normalized,
+					LeftSibling = item5,
+					LengthToLeft = item7,
+					NormalFromLeft = math.normalize(item6),
+					RightSibling = item9,
+					NormalFromRight = math.normalize(item10),
+					LengthToRight = item11,
+					LocalPosition = transform2.parent.InverseTransformPoint(position),
+					LocalRotation = transform2.localRotation,
+					DirectionFromOrigin = (quaternion * (position - vector)).normalized,
+					CollisionRadius = CollisionRadius * CollisionRadiusCurve.Evaluate(num2),
+					DampingInv = 1f - Material.GetDamping(num2),
+					RotationConstraintIndex = rotationConstraintIndex,
+					SkinConstraintIndex = skinConstraintIndex,
+					LengthConstraint = (((object)burstClothConstraint != null && burstClothConstraint.ConstrainLength) ? ((float2)burstClothConstraint.Length) : ((float2)DefaultLengthConstraint)) * magnitude,
+					LengthRelaxation = Material.GetLengthRelaxation(num2),
+					ShapeRelaxation = Material.GetShapeRelaxation(num2),
+					SiblingRelaxation = Material.GetSiblingRelaxation(num2)
+				});
+				num++;
+			}
+		}
+		if (ViewModelRootTransform != null)
+		{
+			ViewModelRootTransform.localScale = localScale;
+		}
+	}
+
+	protected virtual void Awake()
+	{
+		Initialize();
+	}
+
+	protected virtual void OnEnable()
+	{
+		BurstClothManager.Get().Instances.Add(this);
+		_originDirty = true;
+	}
+
+	protected void ResetBoneTransforms(bool resetBoneStates = false)
+	{
+		if (_boneDataOriginal == null || _boneDataOriginal.Count == 0)
+		{
+			return;
+		}
+		int num = 0;
+		for (int i = 0; i < _chains.Count; i++)
+		{
+			Chain chain = _chains[i];
+			for (int j = 0; j < chain.Transforms.Count; j++)
+			{
+				BoneData boneData = _boneDataOriginal[num];
+				num++;
+				if (boneData.Depth != 0)
+				{
+					Transform transform = chain.Transforms[j];
+					transform.localPosition = boneData.LocalPosition;
+					transform.localRotation = boneData.LocalRotation;
+					if (resetBoneStates && _boneState.IsCreated)
+					{
+						transform.GetPositionAndRotation(out var position, out var rotation);
+						_boneState[num - 1] = new BoneState
+						{
+							Position = position,
+							OldPosition = position,
+							Rotation = rotation
+						};
+					}
+				}
+			}
+		}
+	}
+
+	protected virtual void OnDisable()
+	{
+		if (ResetBonesOnDisable)
+		{
+			ResetBoneTransforms();
+		}
+		_accumulator = 0f;
+		_boneCount = 0;
+		_maxBoneDepth = 0;
+		_boneToIndex = null;
+		if (_boneTransforms.isCreated)
+		{
+			_boneTransforms.Dispose();
+		}
+		if (_boneData.IsCreated)
+		{
+			_boneData.Dispose();
+		}
+		if (_rotationConstraints.IsCreated)
+		{
+			_rotationConstraints.Dispose();
+		}
+		if (_boneState.IsCreated)
+		{
+			_boneState.Dispose();
+		}
+		if (_sphereColliderData.IsCreated)
+		{
+			_sphereColliderData.Dispose();
+		}
+		if (_sphereColliderState.IsCreated)
+		{
+			_sphereColliderState.Dispose();
+		}
+		if (_sphereColliderTransforms.isCreated)
+		{
+			_sphereColliderTransforms.Dispose();
+		}
+		if (_skinConstraints.IsCreated)
+		{
+			_skinConstraints.Dispose();
+		}
+		if (_skinConstraintsTransformAccessArray.isCreated)
+		{
+			_skinConstraintsTransformAccessArray.Dispose();
+		}
+		BurstClothManager.Get().Instances.Remove(this);
+	}
+
+	protected internal virtual void FrameUpdate()
+	{
+		Vector3 lhs = _rotation * Vector3.forward;
+		(Vector3, Quaternion, Vector3) originTransform = GetOriginTransform();
+		_origin = originTransform.Item1;
+		_rotation = originTransform.Item2;
+		_up = originTransform.Item3;
+		Vector3 rhs = _rotation * Vector3.forward;
+		if (Vector3.Dot(lhs, rhs) < 0.2f)
+		{
+			ResetBoneTransforms(resetBoneStates: true);
+			_originDirty = true;
+		}
+		if ((object)SimulationSpace != null && SimulationSpace == null)
+		{
+			SimulationSpace = null;
+		}
+		_rotationDelta = _rotation * Quaternion.Inverse(_prevRotation);
+		Vector3 vector = SimulationSpace?.position ?? Vector3.zero;
+		if (_originDirty)
+		{
+			_simulationSpaceDelta = Vector3.zero;
+			_prevSimulationOrigin = vector;
+		}
+		else
+		{
+			_simulationSpaceDelta += (_prevSimulationOrigin.HasValue ? (vector - _prevSimulationOrigin.Value) : Vector3.zero);
+			_prevSimulationOrigin = vector;
+		}
+		if ((object)SimulationSpace != _prevSimulationSpace)
+		{
+			_simulationSpaceDelta = Vector3.zero;
+		}
+		_prevSimulationSpace = SimulationSpace;
+		if (_originDirty)
+		{
+			_originDelta = Vector3.zero;
+			_prevOrigin = _origin;
+		}
+		else
+		{
+			_originDelta += (_prevOrigin.HasValue ? (_origin - _prevOrigin.Value - _simulationSpaceDelta) : Vector3.zero);
+			_prevOrigin = _origin;
+		}
+		_originDirty = false;
+	}
+
+	private void VerifySkinConstraintTransformCache()
+	{
+		if (_skinConstraintTargetsIds == null)
+		{
+			return;
+		}
+		if (_skinConstraintTargetCache == null && _skinConstraintTargetsIds.Count > 0)
+		{
+			_skinConstraintTargetCache = new Transform[_skinConstraintTargetsIds.Count];
+		}
+		for (int i = 0; i < _skinConstraintTargetsIds.Count; i++)
+		{
+			Transform transform = _skinConstraintTargetCache[i];
+			if (transform == null)
+			{
+				_skinAccessArrayDirty = true;
+				transform = GetSkeletonBone(_skinConstraintTargetsIds[i]);
+			}
+			_skinConstraintTargetCache[i] = transform;
+		}
+	}
+
+	private void PopulateSkinConstraintTransformAccessArray()
+	{
+		if (_skinConstraintTargetCache == null || (_skinConstraintsTransformAccessArray.isCreated && !_skinAccessArrayDirty))
+		{
+			return;
+		}
+		if (!_skinConstraintsTransformAccessArray.isCreated || _skinConstraintsTransformAccessArray.capacity < _skinConstraintTargetCache.Length)
+		{
+			if (_skinConstraintsTransformAccessArray.isCreated)
+			{
+				_skinConstraintsTransformAccessArray.Dispose();
+			}
+			_skinConstraintsTransformAccessArray = new TransformAccessArray(_skinConstraintTargetCache.Length);
+		}
+		_skinConstraintsTransformAccessArray.SetTransforms(_skinConstraintTargetCache);
+		_skinAccessArrayDirty = false;
+	}
+
+	internal JobHandle SimulateSystem()
+	{
+		SetupData();
+		_accumulator += Time.deltaTime;
+		float num = 1f / (float)TickRate;
+		int num2 = Mathf.Min(Mathf.FloorToInt(_accumulator / num), MaxTicksPerFrame);
+		if (num2 == 0)
+		{
+			return default(JobHandle);
+		}
+		_accumulator -= (float)num2 * num;
+		UpdateSkinConstraintsJob updateSkinConstraintsJob = default(UpdateSkinConstraintsJob);
+		updateSkinConstraintsJob.SkinConstraints = _skinConstraints;
+		UpdateSkinConstraintsJob jobData = updateSkinConstraintsJob;
+		InitializeBoneStateJob initializeBoneStateJob = default(InitializeBoneStateJob);
+		initializeBoneStateJob.Data = _boneData;
+		initializeBoneStateJob.State = _boneState;
+		InitializeBoneStateJob jobData2 = initializeBoneStateJob;
+		InitializeSphereColliderStateJob initializeSphereColliderStateJob = default(InitializeSphereColliderStateJob);
+		initializeSphereColliderStateJob.Data = _sphereColliderData;
+		initializeSphereColliderStateJob.State = _sphereColliderState;
+		InitializeSphereColliderStateJob jobData3 = initializeSphereColliderStateJob;
+		SimulatePositionsJob simulatePositionsJob = default(SimulatePositionsJob);
+		simulatePositionsJob.ColliderData = _sphereColliderData;
+		simulatePositionsJob.ColliderState = _sphereColliderState;
+		simulatePositionsJob.RotationConstraints = _rotationConstraints;
+		simulatePositionsJob.SkinConstraints = _skinConstraints;
+		simulatePositionsJob.BoneData = _boneData;
+		simulatePositionsJob.BoneStates = _boneState;
+		simulatePositionsJob.TickRate = TickRate;
+		simulatePositionsJob.DeltaTime = num;
+		simulatePositionsJob.IterationCount = num2;
+		simulatePositionsJob.ConstraintIterationCount = ConstraintIterationCount;
+		simulatePositionsJob.SimulationSpaceDelta = _simulationSpaceDelta;
+		simulatePositionsJob.OriginRotationDelta = _rotationDelta;
+		simulatePositionsJob.OriginDelta = ((_originDelta.sqrMagnitude < MaxOriginDelta * MaxOriginDelta) ? (_originDelta * (1f - RootMotionStrength)) : _originDelta);
+		simulatePositionsJob.Gravity = ((Gravity.sqrMagnitude < 0.01f) ? new Vector3(0f, -0.01f, 0f) : Gravity);
+		simulatePositionsJob.SiblingConstraints = SiblingConstraints;
+		simulatePositionsJob.LengthModifier = LengthModifier;
+		simulatePositionsJob.EnableCollisions = EnableCollisions;
+		simulatePositionsJob.Origin = _origin;
+		simulatePositionsJob.Rotation = _rotation;
+		simulatePositionsJob.Up = _up;
+		simulatePositionsJob.CollisionProjectionYOffset = CollisionDirectionAdjustment;
+		simulatePositionsJob.CollisionFilteringScale = CollisionFilteringScale;
+		simulatePositionsJob.Radius = 10f;
+		SimulatePositionsJob jobData4 = simulatePositionsJob;
+		_prevRotation = _rotation;
+		_originDelta = Vector3.zero;
+		_simulationSpaceDelta = Vector3.zero;
+		UpdateTransformsJob updateTransformsJob = default(UpdateTransformsJob);
+		updateTransformsJob.Data = _boneData;
+		updateTransformsJob.State = _boneState;
+		UpdateTransformsJob jobData5 = updateTransformsJob;
+		JobHandle job = default(JobHandle);
+		if (_skinConstraintsTransformAccessArray.isCreated)
+		{
+			job = jobData.ScheduleReadOnly(_skinConstraintsTransformAccessArray, math.max(_boneTransforms.length / math.max(JobsUtility.JobWorkerCount, 1), 32));
+		}
+		JobHandle job2 = jobData2.ScheduleReadOnly(_boneTransforms, math.max(_boneTransforms.length / math.max(JobsUtility.JobWorkerCount, 1), 32));
+		JobHandle job3 = jobData3.ScheduleReadOnly(_sphereColliderTransforms, math.max(_sphereColliderTransforms.length / math.max(JobsUtility.JobWorkerCount, 1), 32));
+		JobHandle dependsOn = JobHandle.CombineDependencies(job, job2, job3);
+		return IJobParallelForTransformExtensions.Schedule(dependsOn: jobData4.Schedule(dependsOn), jobData: jobData5, transforms: _boneTransforms);
+	}
+
+	private void SetupData()
+	{
+		SetupManagedData();
+		SetupNativeData();
+	}
+
+	private void SetupManagedData()
+	{
+		if (_boneCount == 0 || _maxBoneDepth == 0)
+		{
+			_boneCount = _chains.Sum((Chain c) => c.Transforms.Count);
+			_maxBoneDepth = _chains.Max((Chain c) => c.Transforms.Count);
+		}
+		if (_boneToIndex == null)
+		{
+			_boneToIndex = new Dictionary<Transform, int>();
+			BuildBoneToIndexMap(_boneToIndex);
+		}
+		VerifySkinConstraintTransformCache();
+	}
+
+	private void SetupNativeData()
+	{
+		if (!_boneTransforms.isCreated)
+		{
+			_boneTransforms = new TransformAccessArray(_boneCount);
+			foreach (Chain chain in _chains)
+			{
+				foreach (Transform transform in chain.Transforms)
+				{
+					_boneTransforms.Add(transform);
+				}
+			}
+		}
+		if (!_boneData.IsCreated)
+		{
+			_boneData = new NativeArray<BoneData>(_boneCount, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+			int num = 0;
+			foreach (BoneData item in _boneDataOriginal)
+			{
+				_boneData[num++] = item;
+			}
+		}
+		if (!_rotationConstraints.IsCreated)
+		{
+			_rotationConstraints = new NativeArray<RotationConstraint>(_rotationConstraintsDataOriginal.Count, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+			int num2 = 0;
+			foreach (RotationConstraint item2 in _rotationConstraintsDataOriginal)
+			{
+				_rotationConstraints[num2++] = item2;
+			}
+		}
+		if (!_boneState.IsCreated)
+		{
+			_boneState = new NativeArray<BoneState>(_boneCount, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+			int num3 = 0;
+			foreach (Chain chain2 in _chains)
+			{
+				foreach (Transform transform2 in chain2.Transforms)
+				{
+					Vector3 position = transform2.position;
+					_boneState[num3++] = new BoneState
+					{
+						Position = position,
+						Rotation = transform2.rotation,
+						OldPosition = position
+					};
+				}
+			}
+		}
+		if (!_sphereColliderTransforms.isCreated || !_sphereColliderData.IsCreated)
+		{
+			SphereParamsShared.Clear();
+			GatherColliders(SphereParamsShared);
+			_sphereColliderTransforms = new TransformAccessArray(SphereParamsShared.Count);
+			_sphereColliderData = new NativeArray<SphereColliderData>(SphereParamsShared.Count, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+			for (int i = 0; i < SphereParamsShared.Count; i++)
+			{
+				SphereParams sphereParams = SphereParamsShared[i];
+				_sphereColliderTransforms.Add(sphereParams.Transform);
+				_sphereColliderData[i] = new SphereColliderData
+				{
+					Radius = sphereParams.Radius,
+					RadiusSqr = sphereParams.Radius * sphereParams.Radius,
+					LocalPosition = sphereParams.Point
+				};
+			}
+			SphereParamsShared.Clear();
+		}
+		if (!_sphereColliderState.IsCreated)
+		{
+			_sphereColliderState = new NativeArray<SphereColliderState>(_sphereColliderData.Length, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+		}
+		if (!_skinConstraints.IsCreated)
+		{
+			_skinConstraints = new NativeArray<SkinConstraint>(_skinConstraintsOriginal.Count, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+			for (int j = 0; j < _skinConstraintsOriginal.Count; j++)
+			{
+				_skinConstraints[j] = _skinConstraintsOriginal[j];
+			}
+		}
+		PopulateSkinConstraintTransformAccessArray();
+	}
+
+	protected virtual (Vector3 Origin, Quaternion Rotation, Vector3 Up) GetOriginTransform()
+	{
+		return (Origin: base.transform.position, Rotation: base.transform.rotation, Up: base.transform.up);
+	}
+
+	protected virtual void GatherColliders(List<SphereParams> sphereColliders)
+	{
+	}
+
+	private static (Vector3, float) GetBoneLocalPositionAndLength(Transform parent, Transform child)
+	{
+		if (child == null)
+		{
+			return (Vector3.zero, 0f);
+		}
+		Vector3 item = child.InverseTransformPoint(parent.position);
+		return (item, item.magnitude);
+	}
+
+	private (Transform, int) GetSiblingAndIndex(int chainIndex, int depth)
+	{
+		if (chainIndex < 0 || chainIndex >= _chains.Count)
+		{
+			return (null, -1);
+		}
+		List<Transform> transforms = _chains[chainIndex].Transforms;
+		if (depth < 0 || depth >= transforms.Count)
+		{
+			return (null, -1);
+		}
+		Transform transform = transforms[depth];
+		return (transform, _boneToIndex[transform]);
+	}
+
+	private void BuildBoneToIndexMap(Dictionary<Transform, int> boneToIndex)
+	{
+		boneToIndex.Clear();
+		int num = 0;
+		foreach (Chain chain in _chains)
+		{
+			foreach (Transform transform in chain.Transforms)
+			{
+				boneToIndex.Add(transform, num++);
+			}
+		}
+	}
+
+	protected void UpdateCachedMaterialData()
+	{
+		bool flag = false;
+		if (_chains != null)
+		{
+			foreach (Chain chain in _chains)
+			{
+				foreach (Transform transform in chain.Transforms)
+				{
+					if (transform == null)
+					{
+						flag = true;
+						break;
+					}
+				}
+				if (flag)
+				{
+					break;
+				}
+			}
+		}
+		if (flag)
+		{
+			_chains.Clear();
+		}
+		if (!Application.isPlaying || !_boneData.IsCreated)
+		{
+			return;
+		}
+		if (Material == null)
+		{
+			Material = BurstClothMaterial.DefaultMaterial;
+		}
+		int num = 0;
+		for (int i = 0; i < _chains.Count; i++)
+		{
+			List<Transform> transforms = _chains[i].Transforms;
+			for (int j = 0; j < transforms.Count; j++)
+			{
+				BoneData value = _boneDataOriginal[num];
+				float num2 = (float)j / (float)_maxBoneDepth;
+				value.CollisionRadius = CollisionRadius * CollisionRadiusCurve.Evaluate(num2);
+				value.DampingInv = 1f - Material.GetDamping(num2);
+				value.LengthRelaxation = Material.GetLengthRelaxation(num2);
+				value.ShapeRelaxation = Material.GetShapeRelaxation(num2);
+				value.SiblingRelaxation = Material.GetSiblingRelaxation(num2);
+				_boneDataOriginal[num] = value;
+				_boneData[num] = value;
+				num++;
+			}
+		}
+	}
+}

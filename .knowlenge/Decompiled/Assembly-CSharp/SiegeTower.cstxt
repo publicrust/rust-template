@@ -1,0 +1,392 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using ConVar;
+using Facepunch;
+using Network;
+using ProtoBuf;
+using Rust;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class SiegeTower : BaseSiegeWeapon
+{
+	[SerializeField]
+	[Header("Siege Tower")]
+	private SiegeTowerDoor drawBridgePrefab;
+
+	[SerializeField]
+	private SiegeTowerDoor drawBridge2Prefab;
+
+	[SerializeField]
+	private SiegeTowerDoor drawBridge3Prefab;
+
+	private EntityRef<SiegeTowerDoor> drawBridgeRef;
+
+	private EntityRef<SiegeTowerDoor> drawBridge2Ref;
+
+	private EntityRef<SiegeTowerDoor> drawBridge3Ref;
+
+	private const Flags Flag_IsTipping = Flags.Reserved18;
+
+	private const Flags Flag_IsTipped = Flags.Reserved16;
+
+	[Header("Raise Command")]
+	public float torqueForce = 10f;
+
+	public float uprightAngle = 10f;
+
+	private bool shouldRaise;
+
+	private float raiseTimer;
+
+	public override float DriveWheelVelocity { get; }
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("SiegeTower.OnRpcMessage"))
+		{
+			if (rpc == 886085783 && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (ConVar.Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - SV_RequestRaise ");
+				}
+				using (TimeWarning.New("SV_RequestRaise"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.MaxDistance.Test(886085783u, "SV_RequestRaise", this, player, 3f))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							SV_RequestRaise(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						Debug.LogException(exception);
+						player.Kick("RPC Error in SV_RequestRaise");
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	public override void Load(LoadInfo info)
+	{
+		base.Load(info);
+		if (info.msg.siegeTower != null && base.isServer)
+		{
+			drawBridgeRef.uid = info.msg.siegeTower.drawBridgeID;
+			drawBridge2Ref.uid = info.msg.siegeTower.drawBridge2ID;
+			drawBridge3Ref.uid = info.msg.siegeTower.drawBridge3ID;
+		}
+	}
+
+	public override void Save(SaveInfo info)
+	{
+		base.Save(info);
+		info.msg.siegeTower = Facepunch.Pool.Get<ProtoBuf.SiegeTower>();
+		info.msg.siegeTower.drawBridgeID = drawBridgeRef.uid;
+		info.msg.siegeTower.drawBridge2ID = drawBridge2Ref.uid;
+		info.msg.siegeTower.drawBridge3ID = drawBridge3Ref.uid;
+	}
+
+	protected override void OnChildAdded(BaseEntity child)
+	{
+		base.OnChildAdded(child);
+		if (base.isServer && !Rust.Application.isLoadingSave)
+		{
+			if (child.prefabID == drawBridgePrefab.GetEntity().prefabID)
+			{
+				SiegeTowerDoor siegeTowerDoor = (SiegeTowerDoor)child;
+				drawBridgeRef.Set(siegeTowerDoor);
+				SetupDoor(siegeTowerDoor);
+			}
+			if (child.prefabID == drawBridge2Prefab.GetEntity().prefabID)
+			{
+				SiegeTowerDoor siegeTowerDoor2 = (SiegeTowerDoor)child;
+				drawBridge2Ref.Set(siegeTowerDoor2);
+				SetupDoor(siegeTowerDoor2);
+			}
+			if (child.prefabID == drawBridge3Prefab.GetEntity().prefabID)
+			{
+				SiegeTowerDoor siegeTowerDoor3 = (SiegeTowerDoor)child;
+				drawBridge3Ref.Set(siegeTowerDoor3);
+				SetupDoor(siegeTowerDoor3);
+			}
+			UpdateDoorHp();
+		}
+	}
+
+	protected override bool CanPushNow(BasePlayer pusher)
+	{
+		if (HasFlag(Flags.Reserved16))
+		{
+			return false;
+		}
+		if (base.isServer)
+		{
+			BaseEntity baseEntity = pusher.parentEntity.Get(serverside: true);
+			if (baseEntity.IsValid())
+			{
+				BaseEntity baseEntity2 = baseEntity.parentEntity.Get(serverside: true);
+				if (baseEntity2.IsValid() && baseEntity2 == this)
+				{
+					return false;
+				}
+			}
+			if (!IsYValid(pusher))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	private bool IsYValid(BasePlayer pusher)
+	{
+		return !(Mathf.Abs(base.transform.position.y - pusher.transform.position.y) > 2f);
+	}
+
+	protected override void CreateEngineController()
+	{
+	}
+
+	public override bool SupportsChildDeployables()
+	{
+		return true;
+	}
+
+	public override bool ForceDeployableSetParent()
+	{
+		return true;
+	}
+
+	public override void ServerInit()
+	{
+		base.ServerInit();
+		DisablePhysics();
+		Invoke(base.EnablePhysics, 1f);
+		InvokeRepeating(CheckIfTipped, 0f, 2f);
+	}
+
+	public void GetDoors(List<SiegeTowerDoor> doors)
+	{
+		SiegeTowerDoor siegeTowerDoor = drawBridgeRef.Get(base.isServer);
+		if (siegeTowerDoor.IsValid())
+		{
+			doors.Add(siegeTowerDoor);
+		}
+		siegeTowerDoor = drawBridge2Ref.Get(base.isServer);
+		if (siegeTowerDoor.IsValid())
+		{
+			doors.Add(siegeTowerDoor);
+		}
+		siegeTowerDoor = drawBridge3Ref.Get(base.isServer);
+		if (siegeTowerDoor.IsValid())
+		{
+			doors.Add(siegeTowerDoor);
+		}
+	}
+
+	public override void Hurt(HitInfo info)
+	{
+		base.Hurt(info);
+		List<SiegeTowerDoor> obj = Facepunch.Pool.Get<List<SiegeTowerDoor>>();
+		GetDoors(obj);
+		foreach (SiegeTowerDoor item in obj)
+		{
+			if (item != null)
+			{
+				item.ProtectedHurt(info);
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	public override void OnDied(HitInfo info)
+	{
+		base.OnDied(info);
+		List<SiegeTowerDoor> obj = Facepunch.Pool.Get<List<SiegeTowerDoor>>();
+		GetDoors(obj);
+		foreach (SiegeTowerDoor item in obj)
+		{
+			if (!item.IsDead())
+			{
+				item.Die();
+			}
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	public override void OnRepair()
+	{
+		base.OnRepair();
+		UpdateDoorHp();
+	}
+
+	public override void OnRepairFinished()
+	{
+		base.OnRepairFinished();
+		UpdateDoorHp();
+	}
+
+	private void UpdateDoorHp()
+	{
+		List<SiegeTowerDoor> obj = Facepunch.Pool.Get<List<SiegeTowerDoor>>();
+		GetDoors(obj);
+		foreach (SiegeTowerDoor item in obj)
+		{
+			item.SetMaxHealth(MaxHealth());
+			item.SetHealth(base.health);
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+	}
+
+	public void ProtectedHurt(HitInfo info)
+	{
+		info.HitEntity = this;
+		base.Hurt(info);
+	}
+
+	public void ProtectedSetHealth(float health)
+	{
+		SetHealth(health);
+		UpdateDoorHp();
+	}
+
+	public override void PostServerLoad()
+	{
+		base.PostServerLoad();
+		List<SiegeTowerDoor> obj = Facepunch.Pool.Get<List<SiegeTowerDoor>>();
+		GetDoors(obj);
+		foreach (SiegeTowerDoor item in obj)
+		{
+			SetupDoor(item);
+		}
+		Facepunch.Pool.FreeUnmanaged(ref obj);
+		UpdateDoorHp();
+	}
+
+	private void SetupDoor(SiegeTowerDoor door)
+	{
+		door.SetupDoor(this);
+		door.SetMaxHealth(MaxHealth());
+		door.SetHealth(MaxHealth());
+		door.startHealth = MaxHealth();
+		door.OwnerID = base.OwnerID;
+	}
+
+	private void CheckIfTipped()
+	{
+		bool flag = IsFlipping();
+		if (HasFlag(Flags.Reserved18) != flag)
+		{
+			SetFlag(Flags.Reserved18, flag);
+		}
+		bool flag2 = IsFlipped();
+		if (HasFlag(Flags.Reserved16) != flag2)
+		{
+			SetFlag(Flags.Reserved16, flag2);
+		}
+	}
+
+	public override bool CheckTowingAllowed()
+	{
+		if (!base.CheckTowingAllowed())
+		{
+			return false;
+		}
+		if (HasFlag(Flags.Reserved18) || HasFlag(Flags.Reserved16))
+		{
+			return false;
+		}
+		return true;
+	}
+
+	private void FixedUpdate()
+	{
+		if (!base.isClient && !rigidBody.isKinematic)
+		{
+			UprightIfRaise();
+		}
+	}
+
+	private void UprightIfRaise()
+	{
+		if (shouldRaise)
+		{
+			if (Mathf.Abs(base.transform.up.y) > uprightAngle || raiseTimer > 5f)
+			{
+				rigidBody.angularDrag = 0.95f;
+			}
+			else if (Mathf.Abs(base.transform.up.y) > 1f || raiseTimer > 15f)
+			{
+				shouldRaise = false;
+				rigidBody.angularDrag = 0.05f;
+			}
+			Vector3 lhs = Quaternion.AngleAxis(rigidBody.angularVelocity.magnitude * 57.29578f * 100f / 350f, rigidBody.angularVelocity) * base.transform.up;
+			Vector3 up = Vector3.up;
+			Vector3 vector = Vector3.Cross(lhs, up);
+			float num = Vector3.Dot(lhs.normalized, up);
+			num = Mathf.Clamp01((num + 1f) / 2f);
+			Vector3 torque = vector * (1f - num) * 350f * 350f;
+			rigidBody.AddTorque(torque);
+			raiseTimer += UnityEngine.Time.fixedDeltaTime;
+		}
+	}
+
+	private void AlignRotationToZero()
+	{
+		if (rigidBody == null || !HasFlag(Flags.Reserved16))
+		{
+			if (IsInvoking(AlignRotationToZero))
+			{
+				CancelInvoke(AlignRotationToZero);
+			}
+			if (rigidBody != null && !HasFlag(Flags.Reserved16))
+			{
+				rigidBody.angularVelocity = Vector3.zero;
+			}
+		}
+	}
+
+	public override void OnEngineStartFailed()
+	{
+	}
+
+	public override bool MeetsEngineRequirements()
+	{
+		return false;
+	}
+
+	[RPC_Server]
+	[RPC_Server.MaxDistance(3f)]
+	public void SV_RequestRaise(RPCMessage msg)
+	{
+		if (HasFlag(Flags.Reserved16) && !IsInvoking(AlignRotationToZero))
+		{
+			if (rigidBody.IsSleeping())
+			{
+				rigidBody.WakeUp();
+			}
+			raiseTimer = 0f;
+			shouldRaise = true;
+		}
+	}
+}

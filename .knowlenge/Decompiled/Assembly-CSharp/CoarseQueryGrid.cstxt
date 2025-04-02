@@ -1,0 +1,338 @@
+#define UNITY_ASSERTIONS
+using System;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
+using UnityEngine;
+
+[GenerateTestsForBurstCompatibility]
+public struct CoarseQueryGrid : IDisposable
+{
+	public struct RefCountedSpatialArray : IDisposable
+	{
+		private NativeArray<byte> _array;
+
+		public NativeArray<byte> RawArray => _array;
+
+		public int Length => _array.Length;
+
+		public static RefCountedSpatialArray Init(int length)
+		{
+			RefCountedSpatialArray result = default(RefCountedSpatialArray);
+			result._array = new NativeArray<byte>(length, Allocator.Persistent);
+			return result;
+		}
+
+		public void Add(int index)
+		{
+			Debug.Assert(_array[index] != byte.MaxValue);
+			_array[index]++;
+		}
+
+		public void Remove(int index)
+		{
+			Debug.Assert(_array[index] != 0);
+			_array[index]--;
+		}
+
+		public bool Get(int index)
+		{
+			return _array[index] > 0;
+		}
+
+		public void Dispose()
+		{
+			_array.Dispose();
+		}
+	}
+
+	private const float StaticBoundsInflation = 0.1f;
+
+	private readonly int _cellXZDimensionCount;
+
+	private readonly Vector2 _gridCentre;
+
+	private readonly float _yCutoff;
+
+	private readonly int _cellSize;
+
+	private readonly int _cellClampLimit;
+
+	private NativeReference<bool> _result;
+
+	private bool _hasDisposed;
+
+	private NativeList<Bounds> _dynamicBounds;
+
+	private RefCountedSpatialArray _upperStaticSpatialArray;
+
+	private RefCountedSpatialArray _lowerStaticSpatialArray;
+
+	public CoarseQueryGrid(int cellSize, int maxWorldSizeXZ, float yCutoff)
+	{
+		_cellSize = cellSize;
+		_cellXZDimensionCount = (int)((float)(maxWorldSizeXZ / cellSize) + 0.5f);
+		_gridCentre = new Vector2((float)maxWorldSizeXZ * 0.5f, (float)maxWorldSizeXZ * 0.5f);
+		_yCutoff = yCutoff;
+		_hasDisposed = false;
+		_result = new NativeReference<bool>(Allocator.Persistent);
+		_upperStaticSpatialArray = RefCountedSpatialArray.Init(_cellXZDimensionCount * _cellXZDimensionCount);
+		_lowerStaticSpatialArray = RefCountedSpatialArray.Init(_cellXZDimensionCount * _cellXZDimensionCount);
+		_dynamicBounds = new NativeList<Bounds>(Allocator.Persistent);
+		_cellClampLimit = _upperStaticSpatialArray.Length - 1;
+	}
+
+	private bool TouchesUpperSpatial(Bounds bounds)
+	{
+		return bounds.max.y >= _yCutoff;
+	}
+
+	private bool TouchesUpperSpatial(Vector3 pos, float r)
+	{
+		return pos.y + r >= _yCutoff;
+	}
+
+	private bool TouchesLowerSpatial(Bounds bounds)
+	{
+		return bounds.min.y <= _yCutoff;
+	}
+
+	private bool TouchesLowerSpatial(Vector3 pos, float r)
+	{
+		return pos.y - r <= _yCutoff;
+	}
+
+	public void PrepareForDynamicPopulate(int dynamicCount)
+	{
+		if (!_hasDisposed)
+		{
+			_dynamicBounds.Clear();
+			if (_dynamicBounds.Capacity < dynamicCount)
+			{
+				_dynamicBounds.SetCapacity(dynamicCount);
+			}
+		}
+	}
+
+	private bool CheckStateAdd()
+	{
+		if (_hasDisposed)
+		{
+			Debug.LogError("Adding bounds to disposed CoarseQueryGrid");
+		}
+		return _hasDisposed;
+	}
+
+	public void AddDynamic(Bounds bounds)
+	{
+		if (!CheckStateAdd())
+		{
+			_dynamicBounds.Add(in bounds);
+		}
+	}
+
+	public void AddStatic(Bounds bounds)
+	{
+		if (!CheckStateAdd())
+		{
+			bounds.Expand(0.1f);
+			Vector2i min = WorldPosToStaticGrid(bounds.min);
+			Vector2i max = WorldPosToStaticGrid(bounds.max);
+			if (TouchesUpperSpatial(bounds))
+			{
+				AddStatic(min, max, _upperStaticSpatialArray);
+			}
+			if (TouchesLowerSpatial(bounds))
+			{
+				AddStatic(min, max, _lowerStaticSpatialArray);
+			}
+		}
+	}
+
+	private void AddStatic(Vector2i min, Vector2i max, RefCountedSpatialArray spatial)
+	{
+		for (int i = min.x; i <= max.x; i++)
+		{
+			for (int j = min.y; j <= max.y; j++)
+			{
+				int index = GridToStaticIndex(new Vector2i(i, j));
+				spatial.Add(index);
+			}
+		}
+	}
+
+	public void RemoveStatic(Bounds bounds)
+	{
+		if (!_hasDisposed)
+		{
+			bounds.Expand(0.1f);
+			Vector2i min = WorldPosToStaticGrid(bounds.min);
+			Vector2i max = WorldPosToStaticGrid(bounds.max);
+			if (TouchesUpperSpatial(bounds))
+			{
+				RemoveStatic(min, max, _upperStaticSpatialArray);
+			}
+			if (TouchesLowerSpatial(bounds))
+			{
+				RemoveStatic(min, max, _lowerStaticSpatialArray);
+			}
+		}
+	}
+
+	private void RemoveStatic(Vector2i min, Vector2i max, RefCountedSpatialArray spatial)
+	{
+		for (int i = min.x; i <= max.x; i++)
+		{
+			for (int j = min.y; j <= max.y; j++)
+			{
+				int index = GridToStaticIndex(new Vector2i(i, j));
+				spatial.Remove(index);
+			}
+		}
+	}
+
+	public bool CheckJob(Bounds checkBounds)
+	{
+		if (_hasDisposed)
+		{
+			return true;
+		}
+		CoarseQueryGridBoundsJob coarseQueryGridBoundsJob = default(CoarseQueryGridBoundsJob);
+		coarseQueryGridBoundsJob.Grid = this;
+		coarseQueryGridBoundsJob.CheckBounds = checkBounds;
+		coarseQueryGridBoundsJob.Result = _result;
+		CoarseQueryGridBoundsJob jobData = coarseQueryGridBoundsJob;
+		IJobExtensions.RunByRef(ref jobData);
+		return _result.Value;
+	}
+
+	public bool Check(Bounds checkBounds)
+	{
+		if (_hasDisposed)
+		{
+			return true;
+		}
+		Vector2i min = WorldPosToStaticGrid(checkBounds.min);
+		Vector2i max = WorldPosToStaticGrid(checkBounds.max);
+		if (TouchesUpperSpatial(checkBounds) && Check(min, max, _upperStaticSpatialArray))
+		{
+			return true;
+		}
+		if (TouchesLowerSpatial(checkBounds) && Check(min, max, _lowerStaticSpatialArray))
+		{
+			return true;
+		}
+		foreach (Bounds dynamicBound in _dynamicBounds)
+		{
+			if (dynamicBound.Intersects(checkBounds))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private bool Check(Vector2i min, Vector2i max, RefCountedSpatialArray spatial)
+	{
+		for (int i = min.x; i <= max.x; i++)
+		{
+			for (int j = min.y; j <= max.y; j++)
+			{
+				int index = GridToStaticIndex(new Vector2i(i, j));
+				if (spatial.Get(index))
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	public bool CheckJob(Vector3 worldPosition, float radius)
+	{
+		if (_hasDisposed)
+		{
+			return true;
+		}
+		CoarseQueryGridPosRadJob coarseQueryGridPosRadJob = default(CoarseQueryGridPosRadJob);
+		coarseQueryGridPosRadJob.Grid = this;
+		coarseQueryGridPosRadJob.CheckPos = worldPosition;
+		coarseQueryGridPosRadJob.CheckRad = radius;
+		coarseQueryGridPosRadJob.Result = _result;
+		CoarseQueryGridPosRadJob jobData = coarseQueryGridPosRadJob;
+		IJobExtensions.RunByRef(ref jobData);
+		return _result.Value;
+	}
+
+	public bool Check(Vector3 worldPosition, float radius)
+	{
+		if (_hasDisposed)
+		{
+			return true;
+		}
+		Vector2i min = WorldPosToStaticGrid(worldPosition - Vector3.one * radius);
+		Vector2i max = WorldPosToStaticGrid(worldPosition + Vector3.one * radius);
+		if (TouchesUpperSpatial(worldPosition, radius) && Check(min, max, _upperStaticSpatialArray))
+		{
+			return true;
+		}
+		if (TouchesLowerSpatial(worldPosition, radius) && Check(min, max, _lowerStaticSpatialArray))
+		{
+			return true;
+		}
+		float num = radius * radius;
+		foreach (Bounds dynamicBound in _dynamicBounds)
+		{
+			if (Vector3.SqrMagnitude(dynamicBound.ClosestPoint(worldPosition) - worldPosition) <= num)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public bool CheckJob(Vector3 start, Vector3 end, float radius)
+	{
+		if (_hasDisposed)
+		{
+			return true;
+		}
+		Vector3 vector = Vector3.one * radius;
+		Vector3 vector2 = Vector3.Min(start, end) - vector;
+		Vector3 vector3 = Vector3.Max(start, end) + vector;
+		Bounds checkBounds = new Bounds((vector3 + vector2) * 0.5f, vector3 - vector2);
+		return CheckJob(checkBounds);
+	}
+
+	public bool Check(Vector3 start, Vector3 end, float radius)
+	{
+		if (_hasDisposed)
+		{
+			return true;
+		}
+		Vector3 vector = Vector3.one * radius;
+		Vector3 vector2 = Vector3.Min(start, end) - vector;
+		Vector3 vector3 = Vector3.Max(start, end) + vector;
+		Bounds checkBounds = new Bounds((vector3 + vector2) * 0.5f, vector3 - vector2);
+		return Check(checkBounds);
+	}
+
+	private Vector2i WorldPosToStaticGrid(Vector3 worldPosition)
+	{
+		return new Vector2i((int)((worldPosition.x + _gridCentre.x) / (float)_cellSize), (int)((worldPosition.z + _gridCentre.y) / (float)_cellSize));
+	}
+
+	private int GridToStaticIndex(Vector2i gridPosition)
+	{
+		return math.clamp(gridPosition.x + gridPosition.y * _cellXZDimensionCount, 0, _cellClampLimit);
+	}
+
+	public void Dispose()
+	{
+		_hasDisposed = true;
+		_result.Dispose();
+		_dynamicBounds.Dispose();
+		_upperStaticSpatialArray.Dispose();
+		_lowerStaticSpatialArray.Dispose();
+	}
+}

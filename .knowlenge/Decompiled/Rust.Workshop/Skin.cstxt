@@ -1,0 +1,470 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using Newtonsoft.Json;
+using Rust;
+using Rust.Workshop;
+using Steamworks;
+using UnityEngine;
+using UnityEngine.Networking;
+
+public class Skin
+{
+	[JsonModel]
+	public class Manifest
+	{
+		[JsonModel]
+		public class Group
+		{
+			public Dictionary<string, string> Textures { get; set; } = new Dictionary<string, string>();
+
+			public Dictionary<string, float> Floats { get; set; } = new Dictionary<string, float>();
+
+			public Dictionary<string, ColorEntry> Colors { get; set; } = new Dictionary<string, ColorEntry>();
+		}
+
+		[JsonModel]
+		public class ColorEntry
+		{
+			public float r { get; set; }
+
+			public float g { get; set; }
+
+			public float b { get; set; }
+
+			public ColorEntry(Color c)
+			{
+				r = c.r;
+				g = c.g;
+				b = c.b;
+			}
+		}
+
+		public int Version { get; set; }
+
+		public string ItemType { get; set; }
+
+		public ulong AuthorId { get; set; }
+
+		public DateTime PublishDate { get; set; }
+
+		public Group[] Groups { get; set; }
+	}
+
+	private string manifestName;
+
+	private string manifestContent;
+
+	private TextAsset manifestAsset;
+
+	private Manifest manifest;
+
+	private string iconName;
+
+	public Sprite sprite;
+
+	public int references;
+
+	public Skinnable Skinnable;
+
+	public Material[] Materials;
+
+	public Material[] DefaultMaterials;
+
+	public List<Texture> TextureAssets;
+
+	public List<Texture> TextureObjects;
+
+	public Action OnLoaded;
+
+	public Action OnIconLoaded;
+
+	public bool AssetsRequested { get; set; }
+
+	public bool IconRequested { get; set; }
+
+	public bool AssetsLoaded { get; internal set; }
+
+	public bool IconLoaded { get; internal set; }
+
+	private void LoadManifestFromFile()
+	{
+		try
+		{
+			manifestContent = File.ReadAllText(manifestName);
+		}
+		catch (Exception exception)
+		{
+			Debug.LogException(exception);
+		}
+	}
+
+	private void DeserializeManifest()
+	{
+		manifest = JsonConvert.DeserializeObject<Manifest>(manifestContent);
+	}
+
+	public IEnumerator LoadIcon(ulong workshopId, string directory = null, AssetBundle bundle = null)
+	{
+		if (bundle != null)
+		{
+			manifestName = "Assets/Skins/" + workshopId + "/manifest.txt";
+			AssetBundleRequest textRequest = bundle.LoadAssetAsync<TextAsset>(manifestName);
+			yield return textRequest;
+			manifestAsset = textRequest.asset as TextAsset;
+			if (manifestAsset != null)
+			{
+				manifestContent = manifestAsset.text;
+			}
+		}
+		if (manifestContent == null && directory != null)
+		{
+			manifestName = directory + "/manifest.txt";
+			if (File.Exists(manifestName))
+			{
+				yield return Global.Runner.StartCoroutine(Parallel.Coroutine(LoadManifestFromFile));
+			}
+		}
+		if (manifestContent != null)
+		{
+			yield return Global.Runner.StartCoroutine(Parallel.Coroutine(DeserializeManifest));
+		}
+		if (manifest == null)
+		{
+			Debug.LogWarning("Invalid skin manifest: " + manifestName);
+			yield break;
+		}
+		Skinnable = Skinnable.FindForItem(manifest.ItemType);
+		if (bundle != null)
+		{
+			iconName = "Assets/Skins/" + workshopId + "/icon.png";
+			AssetBundleRequest textRequest = bundle.LoadAssetAsync<Sprite>(iconName);
+			yield return textRequest;
+			Sprite sprite = textRequest.asset as Sprite;
+			if (sprite != null)
+			{
+				this.sprite = sprite;
+			}
+		}
+		string downloadUrl;
+		InventoryDef[] definitions;
+		if (this.sprite == null && SteamClient.IsValid)
+		{
+			downloadUrl = string.Empty;
+			definitions = SteamInventory.Definitions;
+			iconName = workshopId.ToString();
+			if (definitions != null)
+			{
+				yield return Global.Runner.StartCoroutine(Parallel.Coroutine(FindURL));
+			}
+			if (!string.IsNullOrEmpty(downloadUrl))
+			{
+				UnityWebRequest request = UnityWebRequestTexture.GetTexture(downloadUrl);
+				request.timeout = Mathf.CeilToInt(WorkshopSkin.DownloadTimeout);
+				yield return request.SendWebRequest();
+				if (request.isDone && !request.isHttpError && !request.isNetworkError)
+				{
+					Texture2D content = DownloadHandlerTexture.GetContent(request);
+					this.sprite = Sprite.Create(content, new Rect(0f, 0f, 512f, 512f), Vector2.zero, 100f, 0u, SpriteMeshType.FullRect);
+				}
+				request.Dispose();
+			}
+		}
+		if (this.sprite == null && directory != null)
+		{
+			iconName = directory + "/icon.png";
+			if (File.Exists(iconName))
+			{
+				AsyncTextureLoad request2 = new AsyncTextureLoad(iconName, normal: false, dither: false, hqmode: true, cache: false);
+				yield return request2;
+				Texture2D texture = request2.texture;
+				this.sprite = Sprite.Create(texture, new Rect(0f, 0f, 512f, 512f), Vector2.zero, 100f, 0u, SpriteMeshType.FullRect);
+			}
+		}
+		if (this.sprite != null)
+		{
+			IconLoaded = true;
+			if (OnIconLoaded != null)
+			{
+				OnIconLoaded();
+			}
+		}
+		void FindURL()
+		{
+			for (int num = definitions.Length - 1; num >= 0; num--)
+			{
+				InventoryDef inventoryDef = definitions[num];
+				string property = inventoryDef.GetProperty("workshopdownload");
+				if (iconName == property)
+				{
+					downloadUrl = inventoryDef.IconUrlLarge;
+					break;
+				}
+			}
+		}
+	}
+
+	public IEnumerator LoadAssets(ulong workshopId, string directory = null, AssetBundle bundle = null)
+	{
+		if (Skinnable == null)
+		{
+			Debug.LogWarning("Skinnable is null: " + workshopId);
+			yield break;
+		}
+		if (Skinnable.Groups == null)
+		{
+			Debug.LogWarning("Skinnable.Groups is null: " + workshopId);
+			yield break;
+		}
+		if (manifest == null)
+		{
+			Debug.LogWarning("Manifest is null: " + workshopId);
+			yield break;
+		}
+		if (manifest.Groups == null)
+		{
+			Debug.LogWarning("Manifest.Groups is null: " + workshopId);
+			yield break;
+		}
+		ReadDefaults();
+		for (int i = 0; i < Skinnable.Groups.Length && i < manifest.Groups.Length; i++)
+		{
+			Material material = Materials[i];
+			if (material == null)
+			{
+				continue;
+			}
+			Manifest.Group group = manifest.Groups[i];
+			if (group.Floats != null)
+			{
+				foreach (KeyValuePair<string, float> @float in group.Floats)
+				{
+					material.SetFloat(@float.Key, @float.Value);
+					if (@float.Key == "_Cutoff")
+					{
+						if (@float.Value > 0.1f)
+						{
+							material.SetOverrideTag("RenderType", "TransparentCutout");
+							material.EnableKeyword("_ALPHATEST_ON");
+							material.renderQueue = 2450;
+						}
+						else
+						{
+							material.SetOverrideTag("RenderType", "");
+							material.DisableKeyword("_ALPHATEST_ON");
+							material.renderQueue = -1;
+						}
+					}
+					if (@float.Key == "_MicrofiberFuzzIntensity")
+					{
+						if (@float.Value > 0.1f)
+						{
+							material.EnableKeyword("_MICROFIBERFUZZLAYER_ON");
+						}
+						else
+						{
+							material.DisableKeyword("_MICROFIBERFUZZLAYER_ON");
+						}
+					}
+				}
+			}
+			if (group.Colors != null)
+			{
+				foreach (KeyValuePair<string, Manifest.ColorEntry> color in group.Colors)
+				{
+					material.SetColor(color.Key, new Color(color.Value.r, color.Value.g, color.Value.b));
+				}
+			}
+			foreach (KeyValuePair<string, string> mat in group.Textures)
+			{
+				if (mat.Value == "none")
+				{
+					material.SetTexture(mat.Key, null);
+					continue;
+				}
+				if (mat.Key == "_EmissionMap")
+				{
+					material.EnableKeyword("_EMISSION");
+				}
+				bool isDiffuseMap = mat.Key == "_MainTex";
+				bool isNormalMap = mat.Key == "_BumpMap" || mat.Key == "_DetailNormalMap";
+				bool isOcclusionMap = mat.Key == "_OcclusionMap" || mat.Key == "_DetailOcclusionMap";
+				bool flag = false;
+				string textureName = null;
+				Texture2D texture2D = null;
+				if (bundle != null)
+				{
+					textureName = "Assets/Skins/" + workshopId + "/" + mat.Value;
+					AssetBundleRequest textureRequest = bundle.LoadAssetAsync<Texture2D>(textureName);
+					yield return textureRequest;
+					texture2D = textureRequest.asset as Texture2D;
+					flag = true;
+				}
+				if (texture2D == null && directory != null)
+				{
+					textureName = directory + "/" + mat.Value;
+					if (File.Exists(textureName))
+					{
+						AsyncTextureLoad request = new AsyncTextureLoad(textureName, isNormalMap, !isNormalMap, hqmode: true, cache: false);
+						yield return request;
+						texture2D = request.texture;
+						flag = false;
+					}
+				}
+				if (!(texture2D != null))
+				{
+					continue;
+				}
+				UpdateTextureMetadata(texture2D, textureName, isDiffuseMap || isNormalMap, !isOcclusionMap);
+				material.SetTexture(mat.Key, texture2D);
+				if (flag)
+				{
+					if (TextureAssets == null)
+					{
+						TextureAssets = new List<Texture>();
+					}
+					TextureAssets.Add(texture2D);
+				}
+				else
+				{
+					if (TextureObjects == null)
+					{
+						TextureObjects = new List<Texture>();
+					}
+					TextureObjects.Add(texture2D);
+				}
+			}
+		}
+		AssetsLoaded = true;
+		if (OnLoaded != null)
+		{
+			OnLoaded();
+		}
+	}
+
+	public void UnloadAssets()
+	{
+		if (Materials != null)
+		{
+			for (int i = 0; i < Materials.Length; i++)
+			{
+				Material material = Materials[i];
+				if (!(material == null))
+				{
+					UnityEngine.Object.DestroyImmediate(material);
+					Materials[i] = null;
+				}
+			}
+		}
+		if (TextureObjects != null)
+		{
+			for (int j = 0; j < TextureObjects.Count; j++)
+			{
+				Texture texture = TextureObjects[j];
+				if (!(texture == null))
+				{
+					UnityEngine.Object.DestroyImmediate(texture);
+				}
+			}
+			TextureObjects.Clear();
+		}
+		if (TextureAssets != null)
+		{
+			for (int k = 0; k < TextureAssets.Count; k++)
+			{
+				Texture texture2 = TextureAssets[k];
+				if (!(texture2 == null))
+				{
+					Resources.UnloadAsset(texture2);
+				}
+			}
+			TextureAssets.Clear();
+		}
+		AssetsLoaded = false;
+	}
+
+	private void UpdateTextureMetadata(Texture2D texture, string textureName, bool anisoFiltering, bool trilinearFiltering)
+	{
+		texture.name = textureName;
+		texture.anisoLevel = ((!anisoFiltering) ? 1 : 16);
+		texture.filterMode = ((!trilinearFiltering) ? FilterMode.Bilinear : FilterMode.Trilinear);
+	}
+
+	internal void Apply(GameObject gameObject)
+	{
+		Apply(gameObject, Skinnable, Materials);
+	}
+
+	public int GetSizeInBytes()
+	{
+		int num = 0;
+		if (sprite != null)
+		{
+			num += sprite.texture.GetSizeInBytes();
+		}
+		if (TextureAssets != null)
+		{
+			foreach (Texture textureAsset in TextureAssets)
+			{
+				num += textureAsset.GetSizeInBytes();
+			}
+		}
+		if (TextureObjects != null)
+		{
+			foreach (Texture textureObject in TextureObjects)
+			{
+				num += textureObject.GetSizeInBytes();
+			}
+		}
+		return num;
+	}
+
+	public static void Apply(GameObject obj, Skinnable skinnable, Material[] Materials)
+	{
+		if (Materials != null && !(obj == null))
+		{
+			MaterialReplacement.ReplaceRecursive(obj, skinnable.SourceMaterials, Materials);
+		}
+	}
+
+	internal void ReadDefaults()
+	{
+		if (AssetsLoaded)
+		{
+			UnloadAssets();
+		}
+		if (!(Skinnable != null) || Skinnable.Groups == null)
+		{
+			return;
+		}
+		if (DefaultMaterials == null || DefaultMaterials.Length != Skinnable.Groups.Length)
+		{
+			DefaultMaterials = new Material[Skinnable.Groups.Length];
+		}
+		if (Materials == null || Materials.Length != Skinnable.Groups.Length)
+		{
+			Materials = new Material[Skinnable.Groups.Length];
+		}
+		for (int i = 0; i < DefaultMaterials.Length; i++)
+		{
+			Skinnable.Group group = Skinnable.Groups[i];
+			if (group != null)
+			{
+				DefaultMaterials[i] = group.Material;
+			}
+		}
+		for (int j = 0; j < Materials.Length; j++)
+		{
+			if (DefaultMaterials[j] == null)
+			{
+				Debug.LogWarning("Missing skin for " + Skinnable.ItemName);
+				continue;
+			}
+			Material obj = (Materials[j] = new Material(DefaultMaterials[j]));
+			obj.DisableKeyword("_COLORIZELAYER_ON");
+			obj.SetInt("_COLORIZELAYER_ON", 0);
+			obj.name = DefaultMaterials[j].name + " (Editing)";
+		}
+	}
+}

@@ -1,0 +1,210 @@
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using UnityEngine;
+
+internal class RConClient
+{
+	private Socket socket;
+
+	private bool isAuthorised;
+
+	private string connectionName;
+
+	private int lastMessageID = -1;
+
+	private bool runningConsoleCommand;
+
+	private bool utf8Mode;
+
+	internal RConClient(Socket cl)
+	{
+		socket = cl;
+		socket.NoDelay = true;
+		connectionName = socket.RemoteEndPoint.ToString();
+	}
+
+	internal bool IsValid()
+	{
+		return socket != null;
+	}
+
+	internal void Update()
+	{
+		if (socket == null)
+		{
+			return;
+		}
+		if (!socket.Connected)
+		{
+			Close("Disconnected");
+			return;
+		}
+		int available = socket.Available;
+		if (available < 14)
+		{
+			return;
+		}
+		if (available > 4096)
+		{
+			Close("overflow");
+			return;
+		}
+		byte[] buffer = new byte[available];
+		socket.Receive(buffer);
+		using BinaryReader binaryReader = new BinaryReader(new MemoryStream(buffer, writable: false), utf8Mode ? Encoding.UTF8 : Encoding.ASCII);
+		int num = binaryReader.ReadInt32();
+		if (available < num)
+		{
+			Close("invalid packet");
+			return;
+		}
+		lastMessageID = binaryReader.ReadInt32();
+		int type = binaryReader.ReadInt32();
+		string msg = ReadNullTerminatedString(binaryReader);
+		ReadNullTerminatedString(binaryReader);
+		if (!HandleMessage(type, msg))
+		{
+			Close("invalid packet");
+		}
+		else
+		{
+			lastMessageID = -1;
+		}
+	}
+
+	internal bool HandleMessage(int type, string msg)
+	{
+		if (!isAuthorised)
+		{
+			return HandleMessage_UnAuthed(type, msg);
+		}
+		if (type == SERVERDATA_SWITCH_UTF8)
+		{
+			utf8Mode = true;
+			return true;
+		}
+		if (type == SERVERDATA_EXECCOMMAND)
+		{
+			Debug.Log("[RCON][" + connectionName + "] " + msg);
+			runningConsoleCommand = true;
+			ConsoleSystem.Run(ConsoleSystem.Option.Server, msg);
+			runningConsoleCommand = false;
+			Reply(-1, SERVERDATA_RESPONSE_VALUE, "");
+			return true;
+		}
+		if (type == SERVERDATA_RESPONSE_VALUE)
+		{
+			Reply(lastMessageID, SERVERDATA_RESPONSE_VALUE, "");
+			return true;
+		}
+		Debug.Log("[RCON][" + connectionName + "] Unhandled: " + lastMessageID + " -> " + type + " -> " + msg);
+		return false;
+	}
+
+	internal bool HandleMessage_UnAuthed(int type, string msg)
+	{
+		if (type != SERVERDATA_AUTH)
+		{
+			BanIP((socket.RemoteEndPoint as IPEndPoint).Address, 60f);
+			Close("Invalid Command - Not Authed");
+			return false;
+		}
+		Reply(lastMessageID, SERVERDATA_RESPONSE_VALUE, "");
+		isAuthorised = Password == msg;
+		if (!isAuthorised)
+		{
+			Reply(-1, SERVERDATA_AUTH_RESPONSE, "");
+			BanIP((socket.RemoteEndPoint as IPEndPoint).Address, 60f);
+			Close("Invalid Password");
+			return true;
+		}
+		Reply(lastMessageID, SERVERDATA_AUTH_RESPONSE, "");
+		Debug.Log("[RCON] Auth: " + connectionName);
+		Output.OnMessage += Output_OnMessage;
+		return true;
+	}
+
+	private void Output_OnMessage(string message, string stacktrace, UnityEngine.LogType type)
+	{
+		if (isAuthorised && IsValid())
+		{
+			if (lastMessageID != -1 && runningConsoleCommand)
+			{
+				Reply(lastMessageID, SERVERDATA_RESPONSE_VALUE, message);
+			}
+			Reply(0, SERVERDATA_CONSOLE_LOG, message);
+		}
+	}
+
+	internal void Reply(int id, int type, string msg)
+	{
+		MemoryStream memoryStream = new MemoryStream(1024);
+		using BinaryWriter binaryWriter = new BinaryWriter(memoryStream);
+		if (utf8Mode)
+		{
+			byte[] bytes = Encoding.UTF8.GetBytes(msg);
+			int value = 10 + bytes.Length;
+			binaryWriter.Write(value);
+			binaryWriter.Write(id);
+			binaryWriter.Write(type);
+			binaryWriter.Write(bytes);
+		}
+		else
+		{
+			int value2 = 10 + msg.Length;
+			binaryWriter.Write(value2);
+			binaryWriter.Write(id);
+			binaryWriter.Write(type);
+			foreach (char c in msg)
+			{
+				binaryWriter.Write((sbyte)c);
+			}
+		}
+		binaryWriter.Write((sbyte)0);
+		binaryWriter.Write((sbyte)0);
+		binaryWriter.Flush();
+		try
+		{
+			socket.Send(memoryStream.GetBuffer(), (int)memoryStream.Position, SocketFlags.None);
+		}
+		catch (Exception ex)
+		{
+			Debug.LogWarning("Error sending rcon reply: " + ex);
+			Close("Exception");
+		}
+	}
+
+	internal void Close(string strReasn)
+	{
+		Output.OnMessage -= Output_OnMessage;
+		if (socket != null)
+		{
+			Debug.Log("[RCON][" + connectionName + "] Disconnected: " + strReasn);
+			socket.Close();
+			socket = null;
+		}
+	}
+
+	internal string ReadNullTerminatedString(BinaryReader read)
+	{
+		string text = "";
+		do
+		{
+			if (read.BaseStream.Position == read.BaseStream.Length)
+			{
+				return "";
+			}
+			char c = read.ReadChar();
+			if (c == '\0')
+			{
+				return text;
+			}
+			text += c;
+		}
+		while (text.Length <= 8192);
+		return string.Empty;
+	}
+}

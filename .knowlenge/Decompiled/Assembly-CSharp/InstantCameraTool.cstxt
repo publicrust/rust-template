@@ -1,0 +1,166 @@
+#define UNITY_ASSERTIONS
+using System;
+using System.Collections.Generic;
+using ConVar;
+using Facepunch;
+using Network;
+using Oxide.Core;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public class InstantCameraTool : HeldEntity
+{
+	public ItemDefinition photoItem;
+
+	public GameObjectRef screenshotEffect;
+
+	public SoundDefinition startPhotoSoundDef;
+
+	public SoundDefinition finishPhotoSoundDef;
+
+	[Range(640f, 1920f)]
+	public int resolutionX = 640;
+
+	[Range(480f, 1080f)]
+	public int resolutionY = 480;
+
+	[Range(10f, 100f)]
+	public int quality = 75;
+
+	[Range(0f, 5f)]
+	public float cooldownSeconds = 3f;
+
+	public TimeSince _sinceLastPhoto;
+
+	private bool hasSentAchievement;
+
+	public const string PhotographPlayerAchievement = "SUMMER_PAPARAZZI";
+
+	public override bool OnRpcMessage(BasePlayer player, uint rpc, Message msg)
+	{
+		using (TimeWarning.New("InstantCameraTool.OnRpcMessage"))
+		{
+			if (rpc == 3122234259u && player != null)
+			{
+				Assert.IsTrue(player.isServer, "SV_RPC Message is using a clientside player!");
+				if (Global.developer > 2)
+				{
+					Debug.Log("SV_RPCMessage: " + player?.ToString() + " - TakePhoto ");
+				}
+				using (TimeWarning.New("TakePhoto"))
+				{
+					using (TimeWarning.New("Conditions"))
+					{
+						if (!RPC_Server.CallsPerSecond.Test(3122234259u, "TakePhoto", this, player, 3uL))
+						{
+							return true;
+						}
+						if (!RPC_Server.FromOwner.Test(3122234259u, "TakePhoto", this, player, includeMounted: false))
+						{
+							return true;
+						}
+					}
+					try
+					{
+						using (TimeWarning.New("Call"))
+						{
+							RPCMessage rPCMessage = default(RPCMessage);
+							rPCMessage.connection = msg.connection;
+							rPCMessage.player = player;
+							rPCMessage.read = msg.read;
+							RPCMessage msg2 = rPCMessage;
+							TakePhoto(msg2);
+						}
+					}
+					catch (Exception exception)
+					{
+						Debug.LogException(exception);
+						player.Kick("RPC Error in TakePhoto");
+					}
+				}
+				return true;
+			}
+		}
+		return base.OnRpcMessage(player, rpc, msg);
+	}
+
+	[RPC_Server.FromOwner(false)]
+	[RPC_Server]
+	[RPC_Server.CallsPerSecond(3uL)]
+	private void TakePhoto(RPCMessage msg)
+	{
+		BasePlayer player = msg.player;
+		Item item = GetItem();
+		if (player == null || item == null || item.condition <= 0f)
+		{
+			return;
+		}
+		byte[] array = msg.read.BytesWithSize();
+		if (array.Length > 102400 || !ImageProcessing.IsValidJPG(array, resolutionX, resolutionY))
+		{
+			return;
+		}
+		Item item2 = ItemManager.Create(photoItem, 1, 0uL);
+		if (item2 == null)
+		{
+			Debug.LogError("Failed to create photo item");
+			return;
+		}
+		item2.SetItemOwnership(msg.player, ItemOwnershipPhrases.Photographed);
+		if (!item2.instanceData.subEntity.IsValid)
+		{
+			item2.Remove();
+			Debug.LogError("Photo has no sub-entity");
+			return;
+		}
+		BaseNetworkable baseNetworkable = BaseNetworkable.serverEntities.Find(item2.instanceData.subEntity);
+		if (baseNetworkable == null)
+		{
+			item2.Remove();
+			Debug.LogError("Sub-entity was not found");
+		}
+		else if (!(baseNetworkable is PhotoEntity photoEntity))
+		{
+			item2.Remove();
+			Debug.LogError("Sub-entity is not a photo");
+		}
+		else
+		{
+			if (Interface.CallHook("OnPhotoCapture", photoEntity, item, player, array) != null)
+			{
+				return;
+			}
+			photoEntity.SetImageData(player.userID, array);
+			if (!player.inventory.GiveItem(item2))
+			{
+				item2.Drop(player.GetDropPosition(), player.GetDropVelocity());
+			}
+			EffectNetwork.Send(new Effect(screenshotEffect.resourcePath, base.transform.position, base.transform.forward, msg.connection));
+			if (!hasSentAchievement && !string.IsNullOrEmpty("SUMMER_PAPARAZZI"))
+			{
+				Vector3 position = GetOwnerPlayer().eyes.position;
+				Vector3 vector = GetOwnerPlayer().eyes.HeadForward();
+				List<BasePlayer> obj = Facepunch.Pool.Get<List<BasePlayer>>();
+				Vis.Entities(position + vector * 5f, 5f, obj, 131072);
+				foreach (BasePlayer item3 in obj)
+				{
+					if (item3.isServer && item3 != GetOwnerPlayer() && item3.IsVisible(GetOwnerPlayer().eyes.position))
+					{
+						hasSentAchievement = true;
+						GetOwnerPlayer().GiveAchievement("SUMMER_PAPARAZZI");
+						break;
+					}
+				}
+				Facepunch.Pool.FreeUnmanaged(ref obj);
+			}
+			item.LoseCondition(1f);
+			Interface.CallHook("OnPhotoCaptured", photoEntity, item, player, array);
+		}
+	}
+
+	public override void OnDeployed(BaseEntity parent, BasePlayer deployedBy, Item fromItem)
+	{
+		base.OnDeployed(parent, deployedBy, fromItem);
+		hasSentAchievement = false;
+	}
+}

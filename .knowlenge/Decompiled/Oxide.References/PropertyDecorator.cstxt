@@ -1,0 +1,161 @@
+using System;
+using System.Reflection;
+using ProtoBuf;
+using ProtoBuf.Compiler;
+using ProtoBuf.Meta;
+using ProtoBuf.Serializers;
+
+internal sealed class PropertyDecorator : ProtoDecoratorBase
+{
+	private readonly PropertyInfo property;
+
+	private readonly Type forType;
+
+	private readonly bool readOptionsWriteValue;
+
+	private readonly MethodInfo shadowSetter;
+
+	public override Type ExpectedType => forType;
+
+	public override bool RequiresOldValue => true;
+
+	public override bool ReturnsValue => false;
+
+	public PropertyDecorator(TypeModel model, Type forType, PropertyInfo property, IProtoSerializer tail)
+		: base(tail)
+	{
+		this.forType = forType;
+		this.property = property;
+		SanityCheck(model, property, tail, out readOptionsWriteValue, nonPublic: true, allowInternal: true);
+		shadowSetter = GetShadowSetter(model, property);
+	}
+
+	private static void SanityCheck(TypeModel model, PropertyInfo property, IProtoSerializer tail, out bool writeValue, bool nonPublic, bool allowInternal)
+	{
+		if ((object)property == null)
+		{
+			throw new ArgumentNullException("property");
+		}
+		writeValue = tail.ReturnsValue && ((object)GetShadowSetter(model, property) != null || (property.CanWrite && (object)Helpers.GetSetMethod(property, nonPublic, allowInternal) != null));
+		if (!property.CanRead || (object)Helpers.GetGetMethod(property, nonPublic, allowInternal) == null)
+		{
+			throw new InvalidOperationException("Cannot serialize property without a get accessor");
+		}
+		if (!writeValue && (!tail.RequiresOldValue || Helpers.IsValueType(tail.ExpectedType)))
+		{
+			throw new InvalidOperationException("Cannot apply changes to property " + property.DeclaringType.FullName + "." + property.Name);
+		}
+	}
+
+	private static MethodInfo GetShadowSetter(TypeModel model, PropertyInfo property)
+	{
+		Type reflectedType = property.ReflectedType;
+		MethodInfo instanceMethod = Helpers.GetInstanceMethod(reflectedType, "Set" + property.Name, new Type[1] { property.PropertyType });
+		if ((object)instanceMethod == null || !instanceMethod.IsPublic || (object)instanceMethod.ReturnType != model.MapType(typeof(void)))
+		{
+			return null;
+		}
+		return instanceMethod;
+	}
+
+	public override void Write(object value, ProtoWriter dest)
+	{
+		value = property.GetValue(value, null);
+		if (value != null)
+		{
+			Tail.Write(value, dest);
+		}
+	}
+
+	public override object Read(object value, ProtoReader source)
+	{
+		object value2 = (Tail.RequiresOldValue ? property.GetValue(value, null) : null);
+		object obj = Tail.Read(value2, source);
+		if (readOptionsWriteValue && obj != null)
+		{
+			if ((object)shadowSetter == null)
+			{
+				property.SetValue(value, obj, null);
+			}
+			else
+			{
+				shadowSetter.Invoke(value, new object[1] { obj });
+			}
+		}
+		return null;
+	}
+
+	protected override void EmitWrite(CompilerContext ctx, Local valueFrom)
+	{
+		ctx.LoadAddress(valueFrom, ExpectedType);
+		ctx.LoadValue(property);
+		ctx.WriteNullCheckedTail(property.PropertyType, Tail, null);
+	}
+
+	protected override void EmitRead(CompilerContext ctx, Local valueFrom)
+	{
+		SanityCheck(ctx.Model, property, Tail, out var writeValue, ctx.NonPublic, ctx.AllowInternal(property));
+		if (ExpectedType.IsValueType && valueFrom == null)
+		{
+			throw new InvalidOperationException("Attempt to mutate struct on the head of the stack; changes would be lost");
+		}
+		using Local local = ctx.GetLocalWithValue(ExpectedType, valueFrom);
+		if (Tail.RequiresOldValue)
+		{
+			ctx.LoadAddress(local, ExpectedType);
+			ctx.LoadValue(property);
+		}
+		Type propertyType = property.PropertyType;
+		ctx.ReadNullCheckedTail(propertyType, Tail, null);
+		if (writeValue)
+		{
+			using (Local local2 = new Local(ctx, property.PropertyType))
+			{
+				ctx.StoreValue(local2);
+				CodeLabel label = default(CodeLabel);
+				if (!propertyType.IsValueType)
+				{
+					label = ctx.DefineLabel();
+					ctx.LoadValue(local2);
+					ctx.BranchIfFalse(label, @short: true);
+				}
+				ctx.LoadAddress(local, ExpectedType);
+				ctx.LoadValue(local2);
+				if ((object)shadowSetter == null)
+				{
+					ctx.StoreValue(property);
+				}
+				else
+				{
+					ctx.EmitCall(shadowSetter);
+				}
+				if (!propertyType.IsValueType)
+				{
+					ctx.MarkLabel(label);
+				}
+				return;
+			}
+		}
+		if (Tail.ReturnsValue)
+		{
+			ctx.DiscardValue();
+		}
+	}
+
+	internal static bool CanWrite(TypeModel model, MemberInfo member)
+	{
+		if ((object)member == null)
+		{
+			throw new ArgumentNullException("member");
+		}
+		if (member is PropertyInfo propertyInfo)
+		{
+			if (!propertyInfo.CanWrite)
+			{
+				return (object)GetShadowSetter(model, propertyInfo) != null;
+			}
+			return true;
+		}
+		return member is FieldInfo;
+	}
+}

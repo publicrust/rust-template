@@ -1,0 +1,644 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.CompilerServices;
+using ConVar;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
+using UnityEngine;
+
+public static class ServerOcclusion
+{
+	public readonly struct Grid : IEquatable<Grid>
+	{
+		public readonly int x;
+
+		public readonly int y;
+
+		public readonly int z;
+
+		public const float Resolution = 16f;
+
+		public const float HalfResolution = 8f;
+
+		public Grid(int x, int y, int z)
+		{
+			this.x = x;
+			this.y = y;
+			this.z = z;
+		}
+
+		public int GetOffset(float axis)
+		{
+			return Mathf.RoundToInt(axis / 2f / 16f);
+		}
+
+		public Vector3 GetCenterPoint()
+		{
+			return new Vector3((float)(x - GetOffset(TerrainMeta.Size.x)) * 16f, (float)(y - GetOffset(MaxY)) * 16f, (float)(z - GetOffset(TerrainMeta.Size.z)) * 16f);
+		}
+
+		public override string ToString()
+		{
+			return $"(x: {x}, y: {y}, z: {z})";
+		}
+
+		public bool Equals(Grid other)
+		{
+			if (x == other.x && y == other.y)
+			{
+				return z == other.z;
+			}
+			return false;
+		}
+
+		public override int GetHashCode()
+		{
+			return HashCode.Combine(x, y, z);
+		}
+
+		public bool IsBlocked()
+		{
+			return GamePhysics.CheckBounds(new Bounds(GetCenterPoint(), new Vector3(16f, 16f, 16f)), 8388608);
+		}
+
+		public int GetIndex()
+		{
+			return GetGridIndex(x, y, z);
+		}
+	}
+
+	public readonly struct SubGrid : IEquatable<SubGrid>
+	{
+		public readonly int x;
+
+		public readonly int y;
+
+		public readonly int z;
+
+		public const float Resolution = 2f;
+
+		public const float HalfResolution = 1f;
+
+		public SubGrid(int x, int y, int z)
+		{
+			this.x = x;
+			this.y = y;
+			this.z = z;
+		}
+
+		public SubGrid(int3 p)
+		{
+			x = p.x;
+			y = p.y;
+			z = p.z;
+		}
+
+		public int GetOffset(float axis)
+		{
+			return Mathf.RoundToInt(axis / 2f / 2f);
+		}
+
+		public Vector3 GetCenterPoint()
+		{
+			return new Vector3((float)(x - GetOffset(TerrainMeta.Size.x)) * 2f, (float)(y - GetOffset(MaxY)) * 2f, (float)(z - GetOffset(TerrainMeta.Size.z)) * 2f);
+		}
+
+		public override string ToString()
+		{
+			return $"(x: {x}, y: {y}, z: {z}) - {GetCenterPoint()}, {IsBlocked()}";
+		}
+
+		public bool Equals(SubGrid other)
+		{
+			if (x == other.x && y == other.y)
+			{
+				return z == other.z;
+			}
+			return false;
+		}
+
+		public override int GetHashCode()
+		{
+			return HashCode.Combine(x, y, z);
+		}
+
+		public bool IsBlocked()
+		{
+			bool flag = false;
+			for (int i = 0; i < GridOffsets.Length; i++)
+			{
+				Vector3 pos = GetCenterPoint() + GridOffsets[i];
+				flag = false;
+				if (OcclusionIncludeRocks)
+				{
+					flag = AntiHack.IsInsideMesh(pos);
+				}
+				if (!flag && !AntiHack.TestInsideTerrain(pos))
+				{
+					return false;
+				}
+			}
+			if (flag)
+			{
+				return AntiHack.isInsideRayHit.collider.gameObject.HasCustomTag(GameObjectTag.AllowBarricadePlacement);
+			}
+			return true;
+		}
+
+		public int GetIndex()
+		{
+			return GetSubGridIndex(x, y, z);
+		}
+
+		public int GetDistance(SubGrid other)
+		{
+			return Mathf.Abs(x - other.x) + Mathf.Abs(y - other.y) + Mathf.Abs(z - other.z);
+		}
+	}
+
+	public static int MaxY = 200;
+
+	public static int ChunkCountX;
+
+	public static int ChunkCountY;
+
+	public static int ChunkCountZ;
+
+	public static int SubChunkCountX;
+
+	public static int SubChunkCountY;
+
+	public static int SubChunkCountZ;
+
+	public static float AxisX;
+
+	public static float AxisY;
+
+	public static float AxisZ;
+
+	public static LimitDictionary<(SubGrid, SubGrid), bool> OcclusionCache = new LimitDictionary<(SubGrid, SubGrid), bool>(32768);
+
+	public static NativeArray<NativeBitArray> OcclusionSubGridBlocked;
+
+	public static NativeReference<bool> ReturnHolder;
+
+	public const int OcclusionChunkSize = 16;
+
+	public const int OcclusionChunkResolution = 8;
+
+	public static readonly Vector3[] GridOffsets = new Vector3[2]
+	{
+		new Vector3(0f, 0f, 0f),
+		new Vector3(0f, 1f, 0f)
+	};
+
+	public static readonly (int, int, int)[] neighbours = new(int, int, int)[6]
+	{
+		(1, 0, 0),
+		(-1, 0, 0),
+		(0, 1, 0),
+		(0, -1, 0),
+		(0, 0, 1),
+		(0, 0, -1)
+	};
+
+	[ServerVar]
+	public static bool UseJob = true;
+
+	public static bool OcclusionEnabled { get; set; } = false;
+
+	public static bool OcclusionIncludeRocks { get; set; } = false;
+
+	public static float OcclusionPollRate => 2f;
+
+	public static int MinOcclusionDistance => 25;
+
+	public static string SubGridFilePath
+	{
+		[MethodImpl(MethodImplOptions.NoInlining)]
+		get
+		{
+			return Server.rootFolder + "/" + World.MapFileName + "_" + SaveRestore.WipeId + "_occlusion.dat";
+		}
+	}
+
+	public static int GetGridIndex(int x, int y, int z)
+	{
+		return z * ChunkCountX * ChunkCountY + y * ChunkCountZ + x;
+	}
+
+	public static int GetSubGridIndex(int x, int y, int z)
+	{
+		return z * SubChunkCountX * SubChunkCountY + y * SubChunkCountX + x;
+	}
+
+	public static int GetGrid(float position, float axis)
+	{
+		return Mathf.RoundToInt(position / 16f + axis / 16f);
+	}
+
+	public static Grid GetGrid(Vector3 position)
+	{
+		int grid = GetGrid(position.x, AxisX);
+		int grid2 = GetGrid(position.y, AxisY);
+		int grid3 = GetGrid(position.z, AxisZ);
+		if (IsValidGrid(grid, grid2, grid3))
+		{
+			return new Grid(grid, grid2, grid3);
+		}
+		return default(Grid);
+	}
+
+	public static int GetSubGrid(float position, float axis)
+	{
+		return Mathf.RoundToInt(position / 2f + axis / 2f);
+	}
+
+	public static SubGrid GetSubGrid(Vector3 position)
+	{
+		int subGrid = GetSubGrid(position.x, AxisX);
+		int subGrid2 = GetSubGrid(position.y, AxisY);
+		int subGrid3 = GetSubGrid(position.z, AxisZ);
+		if (IsValidSubGrid(subGrid, subGrid2, subGrid3))
+		{
+			return new SubGrid(subGrid, subGrid2, subGrid3);
+		}
+		return default(SubGrid);
+	}
+
+	public static bool IsBlocked(int x, int y, int z)
+	{
+		int result;
+		int x2 = Math.DivRem(x, 8, out result);
+		int result2;
+		int y2 = Math.DivRem(y, 8, out result2);
+		int result3;
+		int z2 = Math.DivRem(z, 8, out result3);
+		int gridIndex = GetGridIndex(x2, y2, z2);
+		NativeBitArray nativeBitArray = (IsValidGrid(x2, y2, z2) ? OcclusionSubGridBlocked[gridIndex] : default(NativeBitArray));
+		int pos = result3 * 8 * 8 + result2 * 8 + result;
+		if (nativeBitArray.IsCreated)
+		{
+			return nativeBitArray.IsSet(pos);
+		}
+		return false;
+	}
+
+	public static bool IsBlocked(SubGrid sub)
+	{
+		return IsBlocked(sub.x, sub.y, sub.z);
+	}
+
+	public static bool IsValidGrid(int x, int y, int z)
+	{
+		if (x < 0 || y < 0 || z < 0)
+		{
+			return false;
+		}
+		if (x >= ChunkCountX || y >= ChunkCountY || z >= ChunkCountZ)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static bool IsValidSubGrid(int x, int y, int z)
+	{
+		if (x < 0 || y < 0 || z < 0)
+		{
+			return false;
+		}
+		if (x >= SubChunkCountX || y >= SubChunkCountY || z >= SubChunkCountZ)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static void CalculatePathBetweenGridsJob(SubGrid grid1, SubGrid grid2, out bool pathBlocked)
+	{
+		pathBlocked = false;
+		NativeReference<bool> returnHolder = ReturnHolder;
+		CalculatePathBetweenGridsJob calculatePathBetweenGridsJob = default(CalculatePathBetweenGridsJob);
+		calculatePathBetweenGridsJob.Grid1 = grid1;
+		calculatePathBetweenGridsJob.Grid2 = grid2;
+		calculatePathBetweenGridsJob.PathBlocked = returnHolder;
+		calculatePathBetweenGridsJob.OcclusionSubGridBlocked = OcclusionSubGridBlocked;
+		calculatePathBetweenGridsJob.server_occlusion_blocked_grid_threshold = ConVar.AntiHack.server_occlusion_blocked_grid_threshold;
+		calculatePathBetweenGridsJob.server_occlusion_neighbour_threshold = ConVar.AntiHack.server_occlusion_neighbour_threshold;
+		calculatePathBetweenGridsJob.server_occlusion_use_neighbour_thresholds = ConVar.AntiHack.server_occlusion_use_neighbour_thresholds;
+		calculatePathBetweenGridsJob.ChunkCount = new int3(ChunkCountX, ChunkCountY, ChunkCountZ);
+		calculatePathBetweenGridsJob.SubChunkCount = new int3(SubChunkCountX, SubChunkCountY, SubChunkCountZ);
+		CalculatePathBetweenGridsJob jobData = calculatePathBetweenGridsJob;
+		IJobExtensions.RunByRef(ref jobData);
+		pathBlocked = returnHolder.Value;
+	}
+
+	public static void CalculatePathBetweenGrids(SubGrid grid1, SubGrid grid2, out bool pathBlocked)
+	{
+		if (UseJob)
+		{
+			CalculatePathBetweenGridsJob(grid1, grid2, out pathBlocked);
+			return;
+		}
+		int num = 0;
+		int neighboursChecked = 0;
+		pathBlocked = false;
+		int num2 = grid1.x;
+		int num3 = grid1.y;
+		int num4 = grid1.z;
+		int x = grid2.x;
+		int y = grid2.y;
+		int z = grid2.z;
+		int num5 = x - grid1.x;
+		int num6 = y - grid1.y;
+		int num7 = z - grid1.z;
+		int num8 = Mathf.Abs(num5);
+		int num9 = Mathf.Abs(num6);
+		int num10 = Mathf.Abs(num7);
+		int num11 = num8 << 1;
+		int num12 = num9 << 1;
+		int num13 = num10 << 1;
+		int xStep = ((num5 >= 0) ? 1 : (-1));
+		int yStep = ((num6 >= 0) ? 1 : (-1));
+		int zStep = ((num7 >= 0) ? 1 : (-1));
+		int num14;
+		int num15;
+		if (num8 >= num9 && num8 >= num10)
+		{
+			num14 = num12 - num8;
+			num15 = num13 - num8;
+			for (int i = 0; i < num8; i++)
+			{
+				if (!AddToGridArea(new SubGrid(num2, num3, num4)) && ++num > ConVar.AntiHack.server_occlusion_blocked_grid_threshold)
+				{
+					pathBlocked = true;
+					break;
+				}
+				if (num14 > 0)
+				{
+					num3 += yStep;
+					num14 -= num11;
+				}
+				if (num15 > 0)
+				{
+					num4 += zStep;
+					num15 -= num11;
+				}
+				num14 += num12;
+				num15 += num13;
+				num2 += xStep;
+			}
+			return;
+		}
+		if (num9 >= num8 && num9 >= num10)
+		{
+			num14 = num11 - num9;
+			num15 = num13 - num9;
+			for (int j = 0; j < num9; j++)
+			{
+				if (!AddToGridArea(new SubGrid(num2, num3, num4)) && ++num > ConVar.AntiHack.server_occlusion_blocked_grid_threshold)
+				{
+					pathBlocked = true;
+					break;
+				}
+				if (num14 > 0)
+				{
+					num2 += xStep;
+					num14 -= num12;
+				}
+				if (num15 > 0)
+				{
+					num4 += zStep;
+					num15 -= num12;
+				}
+				num14 += num11;
+				num15 += num13;
+				num3 += yStep;
+			}
+			return;
+		}
+		num14 = num12 - num10;
+		num15 = num11 - num10;
+		for (int k = 0; k < num10; k++)
+		{
+			if (!AddToGridArea(new SubGrid(num2, num3, num4)) && ++num > ConVar.AntiHack.server_occlusion_blocked_grid_threshold)
+			{
+				pathBlocked = true;
+				break;
+			}
+			if (num14 > 0)
+			{
+				num3 += yStep;
+				num14 -= num13;
+			}
+			if (num15 > 0)
+			{
+				num2 += xStep;
+				num15 -= num13;
+			}
+			num14 += num12;
+			num15 += num11;
+			num4 += zStep;
+		}
+		bool AddNeighbours(SubGrid grid)
+		{
+			for (int l = 0; l < neighbours.Length; l++)
+			{
+				if (neighbours[l].Item1 != -xStep && neighbours[l].Item2 != -yStep && neighbours[l].Item3 != -zStep)
+				{
+					int x2 = grid.x + neighbours[l].Item1;
+					int y2 = grid.y + neighbours[l].Item2;
+					int z2 = grid.z + neighbours[l].Item3;
+					if (IsValidSubGrid(x2, y2, z2) && !IsBlocked(new SubGrid(x2, y2, z2)))
+					{
+						return true;
+					}
+				}
+			}
+			return false;
+		}
+		bool AddToGridArea(SubGrid grid)
+		{
+			if (!IsBlocked(grid))
+			{
+				return true;
+			}
+			if (!ConVar.AntiHack.server_occlusion_use_neighbour_thresholds || ++neighboursChecked <= ConVar.AntiHack.server_occlusion_neighbour_threshold)
+			{
+				return AddNeighbours(grid);
+			}
+			return false;
+		}
+	}
+
+	public static void SetupGrid()
+	{
+		Stopwatch stopwatch = new Stopwatch();
+		stopwatch.Start();
+		Vector3 size = TerrainMeta.Size;
+		ChunkCountX = Mathf.Max(Mathf.CeilToInt(size.x / 16f), 1);
+		ChunkCountY = Mathf.Max(Mathf.CeilToInt((float)MaxY / 16f), 1);
+		ChunkCountZ = Mathf.Max(Mathf.CeilToInt(size.z / 16f), 1);
+		SubChunkCountX = Mathf.Max(Mathf.CeilToInt(size.x / 2f), 1);
+		SubChunkCountY = Mathf.Max(Mathf.CeilToInt((float)MaxY / 2f), 1);
+		SubChunkCountZ = Mathf.Max(Mathf.CeilToInt(size.z / 2f), 1);
+		AxisX = TerrainMeta.Size.x / 2f;
+		AxisY = MaxY / 2;
+		AxisZ = TerrainMeta.Size.z / 2f;
+		bool server_occlusion_save_grid = ConVar.AntiHack.server_occlusion_save_grid;
+		if (!server_occlusion_save_grid || !ReadGridFromFile(SubGridFilePath))
+		{
+			OcclusionSubGridBlocked = new NativeArray<NativeBitArray>(ChunkCountX * ChunkCountY * ChunkCountZ, Allocator.Persistent);
+			ReturnHolder = new NativeReference<bool>(Allocator.Persistent);
+			UnityEngine.Debug.Log($"Preparing Occlusion Grid ({SubChunkCountX}, {SubChunkCountY}, {SubChunkCountZ})");
+			for (int i = 0; i < ChunkCountX; i++)
+			{
+				for (int j = 0; j < ChunkCountY; j++)
+				{
+					for (int k = 0; k < ChunkCountZ; k++)
+					{
+						Grid cell2 = new Grid(i, j, k);
+						if (cell2.IsBlocked())
+						{
+							PopulateSubGrid(cell2);
+						}
+					}
+				}
+			}
+			if (server_occlusion_save_grid)
+			{
+				WriteGridToFile(ChunkCountX * ChunkCountY * ChunkCountZ, OcclusionSubGridBlocked);
+			}
+			UnityEngine.Debug.Log($"Initialized {SubChunkCountX * SubChunkCountY * SubChunkCountZ} occlusion sub-chunks - took {stopwatch.Elapsed.TotalMilliseconds / 1000.0} seconds");
+		}
+		else
+		{
+			UnityEngine.Debug.Log($"Loaded {SubChunkCountX * SubChunkCountY * SubChunkCountZ} occlusion sub-chunks from file - took {stopwatch.Elapsed.TotalMilliseconds / 1000.0} seconds");
+		}
+		static void PopulateSubGrid(Grid cell)
+		{
+			int num = cell.x * 8;
+			int num2 = cell.y * 8;
+			int num3 = cell.z * 8;
+			int index = cell.GetIndex();
+			NativeBitArray nativeBitArray3;
+			if (!OcclusionSubGridBlocked[index].IsCreated)
+			{
+				NativeBitArray nativeBitArray2 = (OcclusionSubGridBlocked[index] = new NativeBitArray(512, Allocator.Persistent));
+				nativeBitArray3 = nativeBitArray2;
+			}
+			else
+			{
+				nativeBitArray3 = OcclusionSubGridBlocked[index];
+			}
+			NativeBitArray nativeBitArray4 = nativeBitArray3;
+			for (int l = 0; l < 8; l++)
+			{
+				for (int m = 0; m < 8; m++)
+				{
+					for (int n = 0; n < 8; n++)
+					{
+						int pos = n * 8 * 8 + m * 8 + l;
+						nativeBitArray4.Set(pos, new SubGrid(num + l, num2 + m, num3 + n).IsBlocked());
+					}
+				}
+			}
+		}
+	}
+
+	public static void Dispose()
+	{
+		if (OcclusionSubGridBlocked.IsCreated)
+		{
+			for (int i = 0; i < OcclusionSubGridBlocked.Length; i++)
+			{
+				NativeBitArray nativeBitArray = OcclusionSubGridBlocked[i];
+				if (nativeBitArray.IsCreated)
+				{
+					nativeBitArray.Dispose();
+				}
+			}
+			OcclusionSubGridBlocked.Dispose();
+		}
+		if (ReturnHolder.IsCreated)
+		{
+			ReturnHolder.Dispose();
+		}
+	}
+
+	private static void WriteGridToFile(int length, NativeArray<NativeBitArray> data)
+	{
+		try
+		{
+			using BinaryWriter binaryWriter = new BinaryWriter(File.Open(SubGridFilePath, FileMode.Create));
+			binaryWriter.Write(length);
+			foreach (NativeBitArray item in data)
+			{
+				if (!item.IsCreated)
+				{
+					binaryWriter.Write(0);
+					continue;
+				}
+				binaryWriter.Write(item.Length);
+				byte[] array = new byte[(item.Length + 7) / 8];
+				item.AsNativeArray<byte>().CopyTo(array);
+				binaryWriter.Write(array);
+			}
+		}
+		catch (Exception ex)
+		{
+			UnityEngine.Debug.LogError(ex.Message);
+		}
+	}
+
+	public static bool ReadGridFromFile(string path)
+	{
+		try
+		{
+			if (!File.Exists(path))
+			{
+				return false;
+			}
+			using (BinaryReader binaryReader = new BinaryReader(File.Open(path, FileMode.Open)))
+			{
+				int num = binaryReader.ReadInt32();
+				OcclusionSubGridBlocked = new NativeArray<NativeBitArray>(num, Allocator.Persistent);
+				ReturnHolder = new NativeReference<bool>(Allocator.Persistent);
+				for (int i = 0; i < num; i++)
+				{
+					int num2 = binaryReader.ReadInt32();
+					if (num2 != 0)
+					{
+						byte[] array = binaryReader.ReadBytes((num2 + 7) / 8);
+						OcclusionSubGridBlocked[i] = new NativeBitArray(num2, Allocator.Persistent);
+						OcclusionSubGridBlocked[i].AsNativeArray<byte>().CopyFrom(array);
+					}
+				}
+			}
+			return true;
+		}
+		catch (Exception ex)
+		{
+			UnityEngine.Debug.LogError(ex.Message);
+			return false;
+		}
+	}
+
+	[ServerVar(Help = "Tests occlusion visibility between two positions")]
+	public static string serverocclusiondebug(ConsoleSystem.Arg arg)
+	{
+		Vector3 vector = arg.GetVector3(0);
+		Vector3 vector2 = arg.GetVector3(1);
+		SubGrid subGrid = GetSubGrid(vector);
+		SubGrid subGrid2 = GetSubGrid(vector2);
+		if (subGrid.Equals(default(SubGrid)) || subGrid2.Equals(default(SubGrid)))
+		{
+			return $"Invalid grid(s), positions provided: {vector} - {vector2}";
+		}
+		CalculatePathBetweenGrids(subGrid, subGrid2, out var pathBlocked);
+		return $"Grid 1: {subGrid}, Grid 2: {subGrid2}\nPath blocked: {pathBlocked}";
+	}
+}

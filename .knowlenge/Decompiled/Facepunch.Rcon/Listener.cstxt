@@ -1,0 +1,545 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Threading;
+using Facepunch.Rcon;
+using Facepunch.Rust.Profiling;
+using Fleck;
+using Oxide.Core;
+using UnityEngine;
+
+[ConsoleSystem.Factory("rcon")]
+public class Listener
+{
+	public struct IPNetwork : IEquatable<IPNetwork>
+	{
+		public uint Address;
+
+		public uint Mask;
+
+		public byte PrefixLength;
+
+		public IPNetwork(string networkAddress)
+		{
+			if (networkAddress.Contains("/"))
+			{
+				string[] array = networkAddress.Split('/');
+				Address = BitConverter.ToUInt32(IPAddress.Parse(array[0]).GetAddressBytes(), 0);
+				PrefixLength = byte.Parse(array[1]);
+				if (PrefixLength > 32)
+				{
+					throw new Exception($"Invalid prefix length {PrefixLength}");
+				}
+			}
+			else
+			{
+				Address = BitConverter.ToUInt32(IPAddress.Parse(networkAddress).GetAddressBytes(), 0);
+				PrefixLength = 32;
+			}
+			Mask = ((PrefixLength > 0) ? (uint.MaxValue >> 32 - PrefixLength) : 0u);
+		}
+
+		public static bool operator ==(IPNetwork a, IPNetwork b)
+		{
+			if (a.Address == b.Address)
+			{
+				return a.Mask == b.Mask;
+			}
+			return false;
+		}
+
+		public static bool operator !=(IPNetwork a, IPNetwork b)
+		{
+			return !(a == b);
+		}
+
+		public override int GetHashCode()
+		{
+			return (Address, Mask).GetHashCode();
+		}
+
+		public bool Equals(IPNetwork other)
+		{
+			if (Address == other.Address)
+			{
+				return Mask == other.Mask;
+			}
+			return false;
+		}
+
+		public override bool Equals(object obj)
+		{
+			if (obj == null)
+			{
+				return false;
+			}
+			if (obj is IPNetwork other)
+			{
+				return Equals(other);
+			}
+			return false;
+		}
+
+		public IPAddress NetworkAddress()
+		{
+			return new IPAddress(Address);
+		}
+
+		public IPAddress Netmask()
+		{
+			return new IPAddress(Mask);
+		}
+
+		public bool Contains(IPNetwork network)
+		{
+			return Contains(network.NetworkAddress());
+		}
+
+		public bool Contains(IPAddress ip)
+		{
+			uint num = BitConverter.ToUInt32(ip.GetAddressBytes(), 0);
+			return (Address & Mask) == (num & Mask);
+		}
+
+		public override string ToString()
+		{
+			return $"{NetworkAddress()}/{PrefixLength}";
+		}
+	}
+
+	public struct FailedIPData
+	{
+		public bool IsBanned;
+
+		public float BanTime;
+
+		public int Attempts;
+	}
+
+	[ServerVar(Help = "How many password failures before banning an RCON client's IP (default: 5)")]
+	public static int MaxPasswordFailures = 5;
+
+	[ServerVar(Help = "How long in seconds to ban an IP that has exceeded the maximum password failures (default: 300 seconds)")]
+	public static float BanDuration = 300f;
+
+	[ServerVar(Help = "Permanently ban IPs that trigger too many failed attempts (default: false)")]
+	public static bool PermanentBanFailedIPs = false;
+
+	[ServerVar(Help = "Log failed attempts and attempts from banned IP addresses (default: true)")]
+	public static bool LogFailedAttempts = true;
+
+	public string Password;
+
+	public int Port;
+
+	public string Address;
+
+	public string SslCertificate;
+
+	public string SslCertificatePassword;
+
+	public string BansFile;
+
+	public Action<IPAddress, int, string> OnMessage;
+
+	private int nextClientId;
+
+	private readonly Dictionary<int, RconConnection> clients = new Dictionary<int, RconConnection>();
+
+	private readonly List<int> deadClients = new List<int>();
+
+	private WebSocketServer server;
+
+	private readonly HashSet<int> _subscribedRconClients = new HashSet<int>();
+
+	public readonly Dictionary<IPAddress, FailedIPData> FailedIPs = new Dictionary<IPAddress, FailedIPData>();
+
+	public readonly List<IPNetwork> BannedNetworks = new List<IPNetwork>();
+
+	public bool HasSubscribers => _subscribedRconClients.Count > 0;
+
+	public bool BanIP(string addressNetwork)
+	{
+		IPNetwork item;
+		lock (BannedNetworks)
+		{
+			try
+			{
+				item = new IPNetwork(addressNetwork);
+			}
+			catch
+			{
+				return false;
+			}
+			BannedNetworks.Add(item);
+		}
+		lock (clients)
+		{
+			foreach (KeyValuePair<int, RconConnection> client in clients)
+			{
+				if (item.Contains(client.Value.Socket.ConnectionInfo.ClientIpAddress))
+				{
+					Debug.Log($"RCON: Banned IP {client.Value.Socket.ConnectionInfo.ClientIpAddress} connected and was kicked.");
+					client.Value.Socket.Close();
+				}
+			}
+		}
+		SaveBans();
+		return true;
+	}
+
+	public bool UnbanIP(string addressNetwork)
+	{
+		bool flag = false;
+		IPNetwork item = new IPNetwork(addressNetwork);
+		lock (FailedIPs)
+		{
+			foreach (KeyValuePair<IPAddress, FailedIPData> failedIP in FailedIPs)
+			{
+				if (!(failedIP.Key.ToString() != addressNetwork))
+				{
+					flag = FailedIPs.Remove(failedIP.Key);
+					break;
+				}
+			}
+		}
+		lock (BannedNetworks)
+		{
+			flag = BannedNetworks.Remove(item) || flag;
+		}
+		if (flag)
+		{
+			SaveBans();
+		}
+		return flag;
+	}
+
+	public void ClearFailedIPData()
+	{
+		lock (FailedIPs)
+		{
+			FailedIPs.Clear();
+		}
+	}
+
+	public void UpdateFailedIPData(IPAddress IP, FailedIPData data)
+	{
+		lock (FailedIPs)
+		{
+			FailedIPs[IP] = data;
+		}
+	}
+
+	public bool IsBannedIP(IPAddress IP)
+	{
+		lock (BannedNetworks)
+		{
+			foreach (IPNetwork bannedNetwork in BannedNetworks)
+			{
+				if (bannedNetwork.Contains(IP))
+				{
+					return true;
+				}
+			}
+		}
+		FailedIPData failedIPData = GetFailedIPData(IP);
+		if (!failedIPData.IsBanned || !(failedIPData.BanTime < Time.realtimeSinceStartup))
+		{
+			return failedIPData.IsBanned;
+		}
+		failedIPData.IsBanned = false;
+		failedIPData.Attempts = 0;
+		UpdateFailedIPData(IP, failedIPData);
+		return false;
+	}
+
+	public FailedIPData GetFailedIPData(IPAddress IP)
+	{
+		lock (FailedIPs)
+		{
+			if (FailedIPs.TryGetValue(IP, out var value))
+			{
+				return value;
+			}
+		}
+		return default(FailedIPData);
+	}
+
+	public void SaveBans()
+	{
+		StringBuilder stringBuilder = new StringBuilder();
+		foreach (IPNetwork bannedNetwork in BannedNetworks)
+		{
+			stringBuilder.Append(bannedNetwork.ToString()).Append("\n");
+		}
+		File.WriteAllText(BansFile, stringBuilder.ToString());
+	}
+
+	public void LoadBans()
+	{
+		if (!File.Exists(BansFile))
+		{
+			return;
+		}
+		string[] array = File.ReadAllLines(BansFile);
+		foreach (string networkAddress in array)
+		{
+			try
+			{
+				IPNetwork item = new IPNetwork(networkAddress);
+				BannedNetworks.Add(item);
+			}
+			catch (Exception ex)
+			{
+				Debug.Log("RCON: Failed to load ban, skipping: " + ex.Message);
+			}
+		}
+	}
+
+	public void Start()
+	{
+		Shutdown();
+		LoadBans();
+		bool num = !string.IsNullOrEmpty(SslCertificate) && !string.IsNullOrEmpty(SslCertificatePassword);
+		IPAddress address = IPAddress.Any;
+		string arg = (num ? "wss" : "ws");
+		if (Address != null && !IPAddress.TryParse(Address, out address))
+		{
+			address = IPAddress.Any;
+		}
+		string location = $"{arg}://{address}:{Port}";
+		server = new WebSocketServer(location);
+		server.ListenerSocket.NoDelay = true;
+		server.RestartAfterListenError = true;
+		if (num)
+		{
+			X509Certificate2 certificate = new X509Certificate2(SslCertificate, SslCertificatePassword);
+			server.Certificate = certificate;
+		}
+		string requiredPath = "/" + Password;
+		server.Start(delegate(IWebSocketConnection socket)
+		{
+			IWebSocketConnection socket2 = socket;
+			if (IsBannedIP(socket2.ConnectionInfo.ClientIpAddress))
+			{
+				if (LogFailedAttempts)
+				{
+					Debug.Log($"RCON: Banned IP {socket2.ConnectionInfo.ClientIpAddress} attempted to connect.");
+				}
+				if (socket2.ConnectionInfo.Path == requiredPath && LogFailedAttempts)
+				{
+					Debug.Log($"RCON: CRITICAL - Banned IP {socket2.ConnectionInfo.ClientIpAddress} supplied the correct password. Access was still denied.");
+				}
+				socket2.Close();
+			}
+			if (Interface.CallHook("OnRconConnection", socket.ConnectionInfo.ClientIpAddress) == null)
+			{
+				if (!(socket2.ConnectionInfo.Path != requiredPath))
+				{
+					int id = Interlocked.Increment(ref nextClientId);
+					IPAddress ipAddress = socket2.ConnectionInfo.ClientIpAddress;
+					string ipString = ipAddress.ToString();
+					int port = socket2.ConnectionInfo.ClientPort;
+					RconProfiler.OnNewConnection(socket2, id);
+					socket2.OnOpen = delegate
+					{
+						lock (clients)
+						{
+							clients.Add(id, new RconConnection(socket2, id));
+							RconProfiler.UpdateClientCount(clients.Count);
+						}
+					};
+					socket2.OnClose = delegate
+					{
+						lock (clients)
+						{
+							try
+							{
+								RconProfiler.UpdateClientCount(clients.Count);
+								RconProfiler.OnDisconnect(ipString, port, id);
+							}
+							finally
+							{
+								_subscribedRconClients.Remove(id);
+								clients.Remove(id);
+							}
+						}
+					};
+					socket2.OnMessage = delegate(string s)
+					{
+						if (Interface.CallHook("IOnRconMessage", socket2.ConnectionInfo.ClientIpAddress, s) == null)
+						{
+							lock (clients)
+							{
+								if (clients.TryGetValue(id, out var value))
+								{
+									value.Stats.RecievedMessages++;
+								}
+							}
+							RconProfiler.OnRconMessage(ipString, port, id, s);
+							OnMessage?.Invoke(ipAddress, id, s);
+						}
+					};
+					socket2.OnError = delegate(Exception e)
+					{
+						RconProfiler.OnError(socket2);
+						Debug.LogException(e);
+					};
+					return;
+				}
+				if (LogFailedAttempts)
+				{
+					Debug.Log($"RCON: IP {socket2.ConnectionInfo.ClientIpAddress} attempted to connect with incorrect password.");
+				}
+			}
+			RconProfiler.OnFailedConnection(socket2, socket2.ConnectionInfo.Path);
+			socket2.Close();
+			FailedIPData failedIPData = GetFailedIPData(socket2.ConnectionInfo.ClientIpAddress);
+			if (++failedIPData.Attempts >= MaxPasswordFailures)
+			{
+				failedIPData.IsBanned = true;
+				failedIPData.BanTime = Time.realtimeSinceStartup + BanDuration;
+				UpdateFailedIPData(socket2.ConnectionInfo.ClientIpAddress, failedIPData);
+				if (PermanentBanFailedIPs)
+				{
+					lock (BannedNetworks)
+					{
+						BannedNetworks.Add(new IPNetwork(socket2.ConnectionInfo.ClientIpAddress.ToString()));
+					}
+				}
+			}
+		});
+	}
+
+	public void Shutdown()
+	{
+		if (server != null)
+		{
+			_subscribedRconClients.Clear();
+			server.Dispose();
+			server = null;
+		}
+	}
+
+	public void BroadcastMessage(string str)
+	{
+		if (server == null)
+		{
+			return;
+		}
+		lock (clients)
+		{
+			deadClients.Clear();
+			foreach (KeyValuePair<int, RconConnection> client in clients)
+			{
+				if (client.Value.Socket.IsAvailable)
+				{
+					client.Value.Socket.Send(str);
+					client.Value.Stats.BroadcastedMessages++;
+				}
+				else
+				{
+					deadClients.Add(client.Key);
+				}
+			}
+			foreach (int deadClient in deadClients)
+			{
+				if (clients.TryGetValue(deadClient, out var value))
+				{
+					value.Socket.Close();
+					_subscribedRconClients.Remove(deadClient);
+					clients.Remove(deadClient);
+				}
+			}
+			RconProfiler.UpdateClientCount(clients.Count);
+		}
+	}
+
+	public void SendMessage(int target, string str)
+	{
+		if (server == null)
+		{
+			return;
+		}
+		lock (clients)
+		{
+			if (clients.TryGetValue(target, out var value))
+			{
+				if (!value.Socket.IsAvailable)
+				{
+					value.Socket.Close();
+					_subscribedRconClients.Remove(target);
+					clients.Remove(target);
+				}
+				else
+				{
+					value.Socket.Send(str);
+					value.Stats.SentMessages++;
+					RconProfiler.UpdateClientCount(clients.Count);
+				}
+			}
+		}
+	}
+
+	public IList<IPNetwork> GetBannedNetworks()
+	{
+		lock (BannedNetworks)
+		{
+			return BannedNetworks.ToList();
+		}
+	}
+
+	public Dictionary<IPAddress, FailedIPData> GetFailedIPs()
+	{
+		lock (FailedIPs)
+		{
+			return FailedIPs.ToDictionary((KeyValuePair<IPAddress, FailedIPData> e) => e.Key, (KeyValuePair<IPAddress, FailedIPData> e) => e.Value);
+		}
+	}
+
+	public IList<RconClientStats> GetClientStats()
+	{
+		List<RconClientStats> list = new List<RconClientStats>();
+		lock (clients)
+		{
+			foreach (KeyValuePair<int, RconConnection> client in clients)
+			{
+				RconClientStats stats = client.Value.Stats;
+				stats.IsSubscribed = _subscribedRconClients.Contains(client.Key);
+				list.Add(stats);
+			}
+			return list;
+		}
+	}
+
+	public bool AddOrRemoveEventListener(int optionRconConnectionId)
+	{
+		lock (clients)
+		{
+			if (_subscribedRconClients.Contains(optionRconConnectionId))
+			{
+				_subscribedRconClients.Remove(optionRconConnectionId);
+				return false;
+			}
+			_subscribedRconClients.Add(optionRconConnectionId);
+			return true;
+		}
+	}
+
+	public void ClearSubscribers()
+	{
+		_subscribedRconClients.Clear();
+	}
+
+	public void SendMessageToSubscribers(string message)
+	{
+		foreach (int subscribedRconClient in _subscribedRconClients)
+		{
+			SendMessage(subscribedRconClient, message);
+		}
+	}
+}

@@ -1,0 +1,186 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using ProtoBuf;
+using Rust.Demo;
+using UnityEngine;
+
+public class Reader
+{
+	private Stream stream;
+
+	private BinaryReader reader;
+
+	public Action<Indexer.Keyframe, HashSet<NetworkableId>> OnScrubToKeyframe;
+
+	private bool _isScrubbing;
+
+	private float realTimeLastScrub;
+
+	public static Reader Active { get; internal set; }
+
+	public string Name { get; private set; }
+
+	public long CurrentTime { get; private set; }
+
+	public Indexer Index { get; private set; }
+
+	public DemoHeader Header { get; private set; }
+
+	public bool IsScrubbing
+	{
+		get
+		{
+			return _isScrubbing;
+		}
+		set
+		{
+			if (value)
+			{
+				realTimeLastScrub = Time.realtimeSinceStartup;
+			}
+			_isScrubbing = value;
+		}
+	}
+
+	public bool JustScrubbed => Time.realtimeSinceStartup - realTimeLastScrub < 0.05f;
+
+	private long startPosition { get; set; }
+
+	public bool IsFinished => stream.Position >= stream.Length;
+
+	public bool IsPaused { get; internal set; }
+
+	public void Play()
+	{
+		IsPaused = false;
+	}
+
+	public void Pause()
+	{
+		IsPaused = true;
+	}
+
+	public Reader(string name, Stream stream)
+	{
+		Name = name;
+		this.stream = stream;
+		reader = new BinaryReader(this.stream);
+		if (reader.ReadString() != "RUST DEMO FORMAT")
+		{
+			throw new Exception("Demo has invalid ident");
+		}
+		ReadHeader();
+		startPosition = stream.Position;
+		PlaybackStats.Reset();
+		ResetToStart();
+	}
+
+	public void SetActive()
+	{
+		Active = this;
+	}
+
+	public void JumpTo(long time)
+	{
+		using (TimeWarning.New("Demo.JumpTo"))
+		{
+			if (time < 0)
+			{
+				time = 0L;
+			}
+			if ((double)time > Index.TotalLength.TotalMilliseconds)
+			{
+				time = (long)Index.TotalLength.TotalMilliseconds;
+			}
+			HashSet<NetworkableId> changedEntities = Index.GetChangedEntities(CurrentTime, time);
+			Indexer.Keyframe keyframe = Index.LookupKeyframeForTime(time);
+			CurrentTime = time;
+			stream.Position = keyframe.Position;
+			OnScrubToKeyframe?.Invoke(keyframe, changedEntities);
+		}
+	}
+
+	public void CreateIndex()
+	{
+		Index = new Indexer(this);
+	}
+
+	private void ReadHeader()
+	{
+		int count = reader.ReadInt32();
+		byte[] buffer = reader.ReadBytes(count);
+		if (reader.ReadChar() != 0)
+		{
+			throw new Exception("Demo has invalid header");
+		}
+		Header = DemoHeader.Deserialize(buffer);
+		if (Header == null)
+		{
+			throw new Exception("Error when deserializing header");
+		}
+	}
+
+	public static Reader FromFile(string filename)
+	{
+		FileStream fileStream = new FileStream(filename, FileMode.Open);
+		if (fileStream == null)
+		{
+			return null;
+		}
+		return new Reader(filename, fileStream);
+	}
+
+	public void Stop()
+	{
+		reader?.Dispose();
+		reader = null;
+		stream?.Dispose();
+		stream = null;
+		if (Active == this)
+		{
+			Active = null;
+		}
+	}
+
+	public void Progress(long timeAmountMs)
+	{
+		CurrentTime += timeAmountMs;
+	}
+
+	public void ResetToStart()
+	{
+		CurrentTime = 0L;
+		stream.Position = startPosition;
+	}
+
+	public Packet ReadPacket()
+	{
+		long position = stream.Position;
+		int num = reader.ReadInt32();
+		if (num == -1)
+		{
+			stream.Position = stream.Length;
+			return default(Packet);
+		}
+		long num2 = reader.ReadInt64();
+		if (num2 > CurrentTime)
+		{
+			stream.Position = position;
+			return default(Packet);
+		}
+		byte[] data = reader.ReadBytes(num);
+		if (reader.ReadChar() != 0 || reader.ReadChar() != 0)
+		{
+			throw new Exception("Demo has invalid ident");
+		}
+		PlaybackStats.DemoLength = TimeSpan.FromMilliseconds(num2);
+		PlaybackStats.Packets++;
+		Packet result = default(Packet);
+		result.Position = position;
+		result.Size = num;
+		result.Time = num2;
+		result.Data = data;
+		return result;
+	}
+}

@@ -1,0 +1,136 @@
+using System;
+using System.Diagnostics.CodeAnalysis;
+
+protected sealed class Page
+{
+	private readonly PagedMemoryAllocator owner;
+
+	private readonly object sync = new object();
+
+	private FreeMem? freeList;
+
+	public bool IsEmpty
+	{
+		get
+		{
+			FreeMem freeMem = freeList;
+			if (freeMem != null && freeMem.BaseOffset == 0)
+			{
+				return freeMem.Size == Size;
+			}
+			return false;
+		}
+	}
+
+	public IntPtr BaseAddr { get; }
+
+	public uint Size { get; }
+
+	public bool IsExecutable { get; }
+
+	public Page(PagedMemoryAllocator owner, IntPtr baseAddr, uint size, bool isExecutable)
+	{
+		this.owner = owner;
+		BaseAddr = baseAddr;
+		Size = size;
+		IsExecutable = isExecutable;
+		freeList = new FreeMem
+		{
+			BaseOffset = 0u,
+			Size = size,
+			NextFree = null
+		};
+	}
+
+	public bool TryAllocate(uint size, uint align, [<027f1d0e-6e0b-4adc-bc2b-a5d0603c6ea8>MaybeNullWhen(false)] out PageAllocation alloc)
+	{
+		lock (sync)
+		{
+			ref FreeMem nextFree = ref freeList;
+			uint num = 0u;
+			while (nextFree != null)
+			{
+				uint num2 = nextFree.BaseOffset % align;
+				num2 = ((num2 != 0) ? (align - num2) : num2);
+				if (nextFree.Size >= num2 + size)
+				{
+					num = num2;
+					break;
+				}
+				nextFree = ref nextFree.NextFree;
+			}
+			if (nextFree == null)
+			{
+				alloc = null;
+				return false;
+			}
+			uint offset = nextFree.BaseOffset + num;
+			if (num == 0)
+			{
+				nextFree.BaseOffset += size;
+				nextFree.Size -= size;
+			}
+			else
+			{
+				FreeMem freeMem = new FreeMem
+				{
+					BaseOffset = nextFree.BaseOffset,
+					Size = num,
+					NextFree = nextFree
+				};
+				nextFree.BaseOffset += num + size;
+				nextFree.Size -= num + size;
+				nextFree = freeMem;
+			}
+			NormalizeFreeList();
+			alloc = new PageAllocation(this, offset, (int)size);
+			return true;
+		}
+	}
+
+	private void NormalizeFreeList()
+	{
+		ref FreeMem nextFree = ref freeList;
+		while (nextFree != null)
+		{
+			if (nextFree.Size == 0)
+			{
+				nextFree = nextFree.NextFree;
+				continue;
+			}
+			FreeMem nextFree2 = nextFree.NextFree;
+			if (nextFree2 != null && nextFree2.BaseOffset == nextFree.BaseOffset + nextFree.Size)
+			{
+				nextFree.Size += nextFree2.Size;
+				nextFree.NextFree = nextFree2.NextFree;
+			}
+			else
+			{
+				nextFree = ref nextFree.NextFree;
+			}
+		}
+	}
+
+	internal void FreeMem(uint offset, uint size)
+	{
+		lock (sync)
+		{
+			ref FreeMem nextFree = ref freeList;
+			while (nextFree != null && nextFree.BaseOffset <= offset)
+			{
+				nextFree = ref nextFree.NextFree;
+			}
+			nextFree = new FreeMem
+			{
+				BaseOffset = offset,
+				Size = size,
+				NextFree = nextFree
+			};
+			NormalizeFreeList();
+			if (IsEmpty)
+			{
+				owner.RegisterForCleanup(this);
+			}
+		}
+	}
+}

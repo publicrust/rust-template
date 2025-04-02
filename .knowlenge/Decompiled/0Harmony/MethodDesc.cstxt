@@ -1,0 +1,279 @@
+using System;
+using System.Runtime.CompilerServices;
+using MonoMod.Utils;
+
+public struct MethodDesc
+{
+	[Flags]
+	public enum Flags3 : ushort
+	{
+		TokenRemainderMask = 0x3FFF,
+		HasForwardedValuetypeParameter = 0x4000,
+		ValueTypeParametersWalked = 0x4000,
+		DoesNotHaveEquivalentValuetypeParameters = 0x8000
+	}
+
+	[Flags]
+	public enum Flags2 : byte
+	{
+		HasStableEntryPoint = 1,
+		HasPrecode = 2,
+		IsUnboxingStub = 4,
+		HasNativeCodeSlot = 8,
+		TransparencyMask = 0x30,
+		TransparencyUnknown = 0,
+		TransparencyTransparent = 0x10,
+		TransparencyCritical = 0x20,
+		TransparencyTreatAsSafe = 0x30,
+		CASDemandsOnly = 0x40,
+		HostProtectionLinkChecksOnly = 0x80
+	}
+
+	public static readonly nuint Alignment = (nuint)((IntPtr.Size == 8) ? 8 : 4);
+
+	public Flags3 m_wFlags3AndTokenRemainder;
+
+	public byte m_chunkIndex;
+
+	public Flags2 m_bFlags2;
+
+	public const ushort PackedSlot_SlotMask = 1023;
+
+	public const ushort PackedSlot_NameHashMask = 64512;
+
+	public ushort m_wSlotNumber;
+
+	public MethodDescClassification m_wFlags;
+
+	private unsafe static readonly nuint[] s_ClassificationSizeTable = new UIntPtr[8]
+	{
+		(nuint)sizeof(MethodDesc),
+		(nuint)FCallMethodDescPtr.CurrentSize,
+		(nuint)NDirectMethodDescPtr.CurrentSize,
+		(nuint)EEImplMethodDescPtr.CurrentSize,
+		(nuint)ArrayMethodDescPtr.CurrentSize,
+		(nuint)sizeof(InstantiatedMethodDesc),
+		(nuint)sizeof(ComPlusCallMethodDesc),
+		(nuint)DynamicMethodDescPtr.CurrentSize
+	};
+
+	public ushort SlotNumber
+	{
+		get
+		{
+			if (!m_wFlags.Has(MethodDescClassification.RequiresFullSlotNumber))
+			{
+				return (ushort)(m_wSlotNumber & 0x3FF);
+			}
+			return m_wSlotNumber;
+		}
+	}
+
+	public MethodClassification Classification => (MethodClassification)(m_wFlags & MethodDescClassification.ClassificationMask);
+
+	public unsafe MethodDescChunk* MethodDescChunk => (MethodDescChunk*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref System.Runtime.CompilerServices.Unsafe.SubtractByteOffset(ref this, (nuint)sizeof(MethodDescChunk) + m_chunkIndex * Alignment));
+
+	public unsafe MethodTable* MethodTable => MethodDescChunk->MethodTable;
+
+	public bool HasNonVtableSlot => m_wFlags.Has(MethodDescClassification.HasNonVtableSlot);
+
+	public bool HasStableEntryPoint => m_bFlags2.Has(Flags2.HasStableEntryPoint);
+
+	public bool HasPrecode => m_bFlags2.Has(Flags2.HasPrecode);
+
+	public bool HasNativeCodeSlot => m_bFlags2.Has(Flags2.HasNativeCodeSlot);
+
+	public bool IsUnboxingStub => m_bFlags2.Has(Flags2.IsUnboxingStub);
+
+	public unsafe bool HasMethodInstantiation
+	{
+		get
+		{
+			if (TryAsInstantiated(out var md))
+			{
+				return md->IMD_HasMethodInstantiation;
+			}
+			return false;
+		}
+	}
+
+	public unsafe bool IsGenericMethodDefinition
+	{
+		get
+		{
+			if (TryAsInstantiated(out var md))
+			{
+				return md->IMD_IsGenericMethodDefinition;
+			}
+			return false;
+		}
+	}
+
+	public unsafe bool IsInstantiatingStub
+	{
+		get
+		{
+			if (!IsUnboxingStub && TryAsInstantiated(out var md))
+			{
+				return md->IMD_IsWrapperStubWithInstantiations;
+			}
+			return false;
+		}
+	}
+
+	public unsafe bool IsGenericComPlusCall
+	{
+		get
+		{
+			if (TryAsInstantiated(out var md))
+			{
+				return md->IMD_HasComPlusCallInfo;
+			}
+			return false;
+		}
+	}
+
+	public bool IsWrapperStub
+	{
+		get
+		{
+			if (!IsUnboxingStub)
+			{
+				return IsInstantiatingStub;
+			}
+			return true;
+		}
+	}
+
+	public bool IsTightlyBoundToMethodTable
+	{
+		get
+		{
+			if (!HasNonVtableSlot)
+			{
+				return true;
+			}
+			if (HasMethodInstantiation)
+			{
+				return IsGenericMethodDefinition;
+			}
+			if (IsWrapperStub)
+			{
+				return false;
+			}
+			return true;
+		}
+	}
+
+	public unsafe void* GetMethodEntryPoint()
+	{
+		if (HasNonVtableSlot)
+		{
+			nuint baseSize = GetBaseSize();
+			return *(void**)((byte*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref this) + baseSize);
+		}
+		return MethodTable->GetSlot(SlotNumber);
+	}
+
+	public unsafe bool TryAsInstantiated(out InstantiatedMethodDesc* md)
+	{
+		if (Classification == MethodClassification.Instantiated)
+		{
+			md = (InstantiatedMethodDesc*)System.Runtime.CompilerServices.Unsafe.AsPointer(ref this);
+			return true;
+		}
+		md = default(InstantiatedMethodDesc*);
+		return false;
+	}
+
+	public unsafe nuint SizeOf(bool includeNonVtable = true, bool includeMethodImpl = true, bool includeComPlus = true, bool includeNativeCode = true)
+	{
+		nuint num = (nuint)((nint)GetBaseSize() + (nint)((includeNonVtable && m_wFlags.Has(MethodDescClassification.HasNonVtableSlot)) ? sizeof(void*) : 0) + ((includeMethodImpl && m_wFlags.Has(MethodDescClassification.MethodImpl)) ? sizeof(MethodImpl) : 0));
+		if (includeNativeCode && HasNativeCodeSlot)
+		{
+			num += (uint)((((nint)(nuint)System.Runtime.CompilerServices.Unsafe.As<MethodDesc, UIntPtr>(ref System.Runtime.CompilerServices.Unsafe.AddByteOffset(ref this, num)) & 1) != 0) ? (sizeof(void*) + sizeof(void*)) : sizeof(void*));
+		}
+		if (includeComPlus && IsGenericComPlusCall)
+		{
+			num += (uint)ComPlusCallInfoPtr.CurrentSize;
+		}
+		return num;
+	}
+
+	public unsafe void* GetNativeCode()
+	{
+		if (HasNativeCodeSlot)
+		{
+			nuint num = (nuint)((RelativePointer*)GetAddrOfNativeCodeSlot())->Value & (nuint)(~(nint)1);
+			if (num != 0)
+			{
+				return (void*)num;
+			}
+		}
+		if (!HasStableEntryPoint || HasPrecode)
+		{
+			return null;
+		}
+		return GetStableEntryPoint();
+	}
+
+	public unsafe void* GetStableEntryPoint()
+	{
+		return GetMethodEntryPoint();
+	}
+
+	public unsafe static MethodDesc* FindTightlyBoundWrappedMethodDesc(MethodDesc* pMD)
+	{
+		if (pMD->IsUnboxingStub && pMD->TryAsInstantiated(out var md))
+		{
+			pMD = md->IMD_GetWrappedMethodDesc();
+		}
+		if (!pMD->IsTightlyBoundToMethodTable)
+		{
+			pMD = pMD->GetCanonicalMethodTable()->GetParallelMethodDesc(pMD);
+		}
+		if (pMD->IsUnboxingStub)
+		{
+			pMD = GetNextIntroducedMethod(pMD);
+		}
+		return pMD;
+	}
+
+	public unsafe static MethodDesc* GetNextIntroducedMethod(MethodDesc* pMD)
+	{
+		MethodDescChunk* methodDescChunk = pMD->MethodDescChunk;
+		nuint num = (nuint)((byte*)pMD + pMD->SizeOf());
+		nuint num2 = (nuint)((byte*)methodDescChunk + methodDescChunk->SizeOf);
+		if (num < num2)
+		{
+			return (MethodDesc*)num;
+		}
+		methodDescChunk = methodDescChunk->m_next;
+		if (methodDescChunk != null)
+		{
+			return methodDescChunk->FirstMethodDesc;
+		}
+		return null;
+	}
+
+	public unsafe MethodTable* GetCanonicalMethodTable()
+	{
+		return MethodTable->GetCanonicalMethodTable();
+	}
+
+	public unsafe void* GetAddrOfNativeCodeSlot()
+	{
+		nuint byteOffset = SizeOf(includeNonVtable: true, includeMethodImpl: true, includeComPlus: false, includeNativeCode: false);
+		return System.Runtime.CompilerServices.Unsafe.AsPointer(ref System.Runtime.CompilerServices.Unsafe.AddByteOffset(ref this, byteOffset));
+	}
+
+	public nuint GetBaseSize()
+	{
+		return GetBaseSize(Classification);
+	}
+
+	public static nuint GetBaseSize(MethodClassification classification)
+	{
+		return s_ClassificationSizeTable[(int)classification];
+	}
+}

@@ -1,0 +1,355 @@
+using System;
+using System.IO;
+using Mono.Cecil;
+using Mono.Cecil.Metadata;
+using Mono.Cecil.PE;
+
+internal sealed class ImageReader : BinaryStreamReader
+{
+	private readonly Image image;
+
+	private DataDirectory cli;
+
+	private DataDirectory metadata;
+
+	public ImageReader(Stream stream)
+		: base(stream)
+	{
+		image = new Image();
+		image.FileName = stream.GetFullyQualifiedName();
+	}
+
+	private void MoveTo(DataDirectory directory)
+	{
+		BaseStream.Position = image.ResolveVirtualAddress(directory.VirtualAddress);
+	}
+
+	private void MoveTo(uint position)
+	{
+		BaseStream.Position = position;
+	}
+
+	private void ReadImage()
+	{
+		if (BaseStream.Length < 128)
+		{
+			throw new BadImageFormatException();
+		}
+		if (ReadUInt16() != 23117)
+		{
+			throw new BadImageFormatException();
+		}
+		Advance(58);
+		MoveTo(ReadUInt32());
+		if (ReadUInt32() != 17744)
+		{
+			throw new BadImageFormatException();
+		}
+		image.Architecture = ReadArchitecture();
+		ushort count = ReadUInt16();
+		Advance(14);
+		ushort characteristics = ReadUInt16();
+		ReadOptionalHeaders(out var subsystem, out var dll_characteristics);
+		ReadSections(count);
+		ReadCLIHeader();
+		ReadMetadata();
+		image.Kind = GetModuleKind(characteristics, subsystem);
+		image.Characteristics = (ModuleCharacteristics)dll_characteristics;
+	}
+
+	private TargetArchitecture ReadArchitecture()
+	{
+		return ReadUInt16() switch
+		{
+			332 => TargetArchitecture.I386, 
+			34404 => TargetArchitecture.AMD64, 
+			512 => TargetArchitecture.IA64, 
+			452 => TargetArchitecture.ARMv7, 
+			_ => throw new NotSupportedException(), 
+		};
+	}
+
+	private static ModuleKind GetModuleKind(ushort characteristics, ushort subsystem)
+	{
+		if ((characteristics & 0x2000) != 0)
+		{
+			return ModuleKind.Dll;
+		}
+		if (subsystem == 2 || subsystem == 9)
+		{
+			return ModuleKind.Windows;
+		}
+		return ModuleKind.Console;
+	}
+
+	private void ReadOptionalHeaders(out ushort subsystem, out ushort dll_characteristics)
+	{
+		bool flag = ReadUInt16() == 523;
+		Advance(66);
+		subsystem = ReadUInt16();
+		dll_characteristics = ReadUInt16();
+		Advance(flag ? 88 : 72);
+		image.Debug = ReadDataDirectory();
+		Advance(56);
+		cli = ReadDataDirectory();
+		if (cli.IsZero)
+		{
+			throw new BadImageFormatException();
+		}
+		Advance(8);
+	}
+
+	private string ReadAlignedString(int length)
+	{
+		int num = 0;
+		char[] array = new char[length];
+		while (num < length)
+		{
+			byte b = ReadByte();
+			if (b == 0)
+			{
+				break;
+			}
+			array[num++] = (char)b;
+		}
+		Advance(-1 + ((num + 4) & -4) - num);
+		return new string(array, 0, num);
+	}
+
+	private string ReadZeroTerminatedString(int length)
+	{
+		int num = 0;
+		char[] array = new char[length];
+		byte[] array2 = ReadBytes(length);
+		while (num < length)
+		{
+			byte b = array2[num];
+			if (b == 0)
+			{
+				break;
+			}
+			array[num++] = (char)b;
+		}
+		return new string(array, 0, num);
+	}
+
+	private void ReadSections(ushort count)
+	{
+		Section[] array = new Section[count];
+		for (int i = 0; i < count; i++)
+		{
+			Section section = new Section();
+			section.Name = ReadZeroTerminatedString(8);
+			Advance(4);
+			section.VirtualAddress = ReadUInt32();
+			section.SizeOfRawData = ReadUInt32();
+			section.PointerToRawData = ReadUInt32();
+			Advance(16);
+			array[i] = section;
+			ReadSectionData(section);
+		}
+		image.Sections = array;
+	}
+
+	private void ReadSectionData(Section section)
+	{
+		long position = BaseStream.Position;
+		MoveTo(section.PointerToRawData);
+		int sizeOfRawData = (int)section.SizeOfRawData;
+		byte[] array = new byte[sizeOfRawData];
+		int num = 0;
+		int num2;
+		while ((num2 = Read(array, num, sizeOfRawData - num)) > 0)
+		{
+			num += num2;
+		}
+		section.Data = array;
+		BaseStream.Position = position;
+	}
+
+	private void ReadCLIHeader()
+	{
+		MoveTo(cli);
+		Advance(8);
+		metadata = ReadDataDirectory();
+		image.Attributes = (ModuleAttributes)ReadUInt32();
+		image.EntryPointToken = ReadUInt32();
+		image.Resources = ReadDataDirectory();
+		image.StrongName = ReadDataDirectory();
+	}
+
+	private void ReadMetadata()
+	{
+		MoveTo(metadata);
+		if (ReadUInt32() != 1112167234)
+		{
+			throw new BadImageFormatException();
+		}
+		Advance(8);
+		image.RuntimeVersion = ReadZeroTerminatedString(ReadInt32());
+		Advance(2);
+		ushort num = ReadUInt16();
+		Section sectionAtVirtualAddress = image.GetSectionAtVirtualAddress(metadata.VirtualAddress);
+		if (sectionAtVirtualAddress == null)
+		{
+			throw new BadImageFormatException();
+		}
+		image.MetadataSection = sectionAtVirtualAddress;
+		for (int i = 0; i < num; i++)
+		{
+			ReadMetadataStream(sectionAtVirtualAddress);
+		}
+		if (image.TableHeap != null)
+		{
+			ReadTableHeap();
+		}
+	}
+
+	private void ReadMetadataStream(Section section)
+	{
+		uint start = metadata.VirtualAddress - section.VirtualAddress + ReadUInt32();
+		uint size = ReadUInt32();
+		switch (ReadAlignedString(16))
+		{
+		case "#~":
+		case "#-":
+			image.TableHeap = new TableHeap(section, start, size);
+			break;
+		case "#Strings":
+			image.StringHeap = new StringHeap(section, start, size);
+			break;
+		case "#Blob":
+			image.BlobHeap = new BlobHeap(section, start, size);
+			break;
+		case "#GUID":
+			image.GuidHeap = new GuidHeap(section, start, size);
+			break;
+		case "#US":
+			image.UserStringHeap = new UserStringHeap(section, start, size);
+			break;
+		}
+	}
+
+	private void ReadTableHeap()
+	{
+		TableHeap tableHeap = image.TableHeap;
+		uint pointerToRawData = tableHeap.Section.PointerToRawData;
+		MoveTo(tableHeap.Offset + pointerToRawData);
+		Advance(6);
+		byte sizes = ReadByte();
+		Advance(1);
+		tableHeap.Valid = ReadInt64();
+		tableHeap.Sorted = ReadInt64();
+		for (int i = 0; i < 45; i++)
+		{
+			if (tableHeap.HasTable((Table)i))
+			{
+				tableHeap.Tables[i].Length = ReadUInt32();
+			}
+		}
+		SetIndexSize(image.StringHeap, sizes, 1);
+		SetIndexSize(image.GuidHeap, sizes, 2);
+		SetIndexSize(image.BlobHeap, sizes, 4);
+		ComputeTableInformations();
+	}
+
+	private static void SetIndexSize(Heap heap, uint sizes, byte flag)
+	{
+		if (heap != null)
+		{
+			heap.IndexSize = (((sizes & flag) != 0) ? 4 : 2);
+		}
+	}
+
+	private int GetTableIndexSize(Table table)
+	{
+		return image.GetTableIndexSize(table);
+	}
+
+	private int GetCodedIndexSize(CodedIndex index)
+	{
+		return image.GetCodedIndexSize(index);
+	}
+
+	private void ComputeTableInformations()
+	{
+		uint num = (uint)(int)BaseStream.Position - image.MetadataSection.PointerToRawData;
+		int indexSize = image.StringHeap.IndexSize;
+		int num2 = ((image.BlobHeap != null) ? image.BlobHeap.IndexSize : 2);
+		TableHeap tableHeap = image.TableHeap;
+		TableInformation[] tables = tableHeap.Tables;
+		for (int i = 0; i < 45; i++)
+		{
+			Table table = (Table)i;
+			if (tableHeap.HasTable(table))
+			{
+				int num3 = table switch
+				{
+					Table.Module => 2 + indexSize + image.GuidHeap.IndexSize * 3, 
+					Table.TypeRef => GetCodedIndexSize(CodedIndex.ResolutionScope) + indexSize * 2, 
+					Table.TypeDef => 4 + indexSize * 2 + GetCodedIndexSize(CodedIndex.TypeDefOrRef) + GetTableIndexSize(Table.Field) + GetTableIndexSize(Table.Method), 
+					Table.FieldPtr => GetTableIndexSize(Table.Field), 
+					Table.Field => 2 + indexSize + num2, 
+					Table.MethodPtr => GetTableIndexSize(Table.Method), 
+					Table.Method => 8 + indexSize + num2 + GetTableIndexSize(Table.Param), 
+					Table.ParamPtr => GetTableIndexSize(Table.Param), 
+					Table.Param => 4 + indexSize, 
+					Table.InterfaceImpl => GetTableIndexSize(Table.TypeDef) + GetCodedIndexSize(CodedIndex.TypeDefOrRef), 
+					Table.MemberRef => GetCodedIndexSize(CodedIndex.MemberRefParent) + indexSize + num2, 
+					Table.Constant => 2 + GetCodedIndexSize(CodedIndex.HasConstant) + num2, 
+					Table.CustomAttribute => GetCodedIndexSize(CodedIndex.HasCustomAttribute) + GetCodedIndexSize(CodedIndex.CustomAttributeType) + num2, 
+					Table.FieldMarshal => GetCodedIndexSize(CodedIndex.HasFieldMarshal) + num2, 
+					Table.DeclSecurity => 2 + GetCodedIndexSize(CodedIndex.HasDeclSecurity) + num2, 
+					Table.ClassLayout => 6 + GetTableIndexSize(Table.TypeDef), 
+					Table.FieldLayout => 4 + GetTableIndexSize(Table.Field), 
+					Table.StandAloneSig => num2, 
+					Table.EventMap => GetTableIndexSize(Table.TypeDef) + GetTableIndexSize(Table.Event), 
+					Table.EventPtr => GetTableIndexSize(Table.Event), 
+					Table.Event => 2 + indexSize + GetCodedIndexSize(CodedIndex.TypeDefOrRef), 
+					Table.PropertyMap => GetTableIndexSize(Table.TypeDef) + GetTableIndexSize(Table.Property), 
+					Table.PropertyPtr => GetTableIndexSize(Table.Property), 
+					Table.Property => 2 + indexSize + num2, 
+					Table.MethodSemantics => 2 + GetTableIndexSize(Table.Method) + GetCodedIndexSize(CodedIndex.HasSemantics), 
+					Table.MethodImpl => GetTableIndexSize(Table.TypeDef) + GetCodedIndexSize(CodedIndex.MethodDefOrRef) + GetCodedIndexSize(CodedIndex.MethodDefOrRef), 
+					Table.ModuleRef => indexSize, 
+					Table.TypeSpec => num2, 
+					Table.ImplMap => 2 + GetCodedIndexSize(CodedIndex.MemberForwarded) + indexSize + GetTableIndexSize(Table.ModuleRef), 
+					Table.FieldRVA => 4 + GetTableIndexSize(Table.Field), 
+					Table.EncLog => 8, 
+					Table.EncMap => 4, 
+					Table.Assembly => 16 + num2 + indexSize * 2, 
+					Table.AssemblyProcessor => 4, 
+					Table.AssemblyOS => 12, 
+					Table.AssemblyRef => 12 + num2 * 2 + indexSize * 2, 
+					Table.AssemblyRefProcessor => 4 + GetTableIndexSize(Table.AssemblyRef), 
+					Table.AssemblyRefOS => 12 + GetTableIndexSize(Table.AssemblyRef), 
+					Table.File => 4 + indexSize + num2, 
+					Table.ExportedType => 8 + indexSize * 2 + GetCodedIndexSize(CodedIndex.Implementation), 
+					Table.ManifestResource => 8 + indexSize + GetCodedIndexSize(CodedIndex.Implementation), 
+					Table.NestedClass => GetTableIndexSize(Table.TypeDef) + GetTableIndexSize(Table.TypeDef), 
+					Table.GenericParam => 4 + GetCodedIndexSize(CodedIndex.TypeOrMethodDef) + indexSize, 
+					Table.MethodSpec => GetCodedIndexSize(CodedIndex.MethodDefOrRef) + num2, 
+					Table.GenericParamConstraint => GetTableIndexSize(Table.GenericParam) + GetCodedIndexSize(CodedIndex.TypeDefOrRef), 
+					_ => throw new NotSupportedException(), 
+				};
+				tables[i].RowSize = (uint)num3;
+				tables[i].Offset = num;
+				num += (uint)(num3 * (int)tables[i].Length);
+			}
+		}
+	}
+
+	public static Image ReadImageFrom(Stream stream)
+	{
+		try
+		{
+			ImageReader imageReader = new ImageReader(stream);
+			imageReader.ReadImage();
+			return imageReader.image;
+		}
+		catch (EndOfStreamException inner)
+		{
+			throw new BadImageFormatException(stream.GetFullyQualifiedName(), inner);
+		}
+	}
+}

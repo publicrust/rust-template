@@ -1,0 +1,613 @@
+using System;
+using FIMSpace.FTools;
+using UnityEngine;
+
+[Serializable]
+public class FimpIK_Limb : FIK_ProcessorBase
+{
+	public class IKBone : FIK_IKBoneBase
+	{
+		[SerializeField]
+		private Quaternion targetToLocalSpace;
+
+		[SerializeField]
+		private Vector3 defaultLocalPoleNormal;
+
+		public Vector3 right { get; private set; }
+
+		public Vector3 up { get; private set; }
+
+		public Vector3 forward { get; private set; }
+
+		public Vector3 srcPosition { get; private set; }
+
+		public Quaternion srcRotation { get; private set; }
+
+		public IKBone(Transform t)
+			: base(t)
+		{
+		}
+
+		public void Init(Transform root, Vector3 childPosition, Vector3 orientationNormal)
+		{
+			RefreshOrientations(childPosition, orientationNormal);
+			sqrMagn = (childPosition - base.transform.position).sqrMagnitude;
+			LastKeyLocalRotation = base.transform.localRotation;
+			right = base.transform.InverseTransformDirection(root.right);
+			up = base.transform.InverseTransformDirection(root.up);
+			forward = base.transform.InverseTransformDirection(root.forward);
+			CaptureSourceAnimation();
+		}
+
+		public void RefreshOrientations(Vector3 childPosition, Vector3 orientationNormal)
+		{
+			if (!(orientationNormal == Vector3.zero))
+			{
+				Vector3 vector = childPosition - base.transform.position;
+				vector.Normalize();
+				if (!(vector == Vector3.zero))
+				{
+					Quaternion rotation = Quaternion.LookRotation(vector, orientationNormal);
+					targetToLocalSpace = RotationToLocal(base.transform.rotation, rotation);
+					defaultLocalPoleNormal = Quaternion.Inverse(base.transform.rotation) * orientationNormal;
+				}
+			}
+		}
+
+		public void CaptureSourceAnimation()
+		{
+			srcPosition = base.transform.position;
+			srcRotation = base.transform.rotation;
+		}
+
+		public static Quaternion RotationToLocal(Quaternion parent, Quaternion rotation)
+		{
+			return Quaternion.Inverse(Quaternion.Inverse(parent) * rotation);
+		}
+
+		public Quaternion GetRotation(Vector3 direction, Vector3 orientationNormal)
+		{
+			return Quaternion.LookRotation(direction, orientationNormal) * targetToLocalSpace;
+		}
+
+		public Vector3 GetCurrentOrientationNormal()
+		{
+			return base.transform.rotation * defaultLocalPoleNormal;
+		}
+	}
+
+	public enum FIK_HintMode
+	{
+		Default,
+		MiddleForward,
+		MiddleBack,
+		OnGoal,
+		EndForward,
+		Leg,
+		UnityHumanoidIK
+	}
+
+	[NonSerialized]
+	[Tooltip("3-Bones limb array")]
+	private IKBone[] IKBones;
+
+	[Range(0f, 1f)]
+	[Space(4f)]
+	[Tooltip("Blend value for goal position")]
+	public float IKPositionWeight = 1f;
+
+	[Tooltip("Blend value for end bone rotation")]
+	[Range(0f, 1f)]
+	public float FootRotationWeight = 1f;
+
+	[Tooltip("Flex style algorithm for different limbs")]
+	public FIK_HintMode AutoHintMode = FIK_HintMode.MiddleForward;
+
+	protected Vector3 targetElbowNormal = Vector3.right;
+
+	protected Quaternion lateEndBoneRotation;
+
+	protected Quaternion postIKAnimatorEndBoneRot;
+
+	public Vector3 ExtraHintAdjustementOffset = Vector3.zero;
+
+	public bool InverseHint;
+
+	[NonSerialized]
+	public float FeetStretchWeight = 1f;
+
+	[NonSerialized]
+	public float FeetStretchSensitivity = 1f;
+
+	[NonSerialized]
+	public float FeetStretchLimit = 1f;
+
+	[NonSerialized]
+	public float FeetFadeQuicker = 1f;
+
+	[NonSerialized]
+	public bool disableFeet;
+
+	private float maxFeetAngle;
+
+	private float maxFeetAngleFactor;
+
+	private Vector3 ankleToFeet;
+
+	[NonSerialized]
+	public Animator HumanoidAnimator;
+
+	[NonSerialized]
+	public bool IsRight;
+
+	private bool everyIsChild = true;
+
+	private bool hasFeet;
+
+	private bool hasRoot;
+
+	[HideInInspector]
+	[Range(0f, 1f)]
+	public float ManualHintPositionWeight;
+
+	[HideInInspector]
+	public Vector3 IKManualHintPosition = Vector3.zero;
+
+	[NonSerialized]
+	public bool UseEndBoneMapping = true;
+
+	private float internalRotationWeightMul = 1f;
+
+	public Quaternion EndBoneMapping { get; protected set; }
+
+	public IKBone FeetIKBone => IKBones[3];
+
+	public float ScaleReference { get; protected set; }
+
+	public Transform Root { get; protected set; }
+
+	public IKBone StartIKBone => IKBones[0];
+
+	public IKBone MiddleIKBone => IKBones[1];
+
+	public IKBone EndIKBone => IKBones[2];
+
+	public IKBone EndParentIKBone { get; private set; }
+
+	public int BonesCount => IKBones.Length;
+
+	public override void Update()
+	{
+		if (!base.Initialized)
+		{
+			return;
+		}
+		Refresh();
+		float num = IKPositionWeight * IKWeight;
+		StartIKBone.sqrMagn = (MiddleIKBone.transform.position - StartIKBone.transform.position).sqrMagnitude;
+		MiddleIKBone.sqrMagn = (EndIKBone.transform.position - MiddleIKBone.transform.position).sqrMagnitude;
+		targetElbowNormal = GetDefaultFlexNormal();
+		if (ExtraHintAdjustementOffset != Vector3.zero)
+		{
+			targetElbowNormal = Vector3.Lerp(targetElbowNormal, CalculateElbowNormalToPosition(EndIKBone.transform.position + EndIKBone.transform.rotation * ExtraHintAdjustementOffset), ExtraHintAdjustementOffset.magnitude).normalized;
+		}
+		Vector3 vector = GetOrientationDirection(IKTargetPosition, InverseHint ? (-targetElbowNormal) : targetElbowNormal);
+		if (vector == Vector3.zero)
+		{
+			vector = MiddleIKBone.transform.position - StartIKBone.transform.position;
+		}
+		if (num > 0f)
+		{
+			Quaternion quaternion = StartIKBone.GetRotation(vector, targetElbowNormal) * base.StartBoneRotationOffset;
+			if (num < 1f)
+			{
+				quaternion = Quaternion.LerpUnclamped(StartIKBone.srcRotation, quaternion, num);
+			}
+			StartIKBone.transform.rotation = quaternion;
+			Quaternion quaternion2 = MiddleIKBone.GetRotation(IKTargetPosition - MiddleIKBone.transform.position, MiddleIKBone.GetCurrentOrientationNormal());
+			if (num < 1f)
+			{
+				quaternion2 = Quaternion.LerpUnclamped(MiddleIKBone.srcRotation, quaternion2, num);
+			}
+			MiddleIKBone.transform.rotation = quaternion2;
+		}
+		postIKAnimatorEndBoneRot = EndIKBone.transform.rotation;
+		EndBoneRotation();
+	}
+
+	private Vector3 GetAutomaticFlexNormal()
+	{
+		Vector3 currentOrientationNormal = StartIKBone.GetCurrentOrientationNormal();
+		switch (AutoHintMode)
+		{
+		case FIK_HintMode.Leg:
+		{
+			Vector3 vector2 = IKTargetRotation * (EndIKBone.forward * internalRotationWeightMul * 2f);
+			if (hasRoot)
+			{
+				vector2 += Root.forward * 0.06f;
+				Vector3 position = Root.InverseTransformPoint(IKTargetPosition);
+				position.y = 0f;
+				vector2 += (Root.TransformPoint(position) - Root.position) * 0.025f;
+			}
+			float num = Vector3.Distance(MiddleIKBone.transform.position, EndIKBone.transform.position) * 0.1f;
+			Vector3 b = CalculateElbowNormalToPosition(MiddleIKBone.srcPosition + vector2 * num);
+			return Vector3.LerpUnclamped(currentOrientationNormal.normalized, b, 0.85f);
+		}
+		case FIK_HintMode.MiddleForward:
+			return Vector3.LerpUnclamped(currentOrientationNormal.normalized, MiddleIKBone.srcRotation * MiddleIKBone.right, 0.5f);
+		case FIK_HintMode.MiddleBack:
+			return MiddleIKBone.srcRotation * -MiddleIKBone.right;
+		case FIK_HintMode.EndForward:
+		{
+			Vector3 vector = Vector3.Cross(MiddleIKBone.srcPosition + EndIKBone.srcRotation * EndIKBone.forward - StartIKBone.srcPosition, IKTargetPosition - StartIKBone.srcPosition);
+			if (vector == Vector3.zero)
+			{
+				return currentOrientationNormal;
+			}
+			return vector;
+		}
+		case FIK_HintMode.OnGoal:
+			return Vector3.LerpUnclamped(currentOrientationNormal, lateEndBoneRotation * EndIKBone.right, 0.5f);
+		case FIK_HintMode.UnityHumanoidIK:
+			if ((bool)HumanoidAnimator)
+			{
+				HumanoidAnimator.logWarnings = false;
+				return CalculateElbowNormalToPosition(HumanoidAnimator.GetIKHintPosition(IsRight ? AvatarIKHint.RightKnee : AvatarIKHint.LeftKnee));
+			}
+			break;
+		}
+		return currentOrientationNormal;
+	}
+
+	public void OnDrawGizmos()
+	{
+		_ = base.Initialized;
+	}
+
+	public virtual void SetRootReference(Transform mainParentTransform)
+	{
+		Root = mainParentTransform;
+		EndBoneMapping = Quaternion.FromToRotation(EndIKBone.right, Vector3.right);
+		EndBoneMapping *= Quaternion.FromToRotation(EndIKBone.up, Vector3.up);
+		if ((bool)mainParentTransform)
+		{
+			hasRoot = true;
+		}
+	}
+
+	public void RefreshLength()
+	{
+		ScaleReference = (StartIKBone.transform.position - MiddleIKBone.transform.position).magnitude;
+	}
+
+	public void RefreshScaleReference()
+	{
+		ScaleReference = (StartIKBone.transform.position - MiddleIKBone.transform.position).magnitude;
+	}
+
+	private float GetCurrentLegToAnkleLength()
+	{
+		return Mathf.Epsilon + (StartIKBone.transform.position - MiddleIKBone.transform.position).magnitude + (MiddleIKBone.transform.position - EndIKBone.transform.position).magnitude;
+	}
+
+	public float GetStretchValue(Vector3 targetPos)
+	{
+		return (StartIKBone.transform.position - targetPos).magnitude / GetCurrentLegToAnkleLength();
+	}
+
+	public Vector3 GetNotStretchedPositionTowards(Vector3 targetPos, float maxStretch)
+	{
+		Vector3 vector = targetPos - StartIKBone.transform.position;
+		return StartIKBone.transform.position + vector.normalized * (GetCurrentLegToAnkleLength() * maxStretch);
+	}
+
+	public void ApplyMaxStretchingPreprocessing(float maxStretch, float allowIKRotationFadeout = 2f)
+	{
+		if (!(maxStretch < 1.1f))
+		{
+			return;
+		}
+		float magnitude = (StartIKBone.transform.position - IKTargetPosition).magnitude;
+		float currentLegToAnkleLength = GetCurrentLegToAnkleLength();
+		float num = magnitude / currentLegToAnkleLength;
+		if (num > maxStretch)
+		{
+			if (hasFeet && FeetStretchWeight > 0f)
+			{
+				if (maxFeetAngle > 0f)
+				{
+					Vector3 lhs = IKTargetPosition - StartIKBone.transform.position;
+					lhs.Normalize();
+					Vector3 rhs = FeetIKBone.transform.position - EndIKBone.transform.position;
+					rhs.Normalize();
+					float value = Vector3.Dot(lhs, rhs);
+					value = Mathf.Clamp01(value);
+					float magnitude2 = (FeetIKBone.transform.position - EndIKBone.transform.position).magnitude;
+					float num2 = magnitude - currentLegToAnkleLength * Mathf.Min(maxStretch, 1f);
+					num2 /= magnitude2 * FeetFadeQuicker;
+					float num3 = num2;
+					num2 *= maxFeetAngleFactor * FeetStretchSensitivity;
+					if (num2 > 1f)
+					{
+						num2 = 1f;
+					}
+					if (num3 < 1f)
+					{
+						num3 = 1f;
+					}
+					else
+					{
+						if (num3 > 2f)
+						{
+							num3 = 2f;
+						}
+						num3 -= 1f;
+						num3 *= num3;
+						num3 = 1f - num3;
+					}
+					float num4 = Mathf.Min(FeetStretchLimit, (1f - value) * (90f / maxFeetAngle) * num2 * FeetStretchWeight);
+					if (num > 1.09f)
+					{
+						num3 *= 1f - Mathf.InverseLerp(1.09f, 1.23f, num);
+					}
+					if (num4 != 0f)
+					{
+						OffsetHeel(num4, num3);
+					}
+					magnitude = (StartIKBone.transform.position - IKTargetPosition).magnitude;
+					num = magnitude / currentLegToAnkleLength;
+				}
+				if (num > maxStretch)
+				{
+					float num5 = maxStretch * currentLegToAnkleLength;
+					IKTargetPosition = StartIKBone.transform.position + (IKTargetPosition - StartIKBone.transform.position).normalized * num5;
+				}
+			}
+			else
+			{
+				float num6 = maxStretch * currentLegToAnkleLength;
+				IKTargetPosition = StartIKBone.transform.position + (IKTargetPosition - StartIKBone.transform.position).normalized * num6;
+			}
+			if (allowIKRotationFadeout > 0f)
+			{
+				float num7 = num - maxStretch;
+				num7 = Mathf.Clamp01(num7 * allowIKRotationFadeout);
+				internalRotationWeightMul = 1f - num7;
+			}
+		}
+		else
+		{
+			internalRotationWeightMul = 1f;
+		}
+	}
+
+	private void PrepareFeet()
+	{
+		Vector3 to = EndIKBone.transform.position - MiddleIKBone.transform.position;
+		to.Normalize();
+		ankleToFeet = FeetIKBone.transform.position - EndIKBone.transform.position;
+		ankleToFeet.Normalize();
+		maxFeetAngle = Vector3.Angle(ankleToFeet, to);
+		maxFeetAngleFactor = 90f / maxFeetAngle;
+	}
+
+	internal void OffsetHeel(float heelRot, float feetCompensate = 1f)
+	{
+		if (!hasFeet || disableFeet)
+		{
+			return;
+		}
+		Quaternion iKTargetRotation = IKTargetRotation;
+		Vector3 vector = FeetIKBone.transform.position - EndIKBone.transform.position;
+		Vector3 vector2 = Quaternion.Inverse(iKTargetRotation) * vector;
+		Quaternion quaternion = Quaternion.AngleAxis(axis: (!UseEndBoneMapping) ? (IKTargetRotation * EndIKBone.right) : (IKTargetRotation * Vector3.right), angle: heelRot * maxFeetAngle);
+		vector2 = (IKTargetRotation = quaternion * iKTargetRotation) * vector2 - vector;
+		if (feetCompensate > 0f)
+		{
+			Quaternion quaternion2 = Quaternion.Inverse(quaternion) * FeetIKBone.transform.rotation;
+			if (feetCompensate >= 1f)
+			{
+				FeetIKBone.transform.rotation = quaternion2;
+			}
+			else
+			{
+				FeetIKBone.transform.rotation = Quaternion.Lerp(FeetIKBone.transform.rotation, quaternion2, feetCompensate);
+			}
+		}
+		IKTargetPosition -= vector2;
+	}
+
+	public IKBone GetBone(int index)
+	{
+		return IKBones[index];
+	}
+
+	public override void Init(Transform root)
+	{
+		if (!base.Initialized)
+		{
+			Vector3 vector = Vector3.Cross(MiddleIKBone.transform.position - StartIKBone.transform.position, EndIKBone.transform.position - MiddleIKBone.transform.position);
+			if (vector != Vector3.zero)
+			{
+				targetElbowNormal = vector;
+			}
+			base.fullLength = 0f;
+			StartIKBone.Init(root, MiddleIKBone.transform.position, targetElbowNormal);
+			MiddleIKBone.Init(root, EndIKBone.transform.position, targetElbowNormal);
+			EndIKBone.Init(root, EndIKBone.transform.position + (EndIKBone.transform.position - MiddleIKBone.transform.position), targetElbowNormal);
+			base.fullLength = base.Bones[0].BoneLength + base.Bones[1].BoneLength;
+			RefreshDefaultFlexNormal();
+			if (EndIKBone.transform.parent != MiddleIKBone.transform)
+			{
+				everyIsChild = false;
+			}
+			else if (MiddleIKBone.transform.parent != StartIKBone.transform)
+			{
+				everyIsChild = false;
+			}
+			else
+			{
+				everyIsChild = true;
+			}
+			SetRootReference(root);
+			if (Application.isPlaying)
+			{
+				base.Initialized = true;
+			}
+			if (hasFeet)
+			{
+				PrepareFeet();
+			}
+			if (everyIsChild)
+			{
+				EndParentIKBone = MiddleIKBone;
+			}
+			else
+			{
+				EndParentIKBone = new IKBone(EndIKBone.transform.parent);
+			}
+		}
+	}
+
+	public void SetBones(Transform startBone, Transform midBone, Transform endBone)
+	{
+		IKBones = new IKBone[3];
+		IKBones[0] = new IKBone(startBone);
+		IKBones[1] = new IKBone(midBone);
+		IKBones[2] = new IKBone(endBone);
+		base.Bones = new FIK_IKBoneBase[3]
+		{
+			IKBones[0],
+			IKBones[1],
+			IKBones[2]
+		};
+		IKBones[0].SetChild(IKBones[1]);
+		IKBones[1].SetChild(IKBones[2]);
+		IKTargetPosition = endBone.position;
+		IKTargetRotation = endBone.rotation;
+	}
+
+	public void SetLegWithFeet(Transform startBone, Transform midBone, Transform endBone, Transform feet)
+	{
+		IKBones = new IKBone[4];
+		IKBones[0] = new IKBone(startBone);
+		IKBones[1] = new IKBone(midBone);
+		IKBones[2] = new IKBone(endBone);
+		IKBones[3] = new IKBone(feet);
+		base.Bones = new FIK_IKBoneBase[4]
+		{
+			IKBones[0],
+			IKBones[1],
+			IKBones[2],
+			IKBones[3]
+		};
+		IKBones[0].SetChild(IKBones[1]);
+		IKBones[1].SetChild(IKBones[2]);
+		IKBones[2].SetChild(IKBones[3]);
+		IKTargetPosition = endBone.position;
+		IKTargetRotation = endBone.rotation;
+		hasFeet = true;
+	}
+
+	public void SetBones(Transform startBone, Transform endBone)
+	{
+		SetBones(startBone, endBone.parent, endBone);
+	}
+
+	protected virtual void Refresh()
+	{
+		RefreshAnimatorCoords();
+		if (!everyIsChild)
+		{
+			MiddleIKBone.RefreshOrientations(EndIKBone.transform.position, targetElbowNormal);
+		}
+	}
+
+	protected virtual void EndBoneRotation()
+	{
+		float num = FootRotationWeight * IKWeight * internalRotationWeightMul;
+		if (num > 0f)
+		{
+			if (UseEndBoneMapping)
+			{
+				if (num < 1f)
+				{
+					EndIKBone.transform.rotation = Quaternion.SlerpUnclamped(postIKAnimatorEndBoneRot, IKTargetRotation * EndBoneMapping, num);
+				}
+				else
+				{
+					EndIKBone.transform.rotation = IKTargetRotation * EndBoneMapping;
+				}
+			}
+			else if (num < 1f)
+			{
+				EndIKBone.transform.rotation = Quaternion.SlerpUnclamped(postIKAnimatorEndBoneRot, IKTargetRotation, num);
+			}
+			else
+			{
+				EndIKBone.transform.rotation = IKTargetRotation;
+			}
+		}
+		lateEndBoneRotation = EndIKBone.transform.rotation;
+	}
+
+	public override void PreCalibrate()
+	{
+		base.PreCalibrate();
+		RefreshScaleReference();
+	}
+
+	public void RefreshAnimatorCoords()
+	{
+		StartIKBone.CaptureSourceAnimation();
+		MiddleIKBone.CaptureSourceAnimation();
+		EndIKBone.CaptureSourceAnimation();
+		if (!everyIsChild && MiddleIKBone != EndParentIKBone)
+		{
+			EndParentIKBone.CaptureSourceAnimation();
+		}
+	}
+
+	protected Vector3 GetDefaultFlexNormal()
+	{
+		if (ManualHintPositionWeight > 0f)
+		{
+			if (ManualHintPositionWeight >= 1f)
+			{
+				return CalculateElbowNormalToPosition(IKManualHintPosition);
+			}
+			return Vector3.LerpUnclamped(GetAutomaticFlexNormal().normalized, CalculateElbowNormalToPosition(IKManualHintPosition), ManualHintPositionWeight);
+		}
+		return GetAutomaticFlexNormal();
+	}
+
+	public Vector3 CalculateElbowNormalToPosition(Vector3 targetElbowPos)
+	{
+		return Vector3.Cross(targetElbowPos - StartIKBone.transform.position, EndIKBone.transform.position - StartIKBone.transform.position);
+	}
+
+	public void RefreshDefaultFlexNormal()
+	{
+		Vector3 vector = Vector3.Cross(MiddleIKBone.transform.position - StartIKBone.transform.position, EndIKBone.transform.position - MiddleIKBone.transform.position);
+		if (vector != Vector3.zero)
+		{
+			targetElbowNormal = vector;
+		}
+	}
+
+	protected Vector3 GetOrientationDirection(Vector3 ikPosition, Vector3 orientationNormal)
+	{
+		Vector3 vector = ikPosition - StartIKBone.transform.position;
+		if (vector == Vector3.zero)
+		{
+			return Vector3.zero;
+		}
+		float sqrMagnitude = vector.sqrMagnitude;
+		float num = Mathf.Sqrt(sqrMagnitude);
+		float num2 = (sqrMagnitude + StartIKBone.sqrMagn - MiddleIKBone.sqrMagn) / 2f / num;
+		float y = Mathf.Sqrt(Mathf.Clamp(StartIKBone.sqrMagn - num2 * num2, 0f, float.PositiveInfinity));
+		Vector3 upwards = Vector3.Cross(vector / num, orientationNormal);
+		return Quaternion.LookRotation(vector, upwards) * new Vector3(0f, y, num2);
+	}
+}

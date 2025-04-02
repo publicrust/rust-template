@@ -1,0 +1,154 @@
+using System;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Steamworks;
+using Steamworks.Data;
+using Steamworks.Ugc;
+
+public class SteamUGC : SteamSharedClass<SteamUGC>
+{
+	internal static ISteamUGC Internal => SteamSharedClass<SteamUGC>.Interface as ISteamUGC;
+
+	public static event Action<Result> OnDownloadItemResult;
+
+	public static event Action<AppId, PublishedFileId> OnItemSubscribed;
+
+	public static event Action<AppId, PublishedFileId> OnItemUnsubscribed;
+
+	public static event Action<AppId, PublishedFileId> OnItemInstalled;
+
+	internal override bool InitializeInterface(bool server)
+	{
+		SetInterface(server, new ISteamUGC(server));
+		if (SteamSharedClass<SteamUGC>.Interface.Self == IntPtr.Zero)
+		{
+			return false;
+		}
+		InstallEvents(server);
+		return true;
+	}
+
+	internal static void InstallEvents(bool server)
+	{
+		Dispatch.Install(delegate(DownloadItemResult_t x)
+		{
+			SteamUGC.OnDownloadItemResult?.Invoke(x.Result);
+		}, server);
+		Dispatch.Install(delegate(RemoteStoragePublishedFileSubscribed_t x)
+		{
+			SteamUGC.OnItemSubscribed?.Invoke(x.AppID.Value, x.PublishedFileId);
+		}, server);
+		Dispatch.Install(delegate(RemoteStoragePublishedFileUnsubscribed_t x)
+		{
+			SteamUGC.OnItemUnsubscribed?.Invoke(x.AppID.Value, x.PublishedFileId);
+		}, server);
+		Dispatch.Install(delegate(ItemInstalled_t x)
+		{
+			SteamUGC.OnItemInstalled?.Invoke(x.AppID.Value, x.PublishedFileId);
+		}, server);
+	}
+
+	public static async Task<bool> DeleteFileAsync(PublishedFileId fileId)
+	{
+		DeleteItemResult_t? deleteItemResult_t = await Internal.DeleteItem(fileId);
+		return deleteItemResult_t.HasValue && deleteItemResult_t.GetValueOrDefault().Result == Result.OK;
+	}
+
+	public static bool Download(PublishedFileId fileId, bool highPriority = false)
+	{
+		return Internal.DownloadItem(fileId, highPriority);
+	}
+
+	public static async Task<bool> DownloadAsync(PublishedFileId fileId, Action<float> progress = null, int milisecondsUpdateDelay = 60, CancellationToken ct = default(CancellationToken))
+	{
+		Item item = new Item(fileId);
+		if (ct == default(CancellationToken))
+		{
+			ct = new CancellationTokenSource(TimeSpan.FromSeconds(60.0)).Token;
+		}
+		progress?.Invoke(0f);
+		if (!Download(fileId, highPriority: true))
+		{
+			return item.IsInstalled;
+		}
+		Action<Result> onDownloadStarted = null;
+		try
+		{
+			bool downloadStarted = false;
+			onDownloadStarted = delegate
+			{
+				downloadStarted = true;
+			};
+			OnDownloadItemResult += onDownloadStarted;
+			while (!downloadStarted && !ct.IsCancellationRequested)
+			{
+				await Task.Delay(milisecondsUpdateDelay);
+			}
+		}
+		finally
+		{
+			OnDownloadItemResult -= onDownloadStarted;
+		}
+		progress?.Invoke(0.2f);
+		await Task.Delay(milisecondsUpdateDelay);
+		while (!ct.IsCancellationRequested)
+		{
+			progress?.Invoke(0.2f + item.DownloadAmount * 0.8f);
+			if (!item.IsDownloading && item.IsInstalled)
+			{
+				break;
+			}
+			await Task.Delay(milisecondsUpdateDelay);
+		}
+		progress?.Invoke(1f);
+		return item.IsInstalled;
+	}
+
+	public static async Task<Item?> QueryFileAsync(PublishedFileId fileId)
+	{
+		ResultPage? resultPage = await Query.All.WithFileId(fileId).GetPageAsync(1);
+		if (!resultPage.HasValue || resultPage.Value.ResultCount != 1)
+		{
+			return null;
+		}
+		Item value = resultPage.Value.Entries.First();
+		resultPage.Value.Dispose();
+		return value;
+	}
+
+	public static async Task<bool> StartPlaytimeTracking(PublishedFileId fileId)
+	{
+		return (await Internal.StartPlaytimeTracking(new PublishedFileId[1] { fileId }, 1u)).Value.Result == Result.OK;
+	}
+
+	public static async Task<bool> StopPlaytimeTracking(PublishedFileId fileId)
+	{
+		return (await Internal.StopPlaytimeTracking(new PublishedFileId[1] { fileId }, 1u)).Value.Result == Result.OK;
+	}
+
+	public static async Task<bool> StopPlaytimeTrackingForAllItems()
+	{
+		return (await Internal.StopPlaytimeTrackingForAllItems()).Value.Result == Result.OK;
+	}
+
+	public static void SuspendDownloads()
+	{
+		Internal.SuspendDownloads(bSuspend: true);
+	}
+
+	public static void ResumeDownloads()
+	{
+		Internal.SuspendDownloads(bSuspend: false);
+	}
+
+	public static bool ShowWorkshopEula()
+	{
+		return Internal.ShowWorkshopEULA();
+	}
+
+	public static async Task<bool?> GetWorkshopEulaStatus()
+	{
+		return (await Internal.GetWorkshopEULAStatus())?.Accepted;
+	}
+}
