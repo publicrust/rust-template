@@ -46,7 +46,7 @@ public static class FileEx
 					if (totalHours >= (double)num2)
 					{
 						fileInfo2.Delete();
-						MoveToSafe(fileInfo, fileInfo2.FullName);
+						fileInfo.MoveToSafe(fileInfo2.FullName);
 					}
 				}
 				else
@@ -55,7 +55,7 @@ public static class FileEx
 					{
 						fileInfo2.Directory.Create();
 					}
-					MoveToSafe(fileInfo, fileInfo2.FullName);
+					fileInfo.MoveToSafe(fileInfo2.FullName);
 				}
 			}
 		}
