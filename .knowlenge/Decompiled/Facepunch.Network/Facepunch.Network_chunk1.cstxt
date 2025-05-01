@@ -1,0 +1,5098 @@
+using System;
+using System.Runtime.CompilerServices;
+using Microsoft.CodeAnalysis;
+
+[Embedded]
+[CompilerGenerated]
+internal sealed class IsUnmanagedAttribute : Attribute
+{
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using Network;
+
+public class DemoDiskManager
+{
+	private DateTime nextDemoDiskQuotaEnforcement;
+
+	internal void EnforceDemoDiskSpaceQuota()
+	{
+		if (nextDemoDiskQuotaEnforcement > DateTime.UtcNow)
+		{
+			return;
+		}
+		nextDemoDiskQuotaEnforcement = DateTime.UtcNow.AddMinutes(DemoConVars.DiskCleanupIntervalMinutes);
+		if (!Directory.Exists(DemoConVars.ServerDemoDirectory))
+		{
+			return;
+		}
+		FileInfo[] files = new DirectoryInfo(DemoConVars.ServerDemoDirectory).GetFiles("*.sdem");
+		List<FileInfo> list = files.OrderBy((FileInfo x) => x.CreationTimeUtc).ToList();
+		long num = files.Sum((FileInfo x) => x.Length);
+		long num2 = (long)DemoConVars.MaxDemoDiskSpaceGB * 1024L * 1024 * 1024;
+		foreach (FileInfo item in list)
+		{
+			if (num < num2)
+			{
+				break;
+			}
+			num -= item.Length;
+			item.Delete();
+			File.Delete(DemoPaths.GetLocalHeaderPath(Path.GetFileNameWithoutExtension(item.Name)));
+		}
+	}
+}
+
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using Azure.Storage;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Network;
+using UnityEngine;
+
+public class DemoUploadManager
+{
+	private class UploadResult
+	{
+		public long Bytes;
+
+		public TimeSpan TimeTaken;
+
+		public int Concurrency;
+
+		public long BandwidthPerSecondPerThread;
+
+		public UploadResult(long bytes, TimeSpan time, int concurrency)
+		{
+			Bytes = bytes;
+			TimeTaken = time;
+			Concurrency = concurrency;
+		}
+	}
+
+	private const string UploadUrl = "https://rustserverdemos.blob.core.windows.net/";
+
+	private List<UploadResult> history = new List<UploadResult>();
+
+	private ConcurrentQueue<DemoUploadRequest> queue = new ConcurrentQueue<DemoUploadRequest>();
+
+	private long bytesInQueue;
+
+	private Func<bool> IsConnected;
+
+	internal DemoUploadManager(Func<bool> isConnected)
+	{
+		IsConnected = isConnected;
+	}
+
+	public void EnqueueUpload(DemoUploadRequest request)
+	{
+		ServicePointManager.FindServicePoint(new Uri("https://rustserverdemos.blob.core.windows.net/")).ConnectionLimit = DemoConVars.MaxUploadConcurrency;
+		bytesInQueue += request.BytesToUpload;
+		queue.Enqueue(request);
+	}
+
+	private int CalculateConcurrency(long requestBytes)
+	{
+		long bytesPerSecond = 0L;
+		lock (history)
+		{
+			if (history.Count == 0)
+			{
+				return DemoConVars.MinimumConcurrency;
+			}
+			bytesPerSecond = (long)history.Average((UploadResult x) => x.BandwidthPerSecondPerThread);
+		}
+		int num = ConcurrencyForBytes(requestBytes, bytesPerSecond, TimeSpan.FromSeconds((float)DemoConVars.ServerDemoFlushIntervalSeconds / DemoConVars.BandwidthLimitRatio));
+		int num2 = ConcurrencyForBytes(bytesInQueue, bytesPerSecond, TimeSpan.FromSeconds(DemoConVars.ServerDemoFlushIntervalSeconds * 3));
+		return Mathf.Max(num, num2);
+	}
+
+	private int ConcurrencyForBytes(long bytes, long bytesPerSecond, TimeSpan interval)
+	{
+		int num = (int)(bytes / bytesPerSecond);
+		int num2 = (int)interval.TotalSeconds;
+		return Mathf.Max(1, Mathf.CeilToInt((float)num / (float)num2));
+	}
+
+	internal async Task UploadThread()
+	{
+		while (IsConnected())
+		{
+			await Task.Delay(TimeSpan.FromSeconds(1.0));
+			if (queue.TryDequeue(out var result))
+			{
+				int concurrency = CalculateConcurrency(result.BytesToUpload);
+				bytesInQueue -= result.BytesToUpload;
+				await UploadDemoToAzure(result, concurrency);
+			}
+		}
+	}
+
+	private async Task UploadDemoToAzure(DemoUploadRequest request, int concurrency)
+	{
+		_ = 1;
+		try
+		{
+			ServicePointManager.FindServicePoint(new Uri(request.UploadEndpoint)).ConnectionLimit = DemoConVars.MaxUploadConcurrency;
+			concurrency = Mathf.Clamp(concurrency, DemoConVars.MinimumConcurrency, DemoConVars.MaxUploadConcurrency);
+			BlobContainerClient blobContainer = new BlobContainerClient(new Uri(request.UploadEndpoint), (BlobClientOptions)null);
+			if (!request.State.DemoUploaded)
+			{
+				BlobClient blobClient = blobContainer.GetBlobClient(DemoPaths.GetBlobDemoPath(request.Header));
+				BlobUploadOptions val = new BlobUploadOptions
+				{
+					HttpHeaders = new BlobHttpHeaders
+					{
+						ContentEncoding = (request.Header.IsZipped ? "gzip" : null)
+					}
+				};
+				StorageTransferOptions transferOptions = default(StorageTransferOptions);
+				((StorageTransferOptions)(ref transferOptions)).MaximumConcurrency = concurrency;
+				val.TransferOptions = transferOptions;
+				BlobUploadOptions val2 = val;
+				DateTime timeStart = DateTime.UtcNow;
+				await blobClient.UploadAsync(request.DemoDiskPath, val2, default(CancellationToken));
+				request.State.DemoUploaded = true;
+				request.State.DemoUploadDuration = DateTime.UtcNow - timeStart;
+			}
+			BlobClient blobClient2 = blobContainer.GetBlobClient(DemoPaths.GetBlobHeaderPath(request.Header));
+			BlobUploadOptions val3 = new BlobUploadOptions
+			{
+				HttpHeaders = new BlobHttpHeaders
+				{
+					ContentType = "application/json"
+				}
+			};
+			await blobClient2.UploadAsync(request.HeaderDiskPath, val3, default(CancellationToken));
+			DeleteLocalDemo(request);
+			lock (history)
+			{
+				history.Add(new UploadResult(request.BytesToUpload, request.State.DemoUploadDuration, concurrency));
+				if (history.Count > 20)
+				{
+					history.RemoveAt(0);
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			Debug.LogException(ex);
+			request.State.Failures++;
+			if (request.State.Failures >= DemoConVars.MaxUploadAttempts)
+			{
+				DeleteLocalDemo(request);
+			}
+			else
+			{
+				queue.Enqueue(request);
+			}
+		}
+	}
+
+	private void DeleteLocalDemo(DemoUploadRequest request)
+	{
+		if (File.Exists(request.DemoDiskPath))
+		{
+			File.Delete(request.DemoDiskPath);
+		}
+		if (File.Exists(request.HeaderDiskPath))
+		{
+			File.Delete(request.HeaderDiskPath);
+		}
+	}
+}
+
+
+using System;
+
+private class UploadResult
+{
+	public long Bytes;
+
+	public TimeSpan TimeTaken;
+
+	public int Concurrency;
+
+	public long BandwidthPerSecondPerThread;
+
+	public UploadResult(long bytes, TimeSpan time, int concurrency)
+	{
+		Bytes = bytes;
+		TimeTaken = time;
+		Concurrency = concurrency;
+	}
+}
+
+
+using System.IO;
+using Network;
+
+public class DemoUploadRequest
+{
+	public DemoChunkHeader Header;
+
+	public string DemoDiskPath;
+
+	public string HeaderDiskPath;
+
+	public string UploadEndpoint;
+
+	public DemoUploadState State = new DemoUploadState();
+
+	public long BytesToUpload { get; }
+
+	public DemoUploadRequest(DemoChunkHeader header, string demoLocalPath, string headerDiskPath, string containerUrl)
+	{
+		Header = header;
+		DemoDiskPath = demoLocalPath;
+		HeaderDiskPath = headerDiskPath;
+		UploadEndpoint = containerUrl;
+		if (!File.Exists(DemoDiskPath))
+		{
+			throw new FileNotFoundException("Demo file not found", DemoDiskPath);
+		}
+		FileInfo fileInfo = new FileInfo(demoLocalPath);
+		BytesToUpload = fileInfo.Length;
+	}
+}
+
+
+using System;
+
+public class DemoUploadState
+{
+	public bool DemoUploaded;
+
+	public TimeSpan DemoUploadDuration;
+
+	public int Failures;
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using Azure.Storage;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
+using Network;
+using Newtonsoft.Json;
+using SilentOrbit.ProtocolBuffers;
+using UnityEngine;
+
+public class FullServerDemos
+{
+	public class DebugEntry
+	{
+		public long i { get; set; }
+
+		public long s { get; set; }
+
+		public long e { get; set; }
+
+		public ulong ts { get; set; }
+
+		public long conLen { get; set; }
+
+		public ushort cons { get; set; }
+	}
+
+	private DemoUploadManager upload;
+
+	private DemoDiskManager disk = new DemoDiskManager();
+
+	private IServerCallback serverCallback;
+
+	private AutoResetEvent threadResetEvent;
+
+	private string sessionId;
+
+	private DateTime sessionStartTime = DateTime.MaxValue;
+
+	private int chunkIndex;
+
+	private DateTime nextFlushTime;
+
+	private DateTime timeStart;
+
+	private FileStream fileStream;
+
+	private GZipStream zipStream;
+
+	private BinaryWriter writer;
+
+	private long packetCount;
+
+	private int playerIndex;
+
+	private Dictionary<Connection, int> playerIndexes = new Dictionary<Connection, int>();
+
+	private string localChunkFileId;
+
+	private long uncompressedBytes;
+
+	private bool isZipped;
+
+	private MemoryStream saveStream;
+
+	private bool saveDone;
+
+	private volatile int writeChunkInd;
+
+	private volatile int readChunkInd;
+
+	private byte[] scratchBuffer = new byte[64];
+
+	private bool initSaveReady;
+
+	private bool serializeDebugJson;
+
+	private FileStream debugJson;
+
+	private JsonSerializer debugSerializer;
+
+	private StreamWriter debugWriter;
+
+	private JsonTextWriter jsonDebugWriter;
+
+	private DebugEntry debugEntry;
+
+	public int DemoCount { get; private set; }
+
+	public async Task BenchmarkDemoUpload(int concurrencyCount, string pathOverride, int transferSizeOverride)
+	{
+		ServicePointManager.FindServicePoint(new Uri(DemoConVars.UploadEndpoint)).ConnectionLimit = 4;
+		Task task = CreateDemoUploadTask(concurrencyCount, pathOverride, transferSizeOverride);
+		Task task2 = CreateDemoUploadTask(concurrencyCount, pathOverride, transferSizeOverride);
+		await Task.WhenAll(task, task2);
+	}
+
+	private async Task CreateDemoUploadTask(int concurrencyCount, string pathOverride, int transferSizeOverride)
+	{
+		try
+		{
+			string text = "Bundles/shared/monuments.bundle";
+			if (!string.IsNullOrEmpty(pathOverride))
+			{
+				text = pathOverride;
+			}
+			BlobClient blobClient = new BlobContainerClient(new Uri(DemoConVars.UploadEndpoint), (BlobClientOptions)null).GetBlobClient($"benchmark/upload/{Guid.NewGuid()}");
+			Stopwatch stopwatch = Stopwatch.StartNew();
+			Debug.Log((object)"Beginning to upload file...");
+			DateTime nextLogTime = default(DateTime);
+			int num = 8388608;
+			CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
+			cancellationTokenSource.CancelAfter(TimeSpan.FromSeconds(20.0));
+			if (transferSizeOverride > 0)
+			{
+				num = transferSizeOverride;
+			}
+			string text2 = text;
+			BlobUploadOptions val = new BlobUploadOptions
+			{
+				ProgressHandler = new Progress<long>(delegate(long bytesTransferred)
+				{
+					if (DateTime.UtcNow > nextLogTime)
+					{
+						nextLogTime = DateTime.UtcNow.AddSeconds(1.0);
+						int num2 = (int)(bytesTransferred / 1024 / 1024);
+						Debug.Log((object)$"Transferred {num2}MB");
+					}
+				})
+			};
+			StorageTransferOptions transferOptions = default(StorageTransferOptions);
+			((StorageTransferOptions)(ref transferOptions)).MaximumConcurrency = concurrencyCount;
+			((StorageTransferOptions)(ref transferOptions)).InitialTransferSize = num;
+			((StorageTransferOptions)(ref transferOptions)).MaximumTransferSize = num;
+			val.TransferOptions = transferOptions;
+			await blobClient.UploadAsync(text2, val, cancellationTokenSource.Token);
+			Debug.Log((object)$"Took {Math.Round(stopwatch.Elapsed.TotalSeconds, 1)}s to upload 1GB texture bundle");
+		}
+		catch (Exception ex)
+		{
+			Debug.LogException(ex);
+		}
+	}
+
+	internal FullServerDemos(Func<bool> isConnected, IServerCallback serverCallback, AutoResetEvent resetEvent)
+	{
+		upload = new DemoUploadManager(isConnected);
+		this.serverCallback = serverCallback;
+		threadResetEvent = resetEvent;
+	}
+
+	internal void OnDemoThreadStart()
+	{
+		InitializeFullServerDemo();
+	}
+
+	internal void OnDemoThreadStop()
+	{
+		CleanupFullServerDemo();
+	}
+
+	internal void Cycle()
+	{
+		try
+		{
+			disk.EnforceDemoDiskSpaceQuota();
+		}
+		catch (Exception ex)
+		{
+			Debug.LogException(ex);
+		}
+		if (!initSaveReady && saveDone)
+		{
+			ConsumeSave(localChunkFileId);
+			initSaveReady = true;
+			sessionStartTime = DateTime.UtcNow;
+		}
+		else if (DateTime.UtcNow > nextFlushTime)
+		{
+			if (saveStream == null)
+			{
+				RequestSave();
+			}
+			else if (saveDone)
+			{
+				DateTime utcNow = DateTime.UtcNow;
+				FlushServerDemo(utcNow);
+				SetupNextDemoChunk(utcNow);
+				ConsumeSave(localChunkFileId);
+			}
+		}
+	}
+
+	private void InitializeFullServerDemo()
+	{
+		Directory.CreateDirectory(DemoConVars.ServerDemoDirectory);
+		chunkIndex = 0;
+		sessionId = Guid.NewGuid().ToString("N");
+		SetupNextDemoChunk(DateTime.UtcNow);
+		initSaveReady = false;
+		RequestSave();
+	}
+
+	private void CleanupFullServerDemo()
+	{
+		FlushServerDemo(DateTime.UtcNow);
+	}
+
+	internal void RecordServerDemoPacket(ICollection<Connection> connections, byte[] data, int dataLength, bool isOutgoing, DateTime timestamp)
+	{
+		if (timestamp < sessionStartTime)
+		{
+			return;
+		}
+		if (connections == null)
+		{
+			connections = Array.Empty<Connection>();
+		}
+		packetCount++;
+		ulong num = (ulong)(timestamp - timeStart).TotalMilliseconds;
+		int num2 = ProtocolParser.WriteUInt64(num, scratchBuffer, 0);
+		int num3 = (isOutgoing ? 2 : 0) + connections.Count * 2;
+		int num4 = 1 + num2 + num3 + dataLength;
+		uncompressedBytes += num4;
+		int num5 = ProtocolParser.WriteUInt32((uint)num4, scratchBuffer, 32);
+		uncompressedBytes += num5;
+		writer.Write(scratchBuffer, 32, num5);
+		int num6 = (isOutgoing ? 1 : 0);
+		writer.Write((byte)num6);
+		writer.Write(scratchBuffer, 0, num2);
+		if (isOutgoing)
+		{
+			writer.Write((ushort)connections.Count);
+		}
+		foreach (Connection connection in connections)
+		{
+			if (!playerIndexes.TryGetValue(connection, out var value))
+			{
+				value = playerIndex++;
+				playerIndexes.Add(connection, value);
+			}
+			writer.Write((ushort)value);
+		}
+		writer.Write(data, 0, dataLength);
+		if (debugJson != null)
+		{
+			WriteDebug(packetCount - 1, uncompressedBytes - num4 - num5, uncompressedBytes, num, num3, (ushort)connections.Count);
+		}
+	}
+
+	private void FlushServerDemo(DateTime endOfChunk)
+	{
+		Directory.CreateDirectory(DemoConVars.ServerDemoDirectory);
+		if (fileStream != null)
+		{
+			if (debugJson != null)
+			{
+				((JsonWriter)jsonDebugWriter).WriteEndArray();
+				((JsonWriter)jsonDebugWriter).Close();
+				debugWriter.Close();
+				debugSerializer = null;
+				debugJson = null;
+				debugEntry = null;
+			}
+			if (zipStream != null)
+			{
+				zipStream.Flush();
+			}
+			fileStream.Flush();
+			DemoChunkHeader header = CreateDemoHeader(timeStart, endOfChunk);
+			SaveChunkHeader(header);
+			writer.Dispose();
+			if (zipStream != null)
+			{
+				zipStream.Dispose();
+				zipStream = null;
+			}
+			fileStream.Dispose();
+			if (DemoConVars.UploadDemos && !string.IsNullOrEmpty(DemoConVars.UploadEndpoint))
+			{
+				DemoUploadRequest request = new DemoUploadRequest(header, DemoPaths.GetLocalDemoPath(localChunkFileId), DemoPaths.GetLocalHeaderPath(localChunkFileId), DemoConVars.UploadEndpoint);
+				upload.EnqueueUpload(request);
+			}
+			chunkIndex++;
+			DemoCount++;
+		}
+	}
+
+	private void SetupNextDemoChunk(DateTime startTime)
+	{
+		//IL_0089: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0093: Expected O, but got Unknown
+		Directory.CreateDirectory(DemoConVars.ServerDemoDirectory);
+		localChunkFileId = Guid.NewGuid().ToString("N");
+		fileStream = new FileStream(DemoPaths.GetLocalDemoPath(localChunkFileId), FileMode.OpenOrCreate, FileAccess.Write, FileShare.None, 4096, FileOptions.Asynchronous | FileOptions.SequentialScan);
+		if (serializeDebugJson)
+		{
+			debugJson = new FileStream(DemoPaths.GetDebugPath(localChunkFileId), FileMode.OpenOrCreate, FileAccess.Write);
+			debugSerializer = JsonSerializer.CreateDefault();
+			debugWriter = new StreamWriter(debugJson);
+			jsonDebugWriter = new JsonTextWriter((TextWriter)debugWriter);
+			((JsonWriter)jsonDebugWriter).WriteStartArray();
+			debugEntry = new DebugEntry();
+		}
+		isZipped = DemoConVars.ZipServerDemos;
+		if (isZipped)
+		{
+			zipStream = new GZipStream(fileStream, CompressionLevel.Optimal);
+			writer = new BinaryWriter(zipStream);
+		}
+		else
+		{
+			writer = new BinaryWriter(fileStream);
+		}
+		nextFlushTime = DateTime.UtcNow.AddSeconds(DemoConVars.ServerDemoFlushIntervalSeconds);
+		playerIndexes.Clear();
+		playerIndex = 0;
+		packetCount = 0L;
+		timeStart = startTime;
+		uncompressedBytes = 0L;
+	}
+
+	private DemoChunkHeader CreateDemoHeader(DateTime startTime, DateTime endTime)
+	{
+		ServerInfo serverInfo = serverCallback.GetServerInfo();
+		long length = fileStream.Length;
+		return new DemoChunkHeader
+		{
+			ServerId = DemoConVars.ServerId,
+			SessionId = sessionId,
+			LocalChunkId = localChunkFileId,
+			ChunkIndex = chunkIndex,
+			SessionStartTime = sessionStartTime,
+			TimeStart = startTime,
+			TimeEnd = endTime,
+			BytesDecompressed = (isZipped ? uncompressedBytes : length),
+			BytesCompressed = length,
+			PacketCount = packetCount,
+			Players = playerIndexes.Select((KeyValuePair<Connection, int> x) => new DemoPlayerInfo
+			{
+				ChunkPlayerIndex = x.Value,
+				Guid = x.Key.guid,
+				UserId = x.Key.userid
+			}).ToList(),
+			IsZipped = isZipped,
+			NetworkVersion = serverInfo.NetworkVersion,
+			Changeset = serverInfo.Changeset,
+			Hostname = serverInfo.Hostname,
+			Seed = serverInfo.Seed.ToString(),
+			WorldSize = serverInfo.WorldSize.ToString(),
+			Level = serverInfo.Level,
+			LevelUrl = serverInfo.LevelUrl,
+			Checksum = serverInfo.Checksum
+		};
+	}
+
+	private void SaveChunkHeader(DemoChunkHeader header)
+	{
+		string localHeaderPath = DemoPaths.GetLocalHeaderPath(localChunkFileId);
+		string contents = JsonConvert.SerializeObject((object)header, (Formatting)1);
+		File.WriteAllText(localHeaderPath, contents);
+	}
+
+	private void RequestSave()
+	{
+		Interlocked.Increment(ref writeChunkInd);
+		serverCallback.AddOnSaveCallback(OnSaveDone);
+		saveStream = new MemoryStream(33554432);
+		serverCallback.RequestSave(saveStream);
+	}
+
+	private void ConsumeSave(string filename)
+	{
+		using (FileStream stream = new FileStream(DemoPaths.GetSavePath(filename), FileMode.Create))
+		{
+			saveStream.Position = 0L;
+			saveStream.WriteTo(stream);
+		}
+		saveStream.Dispose();
+		saveStream = null;
+		saveDone = false;
+		Interlocked.Increment(ref readChunkInd);
+	}
+
+	private void OnSaveDone(Stream stream)
+	{
+		if (stream == saveStream)
+		{
+			saveDone = true;
+			serverCallback.RemoveOnSaveCallback(OnSaveDone);
+			if (sessionStartTime == DateTime.MaxValue)
+			{
+				sessionStartTime = DateTime.UtcNow;
+			}
+			threadResetEvent.Set();
+		}
+	}
+
+	internal int GetWriteChunkBit()
+	{
+		return writeChunkInd & 1;
+	}
+
+	internal int GetReadChunkBit()
+	{
+		return readChunkInd & 1;
+	}
+
+	private void WriteDebug(long index, long start, long end, ulong timestamp, long connectionsLength, ushort connectionCount)
+	{
+		debugEntry.i = index;
+		debugEntry.s = start;
+		debugEntry.e = end;
+		debugEntry.ts = timestamp;
+		debugEntry.conLen = connectionsLength;
+		debugEntry.cons = connectionCount;
+		debugSerializer.Serialize((JsonWriter)(object)jsonDebugWriter, (object)debugEntry);
+	}
+}
+
+
+public class DebugEntry
+{
+	public long i { get; set; }
+
+	public long s { get; set; }
+
+	public long e { get; set; }
+
+	public ulong ts { get; set; }
+
+	public long conLen { get; set; }
+
+	public ushort cons { get; set; }
+}
+
+
+using System.CodeDom.Compiler;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+
+[GeneratedCode("Unity.MonoScriptGenerator.MonoScriptInfoGenerator", null)]
+[EditorBrowsable(EditorBrowsableState.Never)]
+[CompilerGenerated]
+internal class UnitySourceGeneratedAssemblyMonoScriptTypes_v1
+{
+	private struct MonoScriptData
+	{
+		public byte[] FilePathsData;
+
+		public byte[] TypesData;
+
+		public int TotalTypes;
+
+		public int TotalFiles;
+
+		public bool IsEditorOnly;
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private static MonoScriptData Get()
+	{
+		MonoScriptData result = default(MonoScriptData);
+		result.FilePathsData = new byte[1548]
+		{
+			0, 0, 0, 3, 0, 0, 0, 48, 92, 65,
+			115, 115, 101, 116, 115, 92, 80, 108, 117, 103,
+			105, 110, 115, 92, 70, 97, 99, 101, 112, 117,
+			110, 99, 104, 46, 78, 101, 116, 119, 111, 114,
+			107, 92, 66, 97, 115, 101, 78, 101, 116, 119,
+			111, 114, 107, 46, 99, 115, 0, 0, 0, 2,
+			0, 0, 0, 43, 92, 65, 115, 115, 101, 116,
+			115, 92, 80, 108, 117, 103, 105, 110, 115, 92,
+			70, 97, 99, 101, 112, 117, 110, 99, 104, 46,
+			78, 101, 116, 119, 111, 114, 107, 92, 67, 108,
+			105, 101, 110, 116, 46, 99, 115, 0, 0, 0,
+			2, 0, 0, 0, 54, 92, 65, 115, 115, 101,
+			116, 115, 92, 80, 108, 117, 103, 105, 110, 115,
+			92, 70, 97, 99, 101, 112, 117, 110, 99, 104,
+			46, 78, 101, 116, 119, 111, 114, 107, 92, 67,
+			108, 105, 101, 110, 116, 46, 68, 101, 109, 111,
+			82, 101, 99, 111, 114, 100, 46, 99, 115, 0,
+			0, 0, 7, 0, 0, 0, 47, 92, 65, 115,
+			115, 101, 116, 115, 92, 80, 108, 117, 103, 105,
+			110, 115, 92, 70, 97, 99, 101, 112, 117, 110,
+			99, 104, 46, 78, 101, 116, 119, 111, 114, 107,
+			92, 67, 111, 110, 110, 101, 99, 116, 105, 111,
+			110, 46, 99, 115, 0, 0, 0, 1, 0, 0,
+			0, 47, 92, 65, 115, 115, 101, 116, 115, 92,
+			80, 108, 117, 103, 105, 110, 115, 92, 70, 97,
+			99, 101, 112, 117, 110, 99, 104, 46, 78, 101,
+			116, 119, 111, 114, 107, 92, 68, 101, 109, 111,
+			67, 108, 105, 101, 110, 116, 46, 99, 115, 0,
+			0, 0, 1, 0, 0, 0, 60, 92, 65, 115,
+			115, 101, 116, 115, 92, 80, 108, 117, 103, 105,
+			110, 115, 92, 70, 97, 99, 101, 112, 117, 110,
+			99, 104, 46, 78, 101, 116, 119, 111, 114, 107,
+			92, 68, 101, 109, 111, 115, 92, 66, 97, 115,
+			101, 78, 101, 116, 119, 111, 114, 107, 46, 68,
+			101, 109, 111, 115, 46, 99, 115, 0, 0, 0,
+			1, 0, 0, 0, 58, 92, 65, 115, 115, 101,
+			116, 115, 92, 80, 108, 117, 103, 105, 110, 115,
+			92, 70, 97, 99, 101, 112, 117, 110, 99, 104,
+			46, 78, 101, 116, 119, 111, 114, 107, 92, 68,
+			101, 109, 111, 115, 92, 68, 101, 109, 111, 67,
+			104, 117, 110, 107, 72, 101, 97, 100, 101, 114,
+			46, 99, 115, 0, 0, 0, 1, 0, 0, 0,
+			57, 92, 65, 115, 115, 101, 116, 115, 92, 80,
+			108, 117, 103, 105, 110, 115, 92, 70, 97, 99,
+			101, 112, 117, 110, 99, 104, 46, 78, 101, 116,
+			119, 111, 114, 107, 92, 68, 101, 109, 111, 115,
+			92, 68, 101, 109, 111, 80, 108, 97, 121, 101,
+			114, 73, 110, 102, 111, 46, 99, 115, 0, 0,
+			0, 1, 0, 0, 0, 56, 92, 65, 115, 115,
+			101, 116, 115, 92, 80, 108, 117, 103, 105, 110,
+			115, 92, 70, 97, 99, 101, 112, 117, 110, 99,
+			104, 46, 78, 101, 116, 119, 111, 114, 107, 92,
+			68, 101, 109, 111, 115, 92, 68, 101, 109, 111,
+			81, 117, 101, 117, 101, 73, 116, 101, 109, 46,
+			99, 115, 0, 0, 0, 1, 0, 0, 0, 61,
+			92, 65, 115, 115, 101, 116, 115, 92, 80, 108,
+			117, 103, 105, 110, 115, 92, 70, 97, 99, 101,
+			112, 117, 110, 99, 104, 46, 78, 101, 116, 119,
+			111, 114, 107, 92, 68, 101, 109, 111, 115, 92,
+			72, 101, 108, 112, 101, 114, 92, 68, 101, 109,
+			111, 67, 111, 110, 86, 97, 114, 115, 46, 99,
+			115, 0, 0, 0, 2, 0, 0, 0, 59, 92,
+			65, 115, 115, 101, 116, 115, 92, 80, 108, 117,
+			103, 105, 110, 115, 92, 70, 97, 99, 101, 112,
+			117, 110, 99, 104, 46, 78, 101, 116, 119, 111,
+			114, 107, 92, 68, 101, 109, 111, 115, 92, 72,
+			101, 108, 112, 101, 114, 92, 68, 101, 109, 111,
+			80, 97, 116, 104, 115, 46, 99, 115, 0, 0,
+			0, 1, 0, 0, 0, 67, 92, 65, 115, 115,
+			101, 116, 115, 92, 80, 108, 117, 103, 105, 110,
+			115, 92, 70, 97, 99, 101, 112, 117, 110, 99,
+			104, 46, 78, 101, 116, 119, 111, 114, 107, 92,
+			68, 101, 109, 111, 115, 92, 77, 97, 110, 97,
+			103, 101, 114, 115, 92, 68, 101, 109, 111, 68,
+			105, 115, 107, 77, 97, 110, 97, 103, 101, 114,
+			46, 99, 115, 0, 0, 0, 2, 0, 0, 0,
+			69, 92, 65, 115, 115, 101, 116, 115, 92, 80,
+			108, 117, 103, 105, 110, 115, 92, 70, 97, 99,
+			101, 112, 117, 110, 99, 104, 46, 78, 101, 116,
+			119, 111, 114, 107, 92, 68, 101, 109, 111, 115,
+			92, 77, 97, 110, 97, 103, 101, 114, 115, 92,
+			68, 101, 109, 111, 85, 112, 108, 111, 97, 100,
+			77, 97, 110, 97, 103, 101, 114, 46, 99, 115,
+			0, 0, 0, 2, 0, 0, 0, 69, 92, 65,
+			115, 115, 101, 116, 115, 92, 80, 108, 117, 103,
+			105, 110, 115, 92, 70, 97, 99, 101, 112, 117,
+			110, 99, 104, 46, 78, 101, 116, 119, 111, 114,
+			107, 92, 68, 101, 109, 111, 115, 92, 77, 97,
+			110, 97, 103, 101, 114, 115, 92, 68, 101, 109,
+			111, 85, 112, 108, 111, 97, 100, 82, 101, 113,
+			117, 101, 115, 116, 46, 99, 115, 0, 0, 0,
+			1, 0, 0, 0, 77, 92, 65, 115, 115, 101,
+			116, 115, 92, 80, 108, 117, 103, 105, 110, 115,
+			92, 70, 97, 99, 101, 112, 117, 110, 99, 104,
+			46, 78, 101, 116, 119, 111, 114, 107, 92, 68,
+			101, 109, 111, 115, 92, 77, 97, 110, 97, 103,
+			101, 114, 115, 92, 70, 117, 108, 108, 83, 101,
+			114, 118, 101, 114, 68, 101, 109, 111, 115, 46,
+			66, 101, 110, 99, 104, 109, 97, 114, 107, 46,
+			99, 115, 0, 0, 0, 2, 0, 0, 0, 67,
+			92, 65, 115, 115, 101, 116, 115, 92, 80, 108,
+			117, 103, 105, 110, 115, 92, 70, 97, 99, 101,
+			112, 117, 110, 99, 104, 46, 78, 101, 116, 119,
+			111, 114, 107, 92, 68, 101, 109, 111, 115, 92,
+			77, 97, 110, 97, 103, 101, 114, 115, 92, 70,
+			117, 108, 108, 83, 101, 114, 118, 101, 114, 68,
+			101, 109, 111, 115, 46, 99, 115, 0, 0, 0,
+			1, 0, 0, 0, 44, 92, 65, 115, 115, 101,
+			116, 115, 92, 80, 108, 117, 103, 105, 110, 115,
+			92, 70, 97, 99, 101, 112, 117, 110, 99, 104,
+			46, 78, 101, 116, 119, 111, 114, 107, 92, 77,
+			101, 115, 115, 97, 103, 101, 46, 99, 115, 0,
+			0, 0, 1, 0, 0, 0, 44, 92, 65, 115,
+			115, 101, 116, 115, 92, 80, 108, 117, 103, 105,
+			110, 115, 92, 70, 97, 99, 101, 112, 117, 110,
+			99, 104, 46, 78, 101, 116, 119, 111, 114, 107,
+			92, 78, 101, 116, 82, 101, 97, 100, 46, 99,
+			115, 0, 0, 0, 2, 0, 0, 0, 48, 92,
+			65, 115, 115, 101, 116, 115, 92, 80, 108, 117,
+			103, 105, 110, 115, 92, 70, 97, 99, 101, 112,
+			117, 110, 99, 104, 46, 78, 101, 116, 119, 111,
+			114, 107, 92, 78, 101, 116, 119, 111, 114, 107,
+			97, 98, 108, 101, 46, 99, 115, 0, 0, 0,
+			1, 0, 0, 0, 45, 92, 65, 115, 115, 101,
+			116, 115, 92, 80, 108, 117, 103, 105, 110, 115,
+			92, 70, 97, 99, 101, 112, 117, 110, 99, 104,
+			46, 78, 101, 116, 119, 111, 114, 107, 92, 78,
+			101, 116, 87, 114, 105, 116, 101, 46, 99, 115,
+			0, 0, 0, 2, 0, 0, 0, 51, 92, 65,
+			115, 115, 101, 116, 115, 92, 80, 108, 117, 103,
+			105, 110, 115, 92, 70, 97, 99, 101, 112, 117,
+			110, 99, 104, 46, 78, 101, 116, 119, 111, 114,
+			107, 92, 80, 97, 99, 107, 101, 116, 80, 114,
+			111, 102, 105, 108, 101, 114, 46, 99, 115, 0,
+			0, 0, 1, 0, 0, 0, 45, 92, 65, 115,
+			115, 101, 116, 115, 92, 80, 108, 117, 103, 105,
+			110, 115, 92, 70, 97, 99, 101, 112, 117, 110,
+			99, 104, 46, 78, 101, 116, 119, 111, 114, 107,
+			92, 83, 101, 110, 100, 73, 110, 102, 111, 46,
+			99, 115, 0, 0, 0, 3, 0, 0, 0, 43,
+			92, 65, 115, 115, 101, 116, 115, 92, 80, 108,
+			117, 103, 105, 110, 115, 92, 70, 97, 99, 101,
+			112, 117, 110, 99, 104, 46, 78, 101, 116, 119,
+			111, 114, 107, 92, 83, 101, 114, 118, 101, 114,
+			46, 99, 115, 0, 0, 0, 2, 0, 0, 0,
+			42, 92, 65, 115, 115, 101, 116, 115, 92, 80,
+			108, 117, 103, 105, 110, 115, 92, 70, 97, 99,
+			101, 112, 117, 110, 99, 104, 46, 78, 101, 116,
+			119, 111, 114, 107, 92, 83, 116, 97, 116, 115,
+			46, 99, 115, 0, 0, 0, 4, 0, 0, 0,
+			47, 92, 65, 115, 115, 101, 116, 115, 92, 80,
+			108, 117, 103, 105, 110, 115, 92, 70, 97, 99,
+			101, 112, 117, 110, 99, 104, 46, 78, 101, 116,
+			119, 111, 114, 107, 92, 86, 105, 115, 105, 98,
+			105, 108, 105, 116, 121, 46, 99, 115
+		};
+		result.TypesData = new byte[1208]
+		{
+			0, 0, 0, 0, 15, 78, 101, 116, 119, 111,
+			114, 107, 124, 68, 101, 102, 105, 110, 101, 115,
+			0, 0, 0, 0, 28, 78, 101, 116, 119, 111,
+			114, 107, 124, 73, 78, 101, 116, 119, 111, 114,
+			107, 67, 114, 121, 112, 116, 111, 103, 114, 97,
+			112, 104, 121, 1, 0, 0, 0, 19, 78, 101,
+			116, 119, 111, 114, 107, 124, 66, 97, 115, 101,
+			78, 101, 116, 119, 111, 114, 107, 0, 0, 0,
+			0, 23, 78, 101, 116, 119, 111, 114, 107, 124,
+			73, 67, 108, 105, 101, 110, 116, 67, 97, 108,
+			108, 98, 97, 99, 107, 0, 0, 0, 0, 14,
+			78, 101, 116, 119, 111, 114, 107, 124, 67, 108,
+			105, 101, 110, 116, 0, 0, 0, 0, 19, 78,
+			101, 116, 119, 111, 114, 107, 124, 73, 68, 101,
+			109, 111, 72, 101, 97, 100, 101, 114, 1, 0,
+			0, 0, 18, 78, 101, 116, 119, 111, 114, 107,
+			124, 67, 111, 110, 110, 101, 99, 116, 105, 111,
+			110, 1, 0, 0, 0, 18, 78, 101, 116, 119,
+			111, 114, 107, 124, 67, 111, 110, 110, 101, 99,
+			116, 105, 111, 110, 0, 0, 0, 0, 29, 78,
+			101, 116, 119, 111, 114, 107, 46, 67, 111, 110,
+			110, 101, 99, 116, 105, 111, 110, 124, 86, 97,
+			108, 105, 100, 97, 116, 105, 111, 110, 0, 0,
+			0, 0, 29, 78, 101, 116, 119, 111, 114, 107,
+			46, 67, 111, 110, 110, 101, 99, 116, 105, 111,
+			110, 124, 67, 108, 105, 101, 110, 116, 73, 110,
+			102, 111, 0, 0, 0, 0, 28, 78, 101, 116,
+			119, 111, 114, 107, 124, 84, 105, 109, 101, 65,
+			118, 101, 114, 97, 103, 101, 86, 97, 108, 117,
+			101, 68, 97, 116, 97, 0, 0, 0, 0, 24,
+			78, 101, 116, 119, 111, 114, 107, 124, 84, 105,
+			109, 101, 65, 118, 101, 114, 97, 103, 101, 86,
+			97, 108, 117, 101, 0, 0, 0, 0, 30, 78,
+			101, 116, 119, 111, 114, 107, 124, 84, 105, 109,
+			101, 65, 118, 101, 114, 97, 103, 101, 86, 97,
+			108, 117, 101, 76, 111, 111, 107, 117, 112, 0,
+			0, 0, 0, 14, 78, 101, 116, 119, 111, 114,
+			107, 124, 84, 105, 109, 101, 69, 120, 0, 0,
+			0, 0, 18, 78, 101, 116, 119, 111, 114, 107,
+			124, 68, 101, 109, 111, 67, 108, 105, 101, 110,
+			116, 1, 0, 0, 0, 19, 78, 101, 116, 119,
+			111, 114, 107, 124, 66, 97, 115, 101, 78, 101,
+			116, 119, 111, 114, 107, 0, 0, 0, 0, 23,
+			78, 101, 116, 119, 111, 114, 107, 124, 68, 101,
+			109, 111, 67, 104, 117, 110, 107, 72, 101, 97,
+			100, 101, 114, 0, 0, 0, 0, 22, 78, 101,
+			116, 119, 111, 114, 107, 124, 68, 101, 109, 111,
+			80, 108, 97, 121, 101, 114, 73, 110, 102, 111,
+			0, 0, 0, 0, 21, 78, 101, 116, 119, 111,
+			114, 107, 124, 68, 101, 109, 111, 81, 117, 101,
+			117, 101, 73, 116, 101, 109, 0, 0, 0, 0,
+			19, 78, 101, 116, 119, 111, 114, 107, 124, 68,
+			101, 109, 111, 67, 111, 110, 86, 97, 114, 115,
+			1, 0, 0, 0, 17, 78, 101, 116, 119, 111,
+			114, 107, 124, 68, 101, 109, 111, 80, 97, 116,
+			104, 115, 1, 0, 0, 0, 17, 78, 101, 116,
+			119, 111, 114, 107, 124, 68, 101, 109, 111, 80,
+			97, 116, 104, 115, 0, 0, 0, 0, 16, 124,
+			68, 101, 109, 111, 68, 105, 115, 107, 77, 97,
+			110, 97, 103, 101, 114, 0, 0, 0, 0, 18,
+			124, 68, 101, 109, 111, 85, 112, 108, 111, 97,
+			100, 77, 97, 110, 97, 103, 101, 114, 0, 0,
+			0, 0, 30, 68, 101, 109, 111, 85, 112, 108,
+			111, 97, 100, 77, 97, 110, 97, 103, 101, 114,
+			124, 85, 112, 108, 111, 97, 100, 82, 101, 115,
+			117, 108, 116, 0, 0, 0, 0, 18, 124, 68,
+			101, 109, 111, 85, 112, 108, 111, 97, 100, 82,
+			101, 113, 117, 101, 115, 116, 0, 0, 0, 0,
+			16, 124, 68, 101, 109, 111, 85, 112, 108, 111,
+			97, 100, 83, 116, 97, 116, 101, 1, 0, 0,
+			0, 16, 124, 70, 117, 108, 108, 83, 101, 114,
+			118, 101, 114, 68, 101, 109, 111, 115, 1, 0,
+			0, 0, 16, 124, 70, 117, 108, 108, 83, 101,
+			114, 118, 101, 114, 68, 101, 109, 111, 115, 0,
+			0, 0, 0, 26, 70, 117, 108, 108, 83, 101,
+			114, 118, 101, 114, 68, 101, 109, 111, 115, 124,
+			68, 101, 98, 117, 103, 69, 110, 116, 114, 121,
+			0, 0, 0, 0, 15, 78, 101, 116, 119, 111,
+			114, 107, 124, 77, 101, 115, 115, 97, 103, 101,
+			0, 0, 0, 0, 15, 78, 101, 116, 119, 111,
+			114, 107, 124, 78, 101, 116, 82, 101, 97, 100,
+			0, 0, 0, 0, 22, 78, 101, 116, 119, 111,
+			114, 107, 124, 78, 101, 116, 119, 111, 114, 107,
+			72, 97, 110, 100, 108, 101, 114, 0, 0, 0,
+			0, 19, 78, 101, 116, 119, 111, 114, 107, 124,
+			78, 101, 116, 119, 111, 114, 107, 97, 98, 108,
+			101, 0, 0, 0, 0, 16, 78, 101, 116, 119,
+			111, 114, 107, 124, 78, 101, 116, 87, 114, 105,
+			116, 101, 0, 0, 0, 0, 22, 78, 101, 116,
+			119, 111, 114, 107, 124, 80, 97, 99, 107, 101,
+			116, 80, 114, 111, 102, 105, 108, 101, 114, 0,
+			0, 0, 0, 36, 78, 101, 116, 119, 111, 114,
+			107, 46, 80, 97, 99, 107, 101, 116, 80, 114,
+			111, 102, 105, 108, 101, 114, 124, 65, 110, 97,
+			108, 121, 116, 105, 99, 115, 75, 101, 121, 115,
+			0, 0, 0, 0, 16, 78, 101, 116, 119, 111,
+			114, 107, 124, 83, 101, 110, 100, 73, 110, 102,
+			111, 0, 0, 0, 0, 18, 78, 101, 116, 119,
+			111, 114, 107, 124, 83, 101, 114, 118, 101, 114,
+			73, 110, 102, 111, 0, 0, 0, 0, 23, 78,
+			101, 116, 119, 111, 114, 107, 124, 73, 83, 101,
+			114, 118, 101, 114, 67, 97, 108, 108, 98, 97,
+			99, 107, 0, 0, 0, 0, 14, 78, 101, 116,
+			119, 111, 114, 107, 124, 83, 101, 114, 118, 101,
+			114, 0, 0, 0, 0, 13, 78, 101, 116, 119,
+			111, 114, 107, 124, 83, 116, 97, 116, 115, 0,
+			0, 0, 0, 18, 78, 101, 116, 119, 111, 114,
+			107, 46, 83, 116, 97, 116, 115, 124, 78, 111,
+			100, 101, 0, 0, 0, 0, 27, 78, 101, 116,
+			119, 111, 114, 107, 46, 86, 105, 115, 105, 98,
+			105, 108, 105, 116, 121, 124, 80, 114, 111, 118,
+			105, 100, 101, 114, 0, 0, 0, 0, 29, 78,
+			101, 116, 119, 111, 114, 107, 46, 86, 105, 115,
+			105, 98, 105, 108, 105, 116, 121, 124, 83, 117,
+			98, 115, 99, 114, 105, 98, 101, 114, 0, 0,
+			0, 0, 24, 78, 101, 116, 119, 111, 114, 107,
+			46, 86, 105, 115, 105, 98, 105, 108, 105, 116,
+			121, 124, 71, 114, 111, 117, 112, 0, 0, 0,
+			0, 26, 78, 101, 116, 119, 111, 114, 107, 46,
+			86, 105, 115, 105, 98, 105, 108, 105, 116, 121,
+			124, 77, 97, 110, 97, 103, 101, 114
+		};
+		result.TotalFiles = 25;
+		result.TotalTypes = 47;
+		result.IsEditorOnly = false;
+		return result;
+	}
+}
+
+
+private struct MonoScriptData
+{
+	public byte[] FilePathsData;
+
+	public byte[] TypesData;
+
+	public int TotalTypes;
+
+	public int TotalFiles;
+
+	public bool IsEditorOnly;
+}
+
+
+public class Defines
+{
+	public const byte lowestUserPacket = 140;
+
+	public const int packetHeaderSize = 1;
+}
+
+
+using System;
+using Network;
+
+public interface INetworkCryptography
+{
+	ArraySegment<byte> EncryptCopy(Connection connection, ArraySegment<byte> data);
+
+	ArraySegment<byte> DecryptCopy(Connection connection, ArraySegment<byte> data);
+
+	void Encrypt(Connection connection, ref ArraySegment<byte> data);
+
+	void Decrypt(Connection connection, ref ArraySegment<byte> data);
+}
+
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+using Facepunch;
+using Network;
+using UnityEngine;
+using UnityEngine.Assertions;
+
+public abstract class BaseNetwork
+{
+	public enum StatTypeLong
+	{
+		BytesSent,
+		BytesSent_LastSecond,
+		BytesReceived,
+		BytesReceived_LastSecond,
+		MessagesInSendBuffer,
+		BytesInSendBuffer,
+		MessagesInResendBuffer,
+		BytesInResendBuffer,
+		PacketLossAverage,
+		PacketLossLastSecond,
+		ThrottleBytes
+	}
+
+	public static ArrayPool<byte> ArrayPool = new ArrayPool<byte>(8388608);
+
+	public static bool Multithreading = true;
+
+	protected readonly object readLock = new object();
+
+	protected readonly object writeLock = new object();
+
+	protected readonly object decryptLock = new object();
+
+	private Stopwatch stopwatch = new Stopwatch();
+
+	private ConcurrentQueue<NetRead> readQueue;
+
+	private ConcurrentQueue<NetWrite> writeQueue;
+
+	private ConcurrentQueue<NetRead> decryptQueue;
+
+	private int readQueueSizeInBytes;
+
+	private int writeQueueSizeInBytes;
+
+	private int decryptQueueSizeInBytes;
+
+	private int readQueueCount;
+
+	private int writeQueueCount;
+
+	private int decryptQueueCount;
+
+	private AutoResetEvent mainThreadReset;
+
+	private AutoResetEvent readThreadReset;
+
+	private AutoResetEvent writeThreadReset;
+
+	private AutoResetEvent decryptThreadReset;
+
+	private Thread readThread;
+
+	private Thread writeThread;
+
+	private Thread decryptThread;
+
+	private Thread demoThread;
+
+	public INetworkCryptography cryptography;
+
+	private List<Connection> tempBufferReadConnections = new List<Connection>();
+
+	private ConcurrentQueue<DemoQueueItem>[] demoQueues = new ConcurrentQueue<DemoQueueItem>[2];
+
+	private AutoResetEvent demoThreadReset;
+
+	private int demoQueueSizeInBytes;
+
+	public FullServerDemos serverDemos;
+
+	protected abstract int MaxReceiveTimeValue { get; }
+
+	protected abstract int MaxReadQueueLengthValue { get; }
+
+	protected abstract int MaxWriteQueueLengthValue { get; }
+
+	protected abstract int MaxDecryptQueueLengthValue { get; }
+
+	protected abstract int MaxReadQueueBytesValue { get; }
+
+	protected abstract int MaxWriteQueueBytesValue { get; }
+
+	protected abstract int MaxDecryptQueueBytesValue { get; }
+
+	protected abstract int MaxMainThreadWaitValue { get; }
+
+	protected abstract int MaxReadThreadWaitValue { get; }
+
+	protected abstract int MaxWriteThreadWaitValue { get; }
+
+	protected abstract int MaxDecryptThreadWaitValue { get; }
+
+	public int ReadQueueLength => Volatile.Read(in readQueueCount);
+
+	public int WriteQueueLength => Volatile.Read(in writeQueueCount);
+
+	public int DecryptQueueLength => Volatile.Read(in decryptQueueCount);
+
+	public int ReadQueueBytes => readQueueSizeInBytes;
+
+	public int WriteQueueBytes => writeQueueSizeInBytes;
+
+	public int DecryptQueueBytes => decryptQueueSizeInBytes;
+
+	protected int MaxDemoQueueLengthValue => 5000;
+
+	protected int MaxDemoQueueBytesValue => 524288000;
+
+	protected int MaxDemoThreadWaitValue => 100;
+
+	public abstract bool SupportsServerDemos { get; }
+
+	protected void MultithreadingInit(IServerCallback callbacks)
+	{
+		if (readThread != null)
+		{
+			readThread.Abort();
+			readThread = null;
+		}
+		if (writeThread != null)
+		{
+			writeThread.Abort();
+			writeThread = null;
+		}
+		if (decryptThread != null)
+		{
+			decryptThread.Abort();
+			decryptThread = null;
+		}
+		if (Multithreading)
+		{
+			readQueue = new ConcurrentQueue<NetRead>();
+			writeQueue = new ConcurrentQueue<NetWrite>();
+			decryptQueue = new ConcurrentQueue<NetRead>();
+			readQueueSizeInBytes = 0;
+			writeQueueSizeInBytes = 0;
+			decryptQueueSizeInBytes = 0;
+			mainThreadReset = new AutoResetEvent(initialState: false);
+			readThreadReset = new AutoResetEvent(initialState: false);
+			writeThreadReset = new AutoResetEvent(initialState: false);
+			decryptThreadReset = new AutoResetEvent(initialState: false);
+			readThread = new Thread(ReadThread);
+			readThread.IsBackground = true;
+			readThread.Start();
+			writeThread = new Thread(WriteThread);
+			writeThread.IsBackground = true;
+			writeThread.Start();
+			decryptThread = new Thread(DecryptThread);
+			decryptThread.IsBackground = true;
+			decryptThread.Start();
+			InitDemoSupport(callbacks);
+		}
+	}
+
+	public virtual bool IsConnected()
+	{
+		return false;
+	}
+
+	protected virtual bool Receive()
+	{
+		return false;
+	}
+
+	public void EnqueueWrite(NetWrite write)
+	{
+		Assert.IsNotNull<NetWrite>(write, "write != null");
+		Assert.IsNotNull<List<Connection>>(write.connections, "write.connections != null");
+		foreach (Connection connection in write.connections)
+		{
+			Assert.IsNotNull<Connection>(connection, "connection != null");
+		}
+		if (WriteQueueLength >= MaxWriteQueueLengthValue || writeQueueSizeInBytes >= MaxWriteQueueBytesValue)
+		{
+			Debug.LogWarning((object)"Main thread stalling: Write queue at capacity, waiting for write thread...");
+			mainThreadReset.WaitOne(MaxMainThreadWaitValue);
+		}
+		writeQueue.Enqueue(write);
+		Interlocked.Add(ref writeQueueSizeInBytes, (int)write.Length);
+		Interlocked.Increment(ref writeQueueCount);
+		writeThreadReset.Set();
+	}
+
+	public void EnqueueRead(NetRead read)
+	{
+		readQueue.Enqueue(read);
+		Interlocked.Add(ref readQueueSizeInBytes, (int)read.Length);
+		Interlocked.Increment(ref readQueueCount);
+	}
+
+	public void EnqueueDecrypt(NetRead read)
+	{
+		decryptQueue.Enqueue(read);
+		Interlocked.Add(ref decryptQueueSizeInBytes, (int)read.Length);
+		Interlocked.Increment(ref decryptQueueCount);
+		decryptThreadReset.Set();
+	}
+
+	public virtual void ProcessWrite(NetWrite write)
+	{
+	}
+
+	public virtual void ProcessRead(NetRead read)
+	{
+	}
+
+	public void ProcessDecrypt(NetRead read)
+	{
+		Decrypt(read.connection, read);
+		if (DemoConVars.ServerDemosEnabled && SupportsServerDemos)
+		{
+			EnqueueToDemoThread(new DemoQueueItem(read));
+		}
+		if (Multithreading)
+		{
+			EnqueueRead(read);
+		}
+		else
+		{
+			ProcessRead(read);
+		}
+	}
+
+	private void ReadThread()
+	{
+		while (IsConnected())
+		{
+			try
+			{
+				ReadThreadCycle();
+			}
+			catch (Exception ex)
+			{
+				Debug.LogException(ex);
+			}
+			if (DecryptQueueLength >= MaxDecryptQueueLengthValue || decryptQueueSizeInBytes >= MaxDecryptQueueBytesValue)
+			{
+				readThreadReset.WaitOne(MaxReadThreadWaitValue);
+			}
+			else
+			{
+				readThreadReset.WaitOne(1);
+			}
+		}
+	}
+
+	private void WriteThread()
+	{
+		while (IsConnected())
+		{
+			try
+			{
+				WriteThreadCycle();
+			}
+			catch (Exception ex)
+			{
+				Debug.LogException(ex);
+			}
+			if (WriteQueueLength <= 0)
+			{
+				writeThreadReset.WaitOne(MaxWriteThreadWaitValue);
+			}
+		}
+	}
+
+	private void DecryptThread()
+	{
+		while (IsConnected())
+		{
+			try
+			{
+				DecryptThreadCycle();
+			}
+			catch (Exception ex)
+			{
+				Debug.LogException(ex);
+			}
+			if (ReadQueueLength >= MaxReadQueueLengthValue || readQueueSizeInBytes >= MaxReadQueueBytesValue || DecryptQueueLength <= 0)
+			{
+				decryptThreadReset.WaitOne(MaxDecryptThreadWaitValue);
+			}
+		}
+	}
+
+	private void ReadThreadCycle()
+	{
+		while (DecryptQueueLength < MaxDecryptQueueLengthValue && decryptQueueSizeInBytes < MaxDecryptQueueBytesValue)
+		{
+			lock (readLock)
+			{
+				if (!IsConnected() || !Receive())
+				{
+					break;
+				}
+			}
+		}
+	}
+
+	private void WriteThreadCycle()
+	{
+		NetWrite result;
+		while (writeQueue.TryDequeue(out result))
+		{
+			Interlocked.Add(ref writeQueueSizeInBytes, -(int)result.Length);
+			Interlocked.Decrement(ref writeQueueCount);
+			mainThreadReset.Set();
+			lock (writeLock)
+			{
+				if (!IsConnected())
+				{
+					break;
+				}
+				ProcessWrite(result);
+			}
+		}
+	}
+
+	private void DecryptThreadCycle()
+	{
+		NetRead result;
+		while (ReadQueueLength < MaxReadQueueLengthValue && readQueueSizeInBytes < MaxReadQueueBytesValue && decryptQueue.TryDequeue(out result))
+		{
+			Interlocked.Add(ref decryptQueueSizeInBytes, -(int)result.Length);
+			Interlocked.Decrement(ref decryptQueueCount);
+			readThreadReset.Set();
+			lock (decryptLock)
+			{
+				if (!IsConnected())
+				{
+					break;
+				}
+				ProcessDecrypt(result);
+			}
+		}
+	}
+
+	public void Cycle()
+	{
+		if (!IsConnected())
+		{
+			return;
+		}
+		if (Multithreading)
+		{
+			stopwatch.Restart();
+			NetRead result;
+			while (readQueue.TryDequeue(out result))
+			{
+				Interlocked.Add(ref readQueueSizeInBytes, -(int)result.Length);
+				Interlocked.Decrement(ref readQueueCount);
+				decryptThreadReset.Set();
+				if (IsConnected())
+				{
+					ProcessRead(result);
+					if (stopwatch.Elapsed.TotalMilliseconds > (double)MaxReceiveTimeValue)
+					{
+						break;
+					}
+					continue;
+				}
+				break;
+			}
+		}
+		else
+		{
+			stopwatch.Restart();
+			while (IsConnected() && Receive() && !(stopwatch.Elapsed.TotalMilliseconds > (double)MaxReceiveTimeValue))
+			{
+			}
+		}
+	}
+
+	public NetWrite StartWrite()
+	{
+		NetWrite netWrite = Pool.Get<NetWrite>();
+		netWrite.Start(this);
+		return netWrite;
+	}
+
+	protected Message StartMessage(Message.Type type, NetRead read)
+	{
+		Message message = Pool.Get<Message>();
+		message.peer = this;
+		message.type = type;
+		message.read = read;
+		return message;
+	}
+
+	public void Decrypt(Connection connection, NetRead read)
+	{
+		if (cryptography == null || connection == null || connection.encryptionLevel == 0 || read.Length <= 1)
+		{
+			return;
+		}
+		int num = read.PeekPacketID() - 140;
+		if (num > 0 && num < 26 && Message.EncryptionPerType[num])
+		{
+			if (connection.encryptionLevel > 1 && read.Length >= 23)
+			{
+				connection.trusted = (read.Data[read.Length - 17] & 1) != 0;
+			}
+			ArraySegment<byte> data = new ArraySegment<byte>(read.Data, 1, (int)read.Length - 1);
+			cryptography.Decrypt(connection, ref data);
+			read.SetLength(data.Offset + data.Count);
+		}
+	}
+
+	public ArraySegment<byte> Encrypt(Connection connection, NetWrite write)
+	{
+		ArraySegment<byte> arraySegment = new ArraySegment<byte>(write.Data, 1, (int)write.Length - 1);
+		if (cryptography == null)
+		{
+			return arraySegment;
+		}
+		if (connection == null)
+		{
+			return arraySegment;
+		}
+		if (connection.encryptionLevel == 0)
+		{
+			return arraySegment;
+		}
+		if (write.Length <= 1)
+		{
+			return arraySegment;
+		}
+		int num = write.PeekPacketID() - 140;
+		if (num <= 0)
+		{
+			return arraySegment;
+		}
+		if (num >= 26)
+		{
+			return arraySegment;
+		}
+		if (!Message.EncryptionPerType[num])
+		{
+			return arraySegment;
+		}
+		return cryptography.EncryptCopy(connection, arraySegment);
+	}
+
+	public void RecordReadForConnection(Connection connection, Stream stream)
+	{
+		connection?.RecordPacket(stream);
+	}
+
+	public virtual string GetDebug(Connection connection)
+	{
+		return null;
+	}
+
+	public virtual ulong GetStat(Connection connection, StatTypeLong type)
+	{
+		return 0uL;
+	}
+
+	private void InitDemoSupport(IServerCallback callbacks)
+	{
+		demoQueues[0] = new ConcurrentQueue<DemoQueueItem>();
+		demoQueues[1] = new ConcurrentQueue<DemoQueueItem>();
+		demoThreadReset = new AutoResetEvent(initialState: false);
+		if (SupportsServerDemos)
+		{
+			demoThread = new Thread(DemoThread);
+			demoThread.IsBackground = true;
+			demoThread.Start(callbacks);
+		}
+	}
+
+	private void DemoThread(object callbacks)
+	{
+		serverDemos = new FullServerDemos(IsConnected, (IServerCallback)callbacks, demoThreadReset);
+		while (IsConnected())
+		{
+			if (!DemoConVars.ServerDemosEnabled)
+			{
+				Thread.Sleep(1000);
+				continue;
+			}
+			try
+			{
+				serverDemos.OnDemoThreadStart();
+			}
+			catch (Exception ex)
+			{
+				Debug.LogException(ex);
+				Thread.Sleep(10000);
+			}
+			while (IsConnected() && DemoConVars.ServerDemosEnabled)
+			{
+				try
+				{
+					DemoThreadCycle();
+				}
+				catch (Exception ex2)
+				{
+					Debug.LogException(ex2);
+				}
+				if (demoQueues[serverDemos.GetReadChunkBit()].Count <= 0)
+				{
+					demoThreadReset.WaitOne(MaxDemoThreadWaitValue);
+				}
+			}
+			try
+			{
+				serverDemos.OnDemoThreadStop();
+			}
+			catch (Exception ex3)
+			{
+				Debug.LogException(ex3);
+				Thread.Sleep(10000);
+			}
+		}
+	}
+
+	private void DemoThreadCycle()
+	{
+		serverDemos.Cycle();
+		ConcurrentQueue<DemoQueueItem> concurrentQueue = demoQueues[serverDemos.GetReadChunkBit()];
+		DemoQueueItem result;
+		while (concurrentQueue.TryDequeue(out result))
+		{
+			if (result.write != null)
+			{
+				int num = (int)result.write.Length;
+				Interlocked.Add(ref demoQueueSizeInBytes, -num);
+				if (result.IgnoreNoConnections || (result.write.connections != null && result.write.connections.Count > 0))
+				{
+					serverDemos.RecordServerDemoPacket(result.write.connections, result.write.Data, num, isOutgoing: true, result.Timestamp);
+				}
+				result.write.RemoveReference();
+			}
+			else if (result.read != null)
+			{
+				int num2 = (int)result.read.Length;
+				Interlocked.Add(ref demoQueueSizeInBytes, -num2);
+				if (result.IgnoreNoConnections || result.read.connection != null)
+				{
+					tempBufferReadConnections.Clear();
+					tempBufferReadConnections.Add(result.read.connection);
+					serverDemos.RecordServerDemoPacket(tempBufferReadConnections, result.read.Data, num2, isOutgoing: false, result.Timestamp);
+				}
+				result.read.RemoveReference();
+			}
+		}
+	}
+
+	public void RecordDisconnection(Connection connection)
+	{
+		NetWrite netWrite = StartWrite();
+		netWrite.PacketID(Message.Type.DemoDisconnection);
+		netWrite.UInt64(connection.guid);
+		EnqueueToDemoThread(new DemoQueueItem(netWrite)
+		{
+			IgnoreNoConnections = true
+		});
+		netWrite.RemoveReference();
+	}
+
+	public void EnqueueToDemoThread(DemoQueueItem item)
+	{
+		if (DemoConVars.ServerDemosEnabled)
+		{
+			if (item.write != null)
+			{
+				Interlocked.Add(ref demoQueueSizeInBytes, (int)item.write.Length);
+				item.write.AddReference();
+			}
+			else if (item.read != null)
+			{
+				Interlocked.Add(ref demoQueueSizeInBytes, (int)item.read.Length);
+				item.read.AddReference();
+			}
+			item.Timestamp = DateTime.UtcNow;
+			ConcurrentQueue<DemoQueueItem> obj = demoQueues[serverDemos.GetWriteChunkBit()];
+			if (obj.Count >= MaxDemoQueueBytesValue)
+			{
+				Debug.LogWarning((object)"Main thread stalling: Demo queue at capacity, waiting for demo thread...");
+				mainThreadReset.WaitOne(MaxMainThreadWaitValue);
+			}
+			obj.Enqueue(item);
+			demoThreadReset.Set();
+		}
+	}
+}
+
+
+public enum StatTypeLong
+{
+	BytesSent,
+	BytesSent_LastSecond,
+	BytesReceived,
+	BytesReceived_LastSecond,
+	MessagesInSendBuffer,
+	BytesInSendBuffer,
+	MessagesInResendBuffer,
+	BytesInResendBuffer,
+	PacketLossAverage,
+	PacketLossLastSecond,
+	ThrottleBytes
+}
+
+
+using Network;
+
+public interface IClientCallback
+{
+	void OnNetworkMessage(Message message);
+
+	void OnClientDisconnected(string reason);
+}
+
+
+using System;
+using Facepunch;
+using Network;
+using Network.Visibility;
+
+public class Client : BaseNetwork
+{
+	public static int MaxReceiveTime = 10;
+
+	public static int MaxReadQueueLength = 500;
+
+	public static int MaxWriteQueueLength = 500;
+
+	public static int MaxDecryptQueueLength = 500;
+
+	public static int MaxReadQueueBytes = 52428800;
+
+	public static int MaxWriteQueueBytes = 52428800;
+
+	public static int MaxDecryptQueueBytes = 52428800;
+
+	public static int MaxMainThreadWait = 100;
+
+	public static int MaxReadThreadWait = 100;
+
+	public static int MaxWriteThreadWait = 100;
+
+	public static int MaxDecryptThreadWait = 100;
+
+	public Manager visibility;
+
+	public static string disconnectReason;
+
+	public Stats IncomingStats = new Stats();
+
+	public IClientCallback callbackHandler;
+
+	public override bool SupportsServerDemos => false;
+
+	protected override int MaxReceiveTimeValue => MaxReceiveTime;
+
+	protected override int MaxReadQueueLengthValue => MaxReadQueueLength;
+
+	protected override int MaxWriteQueueLengthValue => MaxWriteQueueLength;
+
+	protected override int MaxDecryptQueueLengthValue => MaxDecryptQueueLength;
+
+	protected override int MaxReadQueueBytesValue => MaxReadQueueBytes;
+
+	protected override int MaxWriteQueueBytesValue => MaxWriteQueueBytes;
+
+	protected override int MaxDecryptQueueBytesValue => MaxDecryptQueueBytes;
+
+	protected override int MaxMainThreadWaitValue => MaxMainThreadWait;
+
+	protected override int MaxReadThreadWaitValue => MaxReadThreadWait;
+
+	protected override int MaxWriteThreadWaitValue => MaxWriteThreadWait;
+
+	protected override int MaxDecryptThreadWaitValue => MaxDecryptThreadWait;
+
+	public Connection Connection { get; protected set; }
+
+	public virtual bool IsPlaying { get; }
+
+	public string ConnectedAddress { get; set; } = "unset";
+
+	public int ConnectedPort { get; set; }
+
+	public string ServerName { get; set; }
+
+	public bool IsOfficialServer { get; set; }
+
+	public bool IsRecording
+	{
+		get
+		{
+			if (Connection == null)
+			{
+				return false;
+			}
+			return Connection.IsRecording;
+		}
+	}
+
+	public string RecordFilename => Connection.RecordFilename;
+
+	public TimeSpan RecordTimeElapsed => Connection.RecordTimeElapsed;
+
+	public virtual bool Connect(string strURL, int port)
+	{
+		disconnectReason = "Disconnected";
+		return true;
+	}
+
+	public virtual void Flush()
+	{
+	}
+
+	public virtual void Disconnect(string reason, bool sendReasonToServer = true)
+	{
+	}
+
+	protected void OnDisconnected(string str)
+	{
+		if (callbackHandler != null)
+		{
+			callbackHandler.OnClientDisconnected(str);
+		}
+	}
+
+	public Networkable CreateNetworkable(NetworkableId networkID, uint networkGroup)
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0007: Unknown result type (might be due to invalid IL or missing references)
+		Networkable networkable = Pool.Get<Networkable>();
+		networkable.ID = networkID;
+		networkable.SwitchGroup(visibility.Get(networkGroup));
+		return networkable;
+	}
+
+	public void DestroyNetworkable(ref Networkable networkable)
+	{
+		networkable.Destroy();
+		Pool.Free<Networkable>(ref networkable);
+	}
+
+	public void SetupNetworkable(Networkable net)
+	{
+		net.cl = this;
+	}
+
+	public virtual int GetLastPing()
+	{
+		return 0;
+	}
+
+	public bool StartRecording(string targetFilename, IDemoHeader header)
+	{
+		return Connection.StartRecording(targetFilename, header);
+	}
+
+	public void StopRecording()
+	{
+		Connection.StopRecording();
+	}
+}
+
+
+using System.IO;
+
+public interface IDemoHeader
+{
+	long Length { get; set; }
+
+	void Write(BinaryWriter writer);
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using Network;
+using SilentOrbit.ProtocolBuffers;
+using UnityEngine;
+
+public class Connection
+{
+	public enum State
+	{
+		Unconnected,
+		Connecting,
+		InQueue,
+		Welcoming,
+		Connected,
+		Disconnected
+	}
+
+	public struct Validation
+	{
+		public uint entityUpdates;
+	}
+
+	public class ClientInfo
+	{
+		public Dictionary<string, string> info = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+		private int length;
+
+		public void Set(string k, string v)
+		{
+			if (info.TryGetValue(k, out var value))
+			{
+				length -= k.Length + value.Length;
+				info.Remove(v);
+			}
+			if (length + k.Length + v.Length <= MaxClientInfoSize)
+			{
+				length += k.Length + v.Length;
+				info[k] = v;
+			}
+		}
+
+		public string GetString(string k, string def = "")
+		{
+			if (info.TryGetValue(k, out var value))
+			{
+				return value;
+			}
+			return def;
+		}
+
+		public float GetFloat(string k, float def = 0f)
+		{
+			string @string = GetString(k, null);
+			if (@string == null)
+			{
+				return def;
+			}
+			if (float.TryParse(@string, out var result))
+			{
+				return result;
+			}
+			return def;
+		}
+
+		public int GetInt(string k, int def = 0)
+		{
+			string @string = GetString(k, null);
+			if (@string == null)
+			{
+				return def;
+			}
+			if (int.TryParse(@string, out var result))
+			{
+				return result;
+			}
+			return def;
+		}
+
+		public bool GetBool(string k, bool def = false)
+		{
+			string @string = GetString(k, null);
+			if (@string == null)
+			{
+				return def;
+			}
+			if (bool.TryParse(@string, out var result))
+			{
+				return result;
+			}
+			return def;
+		}
+	}
+
+	private static readonly object recordLock = new object();
+
+	private static MemoryStream reusableStream = new MemoryStream(4194304);
+
+	protected MemoryStream recordStream;
+
+	protected BinaryWriter recordWriter;
+
+	protected Stopwatch recordTime;
+
+	protected string recordFilename;
+
+	protected IDemoHeader recordHeader;
+
+	public static int MaxClientInfoSize = 1048576;
+
+	public State state;
+
+	public bool active;
+
+	public bool connected;
+
+	public uint authLevel;
+
+	public uint encryptionLevel;
+
+	public bool trusted;
+
+	public bool rejected;
+
+	public byte[] token;
+
+	public string anticheatId;
+
+	public string anticheatToken;
+
+	public bool hasRequestedWorld;
+
+	public bool globalNetworking;
+
+	public bool canReserveSlot = true;
+
+	public string authStatusSteam;
+
+	public string authStatusEAC;
+
+	public string authStatusNexus;
+
+	public string authStatusCentralizedBans;
+
+	public string authStatusPremiumServer;
+
+	public ulong guid;
+
+	public ulong userid;
+
+	public ulong ownerid;
+
+	public string username;
+
+	public string os;
+
+	public uint protocol;
+
+	public int clientChangeset;
+
+	public long clientBuildTime;
+
+	private TimeAverageValueData[] packetsPerSecond = new TimeAverageValueData[27];
+
+	public double connectionTime;
+
+	public double lastPremiumCheckTime;
+
+	public string ipaddress;
+
+	public MonoBehaviour player;
+
+	public Validation validate;
+
+	public ClientInfo info = new ClientInfo();
+
+	public TimeSpan RecordTimeElapsed
+	{
+		get
+		{
+			if (recordTime == null)
+			{
+				return TimeSpan.Zero;
+			}
+			return recordTime.Elapsed;
+		}
+	}
+
+	public string RecordFilename => recordFilename;
+
+	public int RecordFilesize => (int)recordStream.Length;
+
+	public bool IsRecording => recordStream != null;
+
+	public bool isAuthenticated
+	{
+		get
+		{
+			if (authStatusSteam == "ok" && authStatusEAC == "ok" && authStatusNexus == "ok" && authStatusCentralizedBans == "ok")
+			{
+				return authStatusPremiumServer == "ok";
+			}
+			return false;
+		}
+	}
+
+	public bool StartRecording(string targetFilename, IDemoHeader header)
+	{
+		lock (recordLock)
+		{
+			if (recordStream != null)
+			{
+				return false;
+			}
+			recordFilename = targetFilename;
+			recordHeader = header;
+			recordStream = new MemoryStream();
+			recordWriter = new BinaryWriter(recordStream);
+			recordTime = Stopwatch.StartNew();
+			return true;
+		}
+	}
+
+	public void StopRecording()
+	{
+		lock (recordLock)
+		{
+			if (recordStream == null)
+			{
+				return;
+			}
+			if (recordHeader != null)
+			{
+				Directory.CreateDirectory(Path.GetDirectoryName(recordFilename));
+				using (FileStream fileStream = new FileStream(recordFilename, FileMode.Create))
+				{
+					using BinaryWriter writer = new BinaryWriter(fileStream);
+					recordHeader.Length = (long)recordTime.Elapsed.TotalMilliseconds;
+					recordHeader.Write(writer);
+					recordStream.WriteTo(fileStream);
+				}
+				recordHeader = null;
+			}
+			recordTime = null;
+			recordWriter.Close();
+			recordWriter = null;
+			recordStream.Dispose();
+			recordStream = null;
+			recordFilename = null;
+		}
+	}
+
+	public void RecordPacket(byte packetId, IProto proto)
+	{
+		lock (recordLock)
+		{
+			if (IsRecording)
+			{
+				reusableStream.SetLength(0L);
+				proto.WriteToStream((Stream)reusableStream);
+				byte[] buffer = reusableStream.GetBuffer();
+				int num = (int)reusableStream.Length;
+				recordWriter.Write(num + 1);
+				recordWriter.Write((long)recordTime.Elapsed.TotalMilliseconds);
+				recordWriter.Write((byte)(packetId + 140));
+				recordWriter.Write(buffer, 0, num);
+				recordWriter.Write('\0');
+				recordWriter.Write('\0');
+			}
+		}
+	}
+
+	public void RecordPacket(Stream stream)
+	{
+		lock (recordLock)
+		{
+			if (IsRecording)
+			{
+				byte[] buffer = reusableStream.GetBuffer();
+				int num = (int)stream.Length;
+				long position = stream.Position;
+				stream.Position = 0L;
+				stream.Read(buffer, 0, num);
+				stream.Position = position;
+				recordWriter.Write(num);
+				recordWriter.Write((long)recordTime.Elapsed.TotalMilliseconds);
+				recordWriter.Write(buffer, 0, num);
+				recordWriter.Write('\0');
+				recordWriter.Write('\0');
+			}
+		}
+	}
+
+	public string IPAddressWithoutPort()
+	{
+		int num = ipaddress.LastIndexOf(':');
+		if (num != -1)
+		{
+			return ipaddress.Substring(0, num);
+		}
+		return ipaddress;
+	}
+
+	public virtual void OnDisconnected()
+	{
+		player = null;
+		guid = 0uL;
+		ResetPacketsPerSecond();
+		hasRequestedWorld = false;
+	}
+
+	public void ResetPacketsPerSecond()
+	{
+		for (int i = 0; i < packetsPerSecond.Length; i++)
+		{
+			packetsPerSecond[i].Reset();
+		}
+	}
+
+	public void AddPacketsPerSecond(Message.Type message)
+	{
+		AddPacketsPerSecond((int)message);
+	}
+
+	public void AddPacketsPerSecond(int index = 0)
+	{
+		if (index >= 0 && index < packetsPerSecond.Length)
+		{
+			packetsPerSecond[index].Increment();
+		}
+	}
+
+	public ulong GetPacketsPerSecond(Message.Type message)
+	{
+		return GetPacketsPerSecond((int)message);
+	}
+
+	public ulong GetPacketsPerSecond(int index = 0)
+	{
+		if (index < 0 || index >= packetsPerSecond.Length)
+		{
+			return 0uL;
+		}
+		return packetsPerSecond[index].Calculate();
+	}
+
+	public float GetSecondsConnected()
+	{
+		return (float)(TimeEx.realtimeSinceStartup - connectionTime);
+	}
+
+	public bool IsDevelopmentBuild()
+	{
+		if (authLevel >= 3)
+		{
+			return os == "editor";
+		}
+		return false;
+	}
+
+	public override string ToString()
+	{
+		return $"{ipaddress}/{userid}/{username}";
+	}
+}
+
+
+public enum State
+{
+	Unconnected,
+	Connecting,
+	InQueue,
+	Welcoming,
+	Connected,
+	Disconnected
+}
+
+
+public struct Validation
+{
+	public uint entityUpdates;
+}
+
+
+using System;
+using System.Collections.Generic;
+
+public class ClientInfo
+{
+	public Dictionary<string, string> info = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+	private int length;
+
+	public void Set(string k, string v)
+	{
+		if (info.TryGetValue(k, out var value))
+		{
+			length -= k.Length + value.Length;
+			info.Remove(v);
+		}
+		if (length + k.Length + v.Length <= MaxClientInfoSize)
+		{
+			length += k.Length + v.Length;
+			info[k] = v;
+		}
+	}
+
+	public string GetString(string k, string def = "")
+	{
+		if (info.TryGetValue(k, out var value))
+		{
+			return value;
+		}
+		return def;
+	}
+
+	public float GetFloat(string k, float def = 0f)
+	{
+		string @string = GetString(k, null);
+		if (@string == null)
+		{
+			return def;
+		}
+		if (float.TryParse(@string, out var result))
+		{
+			return result;
+		}
+		return def;
+	}
+
+	public int GetInt(string k, int def = 0)
+	{
+		string @string = GetString(k, null);
+		if (@string == null)
+		{
+			return def;
+		}
+		if (int.TryParse(@string, out var result))
+		{
+			return result;
+		}
+		return def;
+	}
+
+	public bool GetBool(string k, bool def = false)
+	{
+		string @string = GetString(k, null);
+		if (@string == null)
+		{
+			return def;
+		}
+		if (bool.TryParse(@string, out var result))
+		{
+			return result;
+		}
+		return def;
+	}
+}
+
+
+using Network;
+
+public struct TimeAverageValueData
+{
+	private double refreshTime;
+
+	private ulong counterPrev;
+
+	private ulong counterNext;
+
+	public ulong Calculate()
+	{
+		double realtimeSinceStartup = TimeEx.realtimeSinceStartup;
+		double num = realtimeSinceStartup - refreshTime;
+		if (num >= 1.0)
+		{
+			counterPrev = (ulong)((double)counterNext / num + 0.5);
+			counterNext = 0uL;
+			refreshTime = realtimeSinceStartup;
+			num = 0.0;
+		}
+		return (ulong)((double)counterPrev * (1.0 - num)) + counterNext;
+	}
+
+	public void Increment()
+	{
+		counterNext++;
+	}
+
+	public void Reset()
+	{
+		counterPrev = 0uL;
+		counterNext = 0uL;
+	}
+}
+
+
+using Network;
+
+public class TimeAverageValue
+{
+	private TimeAverageValueData data;
+
+	public ulong Calculate()
+	{
+		return data.Calculate();
+	}
+
+	public void Increment()
+	{
+		data.Increment();
+	}
+
+	public void Reset()
+	{
+		data.Reset();
+	}
+}
+
+
+using System.Collections.Generic;
+using Network;
+
+public class TimeAverageValueLookup<T>
+{
+	public Dictionary<T, TimeAverageValue> dict = new Dictionary<T, TimeAverageValue>();
+
+	public bool TryIncrement(T id, ulong limit)
+	{
+		if (!dict.TryGetValue(id, out var value))
+		{
+			value = new TimeAverageValue();
+			dict.Add(id, value);
+			value.Increment();
+			return true;
+		}
+		if (value.Calculate() >= limit)
+		{
+			return false;
+		}
+		value.Increment();
+		return true;
+	}
+
+	public void Increment(T id)
+	{
+		if (!dict.TryGetValue(id, out var value))
+		{
+			value = new TimeAverageValue();
+			dict.Add(id, value);
+		}
+		value.Increment();
+	}
+
+	public ulong Calculate(T id)
+	{
+		if (!dict.TryGetValue(id, out var value))
+		{
+			return 0uL;
+		}
+		return value.Calculate();
+	}
+
+	public void Clear()
+	{
+		dict.Clear();
+	}
+}
+
+
+using System;
+using System.Diagnostics;
+
+public static class TimeEx
+{
+	private static Stopwatch stopwatch = Stopwatch.StartNew();
+
+	public static double realtimeSinceStartup => stopwatch.Elapsed.TotalSeconds;
+
+	public static double currentTimestamp => (double)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+}
+
+
+using System;
+using Facepunch;
+using Network;
+using Rust.Demo;
+using UnityEngine;
+
+public class DemoClient : Client, IDisposable
+{
+	protected Reader demoFile;
+
+	public override bool IsPlaying => true;
+
+	public bool PlayingFinished => demoFile.IsFinished;
+
+	public DemoClient(Reader demoFile)
+	{
+		this.demoFile = demoFile;
+		MultithreadingInit(null);
+	}
+
+	public virtual void Dispose()
+	{
+		Reader obj = demoFile;
+		if (obj != null)
+		{
+			obj.Stop();
+		}
+		demoFile = null;
+	}
+
+	public override bool IsConnected()
+	{
+		return true;
+	}
+
+	public void UpdatePlayback(long frameTime)
+	{
+		if (!PlayingFinished)
+		{
+			demoFile.Progress(frameTime);
+			while (!demoFile.IsFinished && PlaybackPacket())
+			{
+			}
+		}
+	}
+
+	private unsafe bool PlaybackPacket()
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		//IL_000b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0017: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003b: Unknown result type (might be due to invalid IL or missing references)
+		Packet val = demoFile.ReadPacket();
+		if (!((Packet)(ref val)).isValid)
+		{
+			return false;
+		}
+		fixed (byte* data = val.Data)
+		{
+			HandleMessage((IntPtr)data, val.Size);
+		}
+		return IsPlaying;
+	}
+
+	private void HandleMessage(IntPtr data, int size)
+	{
+		NetRead netRead = Pool.Get<NetRead>();
+		netRead.Start(0uL, string.Empty, data, size);
+		Decrypt(netRead.connection, netRead);
+		byte b = netRead.PacketID();
+		if (b < 140)
+		{
+			netRead.RemoveReference();
+			return;
+		}
+		b -= 140;
+		if (b > 26)
+		{
+			Debug.LogWarning((object)("Invalid Packet (higher than " + Message.Type.QueueUpdate.ToString() + ")"));
+			Disconnect($"Invalid Packet ({b}) {size}b");
+			netRead.RemoveReference();
+			return;
+		}
+		Message message = StartMessage((Message.Type)b, netRead);
+		if (callbackHandler != null)
+		{
+			try
+			{
+				TimeWarning val = TimeWarning.New("OnMessage", 0);
+				try
+				{
+					callbackHandler.OnNetworkMessage(message);
+				}
+				finally
+				{
+					((IDisposable)val)?.Dispose();
+				}
+			}
+			catch (Exception ex)
+			{
+				Debug.LogException(ex);
+				if (!IsPlaying)
+				{
+					Disconnect(ex.Message + "\n" + ex.StackTrace);
+				}
+			}
+		}
+		Pool.Free<Message>(ref message);
+		netRead.RemoveReference();
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using Network;
+
+public class DemoChunkHeader
+{
+	public string ServerId { get; set; }
+
+	public string SessionId { get; set; }
+
+	public string LocalChunkId { get; set; }
+
+	public int ChunkIndex { get; set; }
+
+	public DateTime SessionStartTime { get; set; }
+
+	public DateTime TimeStart { get; set; }
+
+	public DateTime TimeEnd { get; set; }
+
+	public long BytesDecompressed { get; set; }
+
+	public long BytesCompressed { get; set; }
+
+	public long PacketCount { get; set; }
+
+	public bool IsZipped { get; set; }
+
+	public int NetworkVersion { get; set; }
+
+	public string Changeset { get; set; }
+
+	public string Hostname { get; set; }
+
+	public string Seed { get; set; }
+
+	public string WorldSize { get; set; }
+
+	public string Level { get; set; }
+
+	public string LevelUrl { get; set; }
+
+	public string Checksum { get; set; }
+
+	public List<DemoPlayerInfo> Players { get; set; } = new List<DemoPlayerInfo>();
+}
+
+
+public class DemoPlayerInfo
+{
+	public ulong Guid { get; set; }
+
+	public ulong UserId { get; set; }
+
+	public int ChunkPlayerIndex { get; set; }
+}
+
+
+using System;
+using Network;
+
+public struct DemoQueueItem
+{
+	public NetWrite write;
+
+	public NetRead read;
+
+	public DateTime Timestamp;
+
+	public bool IgnoreNoConnections;
+
+	public DemoQueueItem(NetWrite write)
+	{
+		this.write = write;
+		read = null;
+		IgnoreNoConnections = false;
+		Timestamp = default(DateTime);
+	}
+
+	public DemoQueueItem(NetRead read)
+	{
+		write = null;
+		this.read = read;
+		IgnoreNoConnections = false;
+		Timestamp = default(DateTime);
+	}
+}
+
+
+using Network;
+
+public static class DemoConVars
+{
+	public static bool UploadDemos = true;
+
+	public static string UploadEndpoint;
+
+	public static bool ServerDemosEnabled = false;
+
+	public static string ServerId = "";
+
+	public static string ServerDemoDirectory = "server_demos";
+
+	public static int ServerDemoFlushIntervalSeconds = 300;
+
+	public static float BandwidthLimitRatio = 1f;
+
+	public static bool DeleteDemoAfterUpload = true;
+
+	public static bool ZipServerDemos = true;
+
+	public static int MaxDemoDiskSpaceGB = 30;
+
+	public static int DiskCleanupIntervalMinutes = 20;
+
+	public static int MaxUploadConcurrency = 20;
+
+	public static int MinimumConcurrency = 2;
+
+	public static int MaxUploadAttempts = 3;
+
+	public static void EnableServerDemos(bool state)
+	{
+		if (!BaseNetwork.Multithreading)
+		{
+			state = false;
+		}
+		ServerDemosEnabled = state;
+	}
+}
+
+
+using System.IO;
+using Network;
+
+public static class DemoPaths
+{
+	public static string GetBlobDemoPath(DemoChunkHeader header)
+	{
+		return $"server-demos/servers/{header.ServerId}/sessions/{header.SessionId}/{header.ChunkIndex}.sdem";
+	}
+
+	public static string GetBlobHeaderPath(DemoChunkHeader header)
+	{
+		return $"server-demos/servers/{header.ServerId}/sessions/{header.SessionId}/{header.ChunkIndex}_header.json";
+	}
+
+	public static string GetLocalDemoPath(string chunkId)
+	{
+		return Path.Combine(DemoConVars.ServerDemoDirectory, chunkId + ".sdem");
+	}
+
+	public static string GetSavePath(string chunkId)
+	{
+		return Path.Combine(DemoConVars.ServerDemoDirectory, chunkId + ".dsav");
+	}
+
+	public static string GetLocalHeaderPath(string chunkId)
+	{
+		return Path.Combine(DemoConVars.ServerDemoDirectory, chunkId + "_header.json");
+	}
+
+	public static string GetDebugPath(string chunkId)
+	{
+		return Path.Combine(DemoConVars.ServerDemoDirectory, chunkId + "_debug.json");
+	}
+}
+
+
+using Facepunch;
+using Network;
+
+public class Message : IPooled
+{
+	public enum Type : byte
+	{
+		First = 0,
+		Welcome = 1,
+		Auth = 2,
+		Approved = 3,
+		Ready = 4,
+		Entities = 5,
+		EntityDestroy = 6,
+		GroupChange = 7,
+		GroupDestroy = 8,
+		RPCMessage = 9,
+		EntityPosition = 10,
+		ConsoleMessage = 11,
+		ConsoleCommand = 12,
+		Effect = 13,
+		DisconnectReason = 14,
+		Tick = 15,
+		Message = 16,
+		RequestUserInformation = 17,
+		GiveUserInformation = 18,
+		GroupEnter = 19,
+		GroupLeave = 20,
+		VoiceData = 21,
+		EAC = 22,
+		EntityFlags = 23,
+		World = 24,
+		ConsoleReplicatedVars = 25,
+		QueueUpdate = 26,
+		Last = 26,
+		Count = 27,
+		DemoDisconnection = 50,
+		DemoTransientEntities = 51
+	}
+
+	public static readonly bool[] EncryptionPerType = new bool[28]
+	{
+		false, false, false, false, false, true, true, true, true, true,
+		true, true, true, true, true, true, true, false, false, true,
+		true, true, false, true, false, false, false, false
+	};
+
+	public Type type;
+
+	public BaseNetwork peer;
+
+	public NetRead read;
+
+	public Connection connection => read.connection;
+
+	void IPooled.LeavePool()
+	{
+	}
+
+	void IPooled.EnterPool()
+	{
+		read = null;
+		peer = null;
+		type = Type.First;
+	}
+}
+
+
+public enum Type : byte
+{
+	First = 0,
+	Welcome = 1,
+	Auth = 2,
+	Approved = 3,
+	Ready = 4,
+	Entities = 5,
+	EntityDestroy = 6,
+	GroupChange = 7,
+	GroupDestroy = 8,
+	RPCMessage = 9,
+	EntityPosition = 10,
+	ConsoleMessage = 11,
+	ConsoleCommand = 12,
+	Effect = 13,
+	DisconnectReason = 14,
+	Tick = 15,
+	Message = 16,
+	RequestUserInformation = 17,
+	GiveUserInformation = 18,
+	GroupEnter = 19,
+	GroupLeave = 20,
+	VoiceData = 21,
+	EAC = 22,
+	EntityFlags = 23,
+	World = 24,
+	ConsoleReplicatedVars = 25,
+	QueueUpdate = 26,
+	Last = 26,
+	Count = 27,
+	DemoDisconnection = 50,
+	DemoTransientEntities = 51
+}
+
+
+using System;
+using System.IO;
+using System.Text;
+using System.Threading;
+using Facepunch;
+using Facepunch.Extend;
+using Network;
+using SilentOrbit.ProtocolBuffers;
+using UnityEngine;
+
+public class NetRead : Stream, IPooled, IStreamReader
+{
+	public byte[] Data;
+
+	private int _length;
+
+	private int _position;
+
+	public int refCount;
+
+	public ulong guid;
+
+	public string ipaddress;
+
+	public Connection connection;
+
+	private const int bufferSize = 8388608;
+
+	private static byte[] byteBuffer = new byte[8388608];
+
+	private static char[] charBuffer = new char[8388608];
+
+	public int Unread => (int)(Length - Position);
+
+	public override bool CanRead => true;
+
+	public override bool CanWrite => false;
+
+	public override long Length => _length;
+
+	public override long Position
+	{
+		get
+		{
+			return _position;
+		}
+		set
+		{
+			_position = (int)value;
+		}
+	}
+
+	public override bool CanSeek => true;
+
+	public void AddReference()
+	{
+		Interlocked.Increment(ref refCount);
+	}
+
+	public void RemoveReference()
+	{
+		if (Interlocked.Decrement(ref refCount) == 0)
+		{
+			NetRead netRead = this;
+			Pool.Free<NetRead>(ref netRead);
+		}
+	}
+
+	private unsafe bool Init(IntPtr data, int length)
+	{
+		if (length > 6291456)
+		{
+			throw new Exception($"Packet was too large (max is {6291456})");
+		}
+		EnsureCapacity(length);
+		SetLength(length);
+		Position = 0L;
+		fixed (byte* data2 = Data)
+		{
+			Buffer.MemoryCopy((void*)data, data2, Data.Length, length);
+		}
+		return true;
+	}
+
+	public void EnterPool()
+	{
+		connection = null;
+		if (Data != null)
+		{
+			BaseNetwork.ArrayPool.Return(Data);
+			Data = null;
+		}
+	}
+
+	public void LeavePool()
+	{
+		refCount = 1;
+	}
+
+	public bool Start(ulong guid, string ipaddress, IntPtr data, int length)
+	{
+		connection = null;
+		this.guid = guid;
+		this.ipaddress = ipaddress;
+		return Init(data, length);
+	}
+
+	public bool Start(Connection connection, IntPtr data, int length)
+	{
+		this.connection = connection;
+		guid = connection.guid;
+		ipaddress = connection.ipaddress;
+		return Init(data, length);
+	}
+
+	public bool Start(Connection connection, ulong guid, IntPtr data, int length)
+	{
+		this.connection = connection;
+		this.guid = guid;
+		ipaddress = connection.ipaddress;
+		return Init(data, length);
+	}
+
+	public bool Start(Connection connection, ulong guid, string ipaddress, IntPtr data, int length)
+	{
+		this.connection = connection;
+		this.guid = guid;
+		this.ipaddress = ipaddress;
+		return Init(data, length);
+	}
+
+	public string String(int maxLength = 256, bool variableLength = false)
+	{
+		return StringInternal(maxLength, allowNewLine: false, variableLength);
+	}
+
+	public string StringMultiLine(int maxLength = 2048, bool variableLength = false)
+	{
+		return StringInternal(maxLength, allowNewLine: true, variableLength);
+	}
+
+	private string StringInternal(int maxLength, bool allowNewLine, bool variableLength = false)
+	{
+		int num = BytesWithSize(byteBuffer, 8388608u, variableLength);
+		if (num <= 0)
+		{
+			return string.Empty;
+		}
+		int num2 = Encoding.UTF8.GetChars(byteBuffer, 0, num, charBuffer, 0);
+		if (num2 > maxLength)
+		{
+			num2 = maxLength;
+		}
+		for (int i = 0; i < num2; i++)
+		{
+			char c = charBuffer[i];
+			if (char.IsControl(c) && (!allowNewLine || c != '\n'))
+			{
+				charBuffer[i] = ' ';
+			}
+		}
+		return new string(charBuffer, 0, num2);
+	}
+
+	public string StringRaw(int maxLength = 8388608, bool variableLength = false)
+	{
+		int num = (int)(variableLength ? VarUInt32() : UInt32());
+		if (num <= 0 || num > maxLength)
+		{
+			return string.Empty;
+		}
+		string @string = Encoding.UTF8.GetString(Data, (int)Position, num);
+		Position += num;
+		return @string;
+	}
+
+	public bool TemporaryBytesWithSize(out byte[] buffer, out int size)
+	{
+		buffer = byteBuffer;
+		size = 0;
+		uint num = UInt32();
+		if (num == 0)
+		{
+			return false;
+		}
+		if (num > byteBuffer.Length)
+		{
+			return false;
+		}
+		size = Read(byteBuffer, 0, (int)num);
+		if (size != num)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public NetworkableId EntityID()
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		return new NetworkableId(UInt64());
+	}
+
+	public ItemContainerId ItemContainerID()
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		return new ItemContainerId(UInt64());
+	}
+
+	public ItemId ItemID()
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		return new ItemId(UInt64());
+	}
+
+	public uint GroupID()
+	{
+		return UInt32();
+	}
+
+	public int BytesWithSize(byte[] buffer, uint maxLength = uint.MaxValue, bool variableLength = false)
+	{
+		uint num = (variableLength ? VarUInt32() : UInt32());
+		if (num == 0)
+		{
+			return 0;
+		}
+		if (num > buffer.Length || num > maxLength)
+		{
+			return -1;
+		}
+		if (Read(buffer, 0, (int)num) != num)
+		{
+			return -1;
+		}
+		return (int)num;
+	}
+
+	public byte[] BytesWithSize(uint maxSize = 10485760u, bool variableLength = false)
+	{
+		uint num = (variableLength ? VarUInt32() : UInt32());
+		if (num == 0)
+		{
+			return null;
+		}
+		if (num > maxSize)
+		{
+			return null;
+		}
+		byte[] array = new byte[num];
+		if (Read(array, 0, (int)num) != num)
+		{
+			return null;
+		}
+		return array;
+	}
+
+	public ArraySegment<byte> PooledBytes(uint maxSize = 6291456u, bool variableLength = false)
+	{
+		uint num = (variableLength ? VarUInt32() : UInt32());
+		if (num == 0)
+		{
+			return default(ArraySegment<byte>);
+		}
+		int num2 = (int)Position;
+		if (num > maxSize || num2 + num > Data.Length)
+		{
+			return default(ArraySegment<byte>);
+		}
+		Seek(num, SeekOrigin.Current);
+		return new ArraySegment<byte>(Data, num2, (int)num);
+	}
+
+	public override int ReadByte()
+	{
+		if (_position == Length)
+		{
+			return -1;
+		}
+		byte result = Data[_position];
+		_position++;
+		return result;
+	}
+
+	private void EnsureCapacity(int spaceRequired)
+	{
+		if (Data == null)
+		{
+			int num = ((spaceRequired <= 2048) ? 2048 : spaceRequired);
+			int num2 = Mathf.NextPowerOfTwo(num);
+			if (num2 > 8388608)
+			{
+				throw new Exception($"Preventing NetWrite buffer from growing too large (requiredLength={num})");
+			}
+			Data = BaseNetwork.ArrayPool.Rent(num2);
+		}
+		else if (Data.Length - _position < spaceRequired)
+		{
+			int num3 = _position + spaceRequired;
+			int num4 = Mathf.NextPowerOfTwo(Math.Max(num3, Data.Length));
+			if (num4 > 8388608)
+			{
+				throw new Exception($"Preventing NetWrite buffer from growing too large (requiredLength={num3})");
+			}
+			byte[] array = BaseNetwork.ArrayPool.Rent(num4);
+			Buffer.BlockCopy(Data, 0, array, 0, _length);
+			BaseNetwork.ArrayPool.Return(Data);
+			Data = array;
+		}
+	}
+
+	public override void SetLength(long value)
+	{
+		_length = (int)value;
+	}
+
+	public byte PacketID()
+	{
+		return Read<byte>();
+	}
+
+	public byte PeekPacketID()
+	{
+		return Peek<byte>();
+	}
+
+	public bool Bool()
+	{
+		return UInt8() != 0;
+	}
+
+	public bool Bit()
+	{
+		return UInt8() != 0;
+	}
+
+	public byte UInt8()
+	{
+		return Read<byte>();
+	}
+
+	public ushort UInt16()
+	{
+		return Read<ushort>();
+	}
+
+	public uint UInt32()
+	{
+		return Read<uint>();
+	}
+
+	public ulong UInt64()
+	{
+		return Read<ulong>();
+	}
+
+	public sbyte Int8()
+	{
+		return Read<sbyte>();
+	}
+
+	public short Int16()
+	{
+		return Read<short>();
+	}
+
+	public int Int32()
+	{
+		return Read<int>();
+	}
+
+	public long Int64()
+	{
+		return Read<long>();
+	}
+
+	public float Float()
+	{
+		return Read<float>();
+	}
+
+	public double Double()
+	{
+		return Read<double>();
+	}
+
+	public uint VarUInt32()
+	{
+		int num = default(int);
+		uint result = ProtocolParser.ReadUInt32(Data, (int)Position, ref num);
+		_position += num;
+		return result;
+	}
+
+	public Vector3 Vector3()
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return this.Read<Vector3>();
+	}
+
+	public Vector4 Vector4()
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return this.Read<Vector4>();
+	}
+
+	public Quaternion Quaternion()
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return this.Read<Quaternion>();
+	}
+
+	public Ray Ray()
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return this.Read<Ray>();
+	}
+
+	public Color Color()
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return this.Read<Color>();
+	}
+
+	public Color32 Color32()
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return this.Read<Color32>();
+	}
+
+	public unsafe override int Read(byte[] buffer, int offset, int count)
+	{
+		if (_position + count > _length)
+		{
+			count = _length - _position;
+		}
+		fixed (byte* data = Data)
+		{
+			fixed (byte* ptr = buffer)
+			{
+				Buffer.MemoryCopy(data + _position, ptr + offset, count, count);
+			}
+		}
+		_position += count;
+		return count;
+	}
+
+	public override long Seek(long offset, SeekOrigin origin)
+	{
+		if (origin == SeekOrigin.Current)
+		{
+			_position += (int)offset;
+			return _position;
+		}
+		throw new NotImplementedException();
+	}
+
+	public unsafe T Read<T>() where T : unmanaged
+	{
+		if (Unread < sizeof(T))
+		{
+			return default(T);
+		}
+		T result = ByteExtensions.ReadUnsafe<T>(Data, _position);
+		_position += sizeof(T);
+		return result;
+	}
+
+	public unsafe T Peek<T>() where T : unmanaged
+	{
+		if (Unread < sizeof(T))
+		{
+			return default(T);
+		}
+		return ByteExtensions.ReadUnsafe<T>(Data, _position);
+	}
+
+	public override void Flush()
+	{
+		throw new NotImplementedException();
+	}
+
+	public override void Write(byte[] buffer, int offset, int count)
+	{
+		throw new NotImplementedException();
+	}
+
+	public override void WriteByte(byte value)
+	{
+		throw new NotImplementedException();
+	}
+}
+
+
+public enum SendMethod
+{
+	Reliable,
+	ReliableUnordered,
+	Unreliable
+}
+
+
+public enum Priority
+{
+	Immediate,
+	Normal
+}
+
+
+using System.Collections.Generic;
+using Network;
+using Network.Visibility;
+
+public interface NetworkHandler
+{
+	void OnNetworkSubscribersEnter(List<Connection> connections);
+
+	void OnNetworkSubscribersLeave(List<Connection> connections);
+
+	void OnNetworkGroupChange();
+
+	void OnNetworkGroupLeave(Group group);
+
+	void OnNetworkGroupEnter(Group group);
+}
+
+
+using System;
+using System.Collections.Generic;
+using Facepunch;
+using Facepunch.Extend;
+using Network;
+using Network.Visibility;
+using Oxide.Core;
+using UnityEngine;
+
+public class Networkable : IPooled
+{
+	public NetworkableId ID;
+
+	public Group group;
+
+	public Group secondaryGroup;
+
+	public Subscriber subscriber;
+
+	public NetworkHandler handler;
+
+	public bool updateSubscriptions;
+
+	public Server sv;
+
+	internal Client cl;
+
+	public Connection connection { get; private set; }
+
+	public void Destroy()
+	{
+		CloseSubscriber();
+		if (((NetworkableId)(ref ID)).IsValid)
+		{
+			SwitchGroup(null);
+			if (sv != null)
+			{
+				sv.ReturnUID(ID.Value);
+			}
+		}
+	}
+
+	public void EnterPool()
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		ID = default(NetworkableId);
+		connection = null;
+		group = null;
+		secondaryGroup = null;
+		sv = null;
+		cl = null;
+		handler = null;
+		updateSubscriptions = false;
+	}
+
+	public void LeavePool()
+	{
+	}
+
+	public void StartSubscriber()
+	{
+		if (subscriber != null)
+		{
+			Debug.Log((object)"BecomeSubscriber called twice!");
+			return;
+		}
+		subscriber = sv.visibility.CreateSubscriber(connection);
+		OnSubscriptionChange();
+	}
+
+	public void OnConnected(Connection c)
+	{
+		connection = c;
+	}
+
+	public void OnDisconnected()
+	{
+		connection = null;
+		CloseSubscriber();
+	}
+
+	public void CloseSubscriber()
+	{
+		if (subscriber != null)
+		{
+			sv.visibility.DestroySubscriber(ref subscriber);
+		}
+	}
+
+	public bool UpdateGroups(Vector3 position)
+	{
+		//IL_0036: Unknown result type (might be due to invalid IL or missing references)
+		Debug.Assert(sv != null, "SV IS NULL");
+		Debug.Assert(sv.visibility != null, "sv.visibility IS NULL");
+		Group newGroup = sv.visibility.GetGroup(position);
+		return SwitchGroup(newGroup);
+	}
+
+	public bool SwitchGroup(Group newGroup)
+	{
+		if (newGroup == group)
+		{
+			return false;
+		}
+		TimeWarning val = TimeWarning.New("SwitchGroup", 0);
+		try
+		{
+			TimeWarning val2;
+			if (group != null)
+			{
+				val2 = TimeWarning.New("group.Leave", 0);
+				try
+				{
+					group.Leave(this);
+				}
+				finally
+				{
+					((IDisposable)val2)?.Dispose();
+				}
+			}
+			Group oldGroup = group;
+			group = newGroup;
+			if (group != null)
+			{
+				val2 = TimeWarning.New("group.Join", 0);
+				try
+				{
+					group.Join(this);
+				}
+				finally
+				{
+					((IDisposable)val2)?.Dispose();
+				}
+			}
+			if (handler != null)
+			{
+				val2 = TimeWarning.New("OnNetworkGroupChange", 0);
+				try
+				{
+					handler.OnNetworkGroupChange();
+				}
+				finally
+				{
+					((IDisposable)val2)?.Dispose();
+				}
+			}
+			val2 = TimeWarning.New("OnSubscriptionChange", 0);
+			try
+			{
+				OnSubscriptionChange();
+			}
+			finally
+			{
+				((IDisposable)val2)?.Dispose();
+			}
+			val2 = TimeWarning.New("OnGroupTransition", 0);
+			try
+			{
+				OnGroupTransition(oldGroup);
+			}
+			finally
+			{
+				((IDisposable)val2)?.Dispose();
+			}
+		}
+		finally
+		{
+			((IDisposable)val)?.Dispose();
+		}
+		return true;
+	}
+
+	public void OnGroupTransition(Group oldGroup)
+	{
+		if (oldGroup == null)
+		{
+			if (group != null && handler != null)
+			{
+				handler.OnNetworkSubscribersEnter(group.subscribers);
+			}
+			return;
+		}
+		if (group == null)
+		{
+			if (oldGroup != null && handler != null)
+			{
+				handler.OnNetworkSubscribersLeave(oldGroup.subscribers);
+			}
+			return;
+		}
+		List<Connection> list = Pool.Get<List<Connection>>();
+		List<Connection> list2 = Pool.Get<List<Connection>>();
+		List.Compare<Connection, List<Connection>, List<Connection>>(oldGroup.subscribers, group.subscribers, list, list2, (List<Connection>)null);
+		if (handler != null)
+		{
+			handler.OnNetworkSubscribersEnter(list);
+		}
+		if (handler != null)
+		{
+			handler.OnNetworkSubscribersLeave(list2);
+		}
+		Pool.FreeUnmanaged<Connection>(ref list);
+		Pool.FreeUnmanaged<Connection>(ref list2);
+	}
+
+	public void OnSubscriptionChange()
+	{
+		if (subscriber == null)
+		{
+			return;
+		}
+		if (group != null && !subscriber.IsSubscribed(group))
+		{
+			subscriber.Subscribe(group);
+			if (handler != null)
+			{
+				handler.OnNetworkGroupEnter(group);
+			}
+		}
+		updateSubscriptions = true;
+		UpdateHighPrioritySubscriptions();
+	}
+
+	public bool SwitchSecondaryGroup(Group newGroup)
+	{
+		if (newGroup == secondaryGroup)
+		{
+			return false;
+		}
+		TimeWarning val = TimeWarning.New("SwitchSecondaryGroup", 0);
+		try
+		{
+			secondaryGroup = newGroup;
+			TimeWarning val2 = TimeWarning.New("OnSubscriptionChange", 0);
+			try
+			{
+				OnSubscriptionChange();
+			}
+			finally
+			{
+				((IDisposable)val2)?.Dispose();
+			}
+		}
+		finally
+		{
+			((IDisposable)val)?.Dispose();
+		}
+		return true;
+	}
+
+	public void AddVisibleFromNear(Group additionalGroup, List<Group> groupsVisible)
+	{
+		if (additionalGroup == null)
+		{
+			return;
+		}
+		List<Group> list = Pool.Get<List<Group>>();
+		sv.visibility.GetVisibleFromNear(additionalGroup, list);
+		for (int i = 0; i < list.Count; i++)
+		{
+			Group item = list[i];
+			if (!groupsVisible.Contains(item))
+			{
+				groupsVisible.Add(item);
+			}
+		}
+		Pool.FreeUnmanaged<Group>(ref list);
+	}
+
+	public bool UpdateSubscriptions(int removeLimit, int addLimit)
+	{
+		if (!updateSubscriptions)
+		{
+			return false;
+		}
+		if (subscriber == null)
+		{
+			return false;
+		}
+		TimeWarning val = TimeWarning.New("UpdateSubscriptions", 0);
+		try
+		{
+			updateSubscriptions = false;
+			List<Group> list = Pool.Get<List<Group>>();
+			List<Group> list2 = Pool.Get<List<Group>>();
+			List<Group> list3 = Pool.Get<List<Group>>();
+			sv.visibility.GetVisibleFromFar(this.group, list3);
+			AddVisibleFromNear(secondaryGroup, list3);
+			List.Compare<Group, ListHashSet<Group>, List<Group>>(subscriber.subscribed, list3, list, list2, (List<Group>)null);
+			if (Interface.CallHook("OnNetworkSubscriptionsUpdate", (object)this, (object)list, (object)list2) == null)
+			{
+				for (int i = 0; i < list2.Count; i++)
+				{
+					Group group = list2[i];
+					if (removeLimit > 0)
+					{
+						subscriber.Unsubscribe(group);
+						if (handler != null)
+						{
+							handler.OnNetworkGroupLeave(group);
+						}
+						removeLimit -= group.networkables.Count;
+					}
+					else
+					{
+						updateSubscriptions = true;
+					}
+				}
+				for (int j = 0; j < list.Count; j++)
+				{
+					Group group2 = list[j];
+					if (addLimit > 0)
+					{
+						subscriber.Subscribe(group2);
+						if (handler != null)
+						{
+							handler.OnNetworkGroupEnter(group2);
+						}
+						addLimit -= group2.networkables.Count;
+					}
+					else
+					{
+						updateSubscriptions = true;
+					}
+				}
+			}
+			Pool.FreeUnmanaged<Group>(ref list);
+			Pool.FreeUnmanaged<Group>(ref list2);
+			Pool.FreeUnmanaged<Group>(ref list3);
+		}
+		finally
+		{
+			((IDisposable)val)?.Dispose();
+		}
+		return true;
+	}
+
+	public bool UpdateHighPrioritySubscriptions()
+	{
+		if (subscriber == null)
+		{
+			return false;
+		}
+		TimeWarning val = TimeWarning.New("UpdateHighPrioritySubscriptions", 0);
+		try
+		{
+			List<Group> list = Pool.Get<List<Group>>();
+			List<Group> list2 = Pool.Get<List<Group>>();
+			sv.visibility.GetVisibleFromNear(this.group, list2);
+			AddVisibleFromNear(secondaryGroup, list2);
+			List.Compare<Group, ListHashSet<Group>, List<Group>>(subscriber.subscribed, list2, list, (List<Group>)null, (List<Group>)null);
+			if (Interface.CallHook("OnNetworkSubscriptionsUpdate", (object)this, (object)list, (object)null) == null)
+			{
+				for (int i = 0; i < list.Count; i++)
+				{
+					Group group = list[i];
+					subscriber.Subscribe(group);
+					if (handler != null)
+					{
+						handler.OnNetworkGroupEnter(group);
+					}
+				}
+			}
+			Pool.FreeUnmanaged<Group>(ref list);
+			Pool.FreeUnmanaged<Group>(ref list2);
+		}
+		finally
+		{
+			((IDisposable)val)?.Dispose();
+		}
+		return true;
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Threading;
+using Facepunch;
+using Facepunch.Extend;
+using Network;
+using SilentOrbit.ProtocolBuffers;
+using UnityEngine;
+
+public class NetWrite : Stream, IPooled, IStreamWriter
+{
+	private static MemoryStream stringBuffer = new MemoryStream();
+
+	private BaseNetwork peer;
+
+	public byte[] Data;
+
+	private int _position;
+
+	private int _length;
+
+	public int refCount = 1;
+
+	public SendMethod method;
+
+	public sbyte channel;
+
+	public Priority priority;
+
+	public List<Connection> connections = new List<Connection>();
+
+	public override bool CanSeek => true;
+
+	public override bool CanRead => true;
+
+	public override bool CanWrite => true;
+
+	public override long Length => _length;
+
+	public override long Position
+	{
+		get
+		{
+			return _position;
+		}
+		set
+		{
+			Seek(value, SeekOrigin.Begin);
+		}
+	}
+
+	public void AddReference()
+	{
+		Interlocked.Increment(ref refCount);
+	}
+
+	public void RemoveReference()
+	{
+		if (Interlocked.Decrement(ref refCount) == 0)
+		{
+			NetWrite netWrite = this;
+			Pool.Free<NetWrite>(ref netWrite);
+		}
+	}
+
+	public void EnterPool()
+	{
+		peer = null;
+		connections.Clear();
+		if (Data != null)
+		{
+			BaseNetwork.ArrayPool.Return(Data);
+			Data = null;
+		}
+	}
+
+	public void LeavePool()
+	{
+		refCount = 1;
+	}
+
+	public bool Start(BaseNetwork peer)
+	{
+		this.peer = peer;
+		connections.Clear();
+		_position = 0;
+		_length = 0;
+		return true;
+	}
+
+	public void Send(SendInfo info)
+	{
+		method = info.method;
+		channel = info.channel;
+		priority = info.priority;
+		if (info.connections != null)
+		{
+			connections.AddRange(info.connections);
+			if (PacketProfiler.enabled)
+			{
+				PacketProfiler.LogOutbound(Data[0] - 140, info.connections.Count, _length);
+			}
+		}
+		if (info.connection != null)
+		{
+			connections.Add(info.connection);
+			if (PacketProfiler.enabled)
+			{
+				PacketProfiler.LogOutbound(Data[0] - 140, 1, _length);
+			}
+		}
+		if (BaseNetwork.Multithreading)
+		{
+			peer.EnqueueWrite(this);
+		}
+		else
+		{
+			peer.ProcessWrite(this);
+		}
+	}
+
+	public void SendImmediate(SendInfo info)
+	{
+		method = info.method;
+		channel = info.channel;
+		priority = info.priority;
+		if (info.connections != null)
+		{
+			connections.AddRange(info.connections);
+		}
+		if (info.connection != null)
+		{
+			connections.Add(info.connection);
+		}
+		if (DemoConVars.ServerDemosEnabled && peer.SupportsServerDemos)
+		{
+			peer.EnqueueToDemoThread(new DemoQueueItem(this));
+		}
+		peer.ProcessWrite(this);
+	}
+
+	public byte PeekPacketID()
+	{
+		if (_length <= 0)
+		{
+			return 0;
+		}
+		return Data[0];
+	}
+
+	public void PacketID(Message.Type val)
+	{
+		byte b = (byte)val;
+		b += 140;
+		UInt8(b);
+	}
+
+	public void UInt8(byte val)
+	{
+		Write(in val);
+	}
+
+	public void UInt16(ushort val)
+	{
+		Write(in val);
+	}
+
+	public void UInt32(uint val)
+	{
+		Write(in val);
+	}
+
+	public void UInt64(ulong val)
+	{
+		Write(in val);
+	}
+
+	public void Int8(sbyte val)
+	{
+		Write(in val);
+	}
+
+	public void Int16(short val)
+	{
+		Write(in val);
+	}
+
+	public void Int32(int val)
+	{
+		Write(in val);
+	}
+
+	public void Int64(long val)
+	{
+		Write(in val);
+	}
+
+	public void Bool(bool val)
+	{
+		Write<byte>((byte)(val ? 1 : 0));
+	}
+
+	public void Float(float val)
+	{
+		Write(in val);
+	}
+
+	public void Double(double val)
+	{
+		Write(in val);
+	}
+
+	public void Bytes(byte[] val)
+	{
+		Write(val, 0, val.Length);
+	}
+
+	public void VarUInt32(uint val)
+	{
+		EnsureCapacity(9);
+		_position += ProtocolParser.WriteUInt32(val, Data, (int)Position);
+		if (_position > _length)
+		{
+			_length = _position;
+		}
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	public void WriteUInt32(uint value, bool variableLength)
+	{
+		if (variableLength)
+		{
+			VarUInt32(value);
+		}
+		else
+		{
+			UInt32(value);
+		}
+	}
+
+	public void String(string val, bool variableLength = false)
+	{
+		if (string.IsNullOrEmpty(val))
+		{
+			BytesWithSize((MemoryStream)null, variableLength);
+			return;
+		}
+		if (stringBuffer.Capacity < val.Length * 8)
+		{
+			stringBuffer.Capacity = val.Length * 8;
+		}
+		stringBuffer.Position = 0L;
+		stringBuffer.SetLength(stringBuffer.Capacity);
+		int bytes = Encoding.UTF8.GetBytes(val, 0, val.Length, stringBuffer.GetBuffer(), 0);
+		stringBuffer.SetLength(bytes);
+		BytesWithSize(stringBuffer, variableLength);
+	}
+
+	public void Vector3(in Vector3 obj)
+	{
+		Float(obj.x);
+		Float(obj.y);
+		Float(obj.z);
+	}
+
+	public void Vector4(in Vector4 obj)
+	{
+		Float(obj.x);
+		Float(obj.y);
+		Float(obj.z);
+		Float(obj.w);
+	}
+
+	public void Quaternion(in Quaternion obj)
+	{
+		Float(obj.x);
+		Float(obj.y);
+		Float(obj.z);
+		Float(obj.w);
+	}
+
+	public void Ray(in Ray obj)
+	{
+		//IL_0002: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0007: Unknown result type (might be due to invalid IL or missing references)
+		//IL_000a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_000f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0019: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0021: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0026: Unknown result type (might be due to invalid IL or missing references)
+		Ray val = obj;
+		Vector3(((Ray)(ref val)).origin);
+		val = obj;
+		Vector3(((Ray)(ref val)).direction);
+	}
+
+	public void Color(in Color obj)
+	{
+		Float(obj.r);
+		Float(obj.g);
+		Float(obj.b);
+		Float(obj.a);
+	}
+
+	public void Color32(in Color32 obj)
+	{
+		UInt8(obj.r);
+		UInt8(obj.g);
+		UInt8(obj.b);
+		UInt8(obj.a);
+	}
+
+	public void EntityID(NetworkableId id)
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		UInt64(id.Value);
+	}
+
+	public void ItemContainerID(ItemContainerId id)
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		UInt64(id.Value);
+	}
+
+	public void ItemID(ItemId id)
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		UInt64(id.Value);
+	}
+
+	public void GroupID(uint id)
+	{
+		UInt32(id);
+	}
+
+	public void BytesWithSize(MemoryStream val, bool variableLength = false)
+	{
+		if (val == null || val.Length == 0L)
+		{
+			WriteUInt32(0u, variableLength);
+		}
+		else
+		{
+			BytesWithSize(val.GetBuffer(), (int)val.Length, variableLength);
+		}
+	}
+
+	public void BytesWithSize(byte[] b, bool variableLength = false)
+	{
+		BytesWithSize(b, b.Length, variableLength);
+	}
+
+	public void BytesWithSize(byte[] b, int length, bool variableLength = false)
+	{
+		if (b == null || b.Length == 0 || length == 0)
+		{
+			WriteUInt32(0u, variableLength);
+		}
+		else if ((uint)length > 10485760u)
+		{
+			WriteUInt32(0u, variableLength);
+			Debug.LogError((object)("BytesWithSize: Too big " + length));
+		}
+		else
+		{
+			WriteUInt32((uint)length, variableLength);
+			Write(b, 0, length);
+		}
+	}
+
+	private unsafe void Write<T>(in T val) where T : unmanaged
+	{
+		int num = sizeof(T);
+		EnsureCapacity(num);
+		ByteExtensions.WriteUnsafe<T>(Data, ref val, _position);
+		_position += num;
+		if (_position > _length)
+		{
+			_length = _position;
+		}
+	}
+
+	private void EnsureCapacity(int spaceRequired)
+	{
+		if (Data == null)
+		{
+			int num = ((spaceRequired <= 2048) ? 2048 : spaceRequired);
+			int num2 = Mathf.NextPowerOfTwo(num);
+			if (num2 > 4194304)
+			{
+				throw new Exception($"Preventing NetWrite buffer from growing too large (requiredLength={num})");
+			}
+			Data = BaseNetwork.ArrayPool.Rent(num2);
+		}
+		else if (Data.Length - _position < spaceRequired)
+		{
+			int num3 = _position + spaceRequired;
+			int num4 = Mathf.NextPowerOfTwo(Math.Max(num3, Data.Length));
+			if (num4 > 4194304)
+			{
+				throw new Exception($"Preventing NetWrite buffer from growing too large (requiredLength={num3})");
+			}
+			byte[] array = BaseNetwork.ArrayPool.Rent(num4);
+			Buffer.BlockCopy(Data, 0, array, 0, _length);
+			BaseNetwork.ArrayPool.Return(Data);
+			Data = array;
+		}
+	}
+
+	public override void Flush()
+	{
+	}
+
+	public override int Read(byte[] buffer, int offset, int count)
+	{
+		int num = _length - _position;
+		int num2 = Mathf.Clamp(count, 0, num);
+		Buffer.BlockCopy(Data, _position, buffer, offset, count);
+		_position += num2;
+		return num2;
+	}
+
+	public override int ReadByte()
+	{
+		if (_position >= _length)
+		{
+			return -1;
+		}
+		return Data[_position++];
+	}
+
+	public override void Write(byte[] buffer, int offset, int count)
+	{
+		EnsureCapacity(count);
+		Buffer.BlockCopy(buffer, offset, Data, _position, count);
+		_position += count;
+		if (_position > _length)
+		{
+			_length = _position;
+		}
+	}
+
+	public override void WriteByte(byte value)
+	{
+		UInt8(value);
+	}
+
+	public override long Seek(long offset, SeekOrigin origin)
+	{
+		int num = origin switch
+		{
+			SeekOrigin.Current => _position + (int)offset, 
+			SeekOrigin.End => _length + (int)offset, 
+			_ => (int)offset, 
+		};
+		if (num < 0 || num > _length)
+		{
+			throw new ArgumentOutOfRangeException("offset");
+		}
+		_position = num;
+		return _position;
+	}
+
+	public override void SetLength(long value)
+	{
+		throw new NotImplementedException();
+	}
+}
+
+
+using System.Runtime.CompilerServices;
+using Network;
+
+public static class PacketProfiler
+{
+	public static class AnalyticsKeys
+	{
+		public static string[] MessageType;
+
+		static AnalyticsKeys()
+		{
+			MessageType = new string[27];
+			for (int i = 0; i < 27; i++)
+			{
+				MessageType[i] = ((Message.Type)i/*cast due to .constrained prefix*/).ToString();
+			}
+		}
+	}
+
+	public static bool enabled = false;
+
+	public static int[] inboundCount = new int[27];
+
+	public static int[] inboundBytes = new int[27];
+
+	public static int[] outboundCount = new int[27];
+
+	public static int[] outboundSum = new int[27];
+
+	public static int[] outboundBytes = new int[27];
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	public static void LogInbound(Message.Type type, int length)
+	{
+		if (enabled && (int)type < 27)
+		{
+			inboundCount[(uint)type]++;
+			inboundBytes[(uint)type] += length;
+		}
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	public static void LogOutbound(int type, int connectionCount, int length)
+	{
+		if (enabled && type < 27)
+		{
+			outboundCount[type]++;
+			outboundSum[type] += connectionCount;
+			outboundBytes[type] += connectionCount * length;
+		}
+	}
+
+	public static void Reset()
+	{
+		for (int i = 0; i < 27; i++)
+		{
+			inboundCount[i] = 0;
+			inboundBytes[i] = 0;
+			outboundCount[i] = 0;
+			outboundSum[i] = 0;
+			outboundBytes[i] = 0;
+		}
+	}
+}
+
+
+public static class AnalyticsKeys
+{
+	public static string[] MessageType;
+
+	static AnalyticsKeys()
+	{
+		MessageType = new string[27];
+		for (int i = 0; i < 27; i++)
+		{
+			MessageType[i] = ((Message.Type)i/*cast due to .constrained prefix*/).ToString();
+		}
+	}
+}
+
+
+using System.Collections.Generic;
+using Network;
+
+public struct SendInfo
+{
+	public SendMethod method;
+
+	public sbyte channel;
+
+	public Priority priority;
+
+	public List<Connection> connections;
+
+	public Connection connection;
+
+	public SendInfo(List<Connection> connections)
+	{
+		this = default(SendInfo);
+		channel = 0;
+		method = SendMethod.Reliable;
+		priority = Priority.Normal;
+		this.connections = connections;
+	}
+
+	public SendInfo(Connection connection)
+	{
+		this = default(SendInfo);
+		channel = 0;
+		method = SendMethod.Reliable;
+		priority = Priority.Normal;
+		this.connection = connection;
+	}
+}
+
+
+public struct ServerInfo
+{
+	public int NetworkVersion;
+
+	public string Changeset;
+
+	public string Hostname;
+
+	public uint Seed;
+
+	public uint WorldSize;
+
+	public string Level;
+
+	public string LevelUrl;
+
+	public string Checksum;
+}
+
+
+using System;
+using System.IO;
+using Network;
+
+public interface IServerCallback
+{
+	void OnNetworkMessage(Message message);
+
+	void OnDisconnected(string reason, Connection connection);
+
+	void RequestSave(Stream stream);
+
+	void AddOnSaveCallback(Action<Stream> callback);
+
+	void RemoveOnSaveCallback(Action<Stream> callback);
+
+	ServerInfo GetServerInfo();
+}
+
+
+using System.Collections.Generic;
+using System.Threading;
+using Facepunch;
+using Network;
+using Network.Visibility;
+using Oxide.Core;
+using UnityEngine;
+
+public abstract class Server : BaseNetwork
+{
+	public static ulong MaxPacketsPerSecond = 1500uL;
+
+	public static int MaxConnectionsPerIP = 5;
+
+	public static int MaxReceiveTime = 20;
+
+	public static int MaxReadQueueLength = 5000;
+
+	public static int MaxWriteQueueLength = 5000;
+
+	public static int MaxDecryptQueueLength = 5000;
+
+	public static int MaxReadQueueBytes = 524288000;
+
+	public static int MaxWriteQueueBytes = 524288000;
+
+	public static int MaxDecryptQueueBytes = 524288000;
+
+	public static int MaxMainThreadWait = 100;
+
+	public static int MaxReadThreadWait = 100;
+
+	public static int MaxWriteThreadWait = 100;
+
+	public static int MaxDecryptThreadWait = 100;
+
+	public string ip = "";
+
+	public int port = 5678;
+
+	public bool compressionEnabled;
+
+	public bool logging;
+
+	public Manager visibility;
+
+	public IServerCallback callbackHandler;
+
+	public bool debug;
+
+	internal ulong lastValueGiven = 1024uL;
+
+	public List<Connection> connections = new List<Connection>();
+
+	private Dictionary<ulong, Connection> connectionByGUID = new Dictionary<ulong, Connection>();
+
+	private Dictionary<string, List<Connection>> connectionsByIP = new Dictionary<string, List<Connection>>();
+
+	public override bool SupportsServerDemos => true;
+
+	protected override int MaxReceiveTimeValue => MaxReceiveTime;
+
+	protected override int MaxReadQueueLengthValue => MaxReadQueueLength;
+
+	protected override int MaxWriteQueueLengthValue => MaxWriteQueueLength;
+
+	protected override int MaxDecryptQueueLengthValue => MaxDecryptQueueLength;
+
+	protected override int MaxReadQueueBytesValue => MaxReadQueueBytes;
+
+	protected override int MaxWriteQueueBytesValue => MaxWriteQueueBytes;
+
+	protected override int MaxDecryptQueueBytesValue => MaxDecryptQueueBytes;
+
+	protected override int MaxMainThreadWaitValue => MaxMainThreadWait;
+
+	protected override int MaxReadThreadWaitValue => MaxReadThreadWait;
+
+	protected override int MaxWriteThreadWaitValue => MaxWriteThreadWait;
+
+	protected override int MaxDecryptThreadWaitValue => MaxDecryptThreadWait;
+
+	public virtual string ProtocolId => "none";
+
+	public void Reset()
+	{
+		ResetUIDs();
+	}
+
+	public virtual bool Start(IServerCallback callbacks)
+	{
+		return true;
+	}
+
+	public virtual void Stop(string shutdownMsg)
+	{
+	}
+
+	public virtual void Flush(Connection cn)
+	{
+	}
+
+	public abstract void Disconnect(Connection cn);
+
+	public abstract void Kick(Connection cn, string message, bool logfile = false);
+
+	public ulong GetLastUIDGiven()
+	{
+		return lastValueGiven;
+	}
+
+	public ulong TakeUID()
+	{
+		if (lastValueGiven == ulong.MaxValue)
+		{
+			Debug.LogError((object)"TakeUID - ran out of available UIDs! Cannot continue running this save file.");
+			Stop("Stopping Server");
+			while (true)
+			{
+				Thread.Sleep(100);
+			}
+		}
+		if (lastValueGiven > 18446744073709550615uL)
+		{
+			Debug.LogError((object)("TakeUID - hitting ceiling limit! " + lastValueGiven));
+		}
+		else if (lastValueGiven > 18446744072859551615uL && lastValueGiven % 100000 == 0L)
+		{
+			Debug.LogError((object)("TakeUID - approaching ceiling limit! " + lastValueGiven));
+		}
+		lastValueGiven++;
+		return lastValueGiven;
+	}
+
+	public void ReturnUID(ulong uid)
+	{
+	}
+
+	public void RegisterUID(ulong uid)
+	{
+		if (uid > lastValueGiven)
+		{
+			lastValueGiven = uid;
+		}
+	}
+
+	internal void ResetUIDs()
+	{
+		lastValueGiven = 1024uL;
+	}
+
+	public Networkable CreateNetworkable()
+	{
+		//IL_000c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0011: Unknown result type (might be due to invalid IL or missing references)
+		Networkable networkable = Pool.Get<Networkable>();
+		networkable.ID = new NetworkableId(TakeUID());
+		networkable.sv = this;
+		return networkable;
+	}
+
+	public Networkable CreateNetworkable(NetworkableId uid)
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0007: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0014: Unknown result type (might be due to invalid IL or missing references)
+		Networkable networkable = Pool.Get<Networkable>();
+		networkable.ID = uid;
+		networkable.sv = this;
+		RegisterUID(uid.Value);
+		return networkable;
+	}
+
+	public void DestroyNetworkable(ref Networkable networkable)
+	{
+		networkable.Destroy();
+		Pool.Free<Networkable>(ref networkable);
+	}
+
+	protected void OnDisconnected(string strReason, Connection cn)
+	{
+		if (cn != null)
+		{
+			RecordDisconnection(cn);
+			cn.connected = false;
+			cn.active = false;
+			if (callbackHandler != null)
+			{
+				callbackHandler.OnDisconnected(strReason, cn);
+			}
+			Interface.CallHook("OnClientDisconnected", (object)cn, (object)strReason);
+			RemoveConnection(cn);
+		}
+	}
+
+	protected Connection FindConnection(ulong guid)
+	{
+		if (connectionByGUID.TryGetValue(guid, out var value))
+		{
+			return value;
+		}
+		return null;
+	}
+
+	protected void OnNewConnection(ulong guid, string ipaddress)
+	{
+		if (!string.IsNullOrEmpty(ipaddress) && !(ipaddress == "UNASSIGNED_SYSTEM_ADDRESS"))
+		{
+			Connection connection = new Connection();
+			connection.guid = guid;
+			connection.ipaddress = ipaddress;
+			connection.active = true;
+			OnNewConnection(connection);
+		}
+	}
+
+	protected void OnNewConnection(Connection connection)
+	{
+		connection.connectionTime = TimeEx.realtimeSinceStartup;
+		connections.Add(connection);
+		connectionByGUID.Add(connection.guid, connection);
+		if (LimitConnectionsPerIP())
+		{
+			string key = connection.IPAddressWithoutPort();
+			if (!connectionsByIP.TryGetValue(key, out var value))
+			{
+				connectionsByIP.Add(key, value = Pool.Get<List<Connection>>());
+			}
+			value.Add(connection);
+			if (value.Count > MaxConnectionsPerIP)
+			{
+				Kick(connection, "Too many connections from this IP");
+				return;
+			}
+		}
+		NetWrite netWrite = StartWrite();
+		netWrite.PacketID(Message.Type.RequestUserInformation);
+		netWrite.Send(new SendInfo(connection));
+	}
+
+	protected void RemoveConnection(Connection connection)
+	{
+		if (LimitConnectionsPerIP())
+		{
+			string key = connection.IPAddressWithoutPort();
+			if (connectionsByIP.TryGetValue(key, out var value))
+			{
+				value.Remove(connection);
+			}
+			if (value != null && value.Count == 0)
+			{
+				connectionsByIP.Remove(key);
+				Pool.FreeUnmanaged<Connection>(ref value);
+			}
+		}
+		connectionByGUID.Remove(connection.guid);
+		connections.Remove(connection);
+		connection.OnDisconnected();
+	}
+
+	public virtual bool LimitConnectionsPerIP()
+	{
+		return true;
+	}
+
+	public virtual int GetAveragePing(Connection connection)
+	{
+		return 0;
+	}
+}
+
+
+using System.Collections.Generic;
+using Facepunch;
+using Facepunch.Extend;
+using Network;
+
+public class Stats
+{
+	public class Node : IPooled
+	{
+		public Dictionary<string, Node> Children;
+
+		public long Bytes;
+
+		public long Count;
+
+		internal Node Add(string category, long bytes)
+		{
+			if (Children == null)
+			{
+				Children = Pool.Get<Dictionary<string, Node>>();
+			}
+			Node orCreatePooled = DictionaryExtensions.GetOrCreatePooled<string, Node>(Children, category);
+			orCreatePooled.Bytes += bytes;
+			orCreatePooled.Count++;
+			return orCreatePooled;
+		}
+
+		internal void Clear()
+		{
+			Bytes = 0L;
+			Count = 0L;
+			if (Children == null)
+			{
+				return;
+			}
+			foreach (KeyValuePair<string, Node> child in Children)
+			{
+				Node value = child.Value;
+				Pool.Free<Node>(ref value);
+			}
+			Children.Clear();
+		}
+
+		public void EnterPool()
+		{
+			Clear();
+		}
+
+		public void LeavePool()
+		{
+			Clear();
+		}
+	}
+
+	public bool Enabled;
+
+	public Node Building = new Node();
+
+	public Node Previous = new Node();
+
+	public Stats()
+	{
+		Building.Add("", 0L);
+		Building.Clear();
+		Previous.Add("", 0L);
+		Previous.Clear();
+	}
+
+	public void Add(string Category, string Object, long Bytes)
+	{
+		if (Enabled)
+		{
+			Building.Bytes += Bytes;
+			Building.Count++;
+			Building.Add(Category, Bytes).Add(Object, Bytes);
+		}
+	}
+
+	public void Add(string Category, long Bytes)
+	{
+		if (Enabled)
+		{
+			Building.Bytes += Bytes;
+			Building.Count++;
+			Building.Add(Category, Bytes);
+		}
+	}
+
+	public void Flip()
+	{
+		if (Enabled)
+		{
+			Node building = Building;
+			Building = Previous;
+			Previous = building;
+			Building.Clear();
+		}
+	}
+}
+
+
+using System.Collections.Generic;
+using Facepunch;
+using Facepunch.Extend;
+
+public class Node : IPooled
+{
+	public Dictionary<string, Node> Children;
+
+	public long Bytes;
+
+	public long Count;
+
+	internal Node Add(string category, long bytes)
+	{
+		if (Children == null)
+		{
+			Children = Pool.Get<Dictionary<string, Node>>();
+		}
+		Node orCreatePooled = DictionaryExtensions.GetOrCreatePooled<string, Node>(Children, category);
+		orCreatePooled.Bytes += bytes;
+		orCreatePooled.Count++;
+		return orCreatePooled;
+	}
+
+	internal void Clear()
+	{
+		Bytes = 0L;
+		Count = 0L;
+		if (Children == null)
+		{
+			return;
+		}
+		foreach (KeyValuePair<string, Node> child in Children)
+		{
+			Node value = child.Value;
+			Pool.Free<Node>(ref value);
+		}
+		Children.Clear();
+	}
+
+	public void EnterPool()
+	{
+		Clear();
+	}
+
+	public void LeavePool()
+	{
+		Clear();
+	}
+}
+
+
+using System.Collections.Generic;
+using Network.Visibility;
+using UnityEngine;
+
+public interface Provider
+{
+	void OnGroupAdded(Group group);
+
+	bool IsInside(Group group, Vector3 vPos);
+
+	Group GetGroup(Vector3 vPos);
+
+	void GetVisibleFromFar(Group group, List<Group> groups);
+
+	void GetVisibleFromNear(Group group, List<Group> groups);
+}
+
+
+using System;
+using Facepunch;
+using Network;
+using Network.Visibility;
+using UnityEngine;
+
+public class Subscriber : IPooled
+{
+	internal Manager manager;
+
+	internal Connection connection;
+
+	public ListHashSet<Group> subscribed = new ListHashSet<Group>(8);
+
+	public Group Subscribe(Group group)
+	{
+		if (subscribed.Contains(group))
+		{
+			Debug.LogWarning((object)"Subscribe: Network Group already subscribed!");
+			return null;
+		}
+		subscribed.Add(group);
+		group.AddSubscriber(connection);
+		return group;
+	}
+
+	public Group Subscribe(uint group)
+	{
+		return Subscribe(manager.Get(group));
+	}
+
+	public bool IsSubscribed(Group group)
+	{
+		return subscribed.Contains(group);
+	}
+
+	public void UnsubscribeAll()
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		//IL_000b: Unknown result type (might be due to invalid IL or missing references)
+		Enumerator<Group> enumerator = subscribed.GetEnumerator();
+		try
+		{
+			while (enumerator.MoveNext())
+			{
+				enumerator.Current.RemoveSubscriber(connection);
+			}
+		}
+		finally
+		{
+			((IDisposable)enumerator/*cast due to .constrained prefix*/).Dispose();
+		}
+		subscribed.Clear();
+	}
+
+	public void Unsubscribe(Group group)
+	{
+		subscribed.Remove(group);
+		group.RemoveSubscriber(connection);
+	}
+
+	public void Destroy()
+	{
+		UnsubscribeAll();
+	}
+
+	public void EnterPool()
+	{
+		connection = null;
+		manager = null;
+	}
+
+	public void LeavePool()
+	{
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using Network;
+using Network.Visibility;
+using UnityEngine;
+
+public class Group : IDisposable
+{
+	protected Manager manager;
+
+	public uint ID;
+
+	public Bounds bounds;
+
+	public bool restricted;
+
+	public ListHashSet<Networkable> networkables = new ListHashSet<Networkable>(8);
+
+	public List<Connection> subscribers = new List<Connection>();
+
+	public bool isGlobal => ID == 0;
+
+	public Group(Manager m, uint id)
+	{
+		manager = m;
+		ID = id;
+	}
+
+	public virtual void Dispose()
+	{
+		networkables = null;
+		subscribers = null;
+		manager = null;
+		ID = 0u;
+	}
+
+	public void Join(Networkable nw)
+	{
+		if (networkables != null)
+		{
+			if (networkables.Contains(nw))
+			{
+				Debug.LogWarning((object)"Insert: Network Group already contains networkable!");
+			}
+			else
+			{
+				networkables.Add(nw);
+			}
+		}
+	}
+
+	public void Leave(Networkable nw)
+	{
+		if (networkables != null)
+		{
+			if (!networkables.Contains(nw))
+			{
+				Debug.LogWarning((object)"Leave: Network Group doesn't contain networkable!");
+			}
+			else
+			{
+				networkables.Remove(nw);
+			}
+		}
+	}
+
+	public void AddSubscriber(Connection cn)
+	{
+		subscribers.Add(cn);
+	}
+
+	public void RemoveSubscriber(Connection cn)
+	{
+		if (subscribers != null)
+		{
+			subscribers.Remove(cn);
+		}
+	}
+
+	public bool HasSubscribers()
+	{
+		return subscribers.Count > 0;
+	}
+
+	public override string ToString()
+	{
+		return "NWGroup" + ID;
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using Facepunch;
+using Network;
+using Network.Visibility;
+using UnityEngine;
+
+public class Manager : IDisposable
+{
+	public Dictionary<uint, Group> groups = new Dictionary<uint, Group>();
+
+	public Provider provider;
+
+	public virtual void Dispose()
+	{
+		foreach (KeyValuePair<uint, Group> group in groups)
+		{
+			group.Value.Dispose();
+		}
+		groups.Clear();
+		provider = null;
+	}
+
+	public Manager(Provider p)
+	{
+		if (groups.Count > 0 && p != null)
+		{
+			Debug.LogWarning((object)("SetProvider should be called before anything else! " + groups.Count + " groups have already been registered!"));
+		}
+		provider = p;
+	}
+
+	public Group TryGet(uint ID)
+	{
+		if (groups.TryGetValue(ID, out var value))
+		{
+			return value;
+		}
+		return null;
+	}
+
+	public Group Get(uint ID)
+	{
+		if (groups.TryGetValue(ID, out var value))
+		{
+			return value;
+		}
+		value = new Group(this, ID);
+		groups.Add(ID, value);
+		if (provider != null)
+		{
+			provider.OnGroupAdded(value);
+		}
+		return value;
+	}
+
+	public Subscriber CreateSubscriber(Connection connection)
+	{
+		Subscriber subscriber = Pool.Get<Subscriber>();
+		subscriber.manager = this;
+		subscriber.connection = connection;
+		return subscriber;
+	}
+
+	public void DestroySubscriber(ref Subscriber subscriber)
+	{
+		subscriber.Destroy();
+		Pool.Free<Subscriber>(ref subscriber);
+	}
+
+	public bool IsInside(Group group, Vector3 vPos)
+	{
+		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
+		if (provider == null)
+		{
+			return false;
+		}
+		if (group == null)
+		{
+			return false;
+		}
+		return provider.IsInside(group, vPos);
+	}
+
+	public Group GetGroup(Vector3 vPos)
+	{
+		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
+		if (provider == null)
+		{
+			return Get(0u);
+		}
+		return provider.GetGroup(vPos);
+	}
+
+	public void GetVisibleFromFar(Group center, List<Group> groups)
+	{
+		if (provider != null && center != null)
+		{
+			provider.GetVisibleFromFar(center, groups);
+		}
+	}
+
+	public void GetVisibleFromNear(Group center, List<Group> groups)
+	{
+		if (provider != null && center != null)
+		{
+			provider.GetVisibleFromNear(center, groups);
+		}
+	}
+}
+
+

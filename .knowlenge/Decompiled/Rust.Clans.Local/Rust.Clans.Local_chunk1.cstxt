@@ -1,0 +1,1725 @@
+internal static class DBError
+{
+	public const int UniqueConstraintViolation = 2067;
+
+	public const int ForeignKeyConstraintViolation = 787;
+
+	public const int TriggerConstraintViolation = 1811;
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using Facepunch;
+using Facepunch.Sqlite;
+using Oxide.Core;
+using UnityEngine;
+
+public class LocalClanDatabase : Database
+{
+	private const int Version = 1;
+
+	private void CreateClansTable()
+	{
+		((Database)this).Execute("\r\n            CREATE TABLE IF NOT EXISTS clans\r\n            (\r\n                clan_id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,\r\n                name TEXT NOT NULL,\r\n                name_normalized TEXT NOT NULL,\r\n                created INTEGER NOT NULL,\r\n                deleted INTEGER NULL,\r\n                creator INTEGER NOT NULL,\r\n                motd TEXT,\r\n                motd_timestamp INTEGER,\r\n                motd_author INTEGER,\r\n                logo BLOB,\r\n                logo_timestamp INTEGER,\r\n                color INTEGER,\r\n                score INTEGER NOT NULL DEFAULT 0\r\n            );\r\n        ");
+		((Database)this).Execute("CREATE UNIQUE INDEX IF NOT EXISTS clans_name_normalized ON clans (name_normalized) WHERE deleted IS NULL;");
+		((Database)this).Execute("CREATE INDEX IF NOT EXISTS clans_score ON clans (score DESC) WHERE deleted IS NULL;");
+	}
+
+	public long? CreateClan(string name, ulong creatorSteamId)
+	{
+		string text = name.ToLowerInvariant().Normalize(NormalizationForm.FormKC);
+		IntPtr intPtr = ((Database)this).Prepare("INSERT INTO clans (name, name_normalized, created, creator) VALUES (?, ?, ?, ?) RETURNING clan_id");
+		Database.Bind<string>(intPtr, 1, name);
+		Database.Bind<string>(intPtr, 2, text);
+		Database.Bind<long>(intPtr, 3, ClanUtility.Timestamp());
+		Database.Bind<ulong>(intPtr, 4, creatorSteamId);
+		long num = ((Database)this).ExecuteAndReadQueryResult<long>(intPtr);
+		if (num <= 0)
+		{
+			return null;
+		}
+		return num;
+	}
+
+	public ClanData? ReadClan(long clanId)
+	{
+		IntPtr intPtr = ((Database)this).Prepare("SELECT name, created, creator, motd, motd_timestamp, motd_author, logo, logo_timestamp, color, score FROM clans WHERE clan_id = ? AND deleted IS NULL");
+		Database.Bind<long>(intPtr, 1, clanId);
+		return ((Database)this).ExecuteAndReadQueryResult<ClanData>(intPtr, (Func<IntPtr, ClanData>)delegate(IntPtr stm)
+		{
+			//IL_0081: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0086: Unknown result type (might be due to invalid IL or missing references)
+			ClanData result = default(ClanData);
+			result.Name = Database.GetColumnValue<string>(stm, 0);
+			result.Created = Database.GetColumnValue<long>(stm, 1);
+			result.Creator = Database.GetColumnValue<ulong>(stm, 2);
+			result.Motd = Database.GetColumnValue<string>(stm, 3);
+			result.MotdTimestamp = Database.GetColumnValue<long>(stm, 4);
+			result.MotdAuthor = Database.GetColumnValue<ulong>(stm, 5);
+			result.Logo = Database.GetColumnValue<byte[]>(stm, 6);
+			result.LogoTimestamp = Database.GetColumnValue<long>(stm, 7);
+			result.Color = ColorEx.FromInt32(Database.GetColumnValue<int>(stm, 8));
+			result.Score = Database.GetColumnValue<long>(stm, 9);
+			return result;
+		});
+	}
+
+	public bool UpdateClanMotd(long clanId, string newMotd, ulong authorSteamId)
+	{
+		((Database)this).Execute<string, long, ulong, long>("UPDATE clans SET motd = ?, motd_timestamp = ?, motd_author = ? WHERE clan_id = ? AND deleted IS NULL", newMotd, ClanUtility.Timestamp(), authorSteamId, clanId);
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public bool UpdateClanLogo(long clanId, byte[] newLogo)
+	{
+		((Database)this).Execute<byte[], long, long>("UPDATE clans SET logo = ?, logo_timestamp = ? WHERE clan_id = ? AND deleted IS NULL", newLogo, ClanUtility.Timestamp(), clanId);
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public bool UpdateClanColor(long clanId, Color32 newColor)
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		((Database)this).Execute<int, long>("UPDATE clans SET color = ? WHERE clan_id = ? AND deleted IS NULL", ColorEx.ToInt32(newColor), clanId);
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public bool DeleteClan(long clanId)
+	{
+		((Database)this).BeginTransaction();
+		((Database)this).Execute<long, long>("UPDATE clans SET deleted = ? WHERE clan_id = ? AND deleted IS NULL", ClanUtility.Timestamp(), clanId);
+		if (((Database)this).AffectedRows == 0)
+		{
+			((Database)this).Rollback();
+			return false;
+		}
+		((Database)this).Execute<long>("DELETE FROM members WHERE clan_id = ?", clanId);
+		((Database)this).Execute<long>("DELETE FROM invites WHERE clan_id = ?", clanId);
+		((Database)this).Commit();
+		return true;
+	}
+
+	public long? FindClanByMember(ulong memberSteamId)
+	{
+		long num = ((Database)this).Query<long, ulong>("SELECT clan_id FROM members WHERE user_id = ?", memberSteamId);
+		if (num <= 0)
+		{
+			return null;
+		}
+		return num;
+	}
+
+	public List<ClanLeaderboardEntry> ListTopClans(int limit)
+	{
+		IntPtr intPtr = ((Database)this).Prepare("SELECT clan_id, name, score FROM clans ORDER BY score DESC LIMIT ?");
+		Database.Bind<int>(intPtr, 1, Mathf.Clamp(limit, 10, 100));
+		List<ClanLeaderboardEntry> list = Pool.Get<List<ClanLeaderboardEntry>>();
+		((Database)this).ExecuteAndReadQueryResults<ClanLeaderboardEntry>(intPtr, list, (Func<IntPtr, ClanLeaderboardEntry>)delegate(IntPtr stm)
+		{
+			//IL_0002: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0032: Unknown result type (might be due to invalid IL or missing references)
+			ClanLeaderboardEntry result = default(ClanLeaderboardEntry);
+			result.ClanId = Database.GetColumnValue<long>(stm, 0);
+			result.Name = Database.GetColumnValue<string>(stm, 1);
+			result.Score = Database.GetColumnValue<long>(stm, 2);
+			return result;
+		});
+		return list;
+	}
+
+	public void Open(string rootFolder)
+	{
+		((Database)this).Open(Path.Combine(rootFolder, $"clans.{1}.db"), true);
+		((Database)this).Execute("PRAGMA foreign_keys = ON");
+		CreateClansTable();
+		CreateRolesTable();
+		CreateMembersTable();
+		CreateInvitesTable();
+		CreateLogsTable();
+		CreateScoreEventsTable();
+	}
+
+	private void CreateInvitesTable()
+	{
+		((Database)this).Execute("\r\n            CREATE TABLE IF NOT EXISTS invites\r\n            (\r\n                clan_id INTEGER NOT NULL,\r\n                user_id INTEGER NOT NULL,\r\n                recruiter INTEGER NOT NULL,\r\n                timestamp INTEGER NOT NULL,\r\n                PRIMARY KEY (clan_id, user_id),\r\n                FOREIGN KEY (clan_id) REFERENCES clans (clan_id) ON DELETE CASCADE\r\n            ) WITHOUT ROWID;\r\n        ");
+		((Database)this).Execute("\r\n            CREATE INDEX IF NOT EXISTS invites_player ON invites (user_id);\r\n        ");
+	}
+
+	public bool CreateInvite(long clanId, ulong steamId, ulong recruiterSteamId)
+	{
+		((Database)this).Execute<long, ulong, ulong, long>("\r\n            INSERT OR IGNORE INTO invites (clan_id, user_id, recruiter, timestamp)\r\n            SELECT ?1, ?2, ?3, ?4\r\n            FROM (SELECT 1)\r\n            WHERE NOT EXISTS (SELECT * FROM members m WHERE m.user_id = ?2);\r\n        ", clanId, steamId, recruiterSteamId, ClanUtility.Timestamp());
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public bool AcceptInvite(long clanId, ulong steamId)
+	{
+		((Database)this).BeginTransaction();
+		try
+		{
+			if (DeleteInvite(clanId, steamId) && CreateMember(clanId, steamId))
+			{
+				((Database)this).Commit();
+				Interface.CallHook("OnClanMemberAdded", (object)clanId, (object)steamId);
+				return true;
+			}
+			((Database)this).Rollback();
+			return false;
+		}
+		catch
+		{
+			((Database)this).Rollback();
+			throw;
+		}
+	}
+
+	public List<ClanInvite> ListInvites(long clanId)
+	{
+		IntPtr intPtr = ((Database)this).Prepare("SELECT user_id, recruiter, timestamp FROM invites WHERE clan_id = ? ORDER BY timestamp ASC");
+		Database.Bind<long>(intPtr, 1, clanId);
+		List<ClanInvite> list = Pool.Get<List<ClanInvite>>();
+		((Database)this).ExecuteAndReadQueryResults<ClanInvite>(intPtr, list, (Func<IntPtr, ClanInvite>)delegate(IntPtr stm)
+		{
+			//IL_0002: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0032: Unknown result type (might be due to invalid IL or missing references)
+			ClanInvite result = default(ClanInvite);
+			result.SteamId = Database.GetColumnValue<ulong>(stm, 0);
+			result.Recruiter = Database.GetColumnValue<ulong>(stm, 1);
+			result.Timestamp = Database.GetColumnValue<long>(stm, 2);
+			return result;
+		});
+		return list;
+	}
+
+	public List<ClanInvitation> ListInvitationsForPlayer(ulong steamId)
+	{
+		IntPtr intPtr = ((Database)this).Prepare("SELECT clan_id, recruiter, timestamp FROM invites WHERE user_id = ? ORDER BY timestamp ASC");
+		Database.Bind<ulong>(intPtr, 1, steamId);
+		List<ClanInvitation> list = Pool.Get<List<ClanInvitation>>();
+		((Database)this).ExecuteAndReadQueryResults<ClanInvitation>(intPtr, list, (Func<IntPtr, ClanInvitation>)delegate(IntPtr stm)
+		{
+			//IL_0002: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0032: Unknown result type (might be due to invalid IL or missing references)
+			ClanInvitation result = default(ClanInvitation);
+			result.ClanId = Database.GetColumnValue<long>(stm, 0);
+			result.Recruiter = Database.GetColumnValue<ulong>(stm, 1);
+			result.Timestamp = Database.GetColumnValue<long>(stm, 2);
+			return result;
+		});
+		return list;
+	}
+
+	public bool DeleteInvite(long clanId, ulong steamId)
+	{
+		((Database)this).Execute<long, ulong>("DELETE FROM invites WHERE clan_id = ? AND user_id = ?", clanId, steamId);
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public void DeleteAllInvites(ulong steamId)
+	{
+		((Database)this).Execute<ulong>("DELETE FROM invites WHERE user_id = ?", steamId);
+	}
+
+	private void CreateLogsTable()
+	{
+		((Database)this).Execute("\r\n            CREATE TABLE IF NOT EXISTS logs\r\n            (\r\n                clan_id INTEGER NOT NULL,\r\n                timestamp INTEGER NOT NULL,\r\n                event TEXT NOT NULL,\r\n                arg1 TEXT,\r\n                arg2 TEXT,\r\n                arg3 TEXT,\r\n                arg4 TEXT,\r\n                FOREIGN KEY (clan_id) REFERENCES clans (clan_id) ON DELETE CASCADE\r\n            );\r\n        ");
+		((Database)this).Execute("\r\n            CREATE INDEX IF NOT EXISTS logs_ordered ON logs (clan_id, timestamp DESC);\r\n        ");
+	}
+
+	public void AppendLog(long clanId, string eventKey)
+	{
+		((Database)this).Execute<long, long, string>("INSERT INTO logs (clan_id, timestamp, event) VALUES (?, ?, ?)", clanId, ClanUtility.Timestamp(), eventKey);
+	}
+
+	public void AppendLog<T1>(long clanId, string eventKey, T1 arg1)
+	{
+		((Database)this).Execute<long, long, string, T1>("INSERT INTO logs (clan_id, timestamp, event, arg1) VALUES (?, ?, ?, ?)", clanId, ClanUtility.Timestamp(), eventKey, arg1);
+	}
+
+	public void AppendLog<T1, T2>(long clanId, string eventKey, T1 arg1, T2 arg2)
+	{
+		((Database)this).Execute<long, long, string, T1, T2>("INSERT INTO logs (clan_id, timestamp, event, arg1, arg2) VALUES (?, ?, ?, ?, ?)", clanId, ClanUtility.Timestamp(), eventKey, arg1, arg2);
+	}
+
+	public void AppendLog<T1, T2, T3>(long clanId, string eventKey, T1 arg1, T2 arg2, T3 arg3)
+	{
+		((Database)this).Execute<long, long, string, T1, T2, T3>("INSERT INTO logs (clan_id, timestamp, event, arg1, arg2, arg3) VALUES (?, ?, ?, ?, ?, ?)", clanId, ClanUtility.Timestamp(), eventKey, arg1, arg2, arg3);
+	}
+
+	public void AppendLog<T1, T2, T3, T4>(long clanId, string eventKey, T1 arg1, T2 arg2, T3 arg3, T4 arg4)
+	{
+		((Database)this).Execute<long, long, string, T1, T2, T3, T4>("INSERT INTO logs (clan_id, timestamp, event, arg1, arg2, arg3, arg4) VALUES (?, ?, ?, ?, ?, ?, ?)", clanId, ClanUtility.Timestamp(), eventKey, arg1, arg2, arg3, arg4);
+	}
+
+	public List<ClanLogEntry> ReadLogs(long clanId, int limit)
+	{
+		IntPtr intPtr = ((Database)this).Prepare("SELECT timestamp, event, arg1, arg2, arg3, arg4 FROM logs WHERE clan_id = ? ORDER BY timestamp DESC LIMIT ?");
+		Database.Bind<long>(intPtr, 1, clanId);
+		Database.Bind<int>(intPtr, 2, Mathf.Clamp(limit, 10, 1000));
+		List<ClanLogEntry> list = Pool.Get<List<ClanLogEntry>>();
+		((Database)this).ExecuteAndReadQueryResults<ClanLogEntry>(intPtr, list, (Func<IntPtr, ClanLogEntry>)delegate(IntPtr stm)
+		{
+			//IL_0002: Unknown result type (might be due to invalid IL or missing references)
+			//IL_005c: Unknown result type (might be due to invalid IL or missing references)
+			ClanLogEntry result = default(ClanLogEntry);
+			result.Timestamp = Database.GetColumnValue<long>(stm, 0);
+			result.EventKey = Database.GetColumnValue<string>(stm, 1);
+			result.Arg1 = Database.GetColumnValue<string>(stm, 2);
+			result.Arg2 = Database.GetColumnValue<string>(stm, 3);
+			result.Arg3 = Database.GetColumnValue<string>(stm, 4);
+			result.Arg4 = Database.GetColumnValue<string>(stm, 5);
+			return result;
+		});
+		return list;
+	}
+
+	private void CreateMembersTable()
+	{
+		((Database)this).Execute("\r\n            CREATE TABLE IF NOT EXISTS members\r\n            (\r\n                clan_id INTEGER NOT NULL,\r\n                user_id INTEGER NOT NULL,\r\n                role_id INTEGER NOT NULL,\r\n                joined INTEGER NOT NULL,\r\n                seen INTEGER NOT NULL,\r\n                notes TEXT,\r\n                notes_timestamp INTEGER,\r\n                PRIMARY KEY (clan_id, user_id),\r\n                UNIQUE (user_id),\r\n                FOREIGN KEY (clan_id) REFERENCES clans (clan_id) ON DELETE CASCADE,\r\n                FOREIGN KEY (clan_id, role_id) REFERENCES roles (clan_id, role_id) ON UPDATE CASCADE ON DELETE RESTRICT\r\n            ) WITHOUT ROWID;\r\n        ");
+	}
+
+	public bool CreateMember(long clanId, ulong steamId)
+	{
+		((Database)this).Execute<long, ulong, long>("\r\n            INSERT OR IGNORE INTO members (clan_id, user_id, role_id, joined, seen)\r\n            SELECT ?1, ?2, MAX(r.role_id), ?3, ?3\r\n            FROM (SELECT role_id FROM roles WHERE clan_id = ?1 ORDER BY rank DESC LIMIT 1) r\r\n        ", clanId, steamId, ClanUtility.Timestamp());
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public bool CreateMember(long clanId, ulong steamId, int roleId)
+	{
+		((Database)this).Execute<long, ulong, int, long>("INSERT INTO members (clan_id, user_id, role_id, joined, seen) VALUES (?1, ?2, ?3, ?4, ?4)", clanId, steamId, roleId, ClanUtility.Timestamp());
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public List<ClanMember> ListMembers(long clanId)
+	{
+		IntPtr intPtr = ((Database)this).Prepare("\r\n            SELECT m.user_id, m.role_id, m.joined, m.seen, m.notes, m.notes_timestamp\r\n            FROM members m\r\n            LEFT JOIN roles r ON r.clan_id = ?1 AND r.role_id = m.role_id\r\n            WHERE m.clan_id = ?1\r\n            ORDER BY r.rank ASC, joined ASC\r\n        ");
+		Database.Bind<long>(intPtr, 1, clanId);
+		List<ClanMember> list = Pool.Get<List<ClanMember>>();
+		((Database)this).ExecuteAndReadQueryResults<ClanMember>(intPtr, list, (Func<IntPtr, ClanMember>)delegate(IntPtr stm)
+		{
+			//IL_0002: Unknown result type (might be due to invalid IL or missing references)
+			//IL_005c: Unknown result type (might be due to invalid IL or missing references)
+			ClanMember result = default(ClanMember);
+			result.SteamId = Database.GetColumnValue<ulong>(stm, 0);
+			result.RoleId = Database.GetColumnValue<int>(stm, 1);
+			result.Joined = Database.GetColumnValue<long>(stm, 2);
+			result.LastSeen = Database.GetColumnValue<long>(stm, 3);
+			result.Notes = Database.GetColumnValue<string>(stm, 4);
+			result.NotesTimestamp = Database.GetColumnValue<long>(stm, 5);
+			return result;
+		});
+		return list;
+	}
+
+	public bool UpdateMemberLastSeen(long clanId, ulong steamId)
+	{
+		((Database)this).Execute<long, long, ulong>("UPDATE members SET seen = ? WHERE clan_id = ? AND user_id = ?", ClanUtility.Timestamp(), clanId, steamId);
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public bool UpdateMemberRole(long clanId, ulong steamId, int newRoleId)
+	{
+		((Database)this).Execute<int, long, ulong>("UPDATE members SET role_id = ? WHERE clan_id = ? AND user_id = ?", newRoleId, clanId, steamId);
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public bool UpdateMemberNotes(long clanId, ulong steamId, string newNotes)
+	{
+		((Database)this).Execute<string, long, long, ulong>("UPDATE members SET notes = ?, notes_timestamp = ? WHERE clan_id = ? AND user_id = ?", newNotes, ClanUtility.Timestamp(), clanId, steamId);
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public bool DeleteMember(long clanId, ulong steamId)
+	{
+		((Database)this).Execute<long, ulong>("DELETE FROM members WHERE clan_id = ? AND user_id = ?", clanId, steamId);
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	private void CreateRolesTable()
+	{
+		((Database)this).Execute("\r\n            CREATE TABLE IF NOT EXISTS roles\r\n            (\r\n                clan_id INTEGER NOT NULL,\r\n                role_id INTEGER NOT NULL,\r\n                rank INTEGER NOT NULL,\r\n                name TEXT NOT NULL,\r\n                can_set_motd BOOLEAN NOT NULL DEFAULT FALSE,\r\n                can_set_logo BOOLEAN NOT NULL DEFAULT FALSE,\r\n                can_invite BOOLEAN NOT NULL DEFAULT FALSE,\r\n                can_kick BOOLEAN NOT NULL DEFAULT FALSE,\r\n                can_promote BOOLEAN NOT NULL DEFAULT FALSE,\r\n                can_demote BOOLEAN NOT NULL DEFAULT FALSE,\r\n                can_set_player_notes BOOLEAN NOT NULL DEFAULT FALSE,\r\n                can_access_logs BOOLEAN NOT NULL DEFAULT FALSE,\r\n                can_access_score_events BOOLEAN NOT NULL DEFAULT FALSE,\r\n                PRIMARY KEY (clan_id, role_id),\r\n                FOREIGN KEY (clan_id) REFERENCES clans (clan_id) ON DELETE CASCADE,\r\n                UNIQUE (clan_id, name)\r\n            ) WITHOUT ROWID;\r\n        ");
+	}
+
+	public int? CreateRole(long clanId, ClanRole role)
+	{
+		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0023: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0030: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0057: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0064: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0072: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0080: Unknown result type (might be due to invalid IL or missing references)
+		//IL_008e: Unknown result type (might be due to invalid IL or missing references)
+		IntPtr intPtr = ((Database)this).Prepare("\r\n            WITH next AS (\r\n\t            SELECT\r\n                    COALESCE(MAX(role_id), 0) + 1 AS role_id,\r\n                    COALESCE(MAX(rank), 0) + 1 AS rank\r\n                FROM roles r\r\n                WHERE r.clan_id = ?1\r\n            )\r\n            INSERT INTO roles (clan_id, role_id, rank, name, can_set_motd, can_set_logo, can_invite, can_kick, can_promote, can_demote, can_set_player_notes, can_access_logs, can_access_score_events)\r\n            SELECT ?1, next.role_id, next.rank, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11\r\n            FROM next\r\n            WHERE 1\r\n            RETURNING role_id\r\n        ");
+		Database.Bind<long>(intPtr, 1, clanId);
+		Database.Bind<string>(intPtr, 2, role.Name);
+		Database.Bind<bool>(intPtr, 3, role.CanSetMotd);
+		Database.Bind<bool>(intPtr, 4, role.CanSetLogo);
+		Database.Bind<bool>(intPtr, 5, role.CanInvite);
+		Database.Bind<bool>(intPtr, 6, role.CanKick);
+		Database.Bind<bool>(intPtr, 7, role.CanPromote);
+		Database.Bind<bool>(intPtr, 8, role.CanDemote);
+		Database.Bind<bool>(intPtr, 9, role.CanSetPlayerNotes);
+		Database.Bind<bool>(intPtr, 10, role.CanAccessLogs);
+		Database.Bind<bool>(intPtr, 11, role.CanAccessScoreEvents);
+		int num = ((Database)this).ExecuteAndReadQueryResult<int>(intPtr);
+		if (num <= 0)
+		{
+			return null;
+		}
+		return num;
+	}
+
+	public List<ClanRole> ListRoles(long clanId)
+	{
+		IntPtr intPtr = ((Database)this).Prepare("\r\n            SELECT role_id, rank, name, can_set_motd, can_set_logo, can_invite, can_kick, can_promote, can_demote, can_set_player_notes, can_access_logs, can_access_score_events\r\n            FROM roles\r\n            WHERE clan_id = ?\r\n            ORDER BY rank ASC, role_id ASC\r\n        ");
+		Database.Bind<long>(intPtr, 1, clanId);
+		List<ClanRole> list = Pool.Get<List<ClanRole>>();
+		((Database)this).ExecuteAndReadQueryResults<ClanRole>(intPtr, list, (Func<IntPtr, ClanRole>)delegate(IntPtr stm)
+		{
+			//IL_0002: Unknown result type (might be due to invalid IL or missing references)
+			//IL_00b3: Unknown result type (might be due to invalid IL or missing references)
+			ClanRole result = default(ClanRole);
+			result.RoleId = Database.GetColumnValue<int>(stm, 0);
+			result.Rank = Database.GetColumnValue<int>(stm, 1);
+			result.Name = Database.GetColumnValue<string>(stm, 2);
+			result.CanSetMotd = Database.GetColumnValue<bool>(stm, 3);
+			result.CanSetLogo = Database.GetColumnValue<bool>(stm, 4);
+			result.CanInvite = Database.GetColumnValue<bool>(stm, 5);
+			result.CanKick = Database.GetColumnValue<bool>(stm, 6);
+			result.CanPromote = Database.GetColumnValue<bool>(stm, 7);
+			result.CanDemote = Database.GetColumnValue<bool>(stm, 8);
+			result.CanSetPlayerNotes = Database.GetColumnValue<bool>(stm, 9);
+			result.CanAccessLogs = Database.GetColumnValue<bool>(stm, 10);
+			result.CanAccessScoreEvents = Database.GetColumnValue<bool>(stm, 11);
+			return result;
+		});
+		return list;
+	}
+
+	public bool UpdateRole(long clanId, ClanRole role)
+	{
+		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0023: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0030: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0057: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0064: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0072: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0080: Unknown result type (might be due to invalid IL or missing references)
+		//IL_008e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_009c: Unknown result type (might be due to invalid IL or missing references)
+		IntPtr intPtr = ((Database)this).Prepare("\r\n            UPDATE roles\r\n            SET name = ?3, can_set_motd = ?4, can_set_logo = ?5, can_invite = ?6, can_kick = ?7, can_promote = ?8, can_demote = ?9, can_set_player_notes = ?10, can_access_logs = ?11, can_access_score_events = ?12\r\n            WHERE clan_id = ?1 AND role_id = ?2\r\n        ");
+		Database.Bind<long>(intPtr, 1, clanId);
+		Database.Bind<int>(intPtr, 2, role.RoleId);
+		Database.Bind<string>(intPtr, 3, role.Name);
+		Database.Bind<bool>(intPtr, 4, role.CanSetMotd);
+		Database.Bind<bool>(intPtr, 5, role.CanSetLogo);
+		Database.Bind<bool>(intPtr, 6, role.CanInvite);
+		Database.Bind<bool>(intPtr, 7, role.CanKick);
+		Database.Bind<bool>(intPtr, 8, role.CanPromote);
+		Database.Bind<bool>(intPtr, 9, role.CanDemote);
+		Database.Bind<bool>(intPtr, 10, role.CanSetPlayerNotes);
+		Database.Bind<bool>(intPtr, 11, role.CanAccessLogs);
+		Database.Bind<bool>(intPtr, 12, role.CanAccessScoreEvents);
+		((Database)this).ExecuteQuery(intPtr);
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public bool UpdateRoleName(long clanId, int roleId, string newRoleName)
+	{
+		((Database)this).Execute<long, int, string>("UPDATE OR IGNORE roles SET name = ?3 WHERE clan_id = ?1 AND role_id = ?2", clanId, roleId, newRoleName);
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	public bool SwapRoleRanks(long clanId, int roleIdA, int roleIdB)
+	{
+		((Database)this).BeginTransaction();
+		try
+		{
+			int num = ((Database)this).Query<int, long, int>("SELECT rank FROM roles WHERE clan_id = ?1 AND role_id = ?2", clanId, roleIdA);
+			int num2 = ((Database)this).Query<int, long, int>("SELECT rank FROM roles WHERE clan_id = ?1 AND role_id = ?2", clanId, roleIdB);
+			if (num <= 0 || num2 <= 0)
+			{
+				((Database)this).Rollback();
+				return false;
+			}
+			((Database)this).Execute<long, int, int>("UPDATE OR IGNORE roles SET rank = ?3 WHERE clan_id = ?1 AND role_id = ?2", clanId, roleIdA, num2);
+			if (((Database)this).AffectedRows != 1)
+			{
+				((Database)this).Rollback();
+				return false;
+			}
+			((Database)this).Execute<long, int, int>("UPDATE OR IGNORE roles SET rank = ?3 WHERE clan_id = ?1 AND role_id = ?2", clanId, roleIdB, num);
+			if (((Database)this).AffectedRows != 1)
+			{
+				((Database)this).Rollback();
+				return false;
+			}
+			((Database)this).Commit();
+			return true;
+		}
+		catch
+		{
+			((Database)this).Rollback();
+			throw;
+		}
+	}
+
+	public bool DeleteRole(long clanId, int roleId)
+	{
+		((Database)this).Execute<long, int>("DELETE FROM roles WHERE clan_id = ? AND role_id = ?", clanId, roleId);
+		return ((Database)this).AffectedRows > 0;
+	}
+
+	private void CreateScoreEventsTable()
+	{
+		((Database)this).Execute("\r\n            CREATE TABLE IF NOT EXISTS score_events\r\n            (\r\n                clan_id INTEGER NOT NULL,\r\n                timestamp INTEGER NOT NULL,\r\n                type INTEGER NOT NULL,\r\n                score INTEGER NOT NULL,\r\n                multiplier INTEGER NOT NULL,\r\n                user_id INTEGER,\r\n                other_user_id INTEGER,\r\n                other_clan_id INTEGER,\r\n                arg1 TEXT,\r\n                arg2 TEXT,\r\n                FOREIGN KEY (clan_id) REFERENCES clans (clan_id) ON DELETE CASCADE\r\n            );\r\n        ");
+		((Database)this).Execute("\r\n            CREATE INDEX IF NOT EXISTS score_events_ordered ON logs (clan_id, timestamp DESC);\r\n        ");
+	}
+
+	public void AppendScoreEvent(long clanId, ClanScoreEvent e)
+	{
+		//IL_0000: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0011: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0026: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0027: Unknown result type (might be due to invalid IL or missing references)
+		//IL_002c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0032: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0038: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0044: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0050: Unknown result type (might be due to invalid IL or missing references)
+		//IL_005b: Expected I4, but got Unknown
+		//IL_0061: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0067: Unknown result type (might be due to invalid IL or missing references)
+		long num = ((e.Timestamp > 0) ? e.Timestamp : ClanUtility.Timestamp());
+		((Database)this).BeginTransaction();
+		((Database)this).Execute<long, long, int, int, int, ulong?, ulong?, long?, string, string>("INSERT INTO score_events (clan_id, timestamp, type, score, multiplier, user_id, other_user_id, other_clan_id, arg1, arg2) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", clanId, num, (int)e.Type, e.Score, e.Multiplier, e.SteamId, e.OtherSteamId, e.OtherClanId, e.Arg1, e.Arg2);
+		((Database)this).Execute<int, long>("UPDATE clans SET score = score + ? WHERE clan_id = ?", e.Score * e.Multiplier, clanId);
+		((Database)this).Commit();
+	}
+
+	public List<ClanScoreEvent> ReadScoreEvents(long clanId, int limit)
+	{
+		IntPtr intPtr = ((Database)this).Prepare("SELECT timestamp, type, score, multiplier, user_id, other_user_id, other_clan_id, arg1, arg2 FROM score_events WHERE clan_id = ? ORDER BY timestamp DESC LIMIT ?");
+		Database.Bind<long>(intPtr, 1, clanId);
+		Database.Bind<int>(intPtr, 2, Mathf.Clamp(limit, 10, 1000));
+		List<ClanScoreEvent> list = Pool.Get<List<ClanScoreEvent>>();
+		((Database)this).ExecuteAndReadQueryResults<ClanScoreEvent>(intPtr, list, (Func<IntPtr, ClanScoreEvent>)delegate(IntPtr stm)
+		{
+			//IL_0002: Unknown result type (might be due to invalid IL or missing references)
+			//IL_001f: Unknown result type (might be due to invalid IL or missing references)
+			//IL_008b: Unknown result type (might be due to invalid IL or missing references)
+			ClanScoreEvent result = default(ClanScoreEvent);
+			result.Timestamp = Database.GetColumnValue<long>(stm, 0);
+			result.Type = (ClanScoreEventType)Database.GetColumnValue<int>(stm, 1);
+			result.Score = Database.GetColumnValue<int>(stm, 2);
+			result.Multiplier = Database.GetColumnValue<int>(stm, 3);
+			result.SteamId = Database.GetColumnValue<ulong>(stm, 4);
+			result.OtherSteamId = Database.GetColumnValue<ulong?>(stm, 5);
+			result.OtherClanId = Database.GetColumnValue<long?>(stm, 6);
+			result.Arg1 = Database.GetColumnValue<string>(stm, 7);
+			result.Arg2 = Database.GetColumnValue<string>(stm, 8);
+			return result;
+		});
+		return list;
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
+using Facepunch;
+using Facepunch.Extend;
+using Facepunch.Sqlite;
+using Oxide.Core;
+using UnityEngine;
+
+public class LocalClan : IClan
+{
+	[StructLayout(LayoutKind.Auto)]
+	[CompilerGenerated]
+	private struct <Disband>d__72 : IAsyncStateMachine
+	{
+		public int <>1__state;
+
+		public AsyncValueTaskMethodBuilder<ClanResult> <>t__builder;
+
+		public LocalClan <>4__this;
+
+		public ulong bySteamId;
+
+		private void MoveNext()
+		{
+			//IL_0023: Unknown result type (might be due to invalid IL or missing references)
+			//IL_00e9: Unknown result type (might be due to invalid IL or missing references)
+			//IL_00a8: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0063: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0068: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0070: Unknown result type (might be due to invalid IL or missing references)
+			//IL_00a4: Unknown result type (might be due to invalid IL or missing references)
+			int num = <>1__state;
+			LocalClan localClan = <>4__this;
+			ClanResult result;
+			try
+			{
+				if (!localClan.TryGetRank(bySteamId, out var rank) || rank != 1)
+				{
+					result = (ClanResult)5;
+				}
+				else if (localClan._backend.Database.DeleteClan(localClan.ClanId))
+				{
+					localClan._backend.ClanDisbanded(localClan.ClanId);
+					List<ClanMember>.Enumerator enumerator = localClan._members.GetEnumerator();
+					try
+					{
+						while (enumerator.MoveNext())
+						{
+							ClanMember current = enumerator.Current;
+							localClan._backend.MembershipChanged(current.SteamId, null);
+						}
+					}
+					finally
+					{
+						if (num < 0)
+						{
+							((IDisposable)enumerator/*cast due to .constrained prefix*/).Dispose();
+						}
+					}
+					result = (ClanResult)1;
+				}
+				else
+				{
+					result = (ClanResult)0;
+				}
+			}
+			catch (Exception exception)
+			{
+				<>1__state = -2;
+				<>t__builder.SetException(exception);
+				return;
+			}
+			Interface.CallHook("OnClanDisbanded", (object)localClan, (object)bySteamId);
+			<>1__state = -2;
+			<>t__builder.SetResult(result);
+		}
+
+		void IAsyncStateMachine.MoveNext()
+		{
+			//ILSpy generated this explicit interface implementation from .override directive in MoveNext
+			this.MoveNext();
+		}
+
+		[DebuggerHidden]
+		private void SetStateMachine(IAsyncStateMachine stateMachine)
+		{
+			<>t__builder.SetStateMachine(stateMachine);
+		}
+
+		void IAsyncStateMachine.SetStateMachine(IAsyncStateMachine stateMachine)
+		{
+			//ILSpy generated this explicit interface implementation from .override directive in SetStateMachine
+			this.SetStateMachine(stateMachine);
+		}
+	}
+
+	private const int MaxChatScrollback = 20;
+
+	private readonly LocalClanBackend _backend;
+
+	private readonly List<ClanRole> _roles;
+
+	private readonly List<ClanMember> _members;
+
+	private readonly List<ClanInvite> _invites;
+
+	private readonly List<ClanChatEntry> _chatHistory;
+
+	private RealTimeSince _sinceLastRefresh;
+
+	public long ClanId { get; }
+
+	public string Name { get; private set; }
+
+	public long Created { get; private set; }
+
+	public ulong Creator { get; private set; }
+
+	public string Motd { get; private set; }
+
+	public long MotdTimestamp { get; private set; }
+
+	public ulong MotdAuthor { get; private set; }
+
+	public byte[] Logo { get; private set; }
+
+	public Color32 Color { get; private set; }
+
+	public long Score { get; private set; }
+
+	public IReadOnlyList<ClanRole> Roles => _roles;
+
+	public IReadOnlyList<ClanMember> Members => _members;
+
+	public int MaxMemberCount => _backend.MaxMemberCount;
+
+	public IReadOnlyList<ClanInvite> Invites => _invites;
+
+	public LocalClan(LocalClanBackend backend, long clanId)
+	{
+		//IL_0057: Unknown result type (might be due to invalid IL or missing references)
+		//IL_005c: Unknown result type (might be due to invalid IL or missing references)
+		_backend = backend ?? throw new ArgumentNullException("backend");
+		ClanId = clanId;
+		_roles = new List<ClanRole>();
+		_members = new List<ClanMember>();
+		_invites = new List<ClanInvite>();
+		_chatHistory = new List<ClanChatEntry>(20);
+		_sinceLastRefresh = RealTimeSince.op_Implicit(0f);
+	}
+
+	public bool Refresh(ClanDataSource sources = -1)
+	{
+		//IL_0000: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0013: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00bc: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0026: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00d2: Unknown result type (might be due to invalid IL or missing references)
+		//IL_012b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0185: Unknown result type (might be due to invalid IL or missing references)
+		if (((Enum)sources).HasFlag((Enum)(object)(ClanDataSource)1) || ((Enum)sources).HasFlag((Enum)(object)(ClanDataSource)2) || ((Enum)sources).HasFlag((Enum)(object)(ClanDataSource)4))
+		{
+			ClanData? clanData = _backend.Database.ReadClan(ClanId);
+			if (!clanData.HasValue)
+			{
+				return false;
+			}
+			ClanData value = clanData.Value;
+			Name = value.Name;
+			Created = value.Created;
+			Creator = value.Creator;
+			Motd = value.Motd;
+			MotdTimestamp = value.MotdTimestamp;
+			MotdAuthor = value.MotdAuthor;
+			Logo = value.Logo;
+			Color = value.Color;
+			Score = value.Score;
+		}
+		if (((Enum)sources).HasFlag((Enum)(object)(ClanDataSource)8))
+		{
+			List<ClanRole> list = _backend.Database.ListRoles(ClanId);
+			if (list.Count == 0)
+			{
+				Pool.FreeUnmanaged<ClanRole>(ref list);
+				return false;
+			}
+			_roles.Clear();
+			_roles.AddRange(list);
+			Pool.FreeUnmanaged<ClanRole>(ref list);
+		}
+		if (((Enum)sources).HasFlag((Enum)(object)(ClanDataSource)16))
+		{
+			List<ClanMember> list2 = _backend.Database.ListMembers(ClanId);
+			if (list2.Count == 0)
+			{
+				Pool.FreeUnmanaged<ClanMember>(ref list2);
+				return false;
+			}
+			_members.Clear();
+			_members.AddRange(list2);
+			Pool.FreeUnmanaged<ClanMember>(ref list2);
+		}
+		if (((Enum)sources).HasFlag((Enum)(object)(ClanDataSource)32))
+		{
+			List<ClanInvite> collection = _backend.Database.ListInvites(ClanId);
+			_invites.Clear();
+			_invites.AddRange(collection);
+			Pool.FreeUnmanaged<ClanInvite>(ref collection);
+		}
+		return true;
+	}
+
+	public async ValueTask RefreshIfStale()
+	{
+		if (RealTimeSince.op_Implicit(_sinceLastRefresh) > 30f)
+		{
+			_sinceLastRefresh = RealTimeSince.op_Implicit(0f);
+			Refresh((ClanDataSource)(-1));
+		}
+	}
+
+	public async ValueTask<ClanValueResult<ClanLogs>> GetLogs(int limit, ulong bySteamId)
+	{
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanAccessLogs))
+		{
+			return ClanValueResult<ClanLogs>.op_Implicit((ClanResult)5);
+		}
+		List<ClanLogEntry> entries = _backend.Database.ReadLogs(ClanId, limit);
+		ClanLogs val = default(ClanLogs);
+		val.ClanId = ClanId;
+		val.Entries = entries;
+		return new ClanValueResult<ClanLogs>(val);
+	}
+
+	public async ValueTask<ClanResult> UpdateLastSeen(ulong steamId)
+	{
+		return (ClanResult)(_backend.Database.UpdateMemberLastSeen(ClanId, steamId) ? 1 : 4);
+	}
+
+	public async ValueTask<ClanResult> SetMotd(string newMotd, ulong bySteamId)
+	{
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanSetMotd))
+		{
+			return (ClanResult)5;
+		}
+		if (newMotd == Motd)
+		{
+			return (ClanResult)1;
+		}
+		if (_backend.Database.UpdateClanMotd(ClanId, newMotd, bySteamId))
+		{
+			_backend.Database.AppendLog(ClanId, "set_motd", bySteamId, newMotd);
+			Changed((ClanDataSource)2);
+			return (ClanResult)1;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> SetLogo(byte[] newLogo, ulong bySteamId)
+	{
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanSetLogo))
+		{
+			return (ClanResult)5;
+		}
+		if (Logo != null && Logo.Length == newLogo.Length && Logo.SequenceEqual(newLogo))
+		{
+			return (ClanResult)1;
+		}
+		if (_backend.Database.UpdateClanLogo(ClanId, newLogo))
+		{
+			_backend.Database.AppendLog(ClanId, "set_logo", bySteamId);
+			Changed((ClanDataSource)4);
+			Interface.CallHook("OnClanLogoChanged", (object)this, (object)newLogo, (object)bySteamId);
+			return (ClanResult)1;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> SetColor(Color32 newColor, ulong bySteamId)
+	{
+		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0017: Unknown result type (might be due to invalid IL or missing references)
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanSetLogo))
+		{
+			return (ClanResult)5;
+		}
+		if (ColorEx.ToInt32(Color) == ColorEx.ToInt32(newColor))
+		{
+			return (ClanResult)1;
+		}
+		if (_backend.Database.UpdateClanColor(ClanId, newColor))
+		{
+			_backend.Database.AppendLog(ClanId, "set_color", bySteamId, ColorEx.ToHex(newColor));
+			Changed((ClanDataSource)1);
+			Interface.CallHook("OnClanColorChanged", (object)this, (object)newColor, (object)bySteamId);
+			return (ClanResult)1;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> Invite(ulong steamId, ulong bySteamId)
+	{
+		if (_backend.MaxMemberCount > 0 && _members.Count >= _backend.MaxMemberCount)
+		{
+			return (ClanResult)17;
+		}
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanInvite))
+		{
+			return (ClanResult)5;
+		}
+		if (_backend.Database.CreateInvite(ClanId, steamId, bySteamId))
+		{
+			_backend.Database.AppendLog(ClanId, "invite", bySteamId, steamId);
+			Changed((ClanDataSource)32);
+			_backend.InvitationCreated(steamId, ClanId);
+			return (ClanResult)1;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> CancelInvite(ulong steamId, ulong bySteamId)
+	{
+		if (steamId != bySteamId && !CheckRole(bySteamId, (ClanRole r) => r.CanInvite))
+		{
+			return (ClanResult)5;
+		}
+		if (_backend.Database.DeleteInvite(ClanId, steamId))
+		{
+			if (steamId == bySteamId)
+			{
+				_backend.Database.AppendLog(ClanId, "decline_invite", bySteamId);
+			}
+			else
+			{
+				_backend.Database.AppendLog(ClanId, "cancel_invite", bySteamId, steamId);
+			}
+			Changed((ClanDataSource)32);
+			return (ClanResult)1;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> AcceptInvite(ulong steamId)
+	{
+		if (_backend.MaxMemberCount > 0 && _members.Count >= _backend.MaxMemberCount)
+		{
+			return (ClanResult)17;
+		}
+		try
+		{
+			if (_backend.Database.AcceptInvite(ClanId, steamId))
+			{
+				_backend.Database.AppendLog(ClanId, "accept_invite", steamId);
+				Changed((ClanDataSource)48);
+				_backend.MembershipChanged(steamId, ClanId);
+				return (ClanResult)1;
+			}
+		}
+		catch (object obj) when (((Func<bool>)delegate
+		{
+			// Could not convert BlockContainer to single expression
+			object obj2 = ((obj is SqliteException) ? obj : null);
+			return obj2 != null && ((SqliteException)obj2).Result == 2067;
+		}).Invoke())
+		{
+			return (ClanResult)15;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> Kick(ulong steamId, ulong bySteamId)
+	{
+		if (!TryGetRank(steamId, out var rank))
+		{
+			return (ClanResult)4;
+		}
+		bool flag = steamId == bySteamId;
+		if (!flag)
+		{
+			if (!CheckRole(bySteamId, (ClanRole r) => r.CanKick))
+			{
+				return (ClanResult)5;
+			}
+			if (!TryGetRank(bySteamId, out var rank2))
+			{
+				return (ClanResult)4;
+			}
+			if (rank <= rank2 && rank2 != 1)
+			{
+				return (ClanResult)5;
+			}
+		}
+		else
+		{
+			if (_members.Count == 1)
+			{
+				return await Disband(bySteamId);
+			}
+			if (rank == 1 && OtherLeaderCount(steamId) == 0)
+			{
+				return (ClanResult)13;
+			}
+		}
+		if (_backend.Database.DeleteMember(ClanId, steamId))
+		{
+			if (flag)
+			{
+				Interface.CallHook("OnClanMemberLeft", (object)this, (object)steamId);
+				_backend.Database.AppendLog(ClanId, "leave", steamId);
+			}
+			else
+			{
+				Interface.CallHook("OnClanMemberKicked", (object)this, (object)steamId, (object)bySteamId);
+				_backend.Database.AppendLog(ClanId, "kick", bySteamId, steamId);
+			}
+			Changed((ClanDataSource)16);
+			_backend.MembershipChanged(steamId, null);
+			return (ClanResult)1;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> SetPlayerRole(ulong steamId, int newRoleId, ulong bySteamId)
+	{
+		ClanMember? val = List.TryFindWith<ClanMember, ulong>((IReadOnlyCollection<ClanMember>)_members, (Func<ClanMember, ulong>)((ClanMember m) => m.SteamId), steamId, (IEqualityComparer<ulong>)null);
+		if (!val.HasValue)
+		{
+			return (ClanResult)4;
+		}
+		ClanRole? val2 = List.TryFindWith<ClanRole, int>((IReadOnlyCollection<ClanRole>)_roles, (Func<ClanRole, int>)((ClanRole r) => r.RoleId), val.Value.RoleId, (IEqualityComparer<int>)null);
+		if (!val2.HasValue)
+		{
+			return (ClanResult)0;
+		}
+		ClanRole? val3 = List.TryFindWith<ClanRole, int>((IReadOnlyCollection<ClanRole>)_roles, (Func<ClanRole, int>)((ClanRole r) => r.RoleId), newRoleId, (IEqualityComparer<int>)null);
+		if (!val3.HasValue)
+		{
+			return (ClanResult)4;
+		}
+		if (!TryGetRank(bySteamId, out var rank))
+		{
+			return (ClanResult)4;
+		}
+		if (val2.Value.Rank <= rank && rank != 1)
+		{
+			return (ClanResult)5;
+		}
+		if (val3.Value.Rank <= rank && rank != 1)
+		{
+			return (ClanResult)5;
+		}
+		if (!((val3.Value.Rank < val2.Value.Rank) ? CheckRole(bySteamId, (ClanRole r) => r.CanPromote) : CheckRole(bySteamId, (ClanRole r) => r.CanDemote)))
+		{
+			return (ClanResult)5;
+		}
+		if (val.Value.RoleId == newRoleId)
+		{
+			return (ClanResult)1;
+		}
+		if (rank == 1 && steamId == bySteamId && OtherLeaderCount(steamId) == 0)
+		{
+			return (ClanResult)14;
+		}
+		if (_backend.Database.UpdateMemberRole(ClanId, steamId, newRoleId))
+		{
+			_backend.Database.AppendLog(ClanId, "change_role", bySteamId, steamId, val2.Value.Name, val3.Value.Name);
+			Changed((ClanDataSource)16);
+			return (ClanResult)1;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> SetPlayerNotes(ulong steamId, string newNotes, ulong bySteamId)
+	{
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanSetPlayerNotes))
+		{
+			return (ClanResult)5;
+		}
+		ClanMember? val = List.TryFindWith<ClanMember, ulong>((IReadOnlyCollection<ClanMember>)_members, (Func<ClanMember, ulong>)((ClanMember m) => m.SteamId), steamId, (IEqualityComparer<ulong>)null);
+		if (!val.HasValue)
+		{
+			return (ClanResult)4;
+		}
+		if (val.Value.Notes == newNotes)
+		{
+			return (ClanResult)1;
+		}
+		if (_backend.Database.UpdateMemberNotes(ClanId, steamId, newNotes))
+		{
+			_backend.Database.AppendLog(ClanId, "set_notes", bySteamId, steamId, newNotes);
+			Changed((ClanDataSource)16);
+			return (ClanResult)1;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> CreateRole(ClanRole role, ulong bySteamId)
+	{
+		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0017: Unknown result type (might be due to invalid IL or missing references)
+		if (string.IsNullOrWhiteSpace(role.Name))
+		{
+			return (ClanResult)6;
+		}
+		if (!TryGetRank(bySteamId, out var rank) || rank != 1)
+		{
+			return (ClanResult)5;
+		}
+		try
+		{
+			if (_backend.Database.CreateRole(ClanId, role).HasValue)
+			{
+				_backend.Database.AppendLog(ClanId, "create_role", bySteamId, role.Name);
+				Changed((ClanDataSource)8);
+				return (ClanResult)1;
+			}
+		}
+		catch (object obj) when (((Func<bool>)delegate
+		{
+			// Could not convert BlockContainer to single expression
+			object obj2 = ((obj is SqliteException) ? obj : null);
+			return obj2 != null && ((SqliteException)obj2).Result == 2067;
+		}).Invoke())
+		{
+			return (ClanResult)9;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> UpdateRole(ClanRole role, ulong bySteamId)
+	{
+		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0017: Unknown result type (might be due to invalid IL or missing references)
+		if (string.IsNullOrWhiteSpace(role.Name))
+		{
+			return (ClanResult)6;
+		}
+		if (!TryGetRank(bySteamId, out var rank) || rank != 1)
+		{
+			return (ClanResult)5;
+		}
+		ClanRole? val = List.TryFindWith<ClanRole, int>((IReadOnlyCollection<ClanRole>)_roles, (Func<ClanRole, int>)((ClanRole r) => r.RoleId), role.RoleId, (IEqualityComparer<int>)null);
+		if (!val.HasValue)
+		{
+			return (ClanResult)4;
+		}
+		try
+		{
+			if ((val.Value.Rank == 1) ? _backend.Database.UpdateRoleName(ClanId, role.RoleId, role.Name) : _backend.Database.UpdateRole(ClanId, role))
+			{
+				if (role.Name != val.Value.Name)
+				{
+					_backend.Database.AppendLog(ClanId, "update_role_renamed", bySteamId, val.Value.Name, role.Name);
+				}
+				else
+				{
+					_backend.Database.AppendLog(ClanId, "update_role", bySteamId, role.Name);
+				}
+				Changed((ClanDataSource)8);
+				return (ClanResult)1;
+			}
+		}
+		catch (object obj) when (((Func<bool>)delegate
+		{
+			// Could not convert BlockContainer to single expression
+			object obj2 = ((obj is SqliteException) ? obj : null);
+			return obj2 != null && ((SqliteException)obj2).Result == 2067;
+		}).Invoke())
+		{
+			return (ClanResult)9;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> SwapRoleRanks(int roleIdA, int roleIdB, ulong bySteamId)
+	{
+		if (!TryGetRank(bySteamId, out var rank) || rank != 1)
+		{
+			return (ClanResult)5;
+		}
+		ClanRole? val = List.TryFindWith<ClanRole, int>((IReadOnlyCollection<ClanRole>)_roles, (Func<ClanRole, int>)((ClanRole r) => r.RoleId), roleIdA, (IEqualityComparer<int>)null);
+		if (!val.HasValue)
+		{
+			return (ClanResult)4;
+		}
+		ClanRole? val2 = List.TryFindWith<ClanRole, int>((IReadOnlyCollection<ClanRole>)_roles, (Func<ClanRole, int>)((ClanRole r) => r.RoleId), roleIdB, (IEqualityComparer<int>)null);
+		if (!val2.HasValue)
+		{
+			return (ClanResult)4;
+		}
+		if (val.Value.Rank == 1 || val2.Value.Rank == 1)
+		{
+			return (ClanResult)11;
+		}
+		if (_backend.Database.SwapRoleRanks(ClanId, roleIdA, roleIdB))
+		{
+			_backend.Database.AppendLog(ClanId, "swap_roles", bySteamId, val.Value.Name, val2.Value.Name);
+			Changed((ClanDataSource)8);
+			return (ClanResult)1;
+		}
+		return (ClanResult)0;
+	}
+
+	public async ValueTask<ClanResult> DeleteRole(int roleId, ulong bySteamId)
+	{
+		if (!TryGetRank(bySteamId, out var rank) || rank != 1)
+		{
+			return (ClanResult)5;
+		}
+		ClanRole? val = List.TryFindWith<ClanRole, int>((IReadOnlyCollection<ClanRole>)_roles, (Func<ClanRole, int>)((ClanRole r) => r.RoleId), roleId, (IEqualityComparer<int>)null);
+		if (!val.HasValue)
+		{
+			return (ClanResult)4;
+		}
+		if (val.Value.Rank == 1)
+		{
+			return (ClanResult)12;
+		}
+		bool flag;
+		try
+		{
+			flag = _backend.Database.DeleteRole(ClanId, roleId);
+		}
+		catch (object obj) when (((Func<bool>)delegate
+		{
+			// Could not convert BlockContainer to single expression
+			object obj2 = ((obj is SqliteException) ? obj : null);
+			Unsafe.SkipInit(out int result);
+			if (obj2 == null)
+			{
+				result = 0;
+			}
+			else
+			{
+				SqliteException val2 = (SqliteException)obj2;
+				result = ((val2.Result == 787 || val2.Result == 1811) ? 1 : 0);
+			}
+			return (byte)result != 0;
+		}).Invoke())
+		{
+			return (ClanResult)10;
+		}
+		if (flag)
+		{
+			_backend.Database.AppendLog(ClanId, "delete_role", bySteamId, val.Value.Name);
+			Changed((ClanDataSource)8);
+			return (ClanResult)1;
+		}
+		return (ClanResult)0;
+	}
+
+	[AsyncStateMachine(typeof(<Disband>d__72))]
+	public ValueTask<ClanResult> Disband(ulong bySteamId)
+	{
+		<Disband>d__72 stateMachine = default(<Disband>d__72);
+		stateMachine.<>t__builder = AsyncValueTaskMethodBuilder<ClanResult>.Create();
+		stateMachine.<>4__this = this;
+		stateMachine.bySteamId = bySteamId;
+		stateMachine.<>1__state = -1;
+		stateMachine.<>t__builder.Start(ref stateMachine);
+		return stateMachine.<>t__builder.Task;
+	}
+
+	public async ValueTask<ClanValueResult<ClanScoreEvents>> GetScoreEvents(int limit, ulong bySteamId)
+	{
+		if (!CheckRole(bySteamId, (ClanRole r) => r.CanAccessScoreEvents))
+		{
+			return ClanValueResult<ClanScoreEvents>.op_Implicit((ClanResult)5);
+		}
+		List<ClanScoreEvent> scoreEvents = _backend.Database.ReadScoreEvents(ClanId, limit);
+		ClanScoreEvents val = default(ClanScoreEvents);
+		val.ClanId = ClanId;
+		val.ScoreEvents = scoreEvents;
+		return new ClanValueResult<ClanScoreEvents>(val);
+	}
+
+	public async ValueTask<ClanResult> AddScoreEvent(ClanScoreEvent scoreEvent)
+	{
+		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0017: Unknown result type (might be due to invalid IL or missing references)
+		if (scoreEvent.Score == 0)
+		{
+			throw new ArgumentException("Score cannot be zero.", "scoreEvent");
+		}
+		if (scoreEvent.Multiplier == 0)
+		{
+			throw new ArgumentException("Multiplier cannot be zero.", "scoreEvent");
+		}
+		_backend.Database.AppendScoreEvent(ClanId, scoreEvent);
+		Changed((ClanDataSource)64);
+		return (ClanResult)1;
+	}
+
+	public async ValueTask<ClanValueResult<ClanChatScrollback>> GetChatScrollback()
+	{
+		ClanChatScrollback val = default(ClanChatScrollback);
+		val.ClanId = ClanId;
+		val.Entries = _chatHistory.ToList();
+		return new ClanValueResult<ClanChatScrollback>(val);
+	}
+
+	public async ValueTask<ClanResult> SendChatMessage(string name, string message, ulong bySteamId)
+	{
+		if (!TryGetRank(bySteamId, out var _))
+		{
+			return (ClanResult)0;
+		}
+		string message2 = default(string);
+		if (!ClanValidator.ValidateChatMessage(message, ref message2))
+		{
+			return (ClanResult)6;
+		}
+		ClanChatEntry val = default(ClanChatEntry);
+		val.SteamId = bySteamId;
+		val.Name = name;
+		val.Message = message2;
+		val.Time = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+		ClanChatEntry val2 = val;
+		if (_chatHistory.Count >= 20)
+		{
+			_chatHistory.RemoveAt(0);
+		}
+		_chatHistory.Add(val2);
+		_backend.ClanChatMessage(ClanId, val2);
+		return (ClanResult)1;
+	}
+
+	private int OtherLeaderCount(ulong excludeSteamId)
+	{
+		//IL_0012: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0017: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0018: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0022: Unknown result type (might be due to invalid IL or missing references)
+		int num = 0;
+		foreach (ClanMember member in _members)
+		{
+			if (member.SteamId != excludeSteamId && TryGetRank(member.SteamId, out var rank) && rank == 1)
+			{
+				num++;
+			}
+		}
+		return num;
+	}
+
+	private bool CheckRole(ulong steamId, Func<ClanRole, bool> roleTest)
+	{
+		//IL_005f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_007d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_008d: Unknown result type (might be due to invalid IL or missing references)
+		ClanMember? val = List.TryFindWith<ClanMember, ulong>((IReadOnlyCollection<ClanMember>)_members, (Func<ClanMember, ulong>)((ClanMember m) => m.SteamId), steamId, (IEqualityComparer<ulong>)null);
+		if (!val.HasValue)
+		{
+			return false;
+		}
+		ClanRole? val2 = List.TryFindWith<ClanRole, int>((IReadOnlyCollection<ClanRole>)_roles, (Func<ClanRole, int>)((ClanRole r) => r.RoleId), val.Value.RoleId, (IEqualityComparer<int>)null);
+		if (!val2.HasValue)
+		{
+			return false;
+		}
+		if (val2.Value.Rank != 1)
+		{
+			return roleTest(val2.Value);
+		}
+		return true;
+	}
+
+	private bool TryGetRank(ulong steamId, out int rank)
+	{
+		//IL_0066: Unknown result type (might be due to invalid IL or missing references)
+		//IL_008c: Unknown result type (might be due to invalid IL or missing references)
+		ClanMember? val = List.TryFindWith<ClanMember, ulong>((IReadOnlyCollection<ClanMember>)_members, (Func<ClanMember, ulong>)((ClanMember m) => m.SteamId), steamId, (IEqualityComparer<ulong>)null);
+		if (!val.HasValue)
+		{
+			rank = int.MaxValue;
+			return false;
+		}
+		ClanRole? val2 = List.TryFindWith<ClanRole, int>((IReadOnlyCollection<ClanRole>)_roles, (Func<ClanRole, int>)((ClanRole r) => r.RoleId), val.Value.RoleId, (IEqualityComparer<int>)null);
+		if (!val2.HasValue)
+		{
+			rank = int.MaxValue;
+			return false;
+		}
+		rank = val2.Value.Rank;
+		return true;
+	}
+
+	private void Changed(ClanDataSource dataSources)
+	{
+		//IL_000c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0013: Unknown result type (might be due to invalid IL or missing references)
+		_backend.ClanChanged(ClanId, dataSources);
+		Refresh(dataSources);
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Facepunch.Sqlite;
+using Oxide.Core;
+
+public class LocalClanBackend : IClanBackend, IDisposable, IClanChangeSink
+{
+	private readonly string _rootFolder;
+
+	public readonly int MaxMemberCount;
+
+	private readonly Dictionary<long, LocalClan> _clans;
+
+	private IClanChangeSink _changeSink;
+
+	public readonly LocalClanDatabase Database;
+
+	public LocalClanBackend(string rootFolder, int maxMemberCount)
+	{
+		_rootFolder = rootFolder;
+		MaxMemberCount = Math.Max(maxMemberCount, 0);
+		_clans = new Dictionary<long, LocalClan>();
+		Database = new LocalClanDatabase();
+	}
+
+	public async ValueTask Initialize(IClanChangeSink changeSink)
+	{
+		_changeSink = changeSink ?? throw new ArgumentNullException("changeSink");
+		Database.Open(_rootFolder);
+	}
+
+	public void Dispose()
+	{
+		((Database)Database).Close();
+	}
+
+	public async ValueTask<ClanValueResult<IClan>> Get(long clanId)
+	{
+		if (clanId <= 0)
+		{
+			return ClanValueResult<IClan>.op_Implicit((ClanResult)4);
+		}
+		LocalClan clan;
+		return TryGetClan(clanId, out clan) ? new ClanValueResult<IClan>((IClan)(object)clan) : ClanValueResult<IClan>.op_Implicit((ClanResult)4);
+	}
+
+	public bool TryGet(long clanId, out IClan clan)
+	{
+		if (_clans.TryGetValue(clanId, out var value))
+		{
+			clan = (IClan)(object)value;
+			return true;
+		}
+		clan = null;
+		return false;
+	}
+
+	public async ValueTask<ClanValueResult<IClan>> GetByMember(ulong steamId)
+	{
+		long? num = Database.FindClanByMember(steamId);
+		if (!num.HasValue)
+		{
+			return ClanValueResult<IClan>.op_Implicit((ClanResult)3);
+		}
+		LocalClan clan;
+		return TryGetClan(num.Value, out clan) ? new ClanValueResult<IClan>((IClan)(object)clan) : ClanValueResult<IClan>.op_Implicit((ClanResult)4);
+	}
+
+	public async ValueTask<ClanValueResult<IClan>> Create(ulong leaderSteamId, string name)
+	{
+		((Database)Database).BeginTransaction();
+		long clanId;
+		try
+		{
+			try
+			{
+				clanId = Database.CreateClan(name, leaderSteamId) ?? throw new Exception("Failed to create clan");
+			}
+			catch (object obj) when (((Func<bool>)delegate
+			{
+				// Could not convert BlockContainer to single expression
+				object obj2 = ((obj is SqliteException) ? obj : null);
+				return obj2 != null && ((SqliteException)obj2).Result == 2067;
+			}).Invoke())
+			{
+				((Database)Database).Rollback();
+				return ClanValueResult<IClan>.op_Implicit((ClanResult)9);
+			}
+			int num = Database.CreateRole(clanId, new ClanRole
+			{
+				Name = "Leader",
+				CanSetMotd = true,
+				CanSetLogo = true,
+				CanInvite = true,
+				CanKick = true,
+				CanPromote = true,
+				CanDemote = true,
+				CanSetPlayerNotes = true
+			}) ?? throw new Exception("Failed to create leader role");
+			if (num != 1)
+			{
+				throw new Exception("Owner role does not have rank 1!");
+			}
+			_ = Database.CreateRole(clanId, new ClanRole
+			{
+				Name = "Member",
+				CanSetMotd = false,
+				CanSetLogo = false,
+				CanInvite = false,
+				CanKick = false,
+				CanPromote = false,
+				CanDemote = false,
+				CanSetPlayerNotes = false
+			}) ?? throw new Exception("Failed to create member role");
+			try
+			{
+				if (!Database.CreateMember(clanId, leaderSteamId, num))
+				{
+					throw new Exception("Failed to add leader to new clan");
+				}
+			}
+			catch (object obj3) when (((Func<bool>)delegate
+			{
+				// Could not convert BlockContainer to single expression
+				object obj4 = ((obj3 is SqliteException) ? obj3 : null);
+				return obj4 != null && ((SqliteException)obj4).Result == 2067;
+			}).Invoke())
+			{
+				((Database)Database).Rollback();
+				return ClanValueResult<IClan>.op_Implicit((ClanResult)15);
+			}
+			Database.AppendLog(clanId, "founded", leaderSteamId);
+			((Database)Database).Commit();
+		}
+		catch
+		{
+			((Database)Database).Rollback();
+			throw;
+		}
+		if (!TryGetClan(clanId, out var clan))
+		{
+			throw new Exception("Couldn't find the clan we just created?");
+		}
+		MembershipChanged(leaderSteamId, clan.ClanId);
+		ClanValueResult<IClan> result = ClanValueResult<IClan>.op_Implicit((IClan)(object)clan);
+		Interface.CallHook("OnClanCreated", (object)clan, (object)leaderSteamId);
+		return result;
+	}
+
+	public async ValueTask<ClanValueResult<List<ClanInvitation>>> ListInvitations(ulong steamId)
+	{
+		return ClanValueResult<List<ClanInvitation>>.op_Implicit(Database.ListInvitationsForPlayer(steamId));
+	}
+
+	public async ValueTask<ClanValueResult<List<ClanLeaderboardEntry>>> GetLeaderboard(int limit)
+	{
+		return ClanValueResult<List<ClanLeaderboardEntry>>.op_Implicit(Database.ListTopClans(limit));
+	}
+
+	private bool TryGetClan(long clanId, out LocalClan clan)
+	{
+		if (_clans.TryGetValue(clanId, out var value))
+		{
+			clan = value;
+			return value != null;
+		}
+		LocalClan localClan = new LocalClan(this, clanId);
+		if (!localClan.Refresh((ClanDataSource)(-1)))
+		{
+			_clans.Add(clanId, null);
+			clan = null;
+			return false;
+		}
+		_clans.Add(clanId, localClan);
+		clan = localClan;
+		return true;
+	}
+
+	public void ClanChanged(long clanId, ClanDataSource dataSources)
+	{
+		//IL_0007: Unknown result type (might be due to invalid IL or missing references)
+		_changeSink.ClanChanged(clanId, dataSources);
+	}
+
+	public void ClanDisbanded(long clanId)
+	{
+		_clans.Remove(clanId);
+		_changeSink.ClanDisbanded(clanId);
+	}
+
+	public void InvitationCreated(ulong steamId, long clanId)
+	{
+		_changeSink.InvitationCreated(steamId, clanId);
+	}
+
+	public void MembershipChanged(ulong steamId, long? clanId)
+	{
+		_changeSink.MembershipChanged(steamId, clanId);
+	}
+
+	public void ClanChatMessage(long clanId, ClanChatEntry entry)
+	{
+		//IL_0007: Unknown result type (might be due to invalid IL or missing references)
+		_changeSink.ClanChatMessage(clanId, entry);
+	}
+}
+
+
+using UnityEngine;
+
+public struct ClanData
+{
+	public string Name;
+
+	public long Created;
+
+	public ulong Creator;
+
+	public string Motd;
+
+	public long MotdTimestamp;
+
+	public ulong MotdAuthor;
+
+	public byte[] Logo;
+
+	public long LogoTimestamp;
+
+	public Color32 Color;
+
+	public long Score;
+}
+
+
+using System.CodeDom.Compiler;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+
+[GeneratedCode("Unity.MonoScriptGenerator.MonoScriptInfoGenerator", null)]
+[EditorBrowsable(EditorBrowsableState.Never)]
+[CompilerGenerated]
+internal class UnitySourceGeneratedAssemblyMonoScriptTypes_v1
+{
+	private struct MonoScriptData
+	{
+		public byte[] FilePathsData;
+
+		public byte[] TypesData;
+
+		public int TotalTypes;
+
+		public int TotalFiles;
+
+		public bool IsEditorOnly;
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private static MonoScriptData Get()
+	{
+		MonoScriptData result = default(MonoScriptData);
+		result.FilePathsData = new byte[761]
+		{
+			0, 0, 0, 1, 0, 0, 0, 52, 92, 65,
+			115, 115, 101, 116, 115, 92, 80, 108, 117, 103,
+			105, 110, 115, 92, 82, 117, 115, 116, 46, 67,
+			108, 97, 110, 115, 46, 76, 111, 99, 97, 108,
+			92, 68, 97, 116, 97, 98, 97, 115, 101, 92,
+			68, 66, 69, 114, 114, 111, 114, 46, 99, 115,
+			0, 0, 0, 1, 0, 0, 0, 68, 92, 65,
+			115, 115, 101, 116, 115, 92, 80, 108, 117, 103,
+			105, 110, 115, 92, 82, 117, 115, 116, 46, 67,
+			108, 97, 110, 115, 46, 76, 111, 99, 97, 108,
+			92, 68, 97, 116, 97, 98, 97, 115, 101, 92,
+			76, 111, 99, 97, 108, 67, 108, 97, 110, 68,
+			97, 116, 97, 98, 97, 115, 101, 46, 67, 108,
+			97, 110, 115, 46, 99, 115, 0, 0, 0, 1,
+			0, 0, 0, 62, 92, 65, 115, 115, 101, 116,
+			115, 92, 80, 108, 117, 103, 105, 110, 115, 92,
+			82, 117, 115, 116, 46, 67, 108, 97, 110, 115,
+			46, 76, 111, 99, 97, 108, 92, 68, 97, 116,
+			97, 98, 97, 115, 101, 92, 76, 111, 99, 97,
+			108, 67, 108, 97, 110, 68, 97, 116, 97, 98,
+			97, 115, 101, 46, 99, 115, 0, 0, 0, 1,
+			0, 0, 0, 70, 92, 65, 115, 115, 101, 116,
+			115, 92, 80, 108, 117, 103, 105, 110, 115, 92,
+			82, 117, 115, 116, 46, 67, 108, 97, 110, 115,
+			46, 76, 111, 99, 97, 108, 92, 68, 97, 116,
+			97, 98, 97, 115, 101, 92, 76, 111, 99, 97,
+			108, 67, 108, 97, 110, 68, 97, 116, 97, 98,
+			97, 115, 101, 46, 73, 110, 118, 105, 116, 101,
+			115, 46, 99, 115, 0, 0, 0, 1, 0, 0,
+			0, 67, 92, 65, 115, 115, 101, 116, 115, 92,
+			80, 108, 117, 103, 105, 110, 115, 92, 82, 117,
+			115, 116, 46, 67, 108, 97, 110, 115, 46, 76,
+			111, 99, 97, 108, 92, 68, 97, 116, 97, 98,
+			97, 115, 101, 92, 76, 111, 99, 97, 108, 67,
+			108, 97, 110, 68, 97, 116, 97, 98, 97, 115,
+			101, 46, 76, 111, 103, 115, 46, 99, 115, 0,
+			0, 0, 1, 0, 0, 0, 70, 92, 65, 115,
+			115, 101, 116, 115, 92, 80, 108, 117, 103, 105,
+			110, 115, 92, 82, 117, 115, 116, 46, 67, 108,
+			97, 110, 115, 46, 76, 111, 99, 97, 108, 92,
+			68, 97, 116, 97, 98, 97, 115, 101, 92, 76,
+			111, 99, 97, 108, 67, 108, 97, 110, 68, 97,
+			116, 97, 98, 97, 115, 101, 46, 77, 101, 109,
+			98, 101, 114, 115, 46, 99, 115, 0, 0, 0,
+			1, 0, 0, 0, 68, 92, 65, 115, 115, 101,
+			116, 115, 92, 80, 108, 117, 103, 105, 110, 115,
+			92, 82, 117, 115, 116, 46, 67, 108, 97, 110,
+			115, 46, 76, 111, 99, 97, 108, 92, 68, 97,
+			116, 97, 98, 97, 115, 101, 92, 76, 111, 99,
+			97, 108, 67, 108, 97, 110, 68, 97, 116, 97,
+			98, 97, 115, 101, 46, 82, 111, 108, 101, 115,
+			46, 99, 115, 0, 0, 0, 1, 0, 0, 0,
+			68, 92, 65, 115, 115, 101, 116, 115, 92, 80,
+			108, 117, 103, 105, 110, 115, 92, 82, 117, 115,
+			116, 46, 67, 108, 97, 110, 115, 46, 76, 111,
+			99, 97, 108, 92, 68, 97, 116, 97, 98, 97,
+			115, 101, 92, 76, 111, 99, 97, 108, 67, 108,
+			97, 110, 68, 97, 116, 97, 98, 97, 115, 101,
+			46, 83, 99, 111, 114, 101, 46, 99, 115, 0,
+			0, 0, 1, 0, 0, 0, 45, 92, 65, 115,
+			115, 101, 116, 115, 92, 80, 108, 117, 103, 105,
+			110, 115, 92, 82, 117, 115, 116, 46, 67, 108,
+			97, 110, 115, 46, 76, 111, 99, 97, 108, 92,
+			76, 111, 99, 97, 108, 67, 108, 97, 110, 46,
+			99, 115, 0, 0, 0, 1, 0, 0, 0, 52,
+			92, 65, 115, 115, 101, 116, 115, 92, 80, 108,
+			117, 103, 105, 110, 115, 92, 82, 117, 115, 116,
+			46, 67, 108, 97, 110, 115, 46, 76, 111, 99,
+			97, 108, 92, 76, 111, 99, 97, 108, 67, 108,
+			97, 110, 66, 97, 99, 107, 101, 110, 100, 46,
+			99, 115, 0, 0, 0, 1, 0, 0, 0, 51,
+			92, 65, 115, 115, 101, 116, 115, 92, 80, 108,
+			117, 103, 105, 110, 115, 92, 82, 117, 115, 116,
+			46, 67, 108, 97, 110, 115, 46, 76, 111, 99,
+			97, 108, 92, 77, 111, 100, 101, 108, 115, 92,
+			67, 108, 97, 110, 68, 97, 116, 97, 46, 99,
+			115
+		};
+		result.TypesData = new byte[225]
+		{
+			0, 0, 0, 0, 8, 124, 68, 66, 69, 114,
+			114, 111, 114, 1, 0, 0, 0, 18, 124, 76,
+			111, 99, 97, 108, 67, 108, 97, 110, 68, 97,
+			116, 97, 98, 97, 115, 101, 1, 0, 0, 0,
+			18, 124, 76, 111, 99, 97, 108, 67, 108, 97,
+			110, 68, 97, 116, 97, 98, 97, 115, 101, 1,
+			0, 0, 0, 18, 124, 76, 111, 99, 97, 108,
+			67, 108, 97, 110, 68, 97, 116, 97, 98, 97,
+			115, 101, 1, 0, 0, 0, 18, 124, 76, 111,
+			99, 97, 108, 67, 108, 97, 110, 68, 97, 116,
+			97, 98, 97, 115, 101, 1, 0, 0, 0, 18,
+			124, 76, 111, 99, 97, 108, 67, 108, 97, 110,
+			68, 97, 116, 97, 98, 97, 115, 101, 1, 0,
+			0, 0, 18, 124, 76, 111, 99, 97, 108, 67,
+			108, 97, 110, 68, 97, 116, 97, 98, 97, 115,
+			101, 1, 0, 0, 0, 18, 124, 76, 111, 99,
+			97, 108, 67, 108, 97, 110, 68, 97, 116, 97,
+			98, 97, 115, 101, 0, 0, 0, 0, 10, 124,
+			76, 111, 99, 97, 108, 67, 108, 97, 110, 0,
+			0, 0, 0, 17, 124, 76, 111, 99, 97, 108,
+			67, 108, 97, 110, 66, 97, 99, 107, 101, 110,
+			100, 0, 0, 0, 0, 9, 124, 67, 108, 97,
+			110, 68, 97, 116, 97
+		};
+		result.TotalFiles = 11;
+		result.TotalTypes = 11;
+		result.IsEditorOnly = false;
+		return result;
+	}
+}
+
+
+private struct MonoScriptData
+{
+	public byte[] FilePathsData;
+
+	public byte[] TypesData;
+
+	public int TotalTypes;
+
+	public int TotalFiles;
+
+	public bool IsEditorOnly;
+}
+
+

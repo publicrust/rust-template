@@ -1,0 +1,5319 @@
+using System.IO;
+using ObjectStream;
+
+public class ObjectStreamClient<TReadWrite> : ObjectStreamClient<TReadWrite, TReadWrite> where TReadWrite : class
+{
+	public ObjectStreamClient(Stream inStream, Stream outStream)
+		: base(inStream, outStream)
+	{
+	}
+}
+
+
+using System;
+
+public delegate void StreamExceptionEventHandler(Exception exception);
+
+
+using System;
+using System.IO;
+using ObjectStream;
+using ObjectStream.Threading;
+
+public class ObjectStreamClient<TRead, TWrite> where TRead : class where TWrite : class
+{
+	private readonly Stream _inStream;
+
+	private readonly Stream _outStream;
+
+	private ObjectStreamConnection<TRead, TWrite> _connection;
+
+	public event ConnectionMessageEventHandler<TRead, TWrite> Message;
+
+	public event StreamExceptionEventHandler Error;
+
+	public ObjectStreamClient(Stream inStream, Stream outStream)
+	{
+		_inStream = inStream;
+		_outStream = outStream;
+	}
+
+	public void Start()
+	{
+		Worker worker = new Worker();
+		worker.Error += OnError;
+		worker.DoWork(ListenSync);
+	}
+
+	public void PushMessage(TWrite message)
+	{
+		if (_connection != null)
+		{
+			_connection.PushMessage(message);
+		}
+	}
+
+	public void Stop()
+	{
+		if (_connection != null)
+		{
+			_connection.Close();
+		}
+	}
+
+	private void ListenSync()
+	{
+		_connection = ConnectionFactory.CreateConnection<TRead, TWrite>(_inStream, _outStream);
+		_connection.ReceiveMessage += OnReceiveMessage;
+		_connection.Error += ConnectionOnError;
+		_connection.Open();
+	}
+
+	private void OnReceiveMessage(ObjectStreamConnection<TRead, TWrite> connection, TRead message)
+	{
+		if (this.Message != null)
+		{
+			this.Message(connection, message);
+		}
+	}
+
+	private void ConnectionOnError(ObjectStreamConnection<TRead, TWrite> connection, Exception exception)
+	{
+		OnError(exception);
+	}
+
+	private void OnError(Exception exception)
+	{
+		if (this.Error != null)
+		{
+			this.Error(exception);
+		}
+	}
+}
+
+
+using System.IO;
+using ObjectStream.IO;
+
+internal static class ObjectStreamClientFactory
+{
+	public static ObjectStreamWrapper<TRead, TWrite> Connect<TRead, TWrite>(Stream inStream, Stream outStream) where TRead : class where TWrite : class
+	{
+		return new ObjectStreamWrapper<TRead, TWrite>(inStream, outStream);
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+using ObjectStream;
+using ObjectStream.IO;
+using ObjectStream.Threading;
+
+public class ObjectStreamConnection<TRead, TWrite> where TRead : class where TWrite : class
+{
+	private readonly ObjectStreamWrapper<TRead, TWrite> _streamWrapper;
+
+	private readonly Queue<TWrite> _writeQueue = new Queue<TWrite>();
+
+	private readonly AutoResetEvent _writeSignal = new AutoResetEvent(initialState: false);
+
+	public event ConnectionMessageEventHandler<TRead, TWrite> ReceiveMessage;
+
+	public event ConnectionExceptionEventHandler<TRead, TWrite> Error;
+
+	internal ObjectStreamConnection(Stream inStream, Stream outStream)
+	{
+		_streamWrapper = new ObjectStreamWrapper<TRead, TWrite>(inStream, outStream);
+	}
+
+	public void Open()
+	{
+		Worker worker = new Worker();
+		worker.Error += OnError;
+		worker.DoWork(ReadStream);
+		Worker worker2 = new Worker();
+		worker2.Error += OnError;
+		worker2.DoWork(WriteStream);
+	}
+
+	public void PushMessage(TWrite message)
+	{
+		_writeQueue.Enqueue(message);
+		_writeSignal.Set();
+	}
+
+	public void Close()
+	{
+		CloseImpl();
+	}
+
+	private void CloseImpl()
+	{
+		this.Error = null;
+		_streamWrapper.Close();
+		_writeSignal.Set();
+	}
+
+	private void OnError(Exception exception)
+	{
+		if (this.Error != null)
+		{
+			this.Error(this, exception);
+		}
+	}
+
+	private void ReadStream()
+	{
+		while (_streamWrapper.CanRead)
+		{
+			TRead val = _streamWrapper.ReadObject();
+			this.ReceiveMessage?.Invoke(this, val);
+			if (val == null)
+			{
+				CloseImpl();
+				break;
+			}
+		}
+	}
+
+	private void WriteStream()
+	{
+		while (_streamWrapper.CanWrite)
+		{
+			_writeSignal.WaitOne();
+			while (_writeQueue.Count > 0)
+			{
+				_streamWrapper.WriteObject(_writeQueue.Dequeue());
+			}
+		}
+	}
+}
+
+
+using System.IO;
+using ObjectStream;
+
+internal static class ConnectionFactory
+{
+	public static ObjectStreamConnection<TRead, TWrite> CreateConnection<TRead, TWrite>(Stream inStream, Stream outStream) where TRead : class where TWrite : class
+	{
+		return new ObjectStreamConnection<TRead, TWrite>(inStream, outStream);
+	}
+}
+
+
+using ObjectStream;
+
+public delegate void ConnectionMessageEventHandler<TRead, TWrite>(ObjectStreamConnection<TRead, TWrite> connection, TRead message) where TRead : class where TWrite : class;
+
+
+using System;
+using ObjectStream;
+
+public delegate void ConnectionExceptionEventHandler<TRead, TWrite>(ObjectStreamConnection<TRead, TWrite> connection, Exception exception) where TRead : class where TWrite : class;
+
+
+using System;
+using System.Threading;
+using ObjectStream.Threading;
+
+internal class Worker
+{
+	public event WorkerExceptionEventHandler Error;
+
+	public void DoWork(Action action)
+	{
+		Thread thread = new Thread(DoWorkImpl);
+		thread.IsBackground = true;
+		thread.Start(action);
+	}
+
+	private void DoWorkImpl(object oAction)
+	{
+		Action action = (Action)oAction;
+		try
+		{
+			action();
+		}
+		catch (Exception ex)
+		{
+			Exception e = ex;
+			Callback(delegate
+			{
+				Fail(e);
+			});
+		}
+	}
+
+	private void Fail(Exception exception)
+	{
+		if (this.Error != null)
+		{
+			this.Error(exception);
+		}
+	}
+
+	private void Callback(Action action)
+	{
+		Thread thread = new Thread(action.Invoke);
+		thread.IsBackground = true;
+		thread.Start();
+	}
+}
+
+
+internal delegate void WorkerSucceededEventHandler();
+
+
+using System;
+
+internal delegate void WorkerExceptionEventHandler(Exception exception);
+
+
+using System;
+using System.Reflection;
+using System.Runtime.Serialization;
+
+public class BindChanger : SerializationBinder
+{
+	public override Type BindToType(string assemblyName, string typeName)
+	{
+		return Type.GetType($"{typeName}, {Assembly.GetExecutingAssembly().FullName}");
+	}
+}
+
+
+using System.IO;
+using ObjectStream.IO;
+
+public class ObjectStreamWrapper<TReadWrite> : ObjectStreamWrapper<TReadWrite, TReadWrite> where TReadWrite : class
+{
+	public ObjectStreamWrapper(Stream inStream, Stream outStream)
+		: base(inStream, outStream)
+	{
+	}
+}
+
+
+using System;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Runtime.Serialization.Formatters;
+using System.Runtime.Serialization.Formatters.Binary;
+using System.Text;
+using ObjectStream.IO;
+
+public class ObjectStreamWrapper<TRead, TWrite> where TRead : class where TWrite : class
+{
+	private readonly BinaryFormatter _binaryFormatter = new BinaryFormatter
+	{
+		Binder = new BindChanger(),
+		AssemblyFormat = FormatterAssemblyStyle.Simple
+	};
+
+	private readonly Stream _inStream;
+
+	private readonly Stream _outStream;
+
+	private bool _run;
+
+	public bool CanRead
+	{
+		get
+		{
+			if (_run)
+			{
+				return _inStream.CanRead;
+			}
+			return false;
+		}
+	}
+
+	public bool CanWrite
+	{
+		get
+		{
+			if (_run)
+			{
+				return _outStream.CanWrite;
+			}
+			return false;
+		}
+	}
+
+	public ObjectStreamWrapper(Stream inStream, Stream outStream)
+	{
+		_inStream = inStream;
+		_outStream = outStream;
+		_run = true;
+	}
+
+	public void Close()
+	{
+		if (!_run)
+		{
+			return;
+		}
+		_run = false;
+		try
+		{
+			_outStream.Close();
+		}
+		catch (Exception)
+		{
+		}
+		try
+		{
+			_inStream.Close();
+		}
+		catch (Exception)
+		{
+		}
+	}
+
+	public TRead ReadObject()
+	{
+		int num = ReadLength();
+		if (num != 0)
+		{
+			return ReadObject(num);
+		}
+		return null;
+	}
+
+	private int ReadLength()
+	{
+		byte[] array = new byte[4];
+		int num = _inStream.Read(array, 0, 4);
+		switch (num)
+		{
+		case 0:
+			return 0;
+		default:
+			Array.Resize(ref array, Encoding.UTF8.GetPreamble().Length);
+			if (Encoding.UTF8.GetPreamble().SequenceEqual(array))
+			{
+				return ReadLength();
+			}
+			throw new IOException($"Expected {4} bytes but read {num}");
+		case 4:
+			return IPAddress.NetworkToHostOrder(BitConverter.ToInt32(array, 0));
+		}
+	}
+
+	private TRead ReadObject(int len)
+	{
+		byte[] buffer = new byte[len];
+		int num;
+		for (int i = 0; len - i > 0; i += num)
+		{
+			if ((num = _inStream.Read(buffer, i, len - i)) <= 0)
+			{
+				break;
+			}
+		}
+		using MemoryStream serializationStream = new MemoryStream(buffer);
+		return (TRead)_binaryFormatter.Deserialize(serializationStream);
+	}
+
+	public void WriteObject(TWrite obj)
+	{
+		byte[] array = Serialize(obj);
+		WriteLength(array.Length);
+		WriteObject(array);
+		Flush();
+	}
+
+	private byte[] Serialize(TWrite obj)
+	{
+		using MemoryStream memoryStream = new MemoryStream();
+		_binaryFormatter.Serialize(memoryStream, obj);
+		return memoryStream.ToArray();
+	}
+
+	private void WriteLength(int len)
+	{
+		byte[] bytes = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(len));
+		_outStream.Write(bytes, 0, bytes.Length);
+	}
+
+	private void WriteObject(byte[] data)
+	{
+		_outStream.Write(data, 0, data.Length);
+	}
+
+	private void Flush()
+	{
+		_outStream.Flush();
+	}
+}
+
+
+using System;
+
+[Serializable]
+public class CompilationResult
+{
+	public string Name { get; set; }
+
+	public byte[] Data { get; set; }
+
+	public byte[] Symbols { get; set; }
+
+	public CompilationResult()
+	{
+		Data = new byte[0];
+		Symbols = new byte[0];
+	}
+}
+
+
+using System;
+using System.Text;
+using ObjectStream.Data;
+
+[Serializable]
+public class CompilerData
+{
+	public bool LoadDefaultReferences { get; set; }
+
+	public string OutputFile { get; set; }
+
+	public CompilerPlatform Platform { get; set; }
+
+	public CompilerFile[] ReferenceFiles { get; set; }
+
+	public string SdkVersion { get; set; }
+
+	public CompilerFile[] SourceFiles { get; set; }
+
+	public bool StdLib { get; set; }
+
+	public CompilerTarget Target { get; set; }
+
+	public CompilerLanguageVersion Version { get; set; }
+
+	public string Encoding { get; set; }
+
+	public bool Debug { get; set; }
+
+	public string[] Preprocessor { get; set; }
+
+	public CompilerData()
+	{
+		StdLib = false;
+		Target = CompilerTarget.Library;
+		Platform = CompilerPlatform.AnyCPU;
+		Version = CompilerLanguageVersion.Preview;
+		LoadDefaultReferences = false;
+		SdkVersion = "2";
+		Encoding = System.Text.Encoding.UTF8.WebName;
+		Debug = false;
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using ObjectStream.Data;
+using Oxide.CSharp.Patching;
+
+[Serializable]
+public class CompilerFile
+{
+	[NonSerialized]
+	internal static readonly Dictionary<string, CompilerFile> FileCache = new Dictionary<string, CompilerFile>(StringComparer.InvariantCultureIgnoreCase);
+
+	[NonSerialized]
+	internal DateTime LastRead;
+
+	[NonSerialized]
+	internal bool KeepCached;
+
+	public string Name { get; set; }
+
+	public byte[] Data { get; set; }
+
+	public static CompilerFile CachedReadFile(string directory, string fileName, byte[] data = null)
+	{
+		string text = Path.Combine(directory, fileName);
+		CompilerFile value;
+		lock (FileCache)
+		{
+			if (FileCache.TryGetValue(text, out value))
+			{
+				if (data != null)
+				{
+					value.Data = data;
+				}
+				value.LastRead = DateTime.Now;
+				return value;
+			}
+		}
+		bool patched = false;
+		if (data == null && File.Exists(text))
+		{
+			data = Patcher.Run(File.ReadAllBytes(text), out patched);
+		}
+		if (data == null)
+		{
+			return null;
+		}
+		value = new CompilerFile(fileName, data);
+		value.LastRead = DateTime.Now;
+		value.KeepCached = patched;
+		lock (FileCache)
+		{
+			FileCache[text] = value;
+			return value;
+		}
+	}
+
+	internal CompilerFile(string name, byte[] data)
+	{
+		Name = name;
+		Data = data;
+	}
+
+	internal CompilerFile(string directory, string name)
+	{
+		Name = name;
+		Data = File.ReadAllBytes(Path.Combine(directory, Name));
+	}
+
+	internal CompilerFile(string path)
+	{
+		Name = Path.GetFileName(path);
+		Data = File.ReadAllBytes(path);
+	}
+}
+
+
+using System;
+
+[Serializable]
+public enum CompilerLanguageVersion
+{
+	Latest = 500,
+	V16 = 16,
+	V15 = 15,
+	V14 = 14,
+	V13 = 13,
+	V12 = 12,
+	V11 = 11,
+	V10 = 10,
+	V9 = 9,
+	V8 = 8,
+	V7 = 7,
+	V6 = 6,
+	V5 = 5,
+	V4 = 4,
+	V3 = 3,
+	V2 = 2,
+	V1 = 1,
+	Preview = 1000
+}
+
+
+using System;
+using ObjectStream.Data;
+
+[Serializable]
+public class CompilerMessage
+{
+	public object Data { get; set; }
+
+	public object ExtraData { get; set; }
+
+	public int Id { get; set; }
+
+	public CompilerMessageType Type { get; set; }
+}
+
+
+using System;
+
+[Serializable]
+public enum CompilerMessageType
+{
+	Assembly,
+	Compile,
+	Error,
+	Exit,
+	Ready
+}
+
+
+using System;
+
+[Serializable]
+public enum CompilerPlatform
+{
+	AnyCPU,
+	AnyCPU32Preferred,
+	Arm,
+	X86,
+	X64,
+	IA64
+}
+
+
+using System;
+
+[Serializable]
+public enum CompilerTarget
+{
+	Library,
+	Exe,
+	Module,
+	WinExe
+}
+
+
+using System;
+using Oxide.Core.Logging;
+using Oxide.Logging;
+
+public static class ExtensionMethods
+{
+	public static void WriteDebug(this Logger logger, LogType level, LogEvent? @event, string source, string message, Exception exception = null)
+	{
+	}
+}
+
+
+using Oxide.Logging;
+
+public struct LogEvent
+{
+	public int Id { get; }
+
+	public string Name { get; }
+
+	public static LogEvent Compile { get; } = new LogEvent(4, "Compile");
+
+	public static LogEvent HookCall { get; } = new LogEvent(10, "ExecuteHook");
+
+	public static LogEvent Patch { get; } = new LogEvent(23, "Patching");
+
+	internal LogEvent(int id, string name)
+	{
+		Id = id;
+		Name = name;
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+using Mono.Cecil.Rocks;
+using Mono.Collections.Generic;
+using Oxide.Core;
+using Oxide.Core.CSharp;
+using Oxide.Core.Plugins;
+
+public class DirectCallMethod
+{
+	public class Node
+	{
+		public char Char;
+
+		public string Name;
+
+		public Dictionary<char, Node> Edges = new Dictionary<char, Node>();
+
+		public Node Parent;
+
+		public Instruction FirstInstruction;
+	}
+
+	private ModuleDefinition module;
+
+	private TypeDefinition type;
+
+	private MethodDefinition method;
+
+	private MethodBody body;
+
+	private Instruction endInstruction;
+
+	private Dictionary<Instruction, Node> jumpToEdgePlaceholderTargets = new Dictionary<Instruction, Node>();
+
+	private List<Instruction> jumpToEndPlaceholders = new List<Instruction>();
+
+	private Dictionary<string, MethodDefinition> hookMethods = new Dictionary<string, MethodDefinition>();
+
+	private MethodReference getLength;
+
+	private MethodReference getChars;
+
+	private MethodReference isNullOrEmpty;
+
+	private MethodReference stringEquals;
+
+	private string hook_attribute = typeof(HookMethodAttribute).FullName;
+
+	public DirectCallMethod(ModuleDefinition module, TypeDefinition type, ReaderParameters readerParameters)
+	{
+		//IL_01a1: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01b3: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01b8: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01c9: Expected O, but got Unknown
+		//IL_01d0: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01d5: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01ee: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0200: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0205: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0212: Unknown result type (might be due to invalid IL or missing references)
+		//IL_021f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_022c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_023b: Expected O, but got Unknown
+		//IL_0242: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0247: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02c0: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02c5: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0268: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0272: Expected O, but got Unknown
+		//IL_02ea: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02f4: Expected O, but got Unknown
+		//IL_0315: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0327: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0338: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0342: Unknown result type (might be due to invalid IL or missing references)
+		//IL_034f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0355: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0362: Unknown result type (might be due to invalid IL or missing references)
+		//IL_036c: Expected O, but got Unknown
+		//IL_03b9: Unknown result type (might be due to invalid IL or missing references)
+		//IL_03c3: Expected O, but got Unknown
+		//IL_03de: Unknown result type (might be due to invalid IL or missing references)
+		//IL_03e8: Expected O, but got Unknown
+		//IL_03e9: Unknown result type (might be due to invalid IL or missing references)
+		//IL_03f5: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0401: Unknown result type (might be due to invalid IL or missing references)
+		//IL_040d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0419: Unknown result type (might be due to invalid IL or missing references)
+		//IL_042b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_044f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_045f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0471: Unknown result type (might be due to invalid IL or missing references)
+		//IL_047d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0489: Unknown result type (might be due to invalid IL or missing references)
+		DirectCallMethod directCallMethod = this;
+		this.module = module;
+		this.type = type;
+		getLength = module.Import((MethodBase)typeof(string).GetMethod("get_Length", new Type[0]));
+		getChars = module.Import((MethodBase)typeof(string).GetMethod("get_Chars", new Type[1] { typeof(int) }));
+		isNullOrEmpty = module.Import((MethodBase)typeof(string).GetMethod("IsNullOrEmpty", new Type[1] { typeof(string) }));
+		stringEquals = module.Import((MethodBase)typeof(string).GetMethod("Equals", new Type[1] { typeof(string) }));
+		AssemblyDefinition val = AssemblyDefinition.ReadAssembly(Path.Combine(Interface.Oxide.ExtensionDirectory, "Oxide.CSharp.dll"), readerParameters);
+		ModuleDefinition mainModule = val.MainModule;
+		TypeDefinition val2 = module.Import((TypeReference)(object)val.MainModule.GetType("Oxide.Plugins.CSharpPlugin")).Resolve();
+		MethodDefinition val3 = module.Import((MethodReference)(object)((IEnumerable<MethodDefinition>)val2.Methods).First((MethodDefinition method) => ((MemberReference)method).Name == "DirectCallHook")).Resolve();
+		method = new MethodDefinition(((MemberReference)val3).Name, val3.Attributes, mainModule.Import(((MethodReference)val3).ReturnType))
+		{
+			DeclaringType = type
+		};
+		Enumerator<ParameterDefinition> enumerator = ((MethodReference)val3).Parameters.GetEnumerator();
+		Enumerator<CustomAttribute> enumerator2;
+		try
+		{
+			while (enumerator.MoveNext())
+			{
+				ParameterDefinition current = enumerator.Current;
+				ParameterDefinition val4 = new ParameterDefinition(((ParameterReference)current).Name, current.Attributes, module.Import(((ParameterReference)current).ParameterType))
+				{
+					IsOut = current.IsOut,
+					Constant = current.Constant,
+					MarshalInfo = current.MarshalInfo,
+					IsReturnValue = current.IsReturnValue
+				};
+				enumerator2 = current.CustomAttributes.GetEnumerator();
+				try
+				{
+					while (enumerator2.MoveNext())
+					{
+						CustomAttribute current2 = enumerator2.Current;
+						val4.CustomAttributes.Add(new CustomAttribute(module.Import(current2.Constructor)));
+					}
+				}
+				finally
+				{
+					((IDisposable)enumerator2/*cast due to .constrained prefix*/).Dispose();
+				}
+				((MethodReference)method).Parameters.Add(val4);
+			}
+		}
+		finally
+		{
+			((IDisposable)enumerator/*cast due to .constrained prefix*/).Dispose();
+		}
+		enumerator2 = val3.CustomAttributes.GetEnumerator();
+		try
+		{
+			while (enumerator2.MoveNext())
+			{
+				CustomAttribute current3 = enumerator2.Current;
+				method.CustomAttributes.Add(new CustomAttribute(module.Import(current3.Constructor)));
+			}
+		}
+		finally
+		{
+			((IDisposable)enumerator2/*cast due to .constrained prefix*/).Dispose();
+		}
+		method.ImplAttributes = val3.ImplAttributes;
+		method.SemanticsAttributes = val3.SemanticsAttributes;
+		MethodDefinition obj = method;
+		obj.Attributes = (MethodAttributes)(obj.Attributes & 0xFEFF);
+		MethodDefinition obj2 = method;
+		obj2.Attributes = (MethodAttributes)(obj2.Attributes | 0);
+		body = new MethodBody(method);
+		MethodBodyRocks.SimplifyMacros(body);
+		method.Body = body;
+		type.Methods.Add(method);
+		body.Variables.Add(new VariableDefinition("name_size", module.TypeSystem.Int32));
+		body.Variables.Add(new VariableDefinition("i", module.TypeSystem.Int32));
+		AddInstruction(OpCodes.Ldarg_2);
+		AddInstruction(OpCodes.Ldnull);
+		AddInstruction(OpCodes.Stind_Ref);
+		AddInstruction(OpCodes.Ldarg_1);
+		AddInstruction(OpCodes.Call, isNullOrEmpty);
+		Instruction obj3 = AddInstruction(OpCodes.Brfalse, body.Instructions[0]);
+		Return(value: false);
+		obj3.Operand = AddInstruction(OpCodes.Ldarg_1);
+		AddInstruction(OpCodes.Callvirt, getLength);
+		AddInstruction(OpCodes.Stloc_0);
+		AddInstruction(OpCodes.Ldc_I4_0);
+		AddInstruction(OpCodes.Stloc_1);
+		foreach (MethodDefinition item in ((IEnumerable<MethodDefinition>)type.Methods).Where((MethodDefinition m) => !m.IsStatic && (m.IsPrivate || directCallMethod.IsHookMethod(m)) && !((MethodReference)m).HasGenericParameters && !((MethodReference)m).ReturnType.IsGenericParameter && m.DeclaringType == type && !m.IsSetter && !m.IsGetter))
+		{
+			if (((MemberReference)item).Name.Contains("<"))
+			{
+				continue;
+			}
+			string text = ((MemberReference)item).Name;
+			if (((MethodReference)item).Parameters.Count > 0)
+			{
+				text = text + "(" + string.Join(", ", ((IEnumerable<ParameterDefinition>)((MethodReference)item).Parameters).Select((ParameterDefinition x) => ((object)((ParameterReference)x).ParameterType).ToString().Replace("/", "+").Replace("<", "[")
+					.Replace(">", "]")).ToArray()) + ")";
+			}
+			if (!hookMethods.ContainsKey(text))
+			{
+				hookMethods[text] = item;
+			}
+		}
+		Node node = new Node();
+		foreach (string key in hookMethods.Keys)
+		{
+			Node node2 = node;
+			for (int i = 1; i <= key.Length; i++)
+			{
+				char c = key[i - 1];
+				if (!node2.Edges.TryGetValue(c, out var value))
+				{
+					value = new Node
+					{
+						Parent = node2,
+						Char = c
+					};
+					node2.Edges[c] = value;
+				}
+				if (i == key.Length)
+				{
+					value.Name = key;
+				}
+				node2 = value;
+			}
+		}
+		int num = 1;
+		foreach (char key2 in node.Edges.Keys)
+		{
+			BuildNode(node.Edges[key2], num++);
+		}
+		endInstruction = Return(value: false);
+		foreach (Instruction key3 in jumpToEdgePlaceholderTargets.Keys)
+		{
+			key3.Operand = jumpToEdgePlaceholderTargets[key3].FirstInstruction;
+		}
+		foreach (Instruction jumpToEndPlaceholder in jumpToEndPlaceholders)
+		{
+			jumpToEndPlaceholder.Operand = endInstruction;
+		}
+		MethodBodyRocks.OptimizeMacros(body);
+	}
+
+	private bool IsHookMethod(MethodDefinition method)
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		//IL_000b: Unknown result type (might be due to invalid IL or missing references)
+		Enumerator<CustomAttribute> enumerator = method.CustomAttributes.GetEnumerator();
+		try
+		{
+			while (enumerator.MoveNext())
+			{
+				if (((MemberReference)enumerator.Current.AttributeType).FullName == hook_attribute)
+				{
+					return true;
+				}
+			}
+		}
+		finally
+		{
+			((IDisposable)enumerator/*cast due to .constrained prefix*/).Dispose();
+		}
+		return false;
+	}
+
+	private void BuildNode(Node node, int edge_number)
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0028: Unknown result type (might be due to invalid IL or missing references)
+		//IL_005c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_006c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0078: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01af: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01bb: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01c7: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01d3: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01e7: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01f3: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0133: Unknown result type (might be due to invalid IL or missing references)
+		//IL_013f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0156: Unknown result type (might be due to invalid IL or missing references)
+		//IL_016e: Unknown result type (might be due to invalid IL or missing references)
+		if (edge_number == 1)
+		{
+			node.FirstInstruction = AddInstruction(OpCodes.Ldloc_1);
+			AddInstruction(OpCodes.Ldloc_0);
+			jumpToEndPlaceholders.Add(AddInstruction(OpCodes.Bge, body.Instructions[0]));
+		}
+		if (edge_number == 1)
+		{
+			AddInstruction(OpCodes.Ldarg_1);
+		}
+		else
+		{
+			node.FirstInstruction = AddInstruction(OpCodes.Ldarg_1);
+		}
+		AddInstruction(OpCodes.Ldloc_1);
+		AddInstruction(OpCodes.Callvirt, getChars);
+		AddInstruction(Ldc_I4_n(node.Char));
+		if (node.Parent.Edges.Count > edge_number)
+		{
+			JumpToEdge(node.Parent.Edges.Values.ElementAt(edge_number));
+		}
+		else
+		{
+			JumpToEnd();
+		}
+		if (node.Edges.Count == 1 && node.Name == null)
+		{
+			Node node2 = node;
+			while (node2.Edges.Count == 1 && node2.Name == null)
+			{
+				node2 = node2.Edges.Values.First();
+			}
+			if (node2.Edges.Count == 0 && node2.Name != null)
+			{
+				AddInstruction(OpCodes.Ldarg_1);
+				AddInstruction(Instruction.Create(OpCodes.Ldstr, node2.Name));
+				AddInstruction(OpCodes.Callvirt, stringEquals);
+				jumpToEndPlaceholders.Add(AddInstruction(OpCodes.Brfalse, body.Instructions[0]));
+				CallMethod(hookMethods[node2.Name]);
+				Return(value: true);
+				return;
+			}
+		}
+		AddInstruction(OpCodes.Ldloc_1);
+		AddInstruction(OpCodes.Ldc_I4_1);
+		AddInstruction(OpCodes.Add);
+		AddInstruction(OpCodes.Stloc_1);
+		if (node.Name != null)
+		{
+			AddInstruction(OpCodes.Ldloc_1);
+			AddInstruction(OpCodes.Ldloc_0);
+			if (node.Edges.Count > 0)
+			{
+				JumpToEdge(node.Edges.Values.First());
+			}
+			else
+			{
+				JumpToEnd();
+			}
+			CallMethod(hookMethods[node.Name]);
+			Return(value: true);
+		}
+		int num = 1;
+		foreach (char key in node.Edges.Keys)
+		{
+			BuildNode(node.Edges[key], num++);
+		}
+	}
+
+	private void CallMethod(MethodDefinition method)
+	{
+		//IL_0048: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0062: Unknown result type (might be due to invalid IL or missing references)
+		//IL_006e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_008b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00da: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00ce: Unknown result type (might be due to invalid IL or missing references)
+		//IL_017b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_011e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0139: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0145: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0108: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01bc: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01d7: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01eb: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0209: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0278: Unknown result type (might be due to invalid IL or missing references)
+		//IL_025b: Unknown result type (might be due to invalid IL or missing references)
+		Dictionary<ParameterDefinition, VariableDefinition> dictionary = new Dictionary<ParameterDefinition, VariableDefinition>();
+		for (int i = 0; i < ((MethodReference)method).Parameters.Count; i++)
+		{
+			ParameterDefinition val = ((MethodReference)method).Parameters[i];
+			TypeReference parameterType = ((ParameterReference)val).ParameterType;
+			ByReferenceType val2 = (ByReferenceType)(object)((parameterType is ByReferenceType) ? parameterType : null);
+			if (val2 != null)
+			{
+				VariableDefinition value = AddVariable(module.Import(((TypeSpecification)val2).ElementType));
+				AddInstruction(OpCodes.Ldarg_3);
+				AddInstruction(Ldc_I4_n(i));
+				AddInstruction(OpCodes.Ldelem_Ref);
+				AddInstruction(OpCodes.Unbox_Any, module.Import(((TypeSpecification)val2).ElementType));
+				AddInstruction(OpCodes.Stloc_S, value);
+				dictionary[val] = value;
+			}
+		}
+		if (((MemberReference)((MethodReference)method).ReturnType).Name != "Void")
+		{
+			AddInstruction(OpCodes.Ldarg_2);
+		}
+		AddInstruction(OpCodes.Ldarg_0);
+		for (int j = 0; j < ((MethodReference)method).Parameters.Count; j++)
+		{
+			ParameterDefinition val3 = ((MethodReference)method).Parameters[j];
+			if (((ParameterReference)val3).ParameterType is ByReferenceType)
+			{
+				AddInstruction(OpCodes.Ldloca, dictionary[val3]);
+				continue;
+			}
+			AddInstruction(OpCodes.Ldarg_3);
+			AddInstruction(Ldc_I4_n(j));
+			AddInstruction(OpCodes.Ldelem_Ref);
+			AddInstruction(OpCodes.Unbox_Any, module.Import(((ParameterReference)val3).ParameterType));
+		}
+		AddInstruction(OpCodes.Call, module.Import((MethodReference)(object)method));
+		for (int k = 0; k < ((MethodReference)method).Parameters.Count; k++)
+		{
+			ParameterDefinition val4 = ((MethodReference)method).Parameters[k];
+			TypeReference parameterType2 = ((ParameterReference)val4).ParameterType;
+			ByReferenceType val5 = (ByReferenceType)(object)((parameterType2 is ByReferenceType) ? parameterType2 : null);
+			if (val5 != null)
+			{
+				AddInstruction(OpCodes.Ldarg_3);
+				AddInstruction(Ldc_I4_n(k));
+				AddInstruction(OpCodes.Ldloc_S, dictionary[val4]);
+				AddInstruction(OpCodes.Box, module.Import(((TypeSpecification)val5).ElementType));
+				AddInstruction(OpCodes.Stelem_Ref);
+			}
+		}
+		if (((MemberReference)((MethodReference)method).ReturnType).Name != "Void")
+		{
+			if (((MemberReference)((MethodReference)method).ReturnType).Name != "Object")
+			{
+				AddInstruction(OpCodes.Box, module.Import(((MethodReference)method).ReturnType));
+			}
+			AddInstruction(OpCodes.Stind_Ref);
+		}
+	}
+
+	private Instruction Return(bool value)
+	{
+		//IL_0014: Unknown result type (might be due to invalid IL or missing references)
+		Instruction result = AddInstruction(Ldc_I4_n(value ? 1 : 0));
+		AddInstruction(OpCodes.Ret);
+		return result;
+	}
+
+	private void JumpToEdge(Node node)
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		Instruction key = AddInstruction(OpCodes.Bne_Un, body.Instructions[1]);
+		jumpToEdgePlaceholderTargets[key] = node;
+	}
+
+	private void JumpToEnd()
+	{
+		//IL_0007: Unknown result type (might be due to invalid IL or missing references)
+		jumpToEndPlaceholders.Add(AddInstruction(OpCodes.Bne_Un, body.Instructions[0]));
+	}
+
+	private Instruction AddInstruction(OpCode opcode)
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return AddInstruction(Instruction.Create(opcode));
+	}
+
+	private Instruction AddInstruction(OpCode opcode, Instruction instruction)
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return AddInstruction(Instruction.Create(opcode, instruction));
+	}
+
+	private Instruction AddInstruction(OpCode opcode, MethodReference method_reference)
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return AddInstruction(Instruction.Create(opcode, method_reference));
+	}
+
+	private Instruction AddInstruction(OpCode opcode, TypeReference type_reference)
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return AddInstruction(Instruction.Create(opcode, type_reference));
+	}
+
+	private Instruction AddInstruction(OpCode opcode, int value)
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return AddInstruction(Instruction.Create(opcode, value));
+	}
+
+	private Instruction AddInstruction(OpCode opcode, VariableDefinition value)
+	{
+		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
+		return AddInstruction(Instruction.Create(opcode, value));
+	}
+
+	private Instruction AddInstruction(Instruction instruction)
+	{
+		body.Instructions.Add(instruction);
+		return instruction;
+	}
+
+	public VariableDefinition AddVariable(TypeReference typeRef, string name = "")
+	{
+		//IL_0002: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0008: Expected O, but got Unknown
+		VariableDefinition val = new VariableDefinition(name, typeRef);
+		body.Variables.Add(val);
+		return val;
+	}
+
+	private Instruction Ldc_I4_n(int n)
+	{
+		//IL_0003: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0012: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0021: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0030: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_005d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_006c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0086: Unknown result type (might be due to invalid IL or missing references)
+		//IL_007b: Unknown result type (might be due to invalid IL or missing references)
+		return (Instruction)(n switch
+		{
+			0 => Instruction.Create(OpCodes.Ldc_I4_0), 
+			1 => Instruction.Create(OpCodes.Ldc_I4_1), 
+			2 => Instruction.Create(OpCodes.Ldc_I4_2), 
+			3 => Instruction.Create(OpCodes.Ldc_I4_3), 
+			4 => Instruction.Create(OpCodes.Ldc_I4_4), 
+			5 => Instruction.Create(OpCodes.Ldc_I4_5), 
+			6 => Instruction.Create(OpCodes.Ldc_I4_6), 
+			7 => Instruction.Create(OpCodes.Ldc_I4_7), 
+			8 => Instruction.Create(OpCodes.Ldc_I4_8), 
+			_ => Instruction.Create(OpCodes.Ldc_I4_S, (sbyte)n), 
+		});
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using Oxide.Core;
+using Oxide.Core.Libraries;
+using Oxide.Core.Plugins;
+using Oxide.Plugins;
+
+public class CompilableFile
+{
+	private static Timer timer = Interface.Oxide.GetLibrary<Timer>((string)null);
+
+	private static object compileLock = new object();
+
+	public CSharpExtension Extension;
+
+	public CSharpPluginLoader Loader;
+
+	public string Name;
+
+	public string Directory;
+
+	public string ScriptName;
+
+	public string ScriptPath;
+
+	public string[] ScriptLines;
+
+	public Encoding ScriptEncoding;
+
+	public HashSet<string> Requires = new HashSet<string>();
+
+	public HashSet<string> References = new HashSet<string>();
+
+	public HashSet<string> IncludePaths = new HashSet<string>();
+
+	public string CompilerErrors;
+
+	public CompiledAssembly CompiledAssembly;
+
+	public DateTime LastModifiedAt;
+
+	public DateTime LastCachedScriptAt;
+
+	public DateTime LastCompiledAt;
+
+	public bool IsCompilationNeeded;
+
+	protected Action<CSharpPlugin> LoadCallback;
+
+	protected Action<bool> CompileCallback;
+
+	protected float CompilationQueuedAt;
+
+	private TimerInstance timeoutTimer;
+
+	public byte[] ScriptSource => ScriptEncoding.GetBytes(string.Join(Environment.NewLine, ScriptLines));
+
+	public CompilableFile(CSharpExtension extension, CSharpPluginLoader loader, string directory, string name)
+	{
+		Extension = extension;
+		Loader = loader;
+		Directory = directory;
+		ScriptName = name;
+		ScriptPath = Path.Combine(Directory, ScriptName + ".cs");
+		Name = Regex.Replace(ScriptName, "_", "");
+		CheckLastModificationTime();
+	}
+
+	internal void Compile(Action<bool> callback)
+	{
+		lock (compileLock)
+		{
+			if (CompilationQueuedAt > 0f)
+			{
+				float num = Interface.Oxide.Now - CompilationQueuedAt;
+				Interface.Oxide.LogDebug($"Plugin compilation is already queued: {ScriptName} ({num:0.000} ago)", Array.Empty<object>());
+				return;
+			}
+			OnLoadingStarted();
+			if (CompiledAssembly != null && !HasBeenModified() && (CompiledAssembly.IsLoading || !CompiledAssembly.IsBatch || CompiledAssembly.CompilablePlugins.All((CompilablePlugin pl) => pl.IsLoading)))
+			{
+				callback(obj: true);
+				return;
+			}
+			IsCompilationNeeded = true;
+			CompileCallback = callback;
+			CompilationQueuedAt = Interface.Oxide.Now;
+			OnCompilationRequested();
+		}
+	}
+
+	internal virtual void OnCompilationStarted()
+	{
+		LastCompiledAt = LastModifiedAt;
+		TimerInstance obj = timeoutTimer;
+		if (obj != null)
+		{
+			obj.Destroy();
+		}
+		timeoutTimer = null;
+		Interface.Oxide.NextTick((Action)delegate
+		{
+			TimerInstance obj2 = timeoutTimer;
+			if (obj2 != null)
+			{
+				obj2.Destroy();
+			}
+			timeoutTimer = timer.Once((float)Math.Max(30, ((PluginLoader)Loader).LoadingPlugins.Count * 3), (Action)OnCompilationTimeout, (Plugin)null);
+		});
+	}
+
+	internal void OnCompilationSucceeded(CompiledAssembly compiledAssembly)
+	{
+		if (timeoutTimer == null)
+		{
+			Interface.Oxide.LogWarning("Ignored unexpected plugin compilation: " + Name, Array.Empty<object>());
+			return;
+		}
+		TimerInstance obj = timeoutTimer;
+		if (obj != null)
+		{
+			obj.Destroy();
+		}
+		timeoutTimer = null;
+		IsCompilationNeeded = false;
+		CompilationQueuedAt = 0f;
+		CompiledAssembly = compiledAssembly;
+		CompileCallback?.Invoke(obj: true);
+	}
+
+	internal void OnCompilationFailed()
+	{
+		if (timeoutTimer == null)
+		{
+			Interface.Oxide.LogWarning("Ignored unexpected plugin compilation failure: " + Name, Array.Empty<object>());
+			return;
+		}
+		TimerInstance obj = timeoutTimer;
+		if (obj != null)
+		{
+			obj.Destroy();
+		}
+		timeoutTimer = null;
+		CompilationQueuedAt = 0f;
+		LastCompiledAt = default(DateTime);
+		CompileCallback?.Invoke(obj: false);
+		IsCompilationNeeded = false;
+	}
+
+	internal void OnCompilationTimeout()
+	{
+		Interface.Oxide.LogError("Timed out waiting for plugin to be compiled: " + Name, Array.Empty<object>());
+		CompilerErrors = "Timed out waiting for compilation";
+		OnCompilationFailed();
+	}
+
+	internal bool HasBeenModified()
+	{
+		DateTime lastModifiedAt = LastModifiedAt;
+		CheckLastModificationTime();
+		return LastModifiedAt != lastModifiedAt;
+	}
+
+	internal void CheckLastModificationTime()
+	{
+		if (!File.Exists(ScriptPath))
+		{
+			LastModifiedAt = default(DateTime);
+			return;
+		}
+		DateTime lastModificationTime = GetLastModificationTime();
+		if (lastModificationTime != default(DateTime))
+		{
+			LastModifiedAt = lastModificationTime;
+		}
+	}
+
+	internal DateTime GetLastModificationTime()
+	{
+		try
+		{
+			return File.GetLastWriteTime(ScriptPath);
+		}
+		catch (IOException ex)
+		{
+			Interface.Oxide.LogError("IOException while checking plugin: {0} ({1})", new object[2] { ScriptName, ex.Message });
+			return default(DateTime);
+		}
+	}
+
+	protected virtual void OnLoadingStarted()
+	{
+	}
+
+	protected virtual void OnCompilationRequested()
+	{
+	}
+
+	protected virtual void InitFailed(string message = null)
+	{
+		if (message != null)
+		{
+			Interface.Oxide.LogError(message, Array.Empty<object>());
+		}
+		LoadCallback?.Invoke(null);
+	}
+}
+
+
+using System;
+using System.Reflection;
+using Oxide.Core;
+using Oxide.Core.Plugins;
+using Oxide.Plugins;
+
+public class CompilablePlugin : CompilableFile
+{
+	private static object compileLock = new object();
+
+	public CompiledAssembly LastGoodAssembly;
+
+	public bool IsLoading;
+
+	public CompilablePlugin(CSharpExtension extension, CSharpPluginLoader loader, string directory, string name)
+		: base(extension, loader, directory, name)
+	{
+	}
+
+	protected override void OnLoadingStarted()
+	{
+		Loader.PluginLoadingStarted(this);
+	}
+
+	protected override void OnCompilationRequested()
+	{
+		Loader.CompilationRequested(this);
+	}
+
+	internal void LoadPlugin(Action<CSharpPlugin> callback = null)
+	{
+		if (CompiledAssembly == null)
+		{
+			Interface.Oxide.LogError("Load called before a compiled assembly exists: {0}", new object[1] { Name });
+			return;
+		}
+		LoadCallback = callback;
+		CompiledAssembly.LoadAssembly(delegate(bool loaded)
+		{
+			if (!loaded)
+			{
+				callback?.Invoke(null);
+			}
+			else if (CompilerErrors != null)
+			{
+				InitFailed("Unable to load " + ScriptName + ". " + CompilerErrors);
+			}
+			else
+			{
+				Type type = CompiledAssembly.LoadedAssembly.GetType("Oxide.Plugins." + Name);
+				if (type == null)
+				{
+					InitFailed("Unable to find main plugin class: " + Name);
+				}
+				else if (!typeof(CSharpPlugin).IsAssignableFrom(type))
+				{
+					InitFailed("Main plugin class is not assignable to `CSharpPlugin`");
+				}
+				else
+				{
+					CSharpPlugin cSharpPlugin;
+					try
+					{
+						cSharpPlugin = Activator.CreateInstance(type) as CSharpPlugin;
+					}
+					catch (MissingMethodException)
+					{
+						InitFailed("Main plugin class should not have a constructor defined: " + Name);
+						return;
+					}
+					catch (TargetInvocationException ex2)
+					{
+						Exception innerException = ex2.InnerException;
+						InitFailed($"Unable to load {ScriptName}. {innerException}");
+						return;
+					}
+					catch (Exception arg)
+					{
+						InitFailed($"Unable to load {ScriptName}. {arg}");
+						return;
+					}
+					if (cSharpPlugin == null)
+					{
+						InitFailed("Plugin assembly failed to load: " + ScriptName);
+					}
+					else if (!cSharpPlugin.SetPluginInfo(ScriptName, ScriptPath))
+					{
+						InitFailed();
+					}
+					else
+					{
+						cSharpPlugin.Watcher = Extension.Watcher;
+						((Plugin)cSharpPlugin).Loader = (PluginLoader)(object)Loader;
+						if (!Interface.Oxide.PluginLoaded((Plugin)(object)cSharpPlugin))
+						{
+							InitFailed();
+						}
+						else
+						{
+							if (!CompiledAssembly.IsBatch)
+							{
+								LastGoodAssembly = CompiledAssembly;
+							}
+							callback?.Invoke(cSharpPlugin);
+						}
+					}
+				}
+			}
+		});
+	}
+
+	internal override void OnCompilationStarted()
+	{
+		base.OnCompilationStarted();
+		foreach (Plugin plugin in Interface.Oxide.RootPluginManager.GetPlugins())
+		{
+			if (plugin is CSharpPlugin)
+			{
+				CompilablePlugin compilablePlugin = CSharpPluginLoader.GetCompilablePlugin(Directory, plugin.Name);
+				if (compilablePlugin.Requires.Contains(Name))
+				{
+					compilablePlugin.CompiledAssembly = null;
+					Loader.Load(compilablePlugin);
+				}
+			}
+		}
+	}
+
+	protected override void InitFailed(string message = null)
+	{
+		base.InitFailed(message);
+		if (LastGoodAssembly == null)
+		{
+			Interface.Oxide.LogInfo("No previous version to rollback plugin: {0}", new object[1] { ScriptName });
+			return;
+		}
+		if (CompiledAssembly == LastGoodAssembly)
+		{
+			Interface.Oxide.LogInfo("Previous version of plugin failed to load: {0}", new object[1] { ScriptName });
+			return;
+		}
+		Interface.Oxide.LogInfo("Rolling back plugin to last good version: {0}", new object[1] { ScriptName });
+		CompiledAssembly = LastGoodAssembly;
+		CompilerErrors = null;
+		LoadPlugin();
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text.RegularExpressions;
+using System.Threading;
+using ObjectStream.Data;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.Extensions;
+using Oxide.Core.Logging;
+using Oxide.Core.Plugins;
+using Oxide.Logging;
+using Oxide.Plugins;
+
+internal class Compilation
+{
+	public static Compilation Current;
+
+	internal int id;
+
+	internal string name;
+
+	internal Action<Compilation> callback;
+
+	internal ConcurrentHashSet<CompilablePlugin> queuedPlugins;
+
+	internal HashSet<CompilablePlugin> plugins = new HashSet<CompilablePlugin>();
+
+	internal float startedAt;
+
+	internal float endedAt;
+
+	internal Hash<string, CompilerFile> references = new Hash<string, CompilerFile>();
+
+	internal HashSet<string> referencedPlugins = new HashSet<string>();
+
+	internal CompiledAssembly compiledAssembly;
+
+	private string includePath;
+
+	private string[] extensionNames;
+
+	internal float duration => endedAt - startedAt;
+
+	internal Compilation(int id, Action<Compilation> callback, CompilablePlugin[] plugins)
+	{
+		this.id = id;
+		this.callback = callback;
+		queuedPlugins = new ConcurrentHashSet<CompilablePlugin>((ICollection<CompilablePlugin>)plugins);
+		if (Current == null)
+		{
+			Current = this;
+		}
+		foreach (CompilablePlugin obj in plugins)
+		{
+			obj.CompilerErrors = null;
+			obj.OnCompilationStarted();
+		}
+		includePath = Path.Combine(Interface.Oxide.PluginDirectory, "include");
+		extensionNames = (from ext in Interface.Oxide.GetAllExtensions()
+			select ext.Name).ToArray();
+	}
+
+	internal void Started()
+	{
+		name = ((plugins.Count < 2) ? plugins.First().Name : "plugins_") + Math.Round(Interface.Oxide.Now * 10000000f) + ".dll";
+	}
+
+	internal void Completed(byte[] rawAssembly = null, byte[] symbols = null)
+	{
+		endedAt = Interface.Oxide.Now;
+		if (plugins.Count > 0 && rawAssembly != null)
+		{
+			compiledAssembly = new CompiledAssembly(name, plugins.ToArray(), rawAssembly, duration, symbols);
+		}
+		Interface.Oxide.NextTick((Action)delegate
+		{
+			callback(this);
+		});
+	}
+
+	internal void Add(CompilablePlugin plugin)
+	{
+		if (!queuedPlugins.Add(plugin))
+		{
+			return;
+		}
+		plugin.Loader.PluginLoadingStarted(plugin);
+		plugin.CompilerErrors = null;
+		plugin.OnCompilationStarted();
+		foreach (Plugin item in from pl in Interface.Oxide.RootPluginManager.GetPlugins()
+			where pl is CSharpPlugin
+			select pl)
+		{
+			CompilablePlugin compilablePlugin = CSharpPluginLoader.GetCompilablePlugin(plugin.Directory, item.Name);
+			if (compilablePlugin.Requires.Contains(plugin.Name))
+			{
+				AddDependency(compilablePlugin);
+			}
+		}
+	}
+
+	internal bool IncludesRequiredPlugin(string name)
+	{
+		if (referencedPlugins.Contains(name))
+		{
+			return true;
+		}
+		CompilablePlugin compilablePlugin = plugins.SingleOrDefault((CompilablePlugin pl) => pl.Name == name);
+		if (compilablePlugin != null)
+		{
+			return compilablePlugin.CompilerErrors == null;
+		}
+		return false;
+	}
+
+	internal void Prepare(Action callback)
+	{
+		ThreadPool.QueueUserWorkItem(delegate
+		{
+			try
+			{
+				referencedPlugins.Clear();
+				references.Clear();
+				foreach (string pluginReference in CSharpPluginLoader.PluginReferences)
+				{
+					bool flag = true;
+					if (File.Exists(Path.Combine(Interface.Oxide.ExtensionDirectory, pluginReference + ".dll")))
+					{
+						references[pluginReference + ".dll"] = CompilerFile.CachedReadFile(Interface.Oxide.ExtensionDirectory, pluginReference + ".dll");
+					}
+					else if (File.Exists(Path.Combine(Interface.Oxide.ExtensionDirectory, pluginReference + ".exe")))
+					{
+						references[pluginReference + ".exe"] = CompilerFile.CachedReadFile(Interface.Oxide.ExtensionDirectory, pluginReference + ".exe");
+					}
+					else if (File.Exists(Path.Combine(Interface.Oxide.RootDirectory, pluginReference + ".exe")))
+					{
+						references[pluginReference + ".exe"] = CompilerFile.CachedReadFile(Interface.Oxide.RootDirectory, pluginReference + ".exe");
+					}
+					else
+					{
+						flag = false;
+					}
+					if (!flag)
+					{
+						((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)1, LogEvent.Compile, "CSharp", "Failed to add default reference: " + pluginReference + " - Not found!");
+					}
+				}
+				((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)2, LogEvent.Compile, "CSharp", "Preparing compilation");
+				List<CompilablePlugin> list = new List<CompilablePlugin>();
+				CompilablePlugin compilablePlugin = default(CompilablePlugin);
+				while (queuedPlugins.TryDequeue(ref compilablePlugin))
+				{
+					if (Current == null)
+					{
+						Current = this;
+					}
+					if (!CacheScriptLines(compilablePlugin) || compilablePlugin.ScriptLines.Length < 1)
+					{
+						compilablePlugin.References.Clear();
+						compilablePlugin.IncludePaths.Clear();
+						compilablePlugin.Requires.Clear();
+						((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)1, LogEvent.Compile, "CSharp", "Script file is empty: " + compilablePlugin.Name);
+						RemovePlugin(compilablePlugin);
+					}
+					if (!list.Contains(compilablePlugin))
+					{
+						list.Add(compilablePlugin);
+						PreparseScript(compilablePlugin);
+						ResolveReferences(compilablePlugin);
+					}
+					else
+					{
+						((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)1, LogEvent.Compile, "CSharp", "Plugin is already part of the compilation: " + compilablePlugin.Name);
+					}
+					CacheModifiedScripts();
+					if (queuedPlugins.Count == 0 && Current == this)
+					{
+						Current = null;
+					}
+				}
+				list.Sort((CompilablePlugin x, CompilablePlugin y) => string.Compare(x.Name, y.Name, StringComparison.Ordinal));
+				foreach (CompilablePlugin item in list)
+				{
+					if (!plugins.Add(item))
+					{
+						((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)1, LogEvent.Compile, "CSharp", "Failed to add plugin to compilation: " + item.Name);
+					}
+					else
+					{
+						((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)2, LogEvent.Compile, "CSharp", "Added plugin to compilation: " + item.Name);
+					}
+				}
+				((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)2, LogEvent.Compile, "CSharp", "Done preparing compilation: " + ExtensionMethods.ToSentence<string>(plugins.Select((CompilablePlugin p) => p.Name)));
+				callback();
+			}
+			catch (Exception ex)
+			{
+				Interface.Oxide.LogException("Exception while resolving plugin references", ex);
+			}
+		});
+	}
+
+	private void PreparseScript(CompilablePlugin plugin)
+	{
+		plugin.References.Clear();
+		plugin.IncludePaths.Clear();
+		plugin.Requires.Clear();
+		bool flag = false;
+		for (int i = 0; i < plugin.ScriptLines.Length; i++)
+		{
+			string text = plugin.ScriptLines[i].Trim();
+			if (text.IndexOf("namespace uMod.Plugins", StringComparison.InvariantCultureIgnoreCase) >= 0)
+			{
+				Interface.Oxide.LogError("Plugin " + plugin.ScriptName + ".cs is a uMod plugin, not an Oxide plugin. Please downgrade to the Oxide version if available.", Array.Empty<object>());
+				plugin.CompilerErrors = "Plugin " + plugin.ScriptName + ".cs is a uMod plugin, not an Oxide plugin. Please downgrade to the Oxide version if available.";
+				RemovePlugin(plugin);
+				break;
+			}
+			if (text.Length < 1)
+			{
+				continue;
+			}
+			Match match;
+			if (flag)
+			{
+				match = Regex.Match(text, "^\\s*\\{?\\s*$", RegexOptions.IgnoreCase);
+				if (match.Success)
+				{
+					continue;
+				}
+				match = Regex.Match(text, "^\\s*\\[", RegexOptions.IgnoreCase);
+				if (match.Success)
+				{
+					continue;
+				}
+				match = Regex.Match(text, "^\\s*(?:public|private|protected|internal)?\\s*class\\s+(\\S+)\\s+\\:\\s+\\S+Plugin\\s*$", RegexOptions.IgnoreCase);
+				if (match.Success)
+				{
+					string value = match.Groups[1].Value;
+					if (value != plugin.Name)
+					{
+						Interface.Oxide.LogError("Plugin filename " + plugin.ScriptName + ".cs must match the main class " + value + " (should be " + value + ".cs)", Array.Empty<object>());
+						plugin.CompilerErrors = "Plugin filename " + plugin.ScriptName + ".cs must match the main class " + value + " (should be " + value + ".cs)";
+						RemovePlugin(plugin);
+					}
+				}
+				break;
+			}
+			match = Regex.Match(text, "^//\\s*Requires:\\s*(\\S+?)(\\.cs)?\\s*$", RegexOptions.IgnoreCase);
+			if (match.Success)
+			{
+				string value2 = match.Groups[1].Value;
+				plugin.Requires.Add(value2);
+				if (!File.Exists(Path.Combine(plugin.Directory, value2 + ".cs")))
+				{
+					Interface.Oxide.LogError(plugin.Name + " plugin requires missing dependency: " + value2, Array.Empty<object>());
+					plugin.CompilerErrors = "Missing dependency: " + value2;
+					RemovePlugin(plugin);
+					break;
+				}
+				CompilablePlugin compilablePlugin = CSharpPluginLoader.GetCompilablePlugin(plugin.Directory, value2);
+				AddDependency(compilablePlugin);
+				continue;
+			}
+			match = Regex.Match(text, "^//\\s*Reference:\\s*(\\S+)\\s*$", RegexOptions.IgnoreCase);
+			if (match.Success)
+			{
+				string value3 = match.Groups[1].Value;
+				if (!value3.StartsWith("Oxide.") && !value3.Contains("Newtonsoft.Json") && !value3.Contains("protobuf-net"))
+				{
+					AddReference(plugin, value3);
+					Interface.Oxide.LogInfo("Added '// Reference: {0}' in plugin '{1}'", new object[2] { value3, plugin.Name });
+				}
+				else
+				{
+					Interface.Oxide.LogWarning("Ignored unnecessary '// Reference: {0}' in plugin '{1}'", new object[2] { value3, plugin.Name });
+				}
+				continue;
+			}
+			match = Regex.Match(text, "^\\s*using\\s+(Oxide\\.(?:Core|Ext|Game)\\.(?:[^\\.]+))[^;]*;.*$", RegexOptions.IgnoreCase);
+			if (match.Success)
+			{
+				string value4 = match.Groups[1].Value;
+				string text2 = Regex.Replace(value4, "Oxide\\.[\\w]+\\.([\\w]+)", "Oxide.$1");
+				if (!string.IsNullOrEmpty(text2) && File.Exists(Path.Combine(Interface.Oxide.ExtensionDirectory, text2 + ".dll")))
+				{
+					AddReference(plugin, text2);
+				}
+				else
+				{
+					AddReference(plugin, value4);
+				}
+			}
+			else
+			{
+				match = Regex.Match(text, "^\\s*namespace Oxide\\.Plugins\\s*(\\{\\s*)?$", RegexOptions.IgnoreCase);
+				if (match.Success)
+				{
+					flag = true;
+				}
+			}
+		}
+	}
+
+	private void ResolveReferences(CompilablePlugin plugin)
+	{
+		foreach (string reference in plugin.References)
+		{
+			Match match = Regex.Match(reference, "^(Oxide\\.(?:Ext|Game)\\.(.+))$", RegexOptions.IgnoreCase);
+			if (!match.Success)
+			{
+				continue;
+			}
+			string value = match.Groups[1].Value;
+			string value2 = match.Groups[2].Value;
+			if (ExtensionMethods.Contains<string>(extensionNames, value2))
+			{
+				continue;
+			}
+			if (Directory.Exists(includePath))
+			{
+				string text = Path.Combine(includePath, "Ext." + value2 + ".cs");
+				if (File.Exists(text))
+				{
+					plugin.IncludePaths.Add(text);
+					continue;
+				}
+			}
+			string text2 = value + " is referenced by " + plugin.Name + " plugin but is not loaded";
+			Interface.Oxide.LogError(text2, Array.Empty<object>());
+			plugin.CompilerErrors = text2;
+			RemovePlugin(plugin);
+		}
+	}
+
+	private void AddDependency(CompilablePlugin plugin)
+	{
+		if (plugin.IsLoading || plugins.Contains(plugin) || queuedPlugins.Contains(plugin))
+		{
+			return;
+		}
+		CompiledAssembly compiledAssembly = plugin.CompiledAssembly;
+		if (compiledAssembly != null && !compiledAssembly.IsOutdated())
+		{
+			referencedPlugins.Add(plugin.Name);
+			if (!references.ContainsKey(compiledAssembly.Name))
+			{
+				references[compiledAssembly.Name] = new CompilerFile(compiledAssembly.Name, compiledAssembly.RawAssembly);
+			}
+		}
+		else
+		{
+			Add(plugin);
+		}
+	}
+
+	private void AddReference(CompilablePlugin plugin, string assemblyName)
+	{
+		if (!File.Exists(Path.Combine(Interface.Oxide.ExtensionDirectory, assemblyName + ".dll")))
+		{
+			if (assemblyName.StartsWith("Oxide."))
+			{
+				plugin.References.Add(assemblyName);
+				return;
+			}
+			Interface.Oxide.LogError("Assembly referenced by " + plugin.Name + " plugin does not exist: " + assemblyName + ".dll", Array.Empty<object>());
+			plugin.CompilerErrors = "Referenced assembly does not exist: " + assemblyName;
+			RemovePlugin(plugin);
+			return;
+		}
+		Assembly assembly;
+		try
+		{
+			assembly = Assembly.Load(assemblyName);
+		}
+		catch (FileNotFoundException)
+		{
+			Interface.Oxide.LogError("Assembly referenced by " + plugin.Name + " plugin is invalid: " + assemblyName + ".dll", Array.Empty<object>());
+			plugin.CompilerErrors = "Referenced assembly is invalid: " + assemblyName;
+			RemovePlugin(plugin);
+			return;
+		}
+		AddReference(plugin, assembly.GetName());
+		AssemblyName[] referencedAssemblies = assembly.GetReferencedAssemblies();
+		foreach (AssemblyName assemblyName2 in referencedAssemblies)
+		{
+			if (!assemblyName2.Name.StartsWith("Newtonsoft.Json") && !assemblyName2.Name.StartsWith("Rust.Workshop"))
+			{
+				if (!File.Exists(Path.Combine(Interface.Oxide.ExtensionDirectory, assemblyName2.Name + ".dll")))
+				{
+					Interface.Oxide.LogWarning("Reference " + assemblyName2.Name + ".dll from " + assembly.GetName().Name + ".dll not found", Array.Empty<object>());
+				}
+				else
+				{
+					AddReference(plugin, assemblyName2);
+				}
+			}
+		}
+	}
+
+	private void AddReference(CompilablePlugin plugin, AssemblyName reference)
+	{
+		string text = reference.Name + ".dll";
+		if (!references.ContainsKey(text))
+		{
+			((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)2, LogEvent.Compile, "CSharp", reference.Name + " has been added as a reference");
+			references[text] = CompilerFile.CachedReadFile(Interface.Oxide.ExtensionDirectory, text);
+		}
+		if (!plugin.References.Contains(reference.Name))
+		{
+			plugin.References.Add(reference.Name);
+		}
+	}
+
+	private bool CacheScriptLines(CompilablePlugin plugin)
+	{
+		bool flag = false;
+		while (true)
+		{
+			try
+			{
+				if (!File.Exists(plugin.ScriptPath))
+				{
+					Interface.Oxide.LogWarning("Script no longer exists: {0}", new object[1] { plugin.Name });
+					plugin.CompilerErrors = "Plugin file was deleted";
+					RemovePlugin(plugin);
+					return false;
+				}
+				plugin.CheckLastModificationTime();
+				if (plugin.LastCachedScriptAt != plugin.LastModifiedAt)
+				{
+					using (StreamReader streamReader = File.OpenText(plugin.ScriptPath))
+					{
+						List<string> list = new List<string>();
+						while (!streamReader.EndOfStream)
+						{
+							list.Add(streamReader.ReadLine());
+						}
+						plugin.ScriptLines = list.ToArray();
+						plugin.ScriptEncoding = streamReader.CurrentEncoding;
+					}
+					plugin.LastCachedScriptAt = plugin.LastModifiedAt;
+					if (plugins.Remove(plugin))
+					{
+						queuedPlugins.Add(plugin);
+					}
+				}
+				return true;
+			}
+			catch (IOException)
+			{
+				if (!flag)
+				{
+					flag = true;
+					Interface.Oxide.LogWarning("Waiting for another application to stop using script: {0}", new object[1] { plugin.Name });
+				}
+				Thread.Sleep(50);
+			}
+		}
+	}
+
+	private void CacheModifiedScripts()
+	{
+		CompilablePlugin[] array = plugins.Where((CompilablePlugin pl) => pl.ScriptLines == null || pl.HasBeenModified() || pl.LastCachedScriptAt != pl.LastModifiedAt).ToArray();
+		if (array.Length >= 1)
+		{
+			CompilablePlugin[] array2 = array;
+			foreach (CompilablePlugin plugin in array2)
+			{
+				CacheScriptLines(plugin);
+			}
+			Thread.Sleep(100);
+			CacheModifiedScripts();
+		}
+	}
+
+	private void RemovePlugin(CompilablePlugin plugin)
+	{
+		if (plugin.LastCompiledAt == default(DateTime))
+		{
+			return;
+		}
+		queuedPlugins.Remove(plugin);
+		plugins.Remove(plugin);
+		plugin.OnCompilationFailed();
+		CompilablePlugin[] array = plugins.Where((CompilablePlugin pl) => !pl.IsCompilationNeeded && plugin.Requires.Contains(pl.Name)).ToArray();
+		foreach (CompilablePlugin requiredPlugin in array)
+		{
+			if (!plugins.Any((CompilablePlugin pl) => pl.Requires.Contains(requiredPlugin.Name)))
+			{
+				RemovePlugin(requiredPlugin);
+			}
+		}
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
+using Mono.Cecil;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.CSharp;
+using Oxide.Core.Logging;
+using Oxide.CSharp;
+using Oxide.Logging;
+using Oxide.Plugins;
+
+public class CompiledAssembly
+{
+	public CompilablePlugin[] CompilablePlugins;
+
+	public string[] PluginNames;
+
+	public string Name;
+
+	public DateTime CompiledAt;
+
+	public byte[] RawAssembly;
+
+	public byte[] Symbols;
+
+	public byte[] PatchedAssembly;
+
+	public float Duration;
+
+	public Assembly LoadedAssembly;
+
+	public bool IsLoading;
+
+	private List<Action<bool>> loadCallbacks = new List<Action<bool>>();
+
+	private bool isPatching;
+
+	private bool isLoaded;
+
+	public bool IsBatch => CompilablePlugins.Length > 1;
+
+	public CompiledAssembly(string name, CompilablePlugin[] plugins, byte[] rawAssembly, float duration, byte[] symbols)
+	{
+		Name = name;
+		CompilablePlugins = plugins;
+		RawAssembly = rawAssembly;
+		Duration = duration;
+		PluginNames = CompilablePlugins.Select((CompilablePlugin pl) => pl.Name).ToArray();
+		Symbols = symbols;
+	}
+
+	public void LoadAssembly(Action<bool> callback)
+	{
+		if (isLoaded)
+		{
+			callback(obj: true);
+			return;
+		}
+		IsLoading = true;
+		loadCallbacks.Add(callback);
+		if (isPatching)
+		{
+			return;
+		}
+		ValidateAssembly(delegate(byte[] rawAssembly)
+		{
+			if (rawAssembly == null)
+			{
+				foreach (Action<bool> loadCallback in loadCallbacks)
+				{
+					loadCallback(obj: true);
+				}
+				loadCallbacks.Clear();
+				IsLoading = false;
+			}
+			else
+			{
+				LoadedAssembly = Assembly.Load(rawAssembly);
+				isLoaded = true;
+				foreach (Action<bool> loadCallback2 in loadCallbacks)
+				{
+					loadCallback2(obj: true);
+				}
+				loadCallbacks.Clear();
+				IsLoading = false;
+			}
+		});
+	}
+
+	private void ValidateAssembly(Action<byte[]> callback)
+	{
+		if (isPatching)
+		{
+			((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)3, LogEvent.Compile, "CSharp", "Already patching plugin assembly: " + ExtensionMethods.ToSentence<string>((IEnumerable<string>)PluginNames) + " (ignoring)");
+			return;
+		}
+		isPatching = true;
+		ThreadPool.QueueUserWorkItem(delegate
+		{
+			//IL_0002: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0007: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0013: Expected O, but got Unknown
+			//IL_029a: Unknown result type (might be due to invalid IL or missing references)
+			//IL_029f: Unknown result type (might be due to invalid IL or missing references)
+			//IL_02ab: Expected O, but got Unknown
+			try
+			{
+				AssemblyDefinition val = null;
+				ReaderParameters val2 = new ReaderParameters
+				{
+					AssemblyResolver = (IAssemblyResolver)(object)new AssemblyResolver()
+				};
+				using (MemoryStream memoryStream = new MemoryStream(RawAssembly))
+				{
+					val = AssemblyDefinition.ReadAssembly((Stream)memoryStream, val2);
+				}
+				int num = 0;
+				int num2 = CompilablePlugins.Count((CompilablePlugin p) => p.CompilerErrors == null);
+				for (int i = 0; i < val.MainModule.Types.Count; i++)
+				{
+					if (num == num2)
+					{
+						((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)2, LogEvent.Compile, "CSharp", $"Patched {num} of {num2} plugins");
+						break;
+					}
+					try
+					{
+						TypeDefinition type = val.MainModule.Types[i];
+						if (!(((TypeReference)type).Namespace != "Oxide.Plugins") && ExtensionMethods.Contains<string>(PluginNames, ((MemberReference)type).Name))
+						{
+							num++;
+							((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)2, LogEvent.Compile, "CSharp", "Preparing " + ((MemberReference)type).Name + " for runtime patching. . .");
+							if (((IEnumerable<MethodDefinition>)type.Methods).FirstOrDefault((Func<MethodDefinition, bool>)((MethodDefinition m) => !m.IsStatic && m.IsConstructor && !((MethodReference)m).HasParameters && !m.IsPublic)) != null)
+							{
+								((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)1, LogEvent.Compile, "CSharp", "User defined constructors are not supported. Please remove the constructor from " + ((MemberReference)type).Name + ".cs");
+								CompilablePlugin compilablePlugin = CompilablePlugins.SingleOrDefault((CompilablePlugin p) => p.Name == ((MemberReference)type).Name);
+								if (compilablePlugin != null)
+								{
+									compilablePlugin.CompilerErrors = "Primary constructor in main class must be public";
+								}
+							}
+							else
+							{
+								((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)2, LogEvent.Compile, "CSharp", "Patching DirectCallMethod on " + ((MemberReference)type).Name);
+								new DirectCallMethod(val.MainModule, type, val2);
+							}
+						}
+					}
+					catch (Exception exception)
+					{
+						((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)1, LogEvent.Compile, "CSharp", $"Failed to patch type at index {i}", exception);
+					}
+				}
+				using (MemoryStream memoryStream2 = new MemoryStream())
+				{
+					val.Write((Stream)memoryStream2, new WriterParameters
+					{
+						WriteSymbols = false
+					});
+					PatchedAssembly = memoryStream2.ToArray();
+				}
+				Interface.Oxide.NextTick((Action)delegate
+				{
+					isPatching = false;
+					callback(PatchedAssembly);
+				});
+			}
+			catch (Exception ex)
+			{
+				Exception ex2 = ex;
+				Exception ex3 = ex2;
+				Interface.Oxide.NextTick((Action)delegate
+				{
+					isPatching = false;
+					((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)3, LogEvent.Compile, "CSharp", "Failed to patch DirectCallHook method on plugins " + ExtensionMethods.ToSentence<string>((IEnumerable<string>)PluginNames) + ", performance may be degraded.", ex3);
+					callback(RawAssembly);
+				});
+			}
+		});
+	}
+
+	public bool IsOutdated()
+	{
+		return CompilablePlugins.Any((CompilablePlugin pl) => pl.GetLastModificationTime() != CompiledAt);
+	}
+}
+
+
+using System;
+
+[AttributeUsage(AttributeTargets.Method)]
+public class CommandAttribute : Attribute
+{
+	public string[] Commands { get; }
+
+	public CommandAttribute(params string[] commands)
+	{
+		Commands = commands;
+	}
+}
+
+
+using System;
+
+[AttributeUsage(AttributeTargets.Method)]
+public class PermissionAttribute : Attribute
+{
+	public string[] Permission { get; }
+
+	public PermissionAttribute(string permission)
+	{
+		Permission = new string[1] { permission };
+	}
+}
+
+
+using System.Reflection;
+using Oxide.Core;
+using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Plugins;
+using Oxide.Plugins;
+
+public class CovalencePlugin : CSharpPlugin
+{
+	private new static readonly Covalence covalence = Interface.Oxide.GetLibrary<Covalence>((string)null);
+
+	protected string game = covalence.Game;
+
+	protected IPlayerManager players = covalence.Players;
+
+	protected IServer server = covalence.Server;
+
+	protected void Log(string format, params object[] args)
+	{
+		Interface.Oxide.LogInfo("[{0}] {1}", new object[2]
+		{
+			((Plugin)this).Title,
+			(args.Length != 0) ? string.Format(format, args) : format
+		});
+	}
+
+	protected void LogWarning(string format, params object[] args)
+	{
+		Interface.Oxide.LogWarning("[{0}] {1}", new object[2]
+		{
+			((Plugin)this).Title,
+			(args.Length != 0) ? string.Format(format, args) : format
+		});
+	}
+
+	protected void LogError(string format, params object[] args)
+	{
+		Interface.Oxide.LogError("[{0}] {1}", new object[2]
+		{
+			((Plugin)this).Title,
+			(args.Length != 0) ? string.Format(format, args) : format
+		});
+	}
+
+	public override void HandleAddedToManager(PluginManager manager)
+	{
+		//IL_009c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00a6: Expected O, but got Unknown
+		MethodInfo[] methods = ((object)this).GetType().GetMethods(BindingFlags.Instance | BindingFlags.NonPublic);
+		foreach (MethodInfo method in methods)
+		{
+			object[] customAttributes = method.GetCustomAttributes(typeof(CommandAttribute), inherit: true);
+			object[] customAttributes2 = method.GetCustomAttributes(typeof(PermissionAttribute), inherit: true);
+			if (customAttributes.Length == 0)
+			{
+				continue;
+			}
+			CommandAttribute commandAttribute = customAttributes[0] as CommandAttribute;
+			PermissionAttribute permissionAttribute = ((customAttributes2.Length == 0) ? null : (customAttributes2[0] as PermissionAttribute));
+			if (commandAttribute != null)
+			{
+				((Plugin)this).AddCovalenceCommand(commandAttribute.Commands, permissionAttribute?.Permission, (CommandCallback)delegate(IPlayer caller, string command, string[] args)
+				{
+					((Plugin)this).CallHook(method.Name, new object[3] { caller, command, args });
+					return true;
+				});
+			}
+		}
+		base.HandleAddedToManager(manager);
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using Oxide.Core;
+using Oxide.Core.Extensions;
+using Oxide.Core.Plugins;
+using Oxide.Core.Plugins.Watchers;
+using Oxide.Plugins;
+
+public class CSharpExtension : Extension
+{
+	internal static Assembly Assembly = Assembly.GetExecutingAssembly();
+
+	internal static AssemblyName AssemblyName = Assembly.GetName();
+
+	internal static VersionNumber AssemblyVersion = new VersionNumber(AssemblyName.Version.Major, AssemblyName.Version.Minor, AssemblyName.Version.Build);
+
+	internal static string AssemblyAuthors = ((AssemblyCompanyAttribute)Attribute.GetCustomAttribute(Assembly, typeof(AssemblyCompanyAttribute), inherit: false)).Company;
+
+	private CSharpPluginLoader loader;
+
+	public override bool IsCoreExtension => true;
+
+	public override string Name => "CSharp";
+
+	public override string Author => AssemblyAuthors;
+
+	public override VersionNumber Version => AssemblyVersion;
+
+	public FSWatcher Watcher { get; private set; }
+
+	public CSharpExtension(ExtensionManager manager)
+		: base(manager)
+	{
+		if (Environment.OSVersion.Platform == PlatformID.Unix)
+		{
+			string extensionDirectory = Interface.Oxide.ExtensionDirectory;
+			string path = Path.Combine(extensionDirectory, "Oxide.References.dll.config");
+			if (!File.Exists(path) || new string[2] { "target=\"x64", "target=\"./x64" }.Any(File.ReadAllText(path).Contains))
+			{
+				File.WriteAllText(path, "<configuration>\n<dllmap dll=\"MonoPosixHelper\" target=\"" + extensionDirectory + "/x86/libMonoPosixHelper.so\" os=\"!windows,osx\" wordsize=\"32\" />\n<dllmap dll=\"MonoPosixHelper\" target=\"" + extensionDirectory + "/x64/libMonoPosixHelper.so\" os=\"!windows,osx\" wordsize=\"64\" />\n</configuration>");
+			}
+		}
+	}
+
+	public override void Load()
+	{
+		loader = new CSharpPluginLoader(this);
+		((Extension)this).Manager.RegisterPluginLoader((PluginLoader)(object)loader);
+		Interface.Oxide.OnFrame((Action<float>)OnFrame);
+	}
+
+	public override void LoadPluginWatchers(string pluginDirectory)
+	{
+		//IL_0007: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0011: Expected O, but got Unknown
+		Watcher = new FSWatcher(pluginDirectory, "*.cs");
+		((Extension)this).Manager.RegisterPluginChangeWatcher((PluginChangeWatcher)(object)Watcher);
+	}
+
+	public override void OnModLoad()
+	{
+		loader.OnModLoaded();
+	}
+
+	public override void OnShutdown()
+	{
+		((Extension)this).OnShutdown();
+		loader.OnShutdown();
+	}
+
+	private void OnFrame(float delta)
+	{
+		object[] array = new object[1] { delta };
+		foreach (KeyValuePair<string, Plugin> loadedPlugin in ((PluginLoader)loader).LoadedPlugins)
+		{
+			if (loadedPlugin.Value is CSharpPlugin { HookedOnFrame: not false } cSharpPlugin)
+			{
+				((Plugin)cSharpPlugin).CallHook("OnFrame", array);
+			}
+		}
+	}
+}
+
+
+using System;
+
+public class PluginLoadFailure : Exception
+{
+	public PluginLoadFailure(string reason)
+	{
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Oxide.Core;
+
+[AttributeUsage(AttributeTargets.Class)]
+public class InfoAttribute : Attribute
+{
+	public string Title { get; }
+
+	public string Author { get; }
+
+	public VersionNumber Version { get; private set; }
+
+	public int ResourceId { get; set; }
+
+	public InfoAttribute(string Title, string Author, string Version)
+	{
+		this.Title = Title;
+		this.Author = Author;
+		SetVersion(Version);
+	}
+
+	public InfoAttribute(string Title, string Author, double Version)
+	{
+		this.Title = Title;
+		this.Author = Author;
+		SetVersion(Version.ToString());
+	}
+
+	private void SetVersion(string version)
+	{
+		//IL_00ab: Unknown result type (might be due to invalid IL or missing references)
+		ushort result;
+		List<ushort> list = (from part in version.Split(new char[1] { '.' })
+			select (ushort)(ushort.TryParse(part, out result) ? result : 0)).ToList();
+		while (list.Count < 3)
+		{
+			list.Add(0);
+		}
+		if (list.Count > 3)
+		{
+			Interface.Oxide.LogWarning("Version `" + version + "` is invalid for " + Title + ", should be `major.minor.patch`", Array.Empty<object>());
+		}
+		Version = new VersionNumber((int)list[0], (int)list[1], (int)list[2]);
+	}
+}
+
+
+using System;
+
+[AttributeUsage(AttributeTargets.Class)]
+public class DescriptionAttribute : Attribute
+{
+	public string Description { get; }
+
+	public DescriptionAttribute(string description)
+	{
+		Description = description;
+	}
+}
+
+
+using System;
+
+[AttributeUsage(AttributeTargets.Property | AttributeTargets.Field)]
+public class PluginReferenceAttribute : Attribute
+{
+	public string Name { get; }
+
+	public PluginReferenceAttribute()
+	{
+	}
+
+	public PluginReferenceAttribute(string name)
+	{
+		Name = name;
+	}
+}
+
+
+using System;
+using System.Linq;
+
+[AttributeUsage(AttributeTargets.Method)]
+public class ConsoleCommandAttribute : Attribute
+{
+	public string Command { get; private set; }
+
+	public ConsoleCommandAttribute(string command)
+	{
+		Command = (Enumerable.Contains(command, '.') ? command : ("global." + command));
+	}
+}
+
+
+using System;
+
+[AttributeUsage(AttributeTargets.Method)]
+public class ChatCommandAttribute : Attribute
+{
+	public string Command { get; private set; }
+
+	public ChatCommandAttribute(string command)
+	{
+		Command = command;
+	}
+}
+
+
+using System;
+
+[AttributeUsage(AttributeTargets.Field)]
+public class OnlinePlayersAttribute : Attribute
+{
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Text;
+using System.Threading;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.Libraries;
+using Oxide.Core.Libraries.Covalence;
+using Oxide.Core.Logging;
+using Oxide.Core.Plugins;
+using Oxide.Core.Plugins.Watchers;
+using Oxide.Logging;
+using Oxide.Plugins;
+
+public abstract class CSharpPlugin : CSPlugin
+{
+	public class PluginFieldInfo
+	{
+		public Plugin Plugin;
+
+		public FieldInfo Field;
+
+		public Type FieldType;
+
+		public Type[] GenericArguments;
+
+		public Dictionary<string, MethodInfo> Methods = new Dictionary<string, MethodInfo>();
+
+		public object Value => Field.GetValue(Plugin);
+
+		public PluginFieldInfo(Plugin plugin, FieldInfo field)
+		{
+			Plugin = plugin;
+			Field = field;
+			FieldType = field.FieldType;
+			GenericArguments = FieldType.GetGenericArguments();
+		}
+
+		public bool HasValidConstructor(params Type[] argument_types)
+		{
+			Type type = GenericArguments[1];
+			if (!(type.GetConstructor(new Type[0]) != null))
+			{
+				return type.GetConstructor(argument_types) != null;
+			}
+			return true;
+		}
+
+		public bool LookupMethod(string method_name, params Type[] argument_types)
+		{
+			MethodInfo method = FieldType.GetMethod(method_name, argument_types);
+			if (method == null)
+			{
+				return false;
+			}
+			Methods[method_name] = method;
+			return true;
+		}
+
+		public object Call(string method_name, params object[] args)
+		{
+			if (!Methods.TryGetValue(method_name, out var value))
+			{
+				value = FieldType.GetMethod(method_name, BindingFlags.Instance | BindingFlags.Public);
+				Methods[method_name] = value;
+			}
+			if (value == null)
+			{
+				throw new MissingMethodException(FieldType.Name, method_name);
+			}
+			return value.Invoke(Value, args);
+		}
+	}
+
+	public FSWatcher Watcher;
+
+	protected Covalence covalence = Interface.Oxide.GetLibrary<Covalence>((string)null);
+
+	protected Lang lang = Interface.Oxide.GetLibrary<Lang>((string)null);
+
+	protected Plugins plugins = Interface.Oxide.GetLibrary<Plugins>((string)null);
+
+	protected Permission permission = Interface.Oxide.GetLibrary<Permission>((string)null);
+
+	protected WebRequests webrequest = Interface.Oxide.GetLibrary<WebRequests>((string)null);
+
+	protected PluginTimers timer;
+
+	protected HashSet<PluginFieldInfo> onlinePlayerFields = new HashSet<PluginFieldInfo>();
+
+	private Dictionary<string, MemberInfo> pluginReferenceMembers = new Dictionary<string, MemberInfo>();
+
+	private bool hookDispatchFallback;
+
+	private static readonly object _logFileLock = new object();
+
+	public bool HookedOnFrame { get; private set; }
+
+	public CSharpPlugin()
+	{
+		timer = new PluginTimers((Plugin)(object)this);
+		Type type = ((object)this).GetType();
+		MemberInfo[] members = type.GetMembers(BindingFlags.Instance | BindingFlags.NonPublic);
+		foreach (MemberInfo memberInfo in members)
+		{
+			if (memberInfo.MemberType == MemberTypes.Property || memberInfo.MemberType == MemberTypes.Field)
+			{
+				if (memberInfo.MemberType != MemberTypes.Property || (memberInfo as PropertyInfo).CanWrite)
+				{
+					object[] customAttributes = memberInfo.GetCustomAttributes(typeof(PluginReferenceAttribute), inherit: true);
+					if (customAttributes.Length != 0)
+					{
+						PluginReferenceAttribute pluginReferenceAttribute = customAttributes[0] as PluginReferenceAttribute;
+						pluginReferenceMembers[pluginReferenceAttribute.Name ?? memberInfo.Name] = memberInfo;
+					}
+				}
+			}
+			else
+			{
+				if (memberInfo.MemberType != MemberTypes.Method)
+				{
+					continue;
+				}
+				MethodInfo methodInfo = memberInfo as MethodInfo;
+				if (methodInfo.GetCustomAttributes(typeof(HookMethodAttribute), inherit: true).Length == 0)
+				{
+					if (methodInfo.Name.Equals("OnFrame"))
+					{
+						HookedOnFrame = true;
+					}
+					if (methodInfo.DeclaringType.Name == type.Name)
+					{
+						((CSPlugin)this).AddHookMethod(methodInfo.Name, methodInfo);
+					}
+				}
+			}
+		}
+	}
+
+	public virtual bool SetPluginInfo(string name, string path)
+	{
+		//IL_0050: Unknown result type (might be due to invalid IL or missing references)
+		((Plugin)this).Name = name;
+		((Plugin)this).Filename = path;
+		object[] customAttributes = ((object)this).GetType().GetCustomAttributes(typeof(InfoAttribute), inherit: true);
+		if (customAttributes.Length != 0)
+		{
+			InfoAttribute infoAttribute = customAttributes[0] as InfoAttribute;
+			((Plugin)this).Title = infoAttribute.Title;
+			((Plugin)this).Author = infoAttribute.Author;
+			((Plugin)this).Version = infoAttribute.Version;
+			((Plugin)this).ResourceId = infoAttribute.ResourceId;
+			object[] customAttributes2 = ((object)this).GetType().GetCustomAttributes(typeof(DescriptionAttribute), inherit: true);
+			if (customAttributes2.Length != 0)
+			{
+				DescriptionAttribute descriptionAttribute = customAttributes2[0] as DescriptionAttribute;
+				((Plugin)this).Description = descriptionAttribute.Description;
+			}
+			MethodInfo method = ((object)this).GetType().GetMethod("LoadDefaultConfig", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+			((Plugin)this).HasConfig = method.DeclaringType != typeof(Plugin);
+			MethodInfo method2 = ((object)this).GetType().GetMethod("LoadDefaultMessages", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+			((Plugin)this).HasMessages = method2.DeclaringType != typeof(Plugin);
+			return true;
+		}
+		Interface.Oxide.LogWarning("Failed to load " + name + ": Info attribute missing", Array.Empty<object>());
+		return false;
+	}
+
+	public override void HandleAddedToManager(PluginManager manager)
+	{
+		//IL_00f0: Unknown result type (might be due to invalid IL or missing references)
+		//IL_002d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0037: Expected O, but got Unknown
+		//IL_0044: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004e: Expected O, but got Unknown
+		((CSPlugin)this).HandleAddedToManager(manager);
+		if (((Plugin)this).Filename != null)
+		{
+			Watcher.AddMapping(((Plugin)this).Name);
+		}
+		((Plugin)this).Manager.OnPluginAdded += new PluginEvent(OnPluginLoaded);
+		((Plugin)this).Manager.OnPluginRemoved += new PluginEvent(OnPluginUnloaded);
+		foreach (KeyValuePair<string, MemberInfo> pluginReferenceMember in pluginReferenceMembers)
+		{
+			if (pluginReferenceMember.Value.MemberType == MemberTypes.Property)
+			{
+				((PropertyInfo)pluginReferenceMember.Value).SetValue(this, manager.GetPlugin(pluginReferenceMember.Key), null);
+			}
+			else
+			{
+				((FieldInfo)pluginReferenceMember.Value).SetValue(this, manager.GetPlugin(pluginReferenceMember.Key));
+			}
+		}
+		try
+		{
+			((Plugin)this).OnCallHook("Loaded", (object[])null);
+		}
+		catch (Exception ex)
+		{
+			Interface.Oxide.LogException($"Failed to initialize plugin '{((Plugin)this).Name} v{((Plugin)this).Version}'", ex);
+			((Plugin)this).Loader.PluginErrors[((Plugin)this).Name] = ex.Message;
+		}
+	}
+
+	public override void HandleRemovedFromManager(PluginManager manager)
+	{
+		//IL_0033: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003d: Expected O, but got Unknown
+		//IL_004a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0054: Expected O, but got Unknown
+		if (((Plugin)this).IsLoaded)
+		{
+			((Plugin)this).CallHook("Unload", (object[])null);
+		}
+		Watcher.RemoveMapping(((Plugin)this).Name);
+		((Plugin)this).Manager.OnPluginAdded -= new PluginEvent(OnPluginLoaded);
+		((Plugin)this).Manager.OnPluginRemoved -= new PluginEvent(OnPluginUnloaded);
+		foreach (KeyValuePair<string, MemberInfo> pluginReferenceMember in pluginReferenceMembers)
+		{
+			if (pluginReferenceMember.Value.MemberType == MemberTypes.Property)
+			{
+				((PropertyInfo)pluginReferenceMember.Value).SetValue(this, null, null);
+			}
+			else
+			{
+				((FieldInfo)pluginReferenceMember.Value).SetValue(this, null);
+			}
+		}
+		((CSPlugin)this).HandleRemovedFromManager(manager);
+	}
+
+	public virtual bool DirectCallHook(string name, out object ret, object[] args)
+	{
+		ret = null;
+		return false;
+	}
+
+	protected override object InvokeMethod(HookMethod method, object[] args)
+	{
+		if (!hookDispatchFallback && !method.IsBaseHook)
+		{
+			if (args != null && args.Length != 0)
+			{
+				ParameterInfo[] parameters = method.Parameters;
+				for (int i = 0; i < args.Length; i++)
+				{
+					object obj = args[i];
+					if (obj == null)
+					{
+						continue;
+					}
+					Type parameterType = parameters[i].ParameterType;
+					if (parameterType.IsValueType)
+					{
+						Type type = obj.GetType();
+						if (parameterType != typeof(object) && type != parameterType)
+						{
+							args[i] = Convert.ChangeType(obj, parameterType);
+						}
+					}
+				}
+			}
+			try
+			{
+				if (DirectCallHook(method.Name, out var ret, args))
+				{
+					return ret;
+				}
+				((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)1, LogEvent.HookCall, ((Plugin)this).Name, "DirectCallHook method is not patched, falling back to reflection based dispatch.");
+				hookDispatchFallback = true;
+			}
+			catch (InvalidProgramException ex)
+			{
+				Interface.Oxide.LogError("Hook dispatch failure detected, falling back to reflection based dispatch. " + ex, Array.Empty<object>());
+				CompilablePlugin compilablePlugin = CSharpPluginLoader.GetCompilablePlugin(Interface.Oxide.PluginDirectory, ((Plugin)this).Name);
+				if (compilablePlugin?.CompiledAssembly != null)
+				{
+					File.WriteAllBytes(Interface.Oxide.PluginDirectory + "\\" + ((Plugin)this).Name + ".dump", compilablePlugin.CompiledAssembly.RawAssembly);
+					Interface.Oxide.LogWarning("The invalid raw assembly has been dumped to Plugins/" + ((Plugin)this).Name + ".dump", Array.Empty<object>());
+				}
+				hookDispatchFallback = true;
+			}
+		}
+		return method.Method.Invoke(this, args);
+	}
+
+	public void SetFailState(string reason)
+	{
+		throw new PluginLoadFailure(reason);
+	}
+
+	private void OnPluginLoaded(Plugin plugin)
+	{
+		if (pluginReferenceMembers.TryGetValue(plugin.Name, out var value))
+		{
+			if (value.MemberType == MemberTypes.Property)
+			{
+				((PropertyInfo)value).SetValue(this, plugin, null);
+			}
+			else
+			{
+				((FieldInfo)value).SetValue(this, plugin);
+			}
+		}
+	}
+
+	private void OnPluginUnloaded(Plugin plugin)
+	{
+		if (pluginReferenceMembers.TryGetValue(plugin.Name, out var value))
+		{
+			if (value.MemberType == MemberTypes.Property)
+			{
+				((PropertyInfo)value).SetValue(this, null, null);
+			}
+			else
+			{
+				((FieldInfo)value).SetValue(this, null);
+			}
+		}
+	}
+
+	protected void Puts(string format, params object[] args)
+	{
+		Interface.Oxide.LogInfo("[{0}] {1}", new object[2]
+		{
+			((Plugin)this).Title,
+			(args.Length != 0) ? string.Format(format, args) : format
+		});
+	}
+
+	protected void PrintWarning(string format, params object[] args)
+	{
+		Interface.Oxide.LogWarning("[{0}] {1}", new object[2]
+		{
+			((Plugin)this).Title,
+			(args.Length != 0) ? string.Format(format, args) : format
+		});
+	}
+
+	protected void PrintError(string format, params object[] args)
+	{
+		Interface.Oxide.LogError("[{0}] {1}", new object[2]
+		{
+			((Plugin)this).Title,
+			(args.Length != 0) ? string.Format(format, args) : format
+		});
+	}
+
+	protected void LogToFile(string filename, string text, Plugin plugin, bool datedFilename = true, bool timestampPrefix = false)
+	{
+		string text2 = Path.Combine(Interface.Oxide.LogDirectory, plugin.Name);
+		if (!Directory.Exists(text2))
+		{
+			Directory.CreateDirectory(text2);
+		}
+		filename = plugin.Name.ToLower() + "_" + filename.ToLower() + (datedFilename ? $"-{DateTime.Now:yyyy-MM-dd}" : "") + ".txt";
+		lock (_logFileLock)
+		{
+			using FileStream stream = new FileStream(Path.Combine(text2, Utility.CleanPath(filename)), FileMode.Append, FileAccess.Write, FileShare.Read);
+			using StreamWriter streamWriter = new StreamWriter(stream, Encoding.UTF8);
+			streamWriter.WriteLine(timestampPrefix ? $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {text}" : text);
+		}
+	}
+
+	protected void NextFrame(Action callback)
+	{
+		Interface.Oxide.NextTick(callback);
+	}
+
+	protected void NextTick(Action callback)
+	{
+		Interface.Oxide.NextTick(callback);
+	}
+
+	protected void QueueWorkerThread(Action<object> callback)
+	{
+		ThreadPool.QueueUserWorkItem(delegate(object context)
+		{
+			//IL_002b: Unknown result type (might be due to invalid IL or missing references)
+			try
+			{
+				callback(context);
+			}
+			catch (Exception arg)
+			{
+				((Plugin)this).RaiseError($"Exception in '{((Plugin)this).Name} v{((Plugin)this).Version}' plugin worker thread: {arg}");
+			}
+		});
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Text.RegularExpressions;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.Extensions;
+using Oxide.Core.Libraries;
+using Oxide.Core.Logging;
+using Oxide.Core.Plugins;
+using Oxide.CSharp;
+using Oxide.Logging;
+using Oxide.Plugins;
+
+public class CSharpPluginLoader : PluginLoader
+{
+	public static string[] DefaultReferences = new string[8] { "mscorlib", "Oxide.Core", "Oxide.CSharp", "Oxide.Common", "System", "System.Core", "System.Data", "System.Xml" };
+
+	public static HashSet<string> PluginReferences = new HashSet<string>(DefaultReferences);
+
+	public static CSharpPluginLoader Instance;
+
+	private static CSharpExtension extension;
+
+	private static Dictionary<string, CompilablePlugin> plugins = new Dictionary<string, CompilablePlugin>();
+
+	private static readonly string[] AssemblyBlacklist = new string[3] { "Newtonsoft.Json", "protobuf-net", "websocket-sharp" };
+
+	private List<CompilablePlugin> compilationQueue = new List<CompilablePlugin>();
+
+	private CompilerService compiler;
+
+	private Timer timer { get; } = Interface.Oxide.GetLibrary<Timer>((string)null);
+
+	public override string FileExtension => ".cs";
+
+	public static CompilablePlugin GetCompilablePlugin(string directory, string name)
+	{
+		string key = Regex.Replace(name, "_", "");
+		if (!plugins.TryGetValue(key, out var value))
+		{
+			value = new CompilablePlugin(extension, Instance, directory, name);
+			plugins[key] = value;
+		}
+		return value;
+	}
+
+	public CSharpPluginLoader(CSharpExtension extension)
+	{
+		Instance = this;
+		CSharpPluginLoader.extension = extension;
+		compiler = new CompilerService((Extension)(object)extension);
+	}
+
+	public void OnModLoaded()
+	{
+		compiler.Precheck();
+		foreach (Extension allExtension in Interface.Oxide.GetAllExtensions())
+		{
+			if (allExtension == null || (!allExtension.IsCoreExtension && !allExtension.IsGameExtension))
+			{
+				continue;
+			}
+			Assembly assembly = ((object)allExtension).GetType().Assembly;
+			string name = assembly.GetName().Name;
+			if (ExtensionMethods.Contains<string>(AssemblyBlacklist, name))
+			{
+				continue;
+			}
+			PluginReferences.Add(name);
+			AssemblyName[] referencedAssemblies = assembly.GetReferencedAssemblies();
+			foreach (AssemblyName assemblyName in referencedAssemblies)
+			{
+				if (assemblyName != null)
+				{
+					PluginReferences.Add(assemblyName.Name);
+				}
+			}
+		}
+	}
+
+	public override IEnumerable<string> ScanDirectory(string directory)
+	{
+		if (!compiler.Installed)
+		{
+			yield break;
+		}
+		IEnumerable<string> enumerable = <>n__0(directory);
+		foreach (string item in enumerable)
+		{
+			yield return item;
+		}
+	}
+
+	public override Plugin Load(string directory, string name)
+	{
+		CompilablePlugin compilablePlugin = GetCompilablePlugin(directory, name);
+		if (compilablePlugin.IsLoading)
+		{
+			((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)3, LogEvent.Compile, "CSharp", "Load requested for plugin which is already loading: " + compilablePlugin.Name);
+			return null;
+		}
+		if (base.LoadedPlugins.ContainsKey(compilablePlugin.Name))
+		{
+			timer.Once(0.5f, (Action)delegate
+			{
+				Load(compilablePlugin);
+			}, (Plugin)null);
+		}
+		else
+		{
+			Load(compilablePlugin);
+		}
+		return null;
+	}
+
+	public override void Reload(string directory, string name)
+	{
+		if (Regex.Match(directory, "\\\\include\\b", RegexOptions.IgnoreCase).Success)
+		{
+			name = "Oxide." + name;
+			{
+				foreach (CompilablePlugin value in plugins.Values)
+				{
+					if (value.References.Contains(name))
+					{
+						Interface.Oxide.LogInfo("Reloading " + value.Name + " because it references updated include file: " + name, Array.Empty<object>());
+						value.LastModifiedAt = DateTime.Now;
+						Load(value);
+					}
+				}
+				return;
+			}
+		}
+		CompilablePlugin compilablePlugin = GetCompilablePlugin(directory, name);
+		if (compilablePlugin.IsLoading)
+		{
+			((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)3, LogEvent.Compile, "CSharp", "Reload requested for plugin which is already loading: " + compilablePlugin.Name);
+		}
+		else
+		{
+			Load(compilablePlugin);
+		}
+	}
+
+	public override void Unloading(Plugin pluginBase)
+	{
+		if (!(pluginBase is CSharpPlugin cSharpPlugin))
+		{
+			return;
+		}
+		base.LoadedPlugins.Remove(((Plugin)cSharpPlugin).Name);
+		foreach (CompilablePlugin value in plugins.Values)
+		{
+			if (value.Requires.Contains(((Plugin)cSharpPlugin).Name))
+			{
+				Interface.Oxide.UnloadPlugin(value.Name);
+			}
+		}
+	}
+
+	public void Load(CompilablePlugin plugin)
+	{
+		PluginLoadingStarted(plugin);
+		plugin.Compile(delegate(bool compiled)
+		{
+			if (!compiled)
+			{
+				PluginLoadingCompleted(plugin);
+			}
+			else
+			{
+				foreach (string item in plugin.Requires.Where((string r) => base.LoadedPlugins.ContainsKey(r) && ((PluginLoader)this).LoadingPlugins.Contains(r)))
+				{
+					Interface.Oxide.UnloadPlugin(item);
+				}
+				IEnumerable<string> enumerable = plugin.Requires.Where((string r) => !base.LoadedPlugins.ContainsKey(r));
+				if (enumerable.Any())
+				{
+					IEnumerable<string> enumerable2 = plugin.Requires.Where((string r) => ((PluginLoader)this).LoadingPlugins.Contains(r));
+					if (enumerable2.Any())
+					{
+						((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)2, LogEvent.Compile, "CSharp", plugin.Name + " plugin is waiting for requirements to be loaded: " + ExtensionMethods.ToSentence<string>(enumerable2));
+					}
+					else
+					{
+						Interface.Oxide.LogError(plugin.Name + " plugin requires missing dependencies: " + ExtensionMethods.ToSentence<string>(enumerable), Array.Empty<object>());
+						((PluginLoader)this).PluginErrors[plugin.Name] = "Missing dependencies: " + ExtensionMethods.ToSentence<string>(enumerable);
+						PluginLoadingCompleted(plugin);
+					}
+				}
+				else
+				{
+					Interface.Oxide.UnloadPlugin(plugin.Name);
+					plugin.LoadPlugin(delegate(CSharpPlugin pl)
+					{
+						if (pl != null)
+						{
+							base.LoadedPlugins[((Plugin)pl).Name] = (Plugin)(object)pl;
+						}
+						PluginLoadingCompleted(plugin);
+					});
+				}
+			}
+		});
+	}
+
+	public void CompilationRequested(CompilablePlugin plugin)
+	{
+		if (Compilation.Current != null)
+		{
+			Compilation.Current.Add(plugin);
+			return;
+		}
+		if (compilationQueue.Count < 1)
+		{
+			Interface.Oxide.NextTick((Action)delegate
+			{
+				CompileAssembly(compilationQueue.ToArray());
+				compilationQueue.Clear();
+			});
+		}
+		compilationQueue.Add(plugin);
+	}
+
+	public void PluginLoadingStarted(CompilablePlugin plugin)
+	{
+		if (!((PluginLoader)this).LoadingPlugins.Contains(plugin.Name))
+		{
+			((PluginLoader)this).LoadingPlugins.Add(plugin.Name);
+		}
+		plugin.IsLoading = true;
+	}
+
+	private void PluginLoadingCompleted(CompilablePlugin plugin)
+	{
+		((PluginLoader)this).LoadingPlugins.Remove(plugin.Name);
+		plugin.IsLoading = false;
+		string[] array = ((PluginLoader)this).LoadingPlugins.ToArray();
+		foreach (string name in array)
+		{
+			CompilablePlugin compilablePlugin = GetCompilablePlugin(plugin.Directory, name);
+			if (compilablePlugin.IsLoading && compilablePlugin.Requires.Contains(plugin.Name))
+			{
+				Load(compilablePlugin);
+			}
+		}
+	}
+
+	private void CompileAssembly(CompilablePlugin[] plugins)
+	{
+		compiler.Compile(plugins, delegate(Compilation compilation)
+		{
+			if (compilation.compiledAssembly == null)
+			{
+				foreach (CompilablePlugin plugin in compilation.plugins)
+				{
+					plugin.OnCompilationFailed();
+					((PluginLoader)this).PluginErrors[plugin.Name] = "Failed to compile: " + plugin.CompilerErrors;
+					Interface.Oxide.LogError("Error while compiling " + plugin.ScriptName + ": " + plugin.CompilerErrors, Array.Empty<object>());
+				}
+				return;
+			}
+			if (compilation.plugins.Count > 0)
+			{
+				string[] array = (from pl in compilation.plugins
+					where string.IsNullOrEmpty(pl.CompilerErrors)
+					select pl.Name).ToArray();
+				string arg = ((array.Length > 1) ? "were" : "was");
+				Interface.Oxide.LogInfo($"{ExtensionMethods.ToSentence<string>((IEnumerable<string>)array)} {arg} compiled successfully in {Math.Round(compilation.duration * 1000f)}ms", Array.Empty<object>());
+			}
+			foreach (CompilablePlugin plugin2 in compilation.plugins)
+			{
+				if (plugin2.CompilerErrors == null)
+				{
+					Interface.Oxide.UnloadPlugin(plugin2.Name);
+					plugin2.OnCompilationSucceeded(compilation.compiledAssembly);
+				}
+				else
+				{
+					plugin2.OnCompilationFailed();
+					((PluginLoader)this).PluginErrors[plugin2.Name] = "Failed to compile: " + plugin2.CompilerErrors;
+					Interface.Oxide.LogError("Error while compiling " + plugin2.ScriptName + ": " + plugin2.CompilerErrors, Array.Empty<object>());
+				}
+			}
+		});
+	}
+
+	public void OnShutdown()
+	{
+		compiler.Stop(synchronous: true, "framework shutting down");
+	}
+
+	[CompilerGenerated]
+	[DebuggerHidden]
+	private IEnumerable<string> <>n__0(string directory)
+	{
+		return ((PluginLoader)this).ScanDirectory(directory);
+	}
+}
+
+
+using System;
+using Oxide.Core.Libraries;
+using Oxide.Core.Plugins;
+
+public class Timer
+{
+	private TimerInstance instance;
+
+	public int Repetitions => instance.Repetitions;
+
+	public float Delay => instance.Delay;
+
+	public Action Callback => instance.Callback;
+
+	public bool Destroyed => instance.Destroyed;
+
+	public Plugin Owner => instance.Owner;
+
+	public Timer(TimerInstance instance)
+	{
+		this.instance = instance;
+	}
+
+	public void Reset(float delay = -1f, int repetitions = 1)
+	{
+		instance.Reset(delay, repetitions);
+	}
+
+	public void Destroy()
+	{
+		instance.Destroy();
+	}
+
+	public void DestroyToPool()
+	{
+		instance.DestroyToPool();
+	}
+}
+
+
+using System;
+using Oxide.Core;
+using Oxide.Core.Libraries;
+using Oxide.Core.Plugins;
+using Oxide.Plugins;
+
+public class PluginTimers
+{
+	private Timer timer = Interface.Oxide.GetLibrary<Timer>("Timer");
+
+	private Plugin plugin;
+
+	public PluginTimers(Plugin plugin)
+	{
+		this.plugin = plugin;
+	}
+
+	public Timer Once(float seconds, Action callback)
+	{
+		return new Timer(timer.Once(seconds, callback, plugin));
+	}
+
+	public Timer In(float seconds, Action callback)
+	{
+		return new Timer(timer.Once(seconds, callback, plugin));
+	}
+
+	public Timer Every(float interval, Action callback)
+	{
+		return new Timer(timer.Repeat(interval, -1, callback, plugin));
+	}
+
+	public Timer Repeat(float interval, int repeats, Action callback)
+	{
+		return new Timer(timer.Repeat(interval, repeats, callback, plugin));
+	}
+
+	public void Destroy(ref Timer timer)
+	{
+		timer?.DestroyToPool();
+		timer = null;
+	}
+}
+
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+
+public class Hash<TKey, TValue> : IDictionary<TKey, TValue>, ICollection<KeyValuePair<TKey, TValue>>, IEnumerable<KeyValuePair<TKey, TValue>>, IEnumerable
+{
+	private readonly IDictionary<TKey, TValue> dictionary;
+
+	public TValue this[TKey key]
+	{
+		get
+		{
+			if (TryGetValue(key, out var value))
+			{
+				return value;
+			}
+			if (typeof(TValue).IsValueType)
+			{
+				return (TValue)Activator.CreateInstance(typeof(TValue));
+			}
+			return default(TValue);
+		}
+		set
+		{
+			if (value == null)
+			{
+				dictionary.Remove(key);
+			}
+			else
+			{
+				dictionary[key] = value;
+			}
+		}
+	}
+
+	public ICollection<TKey> Keys => dictionary.Keys;
+
+	public ICollection<TValue> Values => dictionary.Values;
+
+	public int Count => dictionary.Count;
+
+	public bool IsReadOnly => dictionary.IsReadOnly;
+
+	public Hash()
+	{
+		dictionary = new Dictionary<TKey, TValue>();
+	}
+
+	public Hash(IEqualityComparer<TKey> comparer)
+	{
+		dictionary = new Dictionary<TKey, TValue>(comparer);
+	}
+
+	public IEnumerator<KeyValuePair<TKey, TValue>> GetEnumerator()
+	{
+		return dictionary.GetEnumerator();
+	}
+
+	public bool ContainsKey(TKey key)
+	{
+		return dictionary.ContainsKey(key);
+	}
+
+	public bool Contains(KeyValuePair<TKey, TValue> item)
+	{
+		return dictionary.Contains(item);
+	}
+
+	public void CopyTo(KeyValuePair<TKey, TValue>[] array, int index)
+	{
+		dictionary.CopyTo(array, index);
+	}
+
+	public bool TryGetValue(TKey key, out TValue value)
+	{
+		return dictionary.TryGetValue(key, out value);
+	}
+
+	public void Add(TKey key, TValue value)
+	{
+		dictionary.Add(key, value);
+	}
+
+	public void Add(KeyValuePair<TKey, TValue> item)
+	{
+		dictionary.Add(item);
+	}
+
+	public bool Remove(TKey key)
+	{
+		return dictionary.Remove(key);
+	}
+
+	public bool Remove(KeyValuePair<TKey, TValue> item)
+	{
+		return dictionary.Remove(item);
+	}
+
+	public void Clear()
+	{
+		dictionary.Clear();
+	}
+
+	IEnumerator IEnumerable.GetEnumerator()
+	{
+		return GetEnumerator();
+	}
+}
+
+
+using System.IO;
+using Mono.Cecil;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.Logging;
+using Oxide.Logging;
+
+internal class AssemblyResolver : DefaultAssemblyResolver
+{
+	internal readonly AssemblyDefinition mscorlib;
+
+	public AssemblyResolver()
+	{
+		((BaseAssemblyResolver)this).AddSearchDirectory(Interface.Oxide.ExtensionDirectory);
+		mscorlib = AssemblyDefinition.ReadAssembly(Path.Combine(Interface.Oxide.ExtensionDirectory, "mscorlib.dll"));
+	}
+
+	public override AssemblyDefinition Resolve(AssemblyNameReference name, ReaderParameters parameters)
+	{
+		if (name.Name == "System.Private.CoreLib")
+		{
+			((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)3, new LogEvent(50, "Resolve"), "Resolver", "Redirecting reference to System.Private.CoreLib to mscorlib");
+			return mscorlib;
+		}
+		return ((BaseAssemblyResolver)this).Resolve(name, parameters);
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Cache;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using Mono.Unix.Native;
+using ObjectStream;
+using ObjectStream.Data;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.Extensions;
+using Oxide.Core.Libraries;
+using Oxide.Core.Logging;
+using Oxide.Core.Plugins;
+using Oxide.Logging;
+using Oxide.Plugins;
+
+internal class CompilerService
+{
+	private static readonly Regex SymbolEscapeRegex = new Regex("[^\\w\\d]", RegexOptions.Compiled);
+
+	private const string baseUrl = "https://downloads.oxidemod.com/artifacts/Oxide.Compiler/{0}/";
+
+	private Hash<int, Compilation> compilations;
+
+	private Queue<CompilerMessage> messageQueue;
+
+	private Process process;
+
+	private volatile int lastId;
+
+	private volatile bool ready;
+
+	private TimerInstance idleTimer;
+
+	private ObjectStreamClient<CompilerMessage> client;
+
+	private string filePath;
+
+	private string remoteName;
+
+	private string compilerBasicArguments = "-unsafe true --setting:Force true -ms true";
+
+	private static Regex fileErrorRegex = new Regex("^\\[(?'Severity'\\S+)\\]\\[(?'Code'\\S+)\\]\\[(?'File'\\S+)\\] (?'Message'.+)$", RegexOptions.Compiled);
+
+	private float startTime;
+
+	private string[] preprocessor;
+
+	public bool Installed => File.Exists(filePath);
+
+	public CompilerService(Extension extension)
+	{
+		compilations = new Hash<int, Compilation>();
+		messageQueue = new Queue<CompilerMessage>();
+		string text = ((IntPtr.Size == 8) ? "x64" : "x86");
+		filePath = Path.Combine(Interface.Oxide.RootDirectory, "Oxide.Compiler");
+		string text2 = $"https://downloads.oxidemod.com/artifacts/Oxide.Compiler/{extension.Branch}/";
+		switch (Environment.OSVersion.Platform)
+		{
+		case PlatformID.Win32S:
+		case PlatformID.Win32Windows:
+		case PlatformID.Win32NT:
+			filePath += ".exe";
+			remoteName = text2 + "win-" + text + ".Compiler.exe";
+			break;
+		case PlatformID.MacOSX:
+			remoteName = text2 + "osx-x64.Compiler";
+			break;
+		case PlatformID.Unix:
+			remoteName = text2 + "linux-x64.Compiler";
+			break;
+		}
+		EnvironmentHelper.SetVariable("Path:Root", Interface.Oxide.RootDirectory, false, false);
+		EnvironmentHelper.SetVariable("Path:Logging", Interface.Oxide.LogDirectory, false, false);
+		EnvironmentHelper.SetVariable("Path:Plugins", Interface.Oxide.PluginDirectory, false, false);
+		EnvironmentHelper.SetVariable("Path:Configuration", Interface.Oxide.ConfigDirectory, false, false);
+		EnvironmentHelper.SetVariable("Path:Data", Interface.Oxide.DataDirectory, false, false);
+		EnvironmentHelper.SetVariable("Path:Libraries", Interface.Oxide.ExtensionDirectory, false, false);
+		if (Interface.Oxide.Config.Compiler.Publicize == true)
+		{
+			EnvironmentHelper.SetVariable("AllowPublicize", "true", false, true);
+		}
+	}
+
+	private void ExpireFileCache()
+	{
+		lock (CompilerFile.FileCache)
+		{
+			object[] array = ArrayPool.Get(CompilerFile.FileCache.Count);
+			int num = 0;
+			foreach (KeyValuePair<string, CompilerFile> item in CompilerFile.FileCache)
+			{
+				if (!item.Value.KeepCached)
+				{
+					array[num] = item.Key;
+					num++;
+				}
+			}
+			for (int i = 0; i < num; i++)
+			{
+				string text = (string)array[i];
+				Log((LogType)2, "Removing cached dependency " + Path.GetFileName(text));
+				CompilerFile.FileCache.Remove(text);
+			}
+			ArrayPool.Free(array);
+		}
+	}
+
+	internal bool Precheck()
+	{
+		//IL_009f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00a6: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00ac: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00be: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00c3: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00f8: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00fd: Unknown result type (might be due to invalid IL or missing references)
+		List<string> list = new List<string> { "OXIDE", "OXIDEMOD" };
+		Extension val = Interface.Oxide.GetAllExtensions().SingleOrDefault((Func<Extension, bool>)((Extension e) => e.IsGameExtension));
+		if (val != null)
+		{
+			string text = val.Name.ToUpperInvariant();
+			string text2 = val.Branch?.ToUpperInvariant() ?? "PUBLIC";
+			list.Add(EscapeSymbolName(text));
+			list.Add(EscapeSymbolName(text + "_" + text2));
+			VersionNumber version = val.Version;
+			VersionNumber val2 = default(VersionNumber);
+			if (version != val2)
+			{
+				val2 = val.Version;
+				list.Add(EscapeSymbolName(text + "_" + ((object)(VersionNumber)(ref val2)/*cast due to .constrained prefix*/).ToString()));
+				string[] obj = new string[5] { text, "_", null, null, null };
+				val2 = val.Version;
+				obj[2] = ((object)(VersionNumber)(ref val2)/*cast due to .constrained prefix*/).ToString();
+				obj[3] = "_";
+				obj[4] = text2;
+				list.Add(EscapeSymbolName(string.Concat(obj)));
+			}
+		}
+		foreach (Extension allExtension in Interface.Oxide.GetAllExtensions())
+		{
+			try
+			{
+				string text3 = allExtension.Name.ToUpper() + "_EXT";
+				foreach (string preprocessorDirective in allExtension.GetPreprocessorDirectives())
+				{
+					if (!allExtension.IsGameExtension && !allExtension.IsCoreExtension && !preprocessorDirective.StartsWith(text3))
+					{
+						Interface.Oxide.LogWarning("Missing extension preprocessor prefix '{0}' for directive '{1}' (by extension '{2}')", new object[3] { text3, preprocessorDirective, allExtension.Name });
+					}
+					list.Add(EscapeSymbolName(preprocessorDirective));
+				}
+			}
+			catch (Exception ex)
+			{
+				Interface.Oxide.LogException("An error occurred processing preprocessor directives for extension `" + allExtension.Name + "`", ex);
+			}
+		}
+		if (Interface.Oxide.Config.Compiler.PreprocessorDirectives.Count > 0)
+		{
+			list.AddRange(Interface.Oxide.Config.Compiler.PreprocessorDirectives);
+		}
+		if (Interface.Oxide.Config.Compiler.Publicize == true)
+		{
+			EnvironmentHelper.SetVariable("AllowPublicize", "true", false, true);
+			list.Add("OXIDE_PUBLICIZED");
+		}
+		preprocessor = list.Distinct().ToArray();
+		if (!DownloadFile(remoteName, filePath))
+		{
+			return false;
+		}
+		return SetFilePermissions(filePath);
+	}
+
+	private bool Start()
+	{
+		if (filePath == null)
+		{
+			return false;
+		}
+		if (process != null && process.Handle != IntPtr.Zero && !process.HasExited)
+		{
+			return true;
+		}
+		try
+		{
+			int num = 0;
+			while (!File.Exists(filePath))
+			{
+				num++;
+				if (num > 3)
+				{
+					throw new IOException("Compiler failed to download after 3 attempts");
+				}
+				Log((LogType)1, $"Compiler doesn't exist at {filePath}, attempting to download again | Attempt: {num} of 3");
+				Precheck();
+				Thread.Sleep(100);
+			}
+		}
+		catch (Exception ex)
+		{
+			Log((LogType)1, ex.Message);
+			return false;
+		}
+		Stop(synchronous: false, "starting new process");
+		startTime = Interface.Oxide.Now;
+		string text = compilerBasicArguments + $" --parent {Process.GetCurrentProcess().Id} -l:file \"{Path.Combine(Interface.Oxide.LogDirectory, $"oxide.compiler_{DateTime.Now:yyyy-MM-dd}.log")}\"";
+		Log((LogType)2, "Starting compiler with parameters: " + text);
+		try
+		{
+			process = new Process
+			{
+				StartInfo = 
+				{
+					FileName = filePath,
+					CreateNoWindow = true,
+					UseShellExecute = false,
+					RedirectStandardInput = true,
+					RedirectStandardOutput = true,
+					Arguments = text
+				},
+				EnableRaisingEvents = true
+			};
+			process.Exited += OnProcessExited;
+			process.Start();
+		}
+		catch (Exception ex2)
+		{
+			process?.Dispose();
+			process = null;
+			Interface.Oxide.LogException("Exception while starting compiler", ex2);
+			if (filePath.Contains("'"))
+			{
+				Interface.Oxide.LogError("Server directory path contains an apostrophe, compiler will not work until path is renamed", Array.Empty<object>());
+			}
+			else if (Environment.OSVersion.Platform == PlatformID.Unix)
+			{
+				Interface.Oxide.LogError("Compiler may not be set as executable; chmod +x or 0744/0755 required", Array.Empty<object>());
+			}
+			if (ex2.GetBaseException() != ex2)
+			{
+				Interface.Oxide.LogException("BaseException: ", ex2.GetBaseException());
+			}
+			if (ex2 is Win32Exception ex3)
+			{
+				Interface.Oxide.LogError($"Win32 NativeErrorCode: {ex3.NativeErrorCode} ErrorCode: {ex3.ErrorCode} HelpLink: {ex3.HelpLink}", Array.Empty<object>());
+			}
+		}
+		if (process == null)
+		{
+			return false;
+		}
+		client = new ObjectStreamClient<CompilerMessage>(process.StandardOutput.BaseStream, process.StandardInput.BaseStream);
+		client.Message += OnMessage;
+		client.Error += OnError;
+		client.Start();
+		ResetIdleTimer();
+		Interface.Oxide.LogInfo("[CSharp] Started Oxide.Compiler v" + GetCompilerVersion() + " successfully", Array.Empty<object>());
+		return true;
+	}
+
+	internal void Stop(bool synchronous, string reason)
+	{
+		ready = false;
+		Process endedProcess = process;
+		ObjectStreamClient<CompilerMessage> stream = client;
+		if (endedProcess == null || stream == null)
+		{
+			return;
+		}
+		process = null;
+		client = null;
+		endedProcess.Exited -= OnProcessExited;
+		endedProcess.Refresh();
+		stream.Message -= OnMessage;
+		stream.Error -= OnError;
+		if (!string.IsNullOrEmpty(reason))
+		{
+			Interface.Oxide.LogInfo("Shutting down compiler because " + reason, Array.Empty<object>());
+		}
+		if (!endedProcess.HasExited)
+		{
+			stream.PushMessage(new CompilerMessage
+			{
+				Type = CompilerMessageType.Exit
+			});
+			if (synchronous)
+			{
+				if (endedProcess.WaitForExit(10000))
+				{
+					Interface.Oxide.LogInfo("Compiler shutdown completed", Array.Empty<object>());
+				}
+				else
+				{
+					Interface.Oxide.LogWarning("Compiler failed to gracefully shutdown, killing the process...", Array.Empty<object>());
+					endedProcess.Kill();
+				}
+				stream.Stop();
+				stream = null;
+				endedProcess.Close();
+			}
+			else
+			{
+				ThreadPool.QueueUserWorkItem(delegate
+				{
+					if (endedProcess.WaitForExit(10000))
+					{
+						Interface.Oxide.LogInfo("Compiler shutdown completed", Array.Empty<object>());
+					}
+					else
+					{
+						Interface.Oxide.LogWarning("Compiler failed to gracefully shutdown, killing the process...", Array.Empty<object>());
+						endedProcess.Kill();
+					}
+					stream.Stop();
+					stream = null;
+					endedProcess.Close();
+				});
+			}
+		}
+		else
+		{
+			stream.Stop();
+			stream = null;
+			endedProcess.Close();
+			Log((LogType)2, "Released compiler resources");
+		}
+		ExpireFileCache();
+	}
+
+	private void OnMessage(ObjectStreamConnection<CompilerMessage, CompilerMessage> connection, CompilerMessage message)
+	{
+		if (message == null)
+		{
+			return;
+		}
+		switch (message.Type)
+		{
+		case CompilerMessageType.Assembly:
+		{
+			Compilation compilation = compilations[message.Id];
+			if (compilation == null)
+			{
+				Log((LogType)1, "Compiler compiled an unknown assembly");
+				return;
+			}
+			compilation.endedAt = Interface.Oxide.Now;
+			string text2 = (string)message.ExtraData;
+			if (text2 != null)
+			{
+				string[] array = text2.Split(new char[2] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+				foreach (string text3 in array)
+				{
+					Match match = fileErrorRegex.Match(text3.Trim());
+					if (!match.Success || match.Groups["Severity"].Value != "Error")
+					{
+						continue;
+					}
+					string value = match.Groups["File"].Value;
+					string scriptName = Path.GetFileNameWithoutExtension(value);
+					string value2 = match.Groups["Message"].Value;
+					CompilablePlugin compilablePlugin = compilation.plugins.SingleOrDefault((CompilablePlugin pl) => pl.ScriptName == scriptName);
+					if (compilablePlugin == null)
+					{
+						Interface.Oxide.LogError("Unable to resolve script error to " + value + ": " + value2, Array.Empty<object>());
+						continue;
+					}
+					IEnumerable<string> source = compilablePlugin.Requires.Where((string name) => !compilation.IncludesRequiredPlugin(name));
+					if (source.Any())
+					{
+						compilablePlugin.CompilerErrors = "Missing dependencies: " + string.Join(",", source.ToArray());
+						Log((LogType)1, "[" + match.Groups["Severity"].Value + "][" + scriptName + "] Missing dependencies: " + string.Join(",", source.ToArray()));
+					}
+					else
+					{
+						string text4 = value2.Trim();
+						string pluginDirectory = Interface.Oxide.PluginDirectory;
+						char directorySeparatorChar = Path.DirectorySeparatorChar;
+						compilablePlugin.CompilerErrors = text4.Replace(pluginDirectory + directorySeparatorChar, string.Empty);
+					}
+				}
+			}
+			CompilationResult compilationResult = (CompilationResult)message.Data;
+			if (compilationResult.Data == null || compilationResult.Data.Length == 0)
+			{
+				compilation.Completed();
+			}
+			else
+			{
+				compilation.Completed(compilationResult.Data, compilationResult.Symbols);
+			}
+			compilations.Remove(message.Id);
+			break;
+		}
+		case CompilerMessageType.Error:
+		{
+			Exception ex = (Exception)message.Data;
+			Compilation compilation2 = compilations[message.Id];
+			compilations.Remove(message.Id);
+			if (compilation2 == null)
+			{
+				Interface.Oxide.LogException("Compiler returned a error for a untracked compilation", ex);
+				return;
+			}
+			foreach (CompilablePlugin plugin in compilation2.plugins)
+			{
+				plugin.CompilerErrors = ex.Message;
+			}
+			compilation2.Completed();
+			break;
+		}
+		case CompilerMessageType.Ready:
+		{
+			string text = $"Ready signal received from compiler (Startup took: {Math.Round((Interface.Oxide.Now - startTime) * 1000f)}ms)";
+			switch (messageQueue.Count)
+			{
+			case 0:
+				Log((LogType)2, text);
+				break;
+			case 1:
+				Log((LogType)2, text + ", sending compilation. . .");
+				break;
+			default:
+				Log((LogType)2, text + $", sending {messageQueue.Count} compilations. . .");
+				break;
+			}
+			connection.PushMessage(message);
+			if (!ready)
+			{
+				ready = true;
+				while (messageQueue.Count > 0)
+				{
+					CompilerMessage compilerMessage = messageQueue.Dequeue();
+					compilations[compilerMessage.Id].startedAt = Interface.Oxide.Now;
+					connection.PushMessage(compilerMessage);
+				}
+			}
+			break;
+		}
+		}
+		Interface.Oxide.NextTick((Action)delegate
+		{
+			ResetIdleTimer();
+		});
+	}
+
+	private void OnError(Exception exception)
+	{
+		OnCompilerFailed($"Compiler threw a error: {exception}");
+	}
+
+	private void OnProcessExited(object sender, EventArgs eventArgs)
+	{
+		Interface.Oxide.NextTick((Action)delegate
+		{
+			OnCompilerFailed("compiler was closed unexpectedly");
+			string environmentVariable = Environment.GetEnvironmentVariable("PATH");
+			string text = Path.Combine(Interface.Oxide.ExtensionDirectory, ".dotnet");
+			if (string.IsNullOrEmpty(environmentVariable) || !environmentVariable.Contains(text))
+			{
+				Log((LogType)3, "PATH does not contain path to compiler dependencies: " + text);
+			}
+			else
+			{
+				Log((LogType)3, "User running server may not have the proper permissions or install is missing files");
+			}
+			Stop(synchronous: false, "process exited");
+		});
+	}
+
+	private void ResetIdleTimer()
+	{
+		if (idleTimer != null)
+		{
+			idleTimer.Destroy();
+		}
+		if (Interface.Oxide.Config.Compiler.IdleShutdown)
+		{
+			idleTimer = Interface.Oxide.GetLibrary<Timer>((string)null).Once((float)Interface.Oxide.Config.Compiler.IdleTimeout, (Action)delegate
+			{
+				Stop(synchronous: false, "idle shutdown");
+			}, (Plugin)null);
+		}
+	}
+
+	internal void Compile(CompilablePlugin[] plugins, Action<Compilation> callback)
+	{
+		int num = lastId++;
+		Compilation compilation = new Compilation(num, callback, plugins);
+		compilations[num] = compilation;
+		compilation.Prepare(delegate
+		{
+			EnqueueCompilation(compilation);
+		});
+	}
+
+	internal void OnCompileTimeout()
+	{
+		Stop(synchronous: false, "compiler timeout");
+	}
+
+	private void EnqueueCompilation(Compilation compilation)
+	{
+		if (compilation.plugins.Count < 1)
+		{
+			return;
+		}
+		if ((!Installed && !Precheck()) || !Start())
+		{
+			OnCompilerFailed("compiler couldn't be started");
+			Stop(synchronous: false, "failed to start");
+			return;
+		}
+		compilation.Started();
+		HashSet<string> hashSet = new HashSet<string>();
+		List<CompilerFile> list = new List<CompilerFile>();
+		foreach (CompilablePlugin plugin in compilation.plugins)
+		{
+			string fileName = Path.GetFileName(plugin.ScriptPath ?? plugin.ScriptName);
+			if (plugin.ScriptSource == null || plugin.ScriptSource.Length == 0)
+			{
+				plugin.CompilerErrors = "No data contained in .cs file";
+				Log((LogType)1, "Ignoring plugin " + fileName + ", file is empty");
+				continue;
+			}
+			foreach (string item in plugin.IncludePaths.Distinct())
+			{
+				if (hashSet.Contains(item))
+				{
+					Interface.Oxide.LogWarning("Tried to include " + item + " but it has already been added to the compilation", Array.Empty<object>());
+					continue;
+				}
+				CompilerFile compilerFile = new CompilerFile(item);
+				if (compilerFile.Data == null || compilerFile.Data.Length == 0)
+				{
+					Interface.Oxide.LogWarning("Ignoring plugin " + compilerFile.Name + ", file is empty", Array.Empty<object>());
+					continue;
+				}
+				Interface.Oxide.LogWarning("Adding " + compilerFile.Name + " to compilation project", Array.Empty<object>());
+				list.Add(compilerFile);
+				hashSet.Add(item);
+			}
+			Log((LogType)2, "Adding plugin " + fileName + " to compilation project");
+			list.Add(new CompilerFile(plugin.ScriptPath ?? plugin.ScriptName, plugin.ScriptSource));
+		}
+		if (list.Count == 0)
+		{
+			Interface.Oxide.LogError("Compilation job contained no valid plugins", Array.Empty<object>());
+			compilations.Remove(compilation.id);
+			compilation.Completed();
+			return;
+		}
+		CompilerData data = new CompilerData
+		{
+			OutputFile = compilation.name,
+			SourceFiles = list.ToArray(),
+			ReferenceFiles = compilation.references.Values.ToArray(),
+			Preprocessor = preprocessor
+		};
+		CompilerMessage compilerMessage = new CompilerMessage
+		{
+			Id = compilation.id,
+			Data = data,
+			Type = CompilerMessageType.Compile
+		};
+		if (ready)
+		{
+			compilation.startedAt = Interface.Oxide.Now;
+			client.PushMessage(compilerMessage);
+		}
+		else
+		{
+			messageQueue.Enqueue(compilerMessage);
+		}
+	}
+
+	private void OnCompilerFailed(string reason)
+	{
+		foreach (Compilation value in compilations.Values)
+		{
+			foreach (CompilablePlugin plugin in value.plugins)
+			{
+				plugin.CompilerErrors = reason;
+			}
+			value.Completed();
+		}
+		compilations.Clear();
+	}
+
+	private static bool SetFilePermissions(string filePath)
+	{
+		PlatformID platform = Environment.OSVersion.Platform;
+		if (platform != PlatformID.Unix && platform != PlatformID.MacOSX)
+		{
+			return true;
+		}
+		string fileName = Path.GetFileName(filePath);
+		try
+		{
+			if (Syscall.access(filePath, (AccessModes)4) == 0)
+			{
+				Log((LogType)2, fileName + " is executable");
+			}
+		}
+		catch (Exception ex)
+		{
+			Interface.Oxide.LogException("Unable to check " + fileName + " for executable permission", ex);
+		}
+		try
+		{
+			Syscall.chmod(filePath, (FilePermissions)448);
+			Interface.Oxide.LogInfo("File permissions set for " + fileName, Array.Empty<object>());
+			return true;
+		}
+		catch (Exception ex2)
+		{
+			Interface.Oxide.LogException("Could not set " + filePath + " as executable, please set manually", ex2);
+		}
+		return false;
+	}
+
+	private static bool DownloadFile(string url, string path, int retries = 3)
+	{
+		string fileName = Path.GetFileName(path);
+		int current = 0;
+		string md = null;
+		try
+		{
+			DateTime? lastModified = null;
+			if (File.Exists(path))
+			{
+				md = GenerateFileHash(path);
+				lastModified = File.GetLastWriteTimeUtc(path);
+				string text = "[CSharp] Checking for updates for " + fileName + " | Local MD5: " + md;
+				if (lastModified.HasValue)
+				{
+					text += $" | Last modified: {lastModified.Value:yyyy-MM-dd HH:mm:ss}";
+				}
+				Interface.Oxide.LogInfo(text, Array.Empty<object>());
+			}
+			else
+			{
+				Interface.Oxide.LogInfo("[CSharp] Downloading " + fileName + ". . .", Array.Empty<object>());
+			}
+			if (!TryDownload(url, retries, ref current, lastModified, out var data, out var code, out var newerFound, ref md))
+			{
+				string text2 = ((retries == 1) ? "attempt" : "attempts");
+				Interface.Oxide.LogError($"[CSharp] Failed to download {fileName} after {current} {text2} with response code '{code}', please manually download it from {url} and save it here {path}", Array.Empty<object>());
+				return false;
+			}
+			if (data != null)
+			{
+				using (FileStream fileStream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+				{
+					fileStream.Write(data, 0, data.Length);
+				}
+				if (newerFound)
+				{
+					string text3 = ((md != null) ? ("Remote MD5: " + md) : "Newer found");
+					Interface.Oxide.LogInfo("[CSharp] Downloaded newer version of " + fileName + " | " + text3, Array.Empty<object>());
+				}
+				else
+				{
+					Interface.Oxide.LogInfo("[CSharp] Downloaded " + fileName, Array.Empty<object>());
+				}
+			}
+			else
+			{
+				Interface.Oxide.LogInfo("[CSharp] " + fileName + " is up to date", Array.Empty<object>());
+			}
+			return true;
+		}
+		catch (Exception ex)
+		{
+			Interface.Oxide.LogException("Unexpected error occurred while trying to download " + fileName + ", please manually download it from " + url + " and save it here " + path, ex);
+			return false;
+		}
+	}
+
+	private static bool TryDownload(string url, int retries, ref int current, DateTime? lastModified, out byte[] data, out int code, out bool newerFound, ref string md5)
+	{
+		newerFound = true;
+		data = null;
+		code = -1;
+		try
+		{
+			HttpWebRequest httpWebRequest = (HttpWebRequest)WebRequest.Create(url);
+			httpWebRequest.AllowAutoRedirect = true;
+			httpWebRequest.CachePolicy = new RequestCachePolicy(RequestCacheLevel.NoCacheNoStore);
+			if (!string.IsNullOrEmpty(md5))
+			{
+				string text = "Validating checksum with server for " + Path.GetFileName(url) + " | Local: " + md5;
+				int current2 = 0;
+				string md6 = null;
+				if (TryDownload(url + ".md5", retries, ref current2, null, out var data2, out var code2, out var _, ref md6) && code2 == 200)
+				{
+					md6 = Encoding.UTF8.GetString(data2).Trim();
+					if (string.IsNullOrEmpty(md6))
+					{
+						md6 = "N/A";
+					}
+					text = text + " | Server: " + md6;
+					if (md6.Equals(md5, StringComparison.InvariantCultureIgnoreCase))
+					{
+						md5 = md6;
+						newerFound = false;
+						text += " | Match!";
+						Log((LogType)4, text);
+						return true;
+					}
+					md5 = md6;
+					text += " | No Match!";
+					Log((LogType)3, text);
+				}
+				else if (lastModified.HasValue)
+				{
+					md5 = null;
+					Log((LogType)3, $"Failed to download {url}.md5 after {current2} attempts with response code '{code2}', using last modified date instead");
+					httpWebRequest.IfModifiedSince = lastModified.Value;
+				}
+			}
+			else if (lastModified.HasValue)
+			{
+				httpWebRequest.IfModifiedSince = lastModified.Value;
+			}
+			HttpWebResponse httpWebResponse = (HttpWebResponse)httpWebRequest.GetResponse();
+			switch (code = (int)httpWebResponse.StatusCode)
+			{
+			case 304:
+				newerFound = false;
+				return true;
+			default:
+				if (current <= retries)
+				{
+					current++;
+					Thread.Sleep(1000);
+					return TryDownload(url, retries, ref current, lastModified, out data, out code, out newerFound, ref md5);
+				}
+				return false;
+			case 200:
+			{
+				MemoryStream memoryStream = new MemoryStream();
+				Stream responseStream = httpWebResponse.GetResponseStream();
+				int num = 10000;
+				byte[] buffer = new byte[num];
+				while (true)
+				{
+					int num2 = responseStream.Read(buffer, 0, num);
+					if (num2 == -1 || num2 == 0)
+					{
+						break;
+					}
+					memoryStream.Write(buffer, 0, num2);
+				}
+				data = memoryStream.ToArray();
+				memoryStream.Close();
+				responseStream.Close();
+				httpWebResponse.Close();
+				return true;
+			}
+			}
+		}
+		catch (WebException ex)
+		{
+			if (ex.Response != null)
+			{
+				HttpWebResponse httpWebResponse2 = (HttpWebResponse)ex.Response;
+				code = (int)httpWebResponse2.StatusCode;
+				if (httpWebResponse2.StatusCode == HttpStatusCode.NotModified)
+				{
+					newerFound = false;
+					return true;
+				}
+				if (current <= retries)
+				{
+					current++;
+					Thread.Sleep(1000);
+					return TryDownload(url, retries, ref current, lastModified, out data, out code, out newerFound, ref md5);
+				}
+				return false;
+			}
+		}
+		return false;
+	}
+
+	private static void Log(LogType type, string message, Exception exception = null)
+	{
+		//IL_000a: Unknown result type (might be due to invalid IL or missing references)
+		((Logger)(object)Interface.Oxide.RootLogger).WriteDebug(type, LogEvent.Compile, "CSharp", message, exception);
+	}
+
+	private string GetCompilerVersion()
+	{
+		if (!Installed)
+		{
+			return "0.0.0";
+		}
+		return FileVersionInfo.GetVersionInfo(filePath).FileVersion;
+	}
+
+	private static string GenerateFileHash(string file)
+	{
+		using MD5 mD = MD5.Create();
+		using FileStream inputStream = File.OpenRead(file);
+		return BitConverter.ToString(mD.ComputeHash(inputStream)).Replace("-", string.Empty).ToLowerInvariant();
+	}
+
+	private string EscapeSymbolName(string name)
+	{
+		return SymbolEscapeRegex.Replace(name, "_");
+	}
+}
+
+
+using Oxide.CSharp.Patching;
+
+public interface IPatch
+{
+	void Patch(PatchContext context);
+}
+
+
+using System.Collections.Generic;
+using Mono.Cecil;
+using Oxide.CSharp.Patching.Validation;
+
+public class PatchContext
+{
+	public AssemblyDefinition Assembly { get; }
+
+	public List<PatchValidationAttribute> PatchValidators { get; internal set; }
+
+	public int TotalPatches { get; internal set; }
+
+	public int ContextPatches { get; internal set; }
+
+	public PatchContext(AssemblyDefinition assembly)
+	{
+		Assembly = assembly;
+	}
+
+	public void IncrementPatches()
+	{
+		ContextPatches++;
+		TotalPatches++;
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using Mono.Cecil;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.Logging;
+using Oxide.CSharp.Patching;
+using Oxide.CSharp.Patching.Validation;
+using Oxide.Logging;
+
+public static class Patcher
+{
+	private static Dictionary<Type, List<PatchValidationAttribute>> Patches;
+
+	private static Type PatchType { get; } = typeof(IPatch);
+
+	private static Type PatchValidationType { get; } = typeof(PatchValidationAttribute);
+
+	private static void GetPatches(Assembly module, ref Dictionary<Type, List<PatchValidationAttribute>> patchTypes)
+	{
+		try
+		{
+			Type[] types = module.GetTypes();
+			foreach (Type type in types)
+			{
+				if (!type.IsAbstract && PatchType.IsAssignableFrom(type))
+				{
+					List<PatchValidationAttribute> validationRules = GetValidationRules(type.GetCustomAttributes(PatchValidationType, inherit: true).Concat(type.Assembly.GetCustomAttributes(PatchValidationType, inherit: true)).ToArray());
+					patchTypes.Add(type, validationRules);
+					((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)2, LogEvent.Patch, "Patcher", $"Found {validationRules.Count} total validators for patch {type.Name}");
+				}
+			}
+		}
+		catch (Exception exception)
+		{
+			((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)1, LogEvent.Patch, "Patcher", "Failed to read " + (module.GetName()?.Name ?? module.FullName) + " for patches", exception);
+		}
+	}
+
+	private static void GetPatches(Assembly[] modules, ref Dictionary<Type, List<PatchValidationAttribute>> patchTypes)
+	{
+		for (int i = 0; i < modules.Length; i++)
+		{
+			GetPatches(modules[i], ref patchTypes);
+		}
+	}
+
+	public static bool Run(AssemblyDefinition module)
+	{
+		if (Patches == null)
+		{
+			Patches = new Dictionary<Type, List<PatchValidationAttribute>>();
+			GetPatches(AppDomain.CurrentDomain.GetAssemblies(), ref Patches);
+			((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)2, LogEvent.Patch, "Patcher", $"Found {Patches.Count} patches");
+		}
+		PatchContext patchContext = new PatchContext(module);
+		foreach (KeyValuePair<Type, List<PatchValidationAttribute>> patch in Patches)
+		{
+			Type key = patch.Key;
+			List<PatchValidationAttribute> list = (patchContext.PatchValidators = patch.Value);
+			bool flag = false;
+			for (int i = 0; i < list.Count; i++)
+			{
+				if (!list[i].Validate(module))
+				{
+					flag = true;
+					break;
+				}
+			}
+			if (!flag)
+			{
+				try
+				{
+					IPatch obj = (IPatch)Activator.CreateInstance(key, nonPublic: true);
+					patchContext.ContextPatches = 0;
+					obj.Patch(patchContext);
+					CompoundLogger rootLogger = Interface.Oxide.RootLogger;
+					LogEvent? @event = LogEvent.Patch;
+					string name = key.Name;
+					object arg = patchContext.ContextPatches;
+					AssemblyNameDefinition name2 = module.Name;
+					((Logger)(object)rootLogger).WriteDebug((LogType)2, @event, "Patcher", $"{name} has applied {arg} patches to {((name2 != null) ? ((AssemblyNameReference)name2).Name : null) ?? module.FullName}");
+				}
+				catch (Exception exception)
+				{
+					CompoundLogger rootLogger2 = Interface.Oxide.RootLogger;
+					LogEvent? event2 = LogEvent.Patch;
+					string name3 = key.Name;
+					object arg2 = patchContext.ContextPatches;
+					AssemblyNameDefinition name4 = module.Name;
+					((Logger)(object)rootLogger2).WriteDebug((LogType)1, event2, "Patcher", $"{name3} has applied {arg2} patches to {((name4 != null) ? ((AssemblyNameReference)name4).Name : null) ?? module.FullName} but threw a error", exception);
+				}
+			}
+		}
+		return patchContext.TotalPatches > 0;
+	}
+
+	public static byte[] Run(byte[] data, out bool patched)
+	{
+		try
+		{
+			using MemoryStream memoryStream = new MemoryStream(data);
+			AssemblyDefinition val = AssemblyDefinition.ReadAssembly((Stream)memoryStream);
+			if (Run(val))
+			{
+				using (MemoryStream memoryStream2 = new MemoryStream())
+				{
+					val.Write((Stream)memoryStream2);
+					patched = true;
+					return memoryStream2.ToArray();
+				}
+			}
+		}
+		catch (Exception exception)
+		{
+			((Logger)(object)Interface.Oxide.RootLogger).WriteDebug((LogType)1, LogEvent.Patch, "Patcher", "Failed to patch", exception);
+		}
+		patched = false;
+		return data;
+	}
+
+	public static List<PatchValidationAttribute> GetValidationRules(object[] attributes)
+	{
+		List<PatchValidationAttribute> list = new List<PatchValidationAttribute>();
+		for (int i = 0; i < attributes.Length; i++)
+		{
+			if (attributes[i] as Attribute is PatchValidationAttribute item)
+			{
+				list.Add(item);
+			}
+		}
+		return list;
+	}
+}
+
+
+using System;
+using System.IO;
+using Mono.Cecil;
+using Oxide;
+using Oxide.Core.Logging;
+using Oxide.CSharp.Patching;
+using Oxide.CSharp.Patching.Validation;
+
+[HasName("0Harmony", StringValidationType.StartsWith, StringComparison.InvariantCultureIgnoreCase, InverseCheck = true)]
+[HasName("System", StringValidationType.StartsWith, StringComparison.InvariantCultureIgnoreCase, InverseCheck = true)]
+[HasName("Microsoft", StringValidationType.StartsWith, StringComparison.InvariantCultureIgnoreCase, InverseCheck = true)]
+[HasName("mscorlib", StringValidationType.StartsWith, StringComparison.InvariantCultureIgnoreCase, InverseCheck = true)]
+[HasName("Unity", StringValidationType.StartsWith, StringComparison.InvariantCultureIgnoreCase, InverseCheck = true)]
+[HasName("Mono", StringValidationType.StartsWith, StringComparison.InvariantCultureIgnoreCase, InverseCheck = true)]
+[HasName("netstandard", StringValidationType.StartsWith, StringComparison.InvariantCultureIgnoreCase, InverseCheck = true)]
+[HasName("Oxide", StringValidationType.StartsWith, StringComparison.InvariantCultureIgnoreCase, InverseCheck = true)]
+[HasName("MySql.Data", StringValidationType.StartsWith, StringComparison.InvariantCultureIgnoreCase, InverseCheck = true)]
+[HasConfigNames(InverseCheck = true)]
+[HasEnvironmentalVariable("AllowPublicize")]
+public class Publicizer : TraversePatch
+{
+	[HasVisibility(false)]
+	[HasAttribute("CompilerGeneratedAttribute", StringValidationType.EndsWith, StringComparison.InvariantCultureIgnoreCase, InverseCheck = true)]
+	[HasAttribute("CompilerServices.ExtensionAttribute", StringValidationType.EndsWith, StringComparison.InvariantCultureIgnoreCase, InverseCheck = true)]
+	protected override bool OnMemberDefinition(IMemberDefinition member)
+	{
+		return base.OnMemberDefinition(member);
+	}
+
+	protected override bool OnTypeDefinition(TypeDefinition type)
+	{
+		if (((TypeReference)type).IsNested && !type.IsNestedPublic)
+		{
+			type.IsNestedPublic = true;
+			return true;
+		}
+		if (!type.IsPublic)
+		{
+			type.IsPublic = true;
+			return true;
+		}
+		return false;
+	}
+
+	protected override bool OnFieldDefinition(FieldDefinition field)
+	{
+		if (field.IsPublic)
+		{
+			return false;
+		}
+		field.IsPublic = true;
+		return true;
+	}
+
+	protected override bool OnPropertyDefinition(PropertyDefinition property)
+	{
+		bool num = property.GetMethod != null && OnMethodDefinition(property.GetMethod);
+		bool flag = property.SetMethod != null && OnMethodDefinition(property.SetMethod);
+		return num || flag;
+	}
+
+	protected override bool OnMethodDefinition(MethodDefinition method)
+	{
+		if (method.IsPublic)
+		{
+			return false;
+		}
+		method.IsPublic = true;
+		return true;
+	}
+
+	protected override void OnPatchFinished(PatchContext context)
+	{
+		string variable = EnvironmentHelper.GetVariable("PublicizerOutput");
+		if (string.IsNullOrEmpty(variable))
+		{
+			return;
+		}
+		string name = ((AssemblyNameReference)context.Assembly.Name).Name;
+		if (!Directory.Exists(variable))
+		{
+			Log("Failed to write " + name + " because PublicizeOutput " + variable + " doesn't exist", (LogType)1);
+			return;
+		}
+		try
+		{
+			name = Path.Combine(variable, name + ".dll");
+			context.Assembly.Write(name);
+			Log("Wrote publicized assembly to " + variable, (LogType)2);
+		}
+		catch (Exception e)
+		{
+			Log("Failed to write publicized assembly to " + variable, (LogType)1, e);
+		}
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using Mono.Cecil;
+using Oxide;
+using Oxide.Core;
+using Oxide.Core.Logging;
+using Oxide.CSharp.Patching;
+using Oxide.CSharp.Patching.Validation;
+using Oxide.Logging;
+
+public abstract class TraversePatch : IPatch
+{
+	protected virtual string Name { get; }
+
+	protected IEnumerable<PatchValidationAttribute> TypeValidators { get; }
+
+	protected IEnumerable<PatchValidationAttribute> PropertyValidators { get; }
+
+	protected IEnumerable<PatchValidationAttribute> FieldValidators { get; }
+
+	protected IEnumerable<PatchValidationAttribute> MethodValidators { get; }
+
+	protected IEnumerable<PatchValidationAttribute> EventValidators { get; }
+
+	protected IEnumerable<PatchValidationAttribute> MemberValidators { get; }
+
+	protected TraversePatch()
+	{
+		Type type = GetType();
+		Name = type.Name;
+		TypeValidators = GetValidationRules("OnTypeDefinition", type);
+		PropertyValidators = GetValidationRules("OnPropertyDefinition", type);
+		FieldValidators = GetValidationRules("OnFieldDefinition", type);
+		MethodValidators = GetValidationRules("OnMethodDefinition", type);
+		EventValidators = GetValidationRules("OnEventDefinition", type);
+		MemberValidators = GetValidationRules("OnMemberDefinition", type);
+	}
+
+	public void Patch(PatchContext context)
+	{
+		List<TypeDefinition> list = context.Assembly.MainModule.GetTypes().ToList();
+		for (int i = 0; i < list.Count; i++)
+		{
+			TypeDefinition type = list[i];
+			RecurseType(type, context);
+		}
+		OnPatchFinished(context);
+	}
+
+	private void RecurseType(TypeDefinition type, PatchContext context)
+	{
+		if (RunValidation((IMemberDefinition)(object)type, MemberValidators) && OnMemberDefinition((IMemberDefinition)(object)type))
+		{
+			context.IncrementPatches();
+		}
+		if (type.HasProperties)
+		{
+			for (int i = 0; i < type.Properties.Count; i++)
+			{
+				PropertyDefinition member = type.Properties[i];
+				if (RunValidation((IMemberDefinition)(object)member, MemberValidators) && OnMemberDefinition((IMemberDefinition)(object)member))
+				{
+					context.IncrementPatches();
+				}
+			}
+		}
+		if (type.HasFields)
+		{
+			for (int j = 0; j < type.Fields.Count; j++)
+			{
+				FieldDefinition member2 = type.Fields[j];
+				if (RunValidation((IMemberDefinition)(object)member2, MemberValidators) && OnMemberDefinition((IMemberDefinition)(object)member2))
+				{
+					context.IncrementPatches();
+				}
+			}
+		}
+		if (type.HasMethods)
+		{
+			for (int k = 0; k < type.Methods.Count; k++)
+			{
+				MethodDefinition member3 = type.Methods[k];
+				if (RunValidation((IMemberDefinition)(object)member3, MemberValidators) && OnMemberDefinition((IMemberDefinition)(object)member3))
+				{
+					context.IncrementPatches();
+				}
+			}
+		}
+		if (type.HasEvents)
+		{
+			for (int l = 0; l < type.Events.Count; l++)
+			{
+				EventDefinition member4 = type.Events[l];
+				if (RunValidation((IMemberDefinition)(object)member4, MemberValidators) && OnMemberDefinition((IMemberDefinition)(object)member4))
+				{
+					context.IncrementPatches();
+				}
+			}
+		}
+		if (type.HasNestedTypes)
+		{
+			for (int m = 0; m < type.NestedTypes.Count; m++)
+			{
+				RecurseType(type.NestedTypes[m], context);
+			}
+		}
+	}
+
+	protected virtual bool OnMemberDefinition(IMemberDefinition member)
+	{
+		TypeDefinition val = (TypeDefinition)(object)((member is TypeDefinition) ? member : null);
+		if (val != null)
+		{
+			if (RunValidation(member, TypeValidators))
+			{
+				return OnTypeDefinition(val);
+			}
+			return false;
+		}
+		PropertyDefinition val2 = (PropertyDefinition)(object)((member is PropertyDefinition) ? member : null);
+		if (val2 != null)
+		{
+			if (RunValidation(member, PropertyValidators))
+			{
+				return OnPropertyDefinition(val2);
+			}
+			return false;
+		}
+		FieldDefinition val3 = (FieldDefinition)(object)((member is FieldDefinition) ? member : null);
+		if (val3 != null)
+		{
+			if (RunValidation(member, FieldValidators))
+			{
+				return OnFieldDefinition(val3);
+			}
+			return false;
+		}
+		MethodDefinition val4 = (MethodDefinition)(object)((member is MethodDefinition) ? member : null);
+		if (val4 != null)
+		{
+			if (RunValidation((IMemberDefinition)(object)val4, MethodValidators))
+			{
+				return OnMethodDefinition(val4);
+			}
+			return false;
+		}
+		EventDefinition val5 = (EventDefinition)(object)((member is EventDefinition) ? member : null);
+		if (val5 != null)
+		{
+			if (RunValidation((IMemberDefinition)(object)val5, EventValidators))
+			{
+				return OnEventDefinition(val5);
+			}
+			return false;
+		}
+		return false;
+	}
+
+	protected virtual bool OnTypeDefinition(TypeDefinition type)
+	{
+		return false;
+	}
+
+	protected virtual bool OnPropertyDefinition(PropertyDefinition property)
+	{
+		return false;
+	}
+
+	protected virtual bool OnFieldDefinition(FieldDefinition field)
+	{
+		return false;
+	}
+
+	protected virtual bool OnMethodDefinition(MethodDefinition method)
+	{
+		return false;
+	}
+
+	protected virtual bool OnEventDefinition(EventDefinition @event)
+	{
+		return false;
+	}
+
+	protected virtual void OnPatchFinished(PatchContext context)
+	{
+	}
+
+	protected bool RunValidation(IMemberDefinition member, IEnumerable<PatchValidationAttribute> validations)
+	{
+		if (member == null)
+		{
+			return false;
+		}
+		if (validations == null)
+		{
+			return true;
+		}
+		foreach (PatchValidationAttribute validation in validations)
+		{
+			if (!validation.Validate(member))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	protected void Log(string message, LogType logType = 2, Exception e = null)
+	{
+		//IL_000a: Unknown result type (might be due to invalid IL or missing references)
+		((Logger)(object)Interface.Oxide.RootLogger).WriteDebug(logType, LogEvent.Patch, Name, message, e);
+	}
+
+	private static IEnumerable<PatchValidationAttribute> GetValidationRules(string methodName, Type type)
+	{
+		MethodInfo[] methods = type.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+		Type typeFromHandle = typeof(bool);
+		foreach (MethodInfo methodInfo in methods)
+		{
+			if (methodInfo.Name.Equals(methodName) && methodInfo.ReturnType == typeFromHandle && methodInfo.IsVirtual)
+			{
+				return Patcher.GetValidationRules(methodInfo.GetCustomAttributes(inherit: true));
+			}
+		}
+		return null;
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Mono.Cecil;
+using Mono.Collections.Generic;
+using Oxide.CSharp.Patching.Validation;
+
+public class HasAttributeAttribute : HasNameAttribute
+{
+	public HasAttributeAttribute(string rule, StringValidationType type = StringValidationType.StartsWith, StringComparison comparison = StringComparison.InvariantCultureIgnoreCase)
+		: base(rule, type, comparison)
+	{
+	}
+
+	protected override bool IsValid(object item)
+	{
+		CustomAttribute val = (CustomAttribute)((item is CustomAttribute) ? item : null);
+		if (val != null)
+		{
+			return base.IsValid((object)((MemberReference)val.AttributeType).FullName);
+		}
+		if (item is Collection<CustomAttribute> source)
+		{
+			return ((IEnumerable<CustomAttribute>)source).Any((CustomAttribute a) => base.IsValid((object)((MemberReference)a.AttributeType).FullName));
+		}
+		AssemblyDefinition val2 = (AssemblyDefinition)((item is AssemblyDefinition) ? item : null);
+		if (val2 != null && val2.HasCustomAttributes)
+		{
+			return ((IEnumerable<CustomAttribute>)val2.CustomAttributes).Any((CustomAttribute a) => base.IsValid((object)((MemberReference)a.AttributeType).FullName));
+		}
+		ModuleDefinition val3 = (ModuleDefinition)((item is ModuleDefinition) ? item : null);
+		if (val3 != null && val3.HasCustomAttributes)
+		{
+			return ((IEnumerable<CustomAttribute>)val3.CustomAttributes).Any((CustomAttribute a) => base.IsValid((object)((MemberReference)a.AttributeType).FullName));
+		}
+		IMemberDefinition val4 = (IMemberDefinition)((item is IMemberDefinition) ? item : null);
+		if (val4 != null && ((ICustomAttributeProvider)val4).HasCustomAttributes)
+		{
+			return ((IEnumerable<CustomAttribute>)((ICustomAttributeProvider)val4).CustomAttributes).Any((CustomAttribute a) => base.IsValid((object)((MemberReference)a.AttributeType).FullName));
+		}
+		return false;
+	}
+}
+
+
+using Oxide.Core;
+using Oxide.CSharp.Patching.Validation;
+
+public class HasConfigNamesAttribute : HasNameAttribute
+{
+	public HasConfigNamesAttribute()
+		: base(string.Empty)
+	{
+	}
+
+	protected override bool IsValid(object item)
+	{
+		foreach (string ignoredPublicizerReference in Interface.Oxide.Config.Compiler.IgnoredPublicizerReferences)
+		{
+			base.ValidationRule = ignoredPublicizerReference;
+			if (base.IsValid(item))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+}
+
+
+using System;
+using Oxide;
+using Oxide.CSharp.Patching.Validation;
+
+public class HasEnvironmentalVariableAttribute : PatchValidationAttribute
+{
+	private string VariableName { get; }
+
+	public HasEnvironmentalVariableAttribute(string rule)
+	{
+		VariableName = rule ?? throw new ArgumentNullException("rule");
+	}
+
+	protected override bool IsValid(object item)
+	{
+		return !string.IsNullOrEmpty(EnvironmentHelper.GetVariable(VariableName));
+	}
+}
+
+
+using System;
+using System.Text.RegularExpressions;
+using Mono.Cecil;
+using Oxide.CSharp.Patching.Validation;
+
+public class HasNameAttribute : PatchValidationAttribute
+{
+	public string ValidationRule { get; internal set; }
+
+	public StringValidationType ValidationType { get; }
+
+	public StringComparison ValidationComparison { get; }
+
+	public HasNameAttribute(string rule, StringValidationType type = StringValidationType.StartsWith, StringComparison comparison = StringComparison.InvariantCultureIgnoreCase)
+	{
+		ValidationRule = rule;
+		ValidationType = type;
+		ValidationComparison = comparison;
+	}
+
+	protected override bool IsValid(object item)
+	{
+		string text = null;
+		if (item is string text2)
+		{
+			text = text2;
+		}
+		else
+		{
+			AssemblyDefinition val = (AssemblyDefinition)((item is AssemblyDefinition) ? item : null);
+			if (val != null)
+			{
+				text = val.FullName;
+			}
+			else
+			{
+				ModuleDefinition val2 = (ModuleDefinition)((item is ModuleDefinition) ? item : null);
+				if (val2 != null)
+				{
+					text = val2.Assembly.FullName;
+				}
+				else
+				{
+					ModuleReference val3 = (ModuleReference)((item is ModuleReference) ? item : null);
+					if (val3 != null)
+					{
+						text = val3.Name;
+					}
+					else
+					{
+						AssemblyNameReference val4 = (AssemblyNameReference)((item is AssemblyNameReference) ? item : null);
+						if (val4 != null)
+						{
+							text = val4.FullName;
+						}
+						else
+						{
+							MemberReference val5 = (MemberReference)((item is MemberReference) ? item : null);
+							if (val5 == null)
+							{
+								return false;
+							}
+							text = val5.FullName;
+						}
+					}
+				}
+			}
+		}
+		return ValidationType switch
+		{
+			StringValidationType.Equals => text.Equals(ValidationRule, ValidationComparison), 
+			StringValidationType.Contains => text.IndexOf(ValidationRule, ValidationComparison) >= 0, 
+			StringValidationType.EndsWith => text.EndsWith(ValidationRule, ValidationComparison), 
+			StringValidationType.RegularExpression => Regex.IsMatch(text, ValidationRule, RegexOptions.Compiled), 
+			_ => text.StartsWith(ValidationRule, ValidationComparison), 
+		};
+	}
+}
+
+
+using Mono.Cecil;
+using Oxide.CSharp.Patching.Validation;
+
+public class HasVisibilityAttribute : PatchValidationAttribute
+{
+	public bool IsPublic { get; }
+
+	public bool? IsStatic { get; set; }
+
+	public HasVisibilityAttribute(bool isPublic)
+	{
+		IsPublic = isPublic;
+	}
+
+	protected override bool IsValid(object item)
+	{
+		TypeDefinition val = (TypeDefinition)((item is TypeDefinition) ? item : null);
+		if (val != null)
+		{
+			if (((TypeReference)val).IsNested)
+			{
+				if (val.IsNestedPublic != IsPublic)
+				{
+					return false;
+				}
+			}
+			else if (val.IsPublic != IsPublic)
+			{
+				return false;
+			}
+			if (IsStatic.HasValue && (val.IsAbstract && val.IsSealed) != IsStatic.Value)
+			{
+				return false;
+			}
+			return true;
+		}
+		PropertyDefinition val2 = (PropertyDefinition)((item is PropertyDefinition) ? item : null);
+		if (val2 != null)
+		{
+			if (IsPublic)
+			{
+				if (val2.SetMethod == null)
+				{
+					return IsValid(val2.GetMethod);
+				}
+				if (IsValid(val2.GetMethod))
+				{
+					return IsValid(val2.SetMethod);
+				}
+				return false;
+			}
+			if (val2.SetMethod == null)
+			{
+				return IsValid(val2.GetMethod);
+			}
+			if (!IsValid(val2.GetMethod))
+			{
+				return IsValid(val2.SetMethod);
+			}
+			return true;
+		}
+		EventDefinition val3 = (EventDefinition)((item is EventDefinition) ? item : null);
+		if (val3 != null)
+		{
+			if (val3.AddMethod != null)
+			{
+				return IsValid(val3.AddMethod);
+			}
+			return false;
+		}
+		MethodDefinition val4 = (MethodDefinition)((item is MethodDefinition) ? item : null);
+		if (val4 != null)
+		{
+			if (IsStatic.HasValue && val4.IsStatic != IsStatic.Value)
+			{
+				return false;
+			}
+			return val4.IsPublic == IsPublic;
+		}
+		FieldDefinition val5 = (FieldDefinition)((item is FieldDefinition) ? item : null);
+		if (val5 != null)
+		{
+			if (IsStatic.HasValue && val5.IsStatic != IsStatic.Value)
+			{
+				return false;
+			}
+			return val5.IsPublic == IsPublic;
+		}
+		if (item is IMemberDefinition)
+		{
+			bool? propertyValue = PatchValidationAttribute.GetPropertyValue<bool?>(item, "IsPublic", null);
+			if (!propertyValue.HasValue || propertyValue.Value != IsPublic)
+			{
+				return false;
+			}
+			if (IsStatic.HasValue)
+			{
+				bool? propertyValue2 = PatchValidationAttribute.GetPropertyValue<bool?>(item, "IsStatic", null);
+				if (!propertyValue2.HasValue || propertyValue2.Value != IsStatic.Value)
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+		return false;
+	}
+}
+
+
+using Mono.Cecil;
+using Oxide.CSharp.Patching.Validation;
+
+public class IsHideBySig : PatchValidationAttribute
+{
+	protected override bool IsValid(object item)
+	{
+		if (item is IMemberDefinition)
+		{
+			return PatchValidationAttribute.GetPropertyValue(item, "IsHideBySig", defaultValue: false);
+		}
+		return false;
+	}
+}
+
+
+using Mono.Cecil;
+using Oxide.CSharp.Patching.Validation;
+
+public class IsSpecialNameAttribute : PatchValidationAttribute
+{
+	protected override bool IsValid(object item)
+	{
+		IMemberDefinition val = (IMemberDefinition)((item is IMemberDefinition) ? item : null);
+		if (val != null)
+		{
+			return val.IsSpecialName;
+		}
+		return false;
+	}
+}
+
+
+using System;
+using System.Reflection;
+
+[AttributeUsage(AttributeTargets.Class | AttributeTargets.Method | AttributeTargets.Interface, AllowMultiple = true, Inherited = true)]
+public abstract class PatchValidationAttribute : Attribute
+{
+	public bool InverseCheck { get; set; }
+
+	protected abstract bool IsValid(object item);
+
+	public bool Validate(object item)
+	{
+		if (!InverseCheck)
+		{
+			return IsValid(item);
+		}
+		return !IsValid(item);
+	}
+
+	protected static T GetPropertyValue<T>(object instance, string name, T defaultValue = default(T), BindingFlags flags = BindingFlags.Instance | BindingFlags.Public)
+	{
+		if (instance == null || string.IsNullOrEmpty(name))
+		{
+			return defaultValue;
+		}
+		PropertyInfo property = instance.GetType().GetProperty(name, flags);
+		if (property == null)
+		{
+			return defaultValue;
+		}
+		object value = property.GetValue(instance, null);
+		if (value is T)
+		{
+			return (T)value;
+		}
+		return defaultValue;
+	}
+}
+
+
+public enum StringValidationType
+{
+	Equals = 0,
+	Contains = 1,
+	StartsWith = 2,
+	EndsWith = 4,
+	RegularExpression = 8
+}
+
+
+using System;
+
+[Flags]
+public enum VersionCompareMethod
+{
+	Equality = 0,
+	GreaterThan = 1,
+	LessThan = 2,
+	GreaterThanOrEqualTo = 5,
+	LessThanOrEqualTo = 0xA
+}
+
+
+using System.Collections.Generic;
+using Mono.Cecil.Cil;
+
+public class Node
+{
+	public char Char;
+
+	public string Name;
+
+	public Dictionary<char, Node> Edges = new Dictionary<char, Node>();
+
+	public Node Parent;
+
+	public Instruction FirstInstruction;
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using Oxide.Core.Plugins;
+
+public class PluginFieldInfo
+{
+	public Plugin Plugin;
+
+	public FieldInfo Field;
+
+	public Type FieldType;
+
+	public Type[] GenericArguments;
+
+	public Dictionary<string, MethodInfo> Methods = new Dictionary<string, MethodInfo>();
+
+	public object Value => Field.GetValue(Plugin);
+
+	public PluginFieldInfo(Plugin plugin, FieldInfo field)
+	{
+		Plugin = plugin;
+		Field = field;
+		FieldType = field.FieldType;
+		GenericArguments = FieldType.GetGenericArguments();
+	}
+
+	public bool HasValidConstructor(params Type[] argument_types)
+	{
+		Type type = GenericArguments[1];
+		if (!(type.GetConstructor(new Type[0]) != null))
+		{
+			return type.GetConstructor(argument_types) != null;
+		}
+		return true;
+	}
+
+	public bool LookupMethod(string method_name, params Type[] argument_types)
+	{
+		MethodInfo method = FieldType.GetMethod(method_name, argument_types);
+		if (method == null)
+		{
+			return false;
+		}
+		Methods[method_name] = method;
+		return true;
+	}
+
+	public object Call(string method_name, params object[] args)
+	{
+		if (!Methods.TryGetValue(method_name, out var value))
+		{
+			value = FieldType.GetMethod(method_name, BindingFlags.Instance | BindingFlags.Public);
+			Methods[method_name] = value;
+		}
+		if (value == null)
+		{
+			throw new MissingMethodException(FieldType.Name, method_name);
+		}
+		return value.Invoke(Value, args);
+	}
+}
+
+
