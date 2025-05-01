@@ -1,0 +1,253 @@
+# .github/workflows/run-rust-plugin.yml
+name: Run Rust Server Plugin
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # run every 6 hours (UTC)
+
+# Add permissions needed for artifact upload
+permissions:
+  contents: write # Allow pushing changes to the repo
+  actions: write
+
+jobs:
+  run-plugin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # up to 6 hours
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Download and make installer executable
+        run: |
+          # Download installer that sets up Rust server, Oxide and plugin
+          curl -sL https://raw.githubusercontent.com/publicrust/rust-server-setup/main/install_rust_server.sh \
+            -o install_rust_server.sh
+          chmod +x install_rust_server.sh
+
+      - name: Install Rust server into workspace
+        run: |
+          # Installer will use /home/runner/rust_server internally
+          ./install_rust_server.sh
+
+      # --- NEW: Generate Template ---
+      - name: Clone and Build Template Generator
+        run: |
+          echo "Cloning generator..."
+          # Clone into /home/runner/generator to avoid conflicts
+          git clone https://github.com/publicrust/rust-template-generator /home/runner/generator
+          echo "Building generator..."
+          cd /home/runner/generator
+          # Build in Release mode for potentially better performance
+          # Specify the path to the project file
+          dotnet build /home/runner/generator/RustTemplateGenerator/RustTemplateGenerator.csproj --configuration Release
+          echo "Generator built."
+
+      - name: Clone DLL Parser
+        run: |
+          echo "Cloning DLL parser..."
+          git clone https://github.com/publicrust/DotnetDllParser /home/runner/parser
+          echo "DLL parser cloned."
+
+      - name: Run Template Generator
+        run: |
+          echo "Running generator (UpdateOnly mode)..."
+          GENERATOR_PROJECT="/home/runner/generator/RustTemplateGenerator/RustTemplateGenerator.csproj"
+          INPUT_DIR="/home/runner/rust_server/RustDedicated_Data/Managed"
+          OUTPUT_DIR="/home/runner/generator-output" # Temporary output dir
+
+          # Ensure input directory exists
+          if [ ! -d "$INPUT_DIR" ]; then
+            echo "::error::Input directory for generator not found: $INPUT_DIR"
+            # List parent dir for context
+            ls -la "/home/runner/rust_server/RustDedicated_Data/" || true
+            exit 1
+          fi
+
+          # Create output dir
+          mkdir -p "$OUTPUT_DIR"
+
+          # Run the generator
+          dotnet run --project "$GENERATOR_PROJECT" -- --input "$INPUT_DIR" --output "$OUTPUT_DIR" --mode UpdateOnly
+          echo "Generator finished."
+
+          # Check if hooks file was generated for debugging
+          GENERATED_HOOKS_FILE="$OUTPUT_DIR/.rust-analyzer/hooks.json"
+          if [ ! -f "$GENERATED_HOOKS_FILE" ]; then
+             echo "::warning::hooks.json not found in generator output directory $OUTPUT_DIR/.rust-analyzer/"
+             # Optional: list output dir contents
+             echo "Listing contents of $OUTPUT_DIR:"
+             ls -la "$OUTPUT_DIR" || true
+             echo "Listing contents of $OUTPUT_DIR/.rust-analyzer/:"
+             ls -la "$OUTPUT_DIR/.rust-analyzer/" || true
+          fi
+      # --- END: Generate Template ---
+
+      - name: Link SteamClient library
+        run: |
+          # Create Steam SDK directory for 64-bit library
+          mkdir -p ~/.steam/sdk64
+          # Create symbolic link to steamclient.so from SteamCMD install (usually in /home/runner/steamcmd)
+          # Use -f to overwrite if link exists, -s for symbolic
+          ln -sf "/home/runner/steamcmd/linux64/steamclient.so" ~/.steam/sdk64/steamclient.so
+
+      - name: Generate StringPoolDumper Plugin
+        run: |
+          # Hardcoded values instead of env vars
+          PLUGIN_PATH="/home/runner/rust_server/oxide/plugins/StringPoolDumper.cs"
+          mkdir -p "$(dirname "$PLUGIN_PATH")"
+          cat << EOF > "$PLUGIN_PATH"
+          using Oxide.Core;
+          namespace Oxide.Plugins {
+              [Info("StringPoolDumper", "RustGPT", "1.0.0")]
+              [Description("Dumps StringPool.toNumber dictionary and shuts down the server")]
+              public class StringPoolDumper : RustPlugin {
+                  private const string FileName = "stringpool_dump";
+                  private void OnServerInitialized(bool initial) {
+                      Puts("Server initialized, starting dump...");
+                      DumpStringPool();
+                  }
+                  private void DumpStringPool() {
+                      _ = StringPool.Get(string.Empty);
+                      Interface.Oxide.DataFileSystem.WriteObject(FileName, StringPool.toNumber);
+                      Puts($"StringPool dumped to {FileName}");
+                      Server.Command("quit");
+                      Puts("Quit command issued.");
+                  }
+              }
+          }
+          EOF
+
+      - name: Start Rust Server and Watch Logs
+        run: |
+          echo "Starting server in foreground..."
+          cd /home/runner/rust_server
+          # Execute start.sh directly. Workflow will block here until server quits.
+          # Add || true so the step doesn't fail when the server is killed (exit 137)
+          ./start.sh || true
+          echo "Server process finished."
+
+      # --- НОВЫЙ ШАГ ОТЛАДКИ ---
+      - name: List Data Directory Contents After Server Stop
+        run: |
+          echo "Listing contents using \$HOME (/home/runner/rust_server/oxide/data/):"
+          ls -la "/home/runner/rust_server/oxide/data/" || echo "Could not list /home/runner/rust_server/oxide/data/"
+          echo "---"
+          echo "Listing contents using explicit path (/home/runner/rust_server/oxide/data/):"
+          ls -la "/home/runner/rust_server/oxide/data/" || echo "Could not list /home/runner/rust_server/oxide/data/"
+      # --- КОНЕЦ НОВОГО ШАГА ОТЛАДКИ ---
+
+      # --- NEW: Run DLL Parser ---
+      - name: Run DLL Parser
+        run: |
+          echo "Running DLL parser..."
+          PARSER_PROJECT="/home/runner/parser/DllParser.csproj"
+          INPUT_DIR="/home/runner/rust_server/RustDedicated_Data/Managed"
+          OUTPUT_DIR="${{ github.workspace }}/.knowlenge/Decompiled"
+
+          # Ensure input directory exists
+          if [ ! -d "$INPUT_DIR" ]; then
+            echo "::error::Input directory for parser not found: $INPUT_DIR"
+            ls -la "/home/runner/rust_server/RustDedicated_Data/" || true
+            exit 1
+          fi
+
+          # --- NEW: Remove existing output dir first ---
+          echo "Removing existing .knowlenge directory in workspace..."
+          rm -rf "${{ github.workspace }}/.knowlenge"
+          # --- END: Remove existing output dir ---
+
+          # Create output directory in workspace (parser needs parent)
+          # Parser itself should create the Decompiled subfolder
+          mkdir -p "${{ github.workspace }}/.knowlenge"
+
+          # Run the parser
+          dotnet run --project "$PARSER_PROJECT" -- -s "$INPUT_DIR" -o "$OUTPUT_DIR"
+          echo "DLL Parser finished. Decompiled files should be in $OUTPUT_DIR"
+
+          # Check if output dir seems populated (optional)
+          if [ -z "$(ls -A $OUTPUT_DIR)" ]; then
+            echo "::warning::Decompiled output directory $OUTPUT_DIR appears empty."
+          else
+            echo "Decompiled output directory $OUTPUT_DIR contains files."
+          fi
+      # --- END: Run DLL Parser ---
+
+      - name: Copy Data to Workspace
+        run: |
+          # --- NEW: Remove existing dirs first ---
+          echo "Removing existing destination directories in workspace..."
+          rm -rf "${{ github.workspace }}/Managed"
+          rm -rf "${{ github.workspace }}/.rust-analyzer"
+          echo "Existing directories removed."
+          # --- END: Remove existing dirs ---
+
+          echo "Copying Managed folder..."
+          # Проверяем, существует ли исходная папка
+          if [ -d "/home/runner/rust_server/RustDedicated_Data/Managed" ]; then
+            # Копируем рекурсивно в корень рабочего пространства workflow
+            cp -R "/home/runner/rust_server/RustDedicated_Data/Managed" "${{ github.workspace }}/Managed"
+            echo "Managed folder copied."
+          else
+            echo "::warning::Managed folder not found at /home/runner/rust_server/RustDedicated_Data/Managed"
+          fi
+
+          echo "Copying StringPool data..."
+          SOURCE_JSON="/home/runner/rust_server/oxide/data/stringpool_dump.json"
+          # Создаем папку .rust-analyzer в корне рабочего пространства, если ее нет
+          DEST_DIR="${{ github.workspace }}/.rust-analyzer"
+          mkdir -p "$DEST_DIR"
+          DEST_JSON="$DEST_DIR/stringPool.json"
+          # Проверяем, существует ли исходный файл
+          if [ -f "$SOURCE_JSON" ]; then
+            # Копируем и переименовываем
+            cp "$SOURCE_JSON" "$DEST_JSON"
+            echo "StringPool data copied to $DEST_JSON."
+          else
+            echo "::warning::stringpool_dump.json not found at $SOURCE_JSON"
+          fi
+
+          # --- NEW: Copy hooks.json ---
+          echo "Copying hooks.json..."
+          GENERATOR_HOOKS_FILE="/home/runner/generator-output/.rust-analyzer/hooks.json"
+          # Destination directory was already created for stringPool.json
+          DEST_HOOKS_FILE="${{ github.workspace }}/.rust-analyzer/hooks.json"
+          if [ -f "$GENERATOR_HOOKS_FILE" ]; then
+            cp "$GENERATOR_HOOKS_FILE" "$DEST_HOOKS_FILE"
+            echo "hooks.json copied to $DEST_HOOKS_FILE."
+          else
+            echo "::warning::Generator hooks.json not found at $GENERATOR_HOOKS_FILE"
+          fi
+          # --- END: Copy hooks.json ---
+
+      - name: Commit and Push Data
+        run: |
+          # Настраиваем Git пользователя (необходимо для коммита)
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+          # Добавляем новые/измененные файлы и папки в индекс Git
+          # Добавляем корневые папки, чтобы git видел удаленные/добавленные файлы внутри
+          git add Managed .rust-analyzer .knowlenge || true
+
+          echo "--- Git Status after add ---"
+          git status
+          echo "--- End Git Status ---"
+
+          # Проверяем, есть ли изменения для коммита
+          if git diff --quiet --exit-code --cached; then
+            echo "No changes detected to commit."
+          else
+            echo "Changes detected, committing and pushing..."
+            # Создаем коммит
+            git commit -m "Update Managed, StringPool, Hooks, and Decompiled data [skip ci]"
+            # Отправляем коммит в ту же ветку, где запущен workflow
+            # Используем GITHUB_TOKEN для аутентификации
+            git push https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${{ github.ref_name }}
+            echo "Changes pushed."
+          fi
+      # --- КОНЕЦ НОВЫХ ШАГОВ ---
+
+# Define RUST_SERVER_DIR env var primarily for the upload step
