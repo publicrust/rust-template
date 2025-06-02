@@ -328,7 +328,7 @@ namespace Oxide.Plugins
             return null;
         }
 
-        private void OnPlayerViolation(BasePlayer? player, AntiHackType type, float amount)
+        private void OnPlayerViolation(BasePlayer? player, AntiHackType type, float amount, BaseEntity? entity)
         {
             if (player?.IsAdmin != true)
             {
