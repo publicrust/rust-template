@@ -1,26 +1,27 @@
-# Rust Game Plugin Template
+Шаблон плагина для игры Rust
+Готовый к использованию шаблон для разработки плагинов Rust. Необходимые библиотеки находятся в папке Managed.
 
-A ready-to-use template for Rust game plugins. Required libraries are in the Managed folder.
+Установка
+Выберите среду разработки — Cursor или Windsurf.
 
-## Installation
+Cursor
+Скачайте с сайта: https://www.cursor.com/
 
-Choose between **Cursor** and **Windsurf** for development.
+Откройте Composer и выберите Agent mode.
 
-### Cursor
-1. Download from https://www.cursor.com/
-2. Open **Composer** and select **Agent mode**.
-3. Install and open the project.
+Установите и откройте проект.
 
-### Windsurf
-1. Download from https://codeium.com/windsurf
-2. Install and open the repository.
+Windsurf
+Скачайте с сайта: https://codeium.com/windsurf
 
-## Quick Start
+Установите и откройте репозиторий.
 
-1. Clone the repository:
-```bash
+Быстрый старт
+
+Клонируйте репозиторий:
 git clone https://github.com/RobinPlay-2025/rust-template.git
-```
-2. Open in Cursor or Windsurf.
-3. Start coding!
+
+Откройте в Cursor или Windsurf.
+
+Начните кодить!
 
