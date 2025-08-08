@@ -19,7 +19,7 @@ Choose between **Cursor** and **Windsurf** for development.
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/publicrust/rust-template.git
+git clone https://github.com/RobinPlay-2025/rust-template.git
 ```
 2. Open in Cursor or Windsurf.
 3. Start coding!
