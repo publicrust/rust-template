@@ -79,6 +79,10 @@ public abstract class InvokeHandlerBase<T> : SingletonComponent<T> where T : Mon
 
 	protected void LateUpdate()
 	{
+		if (profiler == null)
+		{
+			profiler = InvokeProfiler.update;
+		}
 		ApplyRemoves();
 		ApplyAdds();
 		DoTick();
@@ -1045,7 +1049,14 @@ public class LeanTween : MonoBehaviour
 			}
 		}
 		tweens = null;
-		Object.Destroy((Object)(object)_tweenEmpty);
+		if (Application.isPlaying)
+		{
+			Object.Destroy((Object)(object)_tweenEmpty);
+		}
+		else
+		{
+			Object.DestroyImmediate((Object)(object)_tweenEmpty);
+		}
 	}
 
 	public void Update()
@@ -8371,6 +8382,34 @@ public class PriorityListComponent<T> : ListComponent<T> where T : PriorityListC
 
 
 using UnityEngine;
+using UnityEngine.Rendering;
+
+public static class ShaderEx
+{
+	public static bool SetTextureEx(this ComputeShader shader, int kernelIndex, string name, Texture texture)
+	{
+		if ((Object)(object)texture == (Object)null)
+		{
+			return false;
+		}
+		shader.SetTexture(kernelIndex, name, texture);
+		return true;
+	}
+
+	public static bool SetComputeTextureParamEx(this CommandBuffer cb, ComputeShader shader, int kernelIndex, string name, Texture texture)
+	{
+		//IL_0012: Unknown result type (might be due to invalid IL or missing references)
+		if ((Object)(object)texture == (Object)null)
+		{
+			return false;
+		}
+		cb.SetComputeTextureParam(shader, kernelIndex, name, RenderTargetIdentifier.op_Implicit(texture));
+		return true;
+	}
+}
+
+
+using UnityEngine;
 
 public abstract class SingletonComponent<T> : SingletonComponent where T : MonoBehaviour
 {
@@ -8419,6 +8458,373 @@ public abstract class SingletonComponent : FacepunchBehaviour
 		{
 			componentsInChildren[i].SingletonSetup();
 		}
+	}
+}
+
+
+public interface IStableIndex
+{
+	int StableIndex { get; set; }
+}
+
+
+public class StableEntityCache
+{
+	public const int NotInCache = -1;
+}
+
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using Facepunch;
+using UnityEngine;
+using UnityEngine.Jobs;
+
+public class StableObjectCache<TObject> : StableEntityCache where TObject : MonoBehaviour, IStableIndex
+{
+	public struct ValidEnumerator : IEnumerator<TObject>, IEnumerator, IDisposable
+	{
+		private StableObjectCache<TObject> cache;
+
+		private int index;
+
+		private int found;
+
+		public TObject Current => cache._objects[index];
+
+		TObject IEnumerator<TObject>.Current => Current;
+
+		object IEnumerator.Current => Current;
+
+		public ValidEnumerator(StableObjectCache<TObject> cache)
+		{
+			this.cache = cache;
+			index = -1;
+			found = 0;
+		}
+
+		public void Dispose()
+		{
+			cache = null;
+		}
+
+		void IDisposable.Dispose()
+		{
+			Dispose();
+		}
+
+		public bool MoveNext()
+		{
+			if (found >= cache._count || index >= cache._objects.Length)
+			{
+				return false;
+			}
+			while (++index < cache._objects.Length && (Object)(object)cache._objects[index] == (Object)null)
+			{
+			}
+			found++;
+			return index < cache._objects.Length;
+		}
+
+		bool IEnumerator.MoveNext()
+		{
+			return MoveNext();
+		}
+
+		public void Reset()
+		{
+			index = -1;
+			found = 0;
+		}
+
+		void IEnumerator.Reset()
+		{
+			Reset();
+		}
+	}
+
+	public struct ValidView : IEnumerable<TObject>, IEnumerable
+	{
+		private StableObjectCache<TObject> cache;
+
+		public ValidView(StableObjectCache<TObject> cache)
+		{
+			this.cache = cache;
+		}
+
+		public ValidEnumerator GetEnumerator()
+		{
+			return new ValidEnumerator(cache);
+		}
+
+		IEnumerator<TObject> IEnumerable<TObject>.GetEnumerator()
+		{
+			return GetEnumerator();
+		}
+
+		IEnumerator IEnumerable.GetEnumerator()
+		{
+			return GetEnumerator();
+		}
+	}
+
+	private TObject[] _objects;
+
+	private int _count;
+
+	private int[] nextIndices;
+
+	private int firstFreeIndex;
+
+	private int lastFreeIndex;
+
+	private const int Occupied = -1;
+
+	private BufferList<int> changes = new BufferList<int>();
+
+	protected TObject[] Objects => _objects;
+
+	public int Count => _count;
+
+	public StableObjectCache(int initialCapacity)
+	{
+		_objects = new TObject[initialCapacity];
+		nextIndices = new int[initialCapacity];
+		SetupFreeList(0, initialCapacity);
+	}
+
+	public void UpdateTransformAccessArray(TransformAccessArray accessArray)
+	{
+		using (TimeWarning.New("TransformAccessRefresh"))
+		{
+			if (((TransformAccessArray)(ref accessArray)).length < _objects.Length)
+			{
+				((TransformAccessArray)(ref accessArray)).capacity = _objects.Length;
+				for (int i = ((TransformAccessArray)(ref accessArray)).length; i < _objects.Length; i++)
+				{
+					((TransformAccessArray)(ref accessArray)).Add((Transform)null);
+				}
+			}
+			BufferList<int> val = Pool.Get<BufferList<int>>();
+			GetDirtyIndices(val);
+			for (int j = 0; j < val.Count; j++)
+			{
+				int num = val[j];
+				TObject val2 = _objects[num];
+				if (Object.op_Implicit((Object)(object)val2))
+				{
+					((TransformAccessArray)(ref accessArray))[num] = ((Component)(object)val2).transform;
+				}
+				else
+				{
+					((TransformAccessArray)(ref accessArray))[num] = null;
+				}
+			}
+			ResetDirtyTracking();
+			Pool.FreeUnmanaged<int>(ref val);
+		}
+	}
+
+	public void Add(TObject obj)
+	{
+		Debug.Assert((Object)(object)obj != (Object)null, "Entity is dead!");
+		Debug.Assert(obj.StableIndex == -1, "Entity is already in the cache or property not correctly initialized to StableEntityCache.NotInCache");
+		bool num = firstFreeIndex == lastFreeIndex;
+		int num2 = firstFreeIndex;
+		_objects[num2] = obj;
+		obj.StableIndex = num2;
+		firstFreeIndex = nextIndices[num2];
+		nextIndices[num2] = -1;
+		if (num)
+		{
+			Grow();
+		}
+		_count++;
+		changes.Add(num2);
+	}
+
+	public void Remove(TObject obj)
+	{
+		Debug.Assert(obj.StableIndex != -1, "Entity is not in the cache!");
+		int stableIndex = obj.StableIndex;
+		obj.StableIndex = -1;
+		_objects[stableIndex] = default(TObject);
+		if (stableIndex < firstFreeIndex)
+		{
+			nextIndices[stableIndex] = firstFreeIndex;
+			firstFreeIndex = stableIndex;
+		}
+		else
+		{
+			nextIndices[lastFreeIndex] = stableIndex;
+			lastFreeIndex = stableIndex;
+		}
+		_count--;
+		changes.Add(stableIndex);
+	}
+
+	public void Clear()
+	{
+		if (_count > 0)
+		{
+			for (int i = 0; i < _objects.Length; i++)
+			{
+				TObject val = _objects[i];
+				if (Object.op_Implicit((Object)(object)val))
+				{
+					val.StableIndex = -1;
+					changes.Add(i);
+				}
+			}
+			_count = 0;
+		}
+		SetupFreeList(0, _objects.Length);
+	}
+
+	public void ResetDirtyTracking()
+	{
+		changes.Clear();
+	}
+
+	public void GetDirtyIndices(BufferList<int> indices)
+	{
+		//IL_0012: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0017: Unknown result type (might be due to invalid IL or missing references)
+		indices.Clear();
+		HashSet<int> hashSet = Pool.Get<HashSet<int>>();
+		Enumerator<int> enumerator = changes.GetEnumerator();
+		try
+		{
+			while (enumerator.MoveNext())
+			{
+				int current = enumerator.Current;
+				if (hashSet.Add(current))
+				{
+					indices.Add(current);
+				}
+			}
+		}
+		finally
+		{
+			((IDisposable)enumerator/*cast due to .constrained prefix*/).Dispose();
+		}
+		Pool.FreeUnmanaged<int>(ref hashSet);
+	}
+
+	private void SetupFreeList(int from, int to)
+	{
+		for (int i = from; i < to; i++)
+		{
+			nextIndices[i] = i + 1;
+		}
+		firstFreeIndex = from;
+		lastFreeIndex = to - 1;
+	}
+
+	private void Grow()
+	{
+		int num = _objects.Length;
+		int num2 = num * 2;
+		Array.Resize(ref _objects, num2);
+		Array.Resize(ref nextIndices, num2);
+		SetupFreeList(num, num2);
+	}
+}
+
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+public struct ValidEnumerator : IEnumerator<TObject>, IEnumerator, IDisposable
+{
+	private StableObjectCache<TObject> cache;
+
+	private int index;
+
+	private int found;
+
+	public TObject Current => cache._objects[index];
+
+	TObject IEnumerator<TObject>.Current => Current;
+
+	object IEnumerator.Current => Current;
+
+	public ValidEnumerator(StableObjectCache<TObject> cache)
+	{
+		this.cache = cache;
+		index = -1;
+		found = 0;
+	}
+
+	public void Dispose()
+	{
+		cache = null;
+	}
+
+	void IDisposable.Dispose()
+	{
+		Dispose();
+	}
+
+	public bool MoveNext()
+	{
+		if (found >= cache._count || index >= cache._objects.Length)
+		{
+			return false;
+		}
+		while (++index < cache._objects.Length && (Object)(object)cache._objects[index] == (Object)null)
+		{
+		}
+		found++;
+		return index < cache._objects.Length;
+	}
+
+	bool IEnumerator.MoveNext()
+	{
+		return MoveNext();
+	}
+
+	public void Reset()
+	{
+		index = -1;
+		found = 0;
+	}
+
+	void IEnumerator.Reset()
+	{
+		Reset();
+	}
+}
+
+
+using System.Collections;
+using System.Collections.Generic;
+
+public struct ValidView : IEnumerable<TObject>, IEnumerable
+{
+	private StableObjectCache<TObject> cache;
+
+	public ValidView(StableObjectCache<TObject> cache)
+	{
+		this.cache = cache;
+	}
+
+	public ValidEnumerator GetEnumerator()
+	{
+		return new ValidEnumerator(cache);
+	}
+
+	IEnumerator<TObject> IEnumerable<TObject>.GetEnumerator()
+	{
+		return GetEnumerator();
+	}
+
+	IEnumerator IEnumerable.GetEnumerator()
+	{
+		return GetEnumerator();
 	}
 }
 
@@ -8478,7 +8884,7 @@ internal class UnitySourceGeneratedAssemblyMonoScriptTypes_v1
 	private static MonoScriptData Get()
 	{
 		MonoScriptData result = default(MonoScriptData);
-		result.FilePathsData = new byte[1632]
+		result.FilePathsData = new byte[1755]
 		{
 			0, 0, 0, 2, 0, 0, 0, 49, 92, 65,
 			115, 115, 101, 116, 115, 92, 80, 108, 117, 103,
@@ -8595,57 +9001,69 @@ internal class UnitySourceGeneratedAssemblyMonoScriptTypes_v1
 			105, 116, 121, 69, 110, 103, 105, 110, 101, 92,
 			82, 101, 110, 100, 101, 114, 84, 101, 120, 116,
 			117, 114, 101, 69, 120, 46, 99, 115, 0, 0,
-			0, 2, 0, 0, 0, 59, 92, 65, 115, 115,
+			0, 1, 0, 0, 0, 49, 92, 65, 115, 115,
 			101, 116, 115, 92, 80, 108, 117, 103, 105, 110,
 			115, 92, 70, 97, 99, 101, 112, 117, 110, 99,
 			104, 46, 85, 110, 105, 116, 121, 69, 110, 103,
-			105, 110, 101, 92, 83, 105, 110, 103, 108, 101,
-			116, 111, 110, 67, 111, 109, 112, 111, 110, 101,
-			110, 116, 46, 99, 115, 0, 0, 0, 1, 0,
-			0, 0, 47, 92, 65, 115, 115, 101, 116, 115,
+			105, 110, 101, 92, 83, 104, 97, 100, 101, 114,
+			69, 120, 46, 99, 115, 0, 0, 0, 2, 0,
+			0, 0, 59, 92, 65, 115, 115, 101, 116, 115,
 			92, 80, 108, 117, 103, 105, 110, 115, 92, 70,
 			97, 99, 101, 112, 117, 110, 99, 104, 46, 85,
 			110, 105, 116, 121, 69, 110, 103, 105, 110, 101,
-			92, 83, 116, 114, 105, 110, 103, 46, 99, 115,
-			0, 0, 0, 1, 0, 0, 0, 50, 92, 65,
-			115, 115, 101, 116, 115, 92, 80, 108, 117, 103,
-			105, 110, 115, 92, 70, 97, 99, 101, 112, 117,
-			110, 99, 104, 46, 85, 110, 105, 116, 121, 69,
-			110, 103, 105, 110, 101, 92, 84, 101, 120, 116,
-			117, 114, 101, 69, 120, 46, 99, 115, 0, 0,
-			0, 1, 0, 0, 0, 52, 92, 65, 115, 115,
+			92, 83, 105, 110, 103, 108, 101, 116, 111, 110,
+			67, 111, 109, 112, 111, 110, 101, 110, 116, 46,
+			99, 115, 0, 0, 0, 5, 0, 0, 0, 58,
+			92, 65, 115, 115, 101, 116, 115, 92, 80, 108,
+			117, 103, 105, 110, 115, 92, 70, 97, 99, 101,
+			112, 117, 110, 99, 104, 46, 85, 110, 105, 116,
+			121, 69, 110, 103, 105, 110, 101, 92, 83, 116,
+			97, 98, 108, 101, 79, 98, 106, 101, 99, 116,
+			67, 97, 99, 104, 101, 46, 99, 115, 0, 0,
+			0, 1, 0, 0, 0, 47, 92, 65, 115, 115,
 			101, 116, 115, 92, 80, 108, 117, 103, 105, 110,
 			115, 92, 70, 97, 99, 101, 112, 117, 110, 99,
 			104, 46, 85, 110, 105, 116, 121, 69, 110, 103,
-			105, 110, 101, 92, 84, 105, 109, 101, 87, 97,
-			114, 110, 105, 110, 103, 46, 99, 115, 0, 0,
-			0, 1, 0, 0, 0, 52, 92, 65, 115, 115,
-			101, 116, 115, 92, 80, 108, 117, 103, 105, 110,
-			115, 92, 70, 97, 99, 101, 112, 117, 110, 99,
-			104, 46, 85, 110, 105, 116, 121, 69, 110, 103,
-			105, 110, 101, 92, 84, 114, 97, 110, 115, 102,
-			111, 114, 109, 69, 120, 46, 99, 115, 0, 0,
-			0, 1, 0, 0, 0, 53, 92, 65, 115, 115,
-			101, 116, 115, 92, 80, 108, 117, 103, 105, 110,
-			115, 92, 70, 97, 99, 101, 112, 117, 110, 99,
-			104, 46, 85, 110, 105, 116, 121, 69, 110, 103,
-			105, 110, 101, 92, 85, 116, 105, 108, 105, 116,
-			121, 92, 77, 101, 115, 104, 46, 99, 115, 0,
-			0, 0, 1, 0, 0, 0, 51, 92, 65, 115,
-			115, 101, 116, 115, 92, 80, 108, 117, 103, 105,
-			110, 115, 92, 70, 97, 99, 101, 112, 117, 110,
-			99, 104, 46, 85, 110, 105, 116, 121, 69, 110,
-			103, 105, 110, 101, 92, 85, 116, 105, 108, 105,
-			116, 121, 92, 79, 115, 46, 99, 115, 0, 0,
-			0, 1, 0, 0, 0, 56, 92, 65, 115, 115,
-			101, 116, 115, 92, 80, 108, 117, 103, 105, 110,
-			115, 92, 70, 97, 99, 101, 112, 117, 110, 99,
-			104, 46, 85, 110, 105, 116, 121, 69, 110, 103,
-			105, 110, 101, 92, 85, 116, 105, 108, 105, 116,
-			121, 92, 84, 101, 120, 116, 117, 114, 101, 46,
-			99, 115
+			105, 110, 101, 92, 83, 116, 114, 105, 110, 103,
+			46, 99, 115, 0, 0, 0, 1, 0, 0, 0,
+			50, 92, 65, 115, 115, 101, 116, 115, 92, 80,
+			108, 117, 103, 105, 110, 115, 92, 70, 97, 99,
+			101, 112, 117, 110, 99, 104, 46, 85, 110, 105,
+			116, 121, 69, 110, 103, 105, 110, 101, 92, 84,
+			101, 120, 116, 117, 114, 101, 69, 120, 46, 99,
+			115, 0, 0, 0, 1, 0, 0, 0, 52, 92,
+			65, 115, 115, 101, 116, 115, 92, 80, 108, 117,
+			103, 105, 110, 115, 92, 70, 97, 99, 101, 112,
+			117, 110, 99, 104, 46, 85, 110, 105, 116, 121,
+			69, 110, 103, 105, 110, 101, 92, 84, 105, 109,
+			101, 87, 97, 114, 110, 105, 110, 103, 46, 99,
+			115, 0, 0, 0, 1, 0, 0, 0, 52, 92,
+			65, 115, 115, 101, 116, 115, 92, 80, 108, 117,
+			103, 105, 110, 115, 92, 70, 97, 99, 101, 112,
+			117, 110, 99, 104, 46, 85, 110, 105, 116, 121,
+			69, 110, 103, 105, 110, 101, 92, 84, 114, 97,
+			110, 115, 102, 111, 114, 109, 69, 120, 46, 99,
+			115, 0, 0, 0, 1, 0, 0, 0, 53, 92,
+			65, 115, 115, 101, 116, 115, 92, 80, 108, 117,
+			103, 105, 110, 115, 92, 70, 97, 99, 101, 112,
+			117, 110, 99, 104, 46, 85, 110, 105, 116, 121,
+			69, 110, 103, 105, 110, 101, 92, 85, 116, 105,
+			108, 105, 116, 121, 92, 77, 101, 115, 104, 46,
+			99, 115, 0, 0, 0, 1, 0, 0, 0, 51,
+			92, 65, 115, 115, 101, 116, 115, 92, 80, 108,
+			117, 103, 105, 110, 115, 92, 70, 97, 99, 101,
+			112, 117, 110, 99, 104, 46, 85, 110, 105, 116,
+			121, 69, 110, 103, 105, 110, 101, 92, 85, 116,
+			105, 108, 105, 116, 121, 92, 79, 115, 46, 99,
+			115, 0, 0, 0, 1, 0, 0, 0, 56, 92,
+			65, 115, 115, 101, 116, 115, 92, 80, 108, 117,
+			103, 105, 110, 115, 92, 70, 97, 99, 101, 112,
+			117, 110, 99, 104, 46, 85, 110, 105, 116, 121,
+			69, 110, 103, 105, 110, 101, 92, 85, 116, 105,
+			108, 105, 116, 121, 92, 84, 101, 120, 116, 117,
+			114, 101, 46, 99, 115
 		};
-		result.TypesData = new byte[945]
+		result.TypesData = new byte[1093]
 		{
 			0, 0, 0, 0, 25, 70, 97, 99, 101, 112,
 			117, 110, 99, 104, 46, 69, 120, 116, 101, 110,
@@ -8717,34 +9135,49 @@ internal class UnitySourceGeneratedAssemblyMonoScriptTypes_v1
 			0, 0, 0, 32, 70, 97, 99, 101, 112, 117,
 			110, 99, 104, 46, 69, 120, 116, 101, 110, 100,
 			124, 82, 101, 110, 100, 101, 114, 84, 101, 120,
-			116, 117, 114, 101, 69, 120, 1, 0, 0, 0,
-			19, 124, 83, 105, 110, 103, 108, 101, 116, 111,
-			110, 67, 111, 109, 112, 111, 110, 101, 110, 116,
+			116, 117, 114, 101, 69, 120, 0, 0, 0, 0,
+			9, 124, 83, 104, 97, 100, 101, 114, 69, 120,
 			1, 0, 0, 0, 19, 124, 83, 105, 110, 103,
 			108, 101, 116, 111, 110, 67, 111, 109, 112, 111,
-			110, 101, 110, 116, 0, 0, 0, 0, 28, 85,
-			110, 105, 116, 121, 69, 110, 103, 105, 110, 101,
-			124, 83, 116, 114, 105, 110, 103, 69, 120, 116,
-			101, 110, 115, 105, 111, 110, 115, 0, 0, 0,
-			0, 21, 85, 110, 105, 116, 121, 69, 110, 103,
-			105, 110, 101, 124, 84, 101, 120, 116, 117, 114,
-			101, 69, 120, 0, 0, 0, 0, 12, 124, 84,
-			105, 109, 101, 87, 97, 114, 110, 105, 110, 103,
-			0, 0, 0, 0, 28, 70, 97, 99, 101, 112,
-			117, 110, 99, 104, 46, 69, 120, 116, 101, 110,
-			100, 124, 84, 114, 97, 110, 115, 102, 111, 114,
-			109, 69, 120, 0, 0, 0, 0, 22, 70, 97,
+			110, 101, 110, 116, 1, 0, 0, 0, 19, 124,
+			83, 105, 110, 103, 108, 101, 116, 111, 110, 67,
+			111, 109, 112, 111, 110, 101, 110, 116, 0, 0,
+			0, 0, 13, 124, 73, 83, 116, 97, 98, 108,
+			101, 73, 110, 100, 101, 120, 0, 0, 0, 0,
+			18, 124, 83, 116, 97, 98, 108, 101, 69, 110,
+			116, 105, 116, 121, 67, 97, 99, 104, 101, 0,
+			0, 0, 0, 18, 124, 83, 116, 97, 98, 108,
+			101, 79, 98, 106, 101, 99, 116, 67, 97, 99,
+			104, 101, 0, 0, 0, 0, 33, 83, 116, 97,
+			98, 108, 101, 79, 98, 106, 101, 99, 116, 67,
+			97, 99, 104, 101, 124, 86, 97, 108, 105, 100,
+			69, 110, 117, 109, 101, 114, 97, 116, 111, 114,
+			0, 0, 0, 0, 27, 83, 116, 97, 98, 108,
+			101, 79, 98, 106, 101, 99, 116, 67, 97, 99,
+			104, 101, 124, 86, 97, 108, 105, 100, 86, 105,
+			101, 119, 0, 0, 0, 0, 28, 85, 110, 105,
+			116, 121, 69, 110, 103, 105, 110, 101, 124, 83,
+			116, 114, 105, 110, 103, 69, 120, 116, 101, 110,
+			115, 105, 111, 110, 115, 0, 0, 0, 0, 21,
+			85, 110, 105, 116, 121, 69, 110, 103, 105, 110,
+			101, 124, 84, 101, 120, 116, 117, 114, 101, 69,
+			120, 0, 0, 0, 0, 12, 124, 84, 105, 109,
+			101, 87, 97, 114, 110, 105, 110, 103, 0, 0,
+			0, 0, 28, 70, 97, 99, 101, 112, 117, 110,
+			99, 104, 46, 69, 120, 116, 101, 110, 100, 124,
+			84, 114, 97, 110, 115, 102, 111, 114, 109, 69,
+			120, 0, 0, 0, 0, 22, 70, 97, 99, 101,
+			112, 117, 110, 99, 104, 46, 85, 116, 105, 108,
+			105, 116, 121, 124, 77, 101, 115, 104, 0, 0,
+			0, 0, 20, 70, 97, 99, 101, 112, 117, 110,
+			99, 104, 46, 85, 116, 105, 108, 105, 116, 121,
+			124, 79, 115, 0, 0, 0, 0, 25, 70, 97,
 			99, 101, 112, 117, 110, 99, 104, 46, 85, 116,
-			105, 108, 105, 116, 121, 124, 77, 101, 115, 104,
-			0, 0, 0, 0, 20, 70, 97, 99, 101, 112,
-			117, 110, 99, 104, 46, 85, 116, 105, 108, 105,
-			116, 121, 124, 79, 115, 0, 0, 0, 0, 25,
-			70, 97, 99, 101, 112, 117, 110, 99, 104, 46,
-			85, 116, 105, 108, 105, 116, 121, 124, 84, 101,
-			120, 116, 117, 114, 101
+			105, 108, 105, 116, 121, 124, 84, 101, 120, 116,
+			117, 114, 101
 		};
-		result.TotalFiles = 26;
-		result.TotalTypes = 44;
+		result.TotalFiles = 28;
+		result.TotalTypes = 50;
 		result.IsEditorOnly = false;
 		return result;
 	}
@@ -9648,7 +10081,25 @@ public static class CameraEx
 		((Component)cam).transform.LookAt(val3, obj.transform.TransformDirection(((Vector3)(ref Up)).normalized));
 	}
 
-	public static void SaveScreenshot(this Camera cam, string name, int width, int height, bool transparent, int SuperSampleSize, Color? background = null)
+	public static void SavePNG(string path, Texture2D texture)
+	{
+		byte[] bytes = ImageConversion.EncodeToPNG(texture);
+		string directoryName = Path.GetDirectoryName(path);
+		if (!Directory.Exists(directoryName))
+		{
+			Directory.CreateDirectory(directoryName);
+		}
+		File.WriteAllBytes(path, bytes);
+	}
+
+	public static void ScreenshotToDisk(this Camera cam, string name, int width, int height, bool transparent, int SuperSampleSize, Color? background = null)
+	{
+		Texture2D val = ScreenshotToTexture(cam, width, height, transparent, SuperSampleSize, background);
+		SavePNG(name, val);
+		Object.DestroyImmediate((Object)(object)val, true);
+	}
+
+	public static Texture2D ScreenshotToTexture(this Camera cam, int width, int height, bool transparent, int superSampleSize, Color? background = null)
 	{
 		//IL_0013: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0018: Unknown result type (might be due to invalid IL or missing references)
@@ -9658,18 +10109,18 @@ public static class CameraEx
 		//IL_003a: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0041: Expected O, but got Unknown
 		//IL_0076: Unknown result type (might be due to invalid IL or missing references)
-		//IL_010e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0105: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00d2: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00c9: Unknown result type (might be due to invalid IL or missing references)
-		//IL_013e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0145: Expected O, but got Unknown
-		//IL_015f: Unknown result type (might be due to invalid IL or missing references)
-		//IL_01d7: Unknown result type (might be due to invalid IL or missing references)
-		//IL_020a: Unknown result type (might be due to invalid IL or missing references)
-		//IL_026f: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0276: Unknown result type (might be due to invalid IL or missing references)
-		RenderTexture temporary = RenderTexture.GetTemporary(width * SuperSampleSize, height * SuperSampleSize, 24, (RenderTextureFormat)0, (RenderTextureReadWrite)2);
+		//IL_010d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0104: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00d1: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00c8: Unknown result type (might be due to invalid IL or missing references)
+		//IL_013d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0144: Expected O, but got Unknown
+		//IL_015e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01d6: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0209: Unknown result type (might be due to invalid IL or missing references)
+		//IL_023b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0242: Unknown result type (might be due to invalid IL or missing references)
+		RenderTexture temporary = RenderTexture.GetTemporary(width * superSampleSize, height * superSampleSize, 24, (RenderTextureFormat)0, (RenderTextureReadWrite)2);
 		Color backgroundColor = cam.backgroundColor;
 		CameraClearFlags clearFlags = cam.clearFlags;
 		RenderTexture targetTexture = cam.targetTexture;
@@ -9706,7 +10157,7 @@ public static class CameraEx
 		QualitySettings.antiAliasing = antiAliasing;
 		QualitySettings.anisotropicFiltering = anisotropicFiltering;
 		Texture.SetGlobalAnisotropicFilteringLimits(1, 16);
-		if (SuperSampleSize != 1)
+		if (superSampleSize != 1)
 		{
 			val2.Apply();
 			RenderTexture val3 = (RenderTexture.active = RenderTexture.GetTemporary(width, height, 24, (RenderTextureFormat)0, (RenderTextureReadWrite)2));
@@ -9719,14 +10170,6 @@ public static class CameraEx
 			val2.Apply();
 			RenderTexture.ReleaseTemporary(val3);
 		}
-		byte[] bytes = ImageConversion.EncodeToPNG(val2);
-		string directoryName = Path.GetDirectoryName(name);
-		if (!Directory.Exists(directoryName))
-		{
-			Directory.CreateDirectory(directoryName);
-		}
-		File.WriteAllBytes(name, bytes);
-		Object.DestroyImmediate((Object)(object)val2, true);
 		RenderTexture.ReleaseTemporary(temporary);
 		Object.DestroyImmediate((Object)(object)val, true);
 		if (transparent)
@@ -9735,6 +10178,7 @@ public static class CameraEx
 			cam.backgroundColor = backgroundColor;
 		}
 		GL.sRGBWrite = sRGBWrite;
+		return val2;
 	}
 }
 
