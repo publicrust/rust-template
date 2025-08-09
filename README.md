@@ -20,10 +20,7 @@
 ⚡ Быстрый старт
 🛠 Клонируйте репозиторий:
 
-bash
-Копировать
-Редактировать
-git clone https://github.com/RobinPlay-2025/rust-template.git
+`git clone https://github.com/RobinPlay-2025/rust-template.git`
 💻 Откройте в Cursor или Windsurf
 
 👨‍💻 Начните кодить
