@@ -10,7 +10,7 @@ using System.Collections.Generic;
 using Oxide;
 using Oxide.Pooling;
 
-internal class BaseArrayPoolProvider<T> : IArrayPoolProvider<T>, IPoolProvider<T[]>, IPoolProvider
+public class BaseArrayPoolProvider<T> : IArrayPoolProvider<T>, IPoolProvider<T[]>, IPoolProvider
 {
 	private readonly int maxSetCapacity;
 
@@ -6503,6 +6503,8 @@ public sealed class FSWatcher : PluginChangeWatcher
 
 	private Dictionary<string, QueuedChange> changeQueue;
 
+	private readonly object changeQueueLock = new object();
+
 	private Timer timers;
 
 	private Dictionary<string, FileSystemWatcher> m_symlinkWatchers = new Dictionary<string, FileSystemWatcher>();
@@ -6618,39 +6620,45 @@ public sealed class FSWatcher : PluginChangeWatcher
 		FileSystemWatcher fileSystemWatcher = (FileSystemWatcher)sender;
 		int length = e.FullPath.Length - fileSystemWatcher.Path.Length - Path.GetExtension(e.Name).Length - 1;
 		string subPath = e.FullPath.Substring(fileSystemWatcher.Path.Length + 1, length);
-		if (!changeQueue.TryGetValue(subPath, out var change))
+		QueuedChange change;
+		lock (changeQueueLock)
 		{
-			change = new QueuedChange();
-			changeQueue[subPath] = change;
-		}
-		change.timer?.Destroy();
-		change.timer = null;
-		switch (e.ChangeType)
-		{
-		case WatcherChangeTypes.Changed:
-			if (change.type != WatcherChangeTypes.Created)
+			if (!changeQueue.TryGetValue(subPath, out change))
 			{
-				change.type = WatcherChangeTypes.Changed;
+				change = new QueuedChange();
+				changeQueue[subPath] = change;
 			}
-			break;
-		case WatcherChangeTypes.Created:
-			if (change.type == WatcherChangeTypes.Deleted)
+			change.timer?.Destroy();
+			change.timer = null;
+			switch (e.ChangeType)
 			{
-				change.type = WatcherChangeTypes.Changed;
+			case WatcherChangeTypes.Changed:
+				if (change.type != WatcherChangeTypes.Created)
+				{
+					change.type = WatcherChangeTypes.Changed;
+				}
+				break;
+			case WatcherChangeTypes.Created:
+				if (change.type == WatcherChangeTypes.Deleted)
+				{
+					change.type = WatcherChangeTypes.Changed;
+				}
+				else
+				{
+					change.type = WatcherChangeTypes.Created;
+				}
+				break;
+			case WatcherChangeTypes.Deleted:
+				if (change.type == WatcherChangeTypes.Created)
+				{
+					changeQueue.Remove(subPath);
+					return;
+				}
+				change.type = WatcherChangeTypes.Deleted;
+				break;
+			case WatcherChangeTypes.Created | WatcherChangeTypes.Deleted:
+				break;
 			}
-			else
-			{
-				change.type = WatcherChangeTypes.Created;
-			}
-			break;
-		case WatcherChangeTypes.Deleted:
-			if (change.type == WatcherChangeTypes.Created)
-			{
-				changeQueue.Remove(subPath);
-				return;
-			}
-			change.type = WatcherChangeTypes.Deleted;
-			break;
 		}
 		Interface.Oxide.NextTick(delegate
 		{
@@ -6677,8 +6685,11 @@ public sealed class FSWatcher : PluginChangeWatcher
 			change.timer?.Destroy();
 			change.timer = timers.Once(0.2f, delegate
 			{
-				change.timer = null;
-				changeQueue.Remove(subPath);
+				lock (changeQueueLock)
+				{
+					change.timer = null;
+					changeQueue.Remove(subPath);
+				}
 				if (Regex.Match(subPath, "include\\\\", RegexOptions.IgnoreCase).Success)
 				{
 					if (change.type == WatcherChangeTypes.Created || change.type == WatcherChangeTypes.Changed)

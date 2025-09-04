@@ -236,11 +236,11 @@ public abstract class RustPlugin : CSharpPlugin
 	protected void ForcePlayerPosition(BasePlayer player, Vector3 destination)
 	{
 		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0033: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0038: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0015: Unknown result type (might be due to invalid IL or missing references)
-		//IL_001a: Unknown result type (might be due to invalid IL or missing references)
-		player.MovePosition(destination);
+		//IL_0034: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0039: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001b: Unknown result type (might be due to invalid IL or missing references)
+		player.MovePosition(destination, true);
 		if (!player.IsSpectating() || (double)Vector3.Distance(((Component)player).transform.position, destination) > 25.0)
 		{
 			((BaseEntity)player).ClientRPC(RpcTarget.Player("ForcePositionTo", player), destination);
@@ -1716,6 +1716,12 @@ public class RustCore : CSPlugin
 			Interface.Oxide.CallDeprecatedHook("OnTeamPromote", "OnTeamMemberPromote(PlayerTeam team, ulong userId)", Eoy, new object[2] { team, val });
 		}
 	}
+
+	[HookMethod("IOnTeamInvite")]
+	private void IOnTeamInvite(BasePlayer basePlayer, BasePlayer basePlayer2)
+	{
+		Interface.Oxide.CallDeprecatedHook("OnTeamInvite", "OnTeamMemberInvite(PlayerTeam playerTeam, BasePlayer basePlayer, ulong userId)", Eoy, new object[2] { basePlayer, basePlayer2 });
+	}
 }
 
 
@@ -1764,7 +1770,7 @@ public class RustExtension : Extension
 
 	public override string[] DefaultReferences => new string[35]
 	{
-		"0Harmony", "Facepunch.Network", "Facepunch.Steamworks.Posix64", "Facepunch.System", "Facepunch.UnityEngine", "Facepunch.Steamworks.Win64", "Rust.Data", "Rust.FileSystem", "Rust.Clans", "Rust.Clans.Local",
+		"0Harmony", "Facepunch.Network", "Facepunch.Steamworks.Posix", "Facepunch.System", "Facepunch.UnityEngine", "Facepunch.Steamworks.Win64", "Rust.Data", "Rust.FileSystem", "Rust.Clans", "Rust.Clans.Local",
 		"Rust.Global", "Rust.Localization", "Rust.Platform", "Rust.Platform.Common", "Rust.Platform.Steam", "Rust.Workshop", "Rust.World", "System.Drawing", "UnityEngine.AIModule", "UnityEngine.AssetBundleModule",
 		"UnityEngine.CoreModule", "UnityEngine.GridModule", "UnityEngine.ImageConversionModule", "UnityEngine.PhysicsModule", "UnityEngine.TerrainModule", "UnityEngine.TerrainPhysicsModule", "UnityEngine.UI", "UnityEngine.UIModule", "UnityEngine.UIElementsModule", "UnityEngine.UnityWebRequestAudioModule",
 		"UnityEngine.UnityWebRequestModule", "UnityEngine.UnityWebRequestTextureModule", "UnityEngine.UnityWebRequestWWWModule", "UnityEngine.VehiclesModule", "netstandard"
@@ -1876,8 +1882,46 @@ public class RustPluginLoader : PluginLoader
 }
 
 
+using Newtonsoft.Json;
+using Oxide.Core;
+using Oxide.Game.Rust.Cui;
+using Oxide.Pooling;
+
+public sealed class JsonArrayPool<T> : IArrayPool<T>
+{
+	public static readonly JsonArrayPool<T> Shared = new JsonArrayPool<T>();
+
+	private static readonly IArrayPoolProvider<T> Provider = GetOrCreateProvider();
+
+	private static IArrayPoolProvider<T> GetOrCreateProvider()
+	{
+		if (Interface.Oxide.PoolFactory.IsHandledType<T[]>())
+		{
+			return PoolingExtensions.GetArrayProvider<T>(Interface.Oxide.PoolFactory);
+		}
+		BaseArrayPoolProvider<T> result = default(BaseArrayPoolProvider<T>);
+		Interface.Oxide.PoolFactory.RegisterProvider<BaseArrayPoolProvider<T>>(ref result, new object[2] { 1000, 16384 });
+		return (IArrayPoolProvider<T>)(object)result;
+	}
+
+	public T[] Rent(int minimumLength)
+	{
+		return Provider.Take(minimumLength);
+	}
+
+	public void Return(T[] array)
+	{
+		((IPoolProvider)Provider).Return((object)array);
+	}
+}
+
+
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Threading;
 using Newtonsoft.Json;
 using Oxide.Core;
 using Oxide.Game.Rust.Cui;
@@ -1885,15 +1929,56 @@ using UnityEngine;
 
 public static class CuiHelper
 {
-	public static string ToJson(List<CuiElement> elements, bool format = false)
+	private class JsonWriterResources
 	{
-		//IL_0008: Unknown result type (might be due to invalid IL or missing references)
-		//IL_000d: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0019: Expected O, but got Unknown
-		return JsonConvert.SerializeObject((object)elements, (Formatting)(format ? 1 : 0), new JsonSerializerSettings
+		public readonly StringBuilder StringBuilder = new StringBuilder(65536);
+
+		public readonly StringWriter StringWriter;
+
+		public readonly JsonTextWriter JsonWriter;
+
+		public readonly JsonSerializer Serializer;
+
+		public JsonWriterResources()
 		{
-			DefaultValueHandling = (DefaultValueHandling)1
-		}).Replace("\\n", "\n");
+			//IL_0033: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0038: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0043: Unknown result type (might be due to invalid IL or missing references)
+			//IL_004f: Expected O, but got Unknown
+			StringWriter = new StringWriter(StringBuilder, CultureInfo.InvariantCulture);
+			JsonWriter = new JsonTextWriter((TextWriter)StringWriter)
+			{
+				ArrayPool = JsonArrayPool<char>.Shared,
+				CloseOutput = false
+			};
+			Serializer = JsonSerializer.Create(Settings);
+		}
+
+		public void Reset(bool format = false)
+		{
+			StringBuilder.Clear();
+			((JsonWriter)JsonWriter).Formatting = (Formatting)(format ? 1 : 0);
+		}
+	}
+
+	private static readonly JsonSerializerSettings Settings = new JsonSerializerSettings
+	{
+		DefaultValueHandling = (DefaultValueHandling)1,
+		NullValueHandling = (NullValueHandling)1,
+		DateParseHandling = (DateParseHandling)0,
+		FloatFormatHandling = (FloatFormatHandling)1,
+		StringEscapeHandling = (StringEscapeHandling)0
+	};
+
+	private static readonly ThreadLocal<JsonWriterResources> SharedWriterResources = new ThreadLocal<JsonWriterResources>(() => new JsonWriterResources());
+
+	public static string ToJson(IReadOnlyList<CuiElement> elements, bool format = false)
+	{
+		JsonWriterResources value = SharedWriterResources.Value;
+		value.Reset(format);
+		value.Serializer.Serialize((JsonWriter)(object)value.JsonWriter, (object)elements);
+		((JsonWriter)value.JsonWriter).Flush();
+		return value.StringBuilder.ToString().Replace("\\n", "\n");
 	}
 
 	public static List<CuiElement> FromJson(string json)
@@ -1903,11 +1988,15 @@ public static class CuiHelper
 
 	public static string GetGuid()
 	{
-		return Guid.NewGuid().ToString().Replace("-", string.Empty);
+		return Guid.NewGuid().ToString("N");
 	}
 
 	public static bool AddUi(BasePlayer player, List<CuiElement> elements)
 	{
+		if (((BaseNetworkable)(player?)).net == null)
+		{
+			return false;
+		}
 		return AddUi(player, ToJson(elements));
 	}
 
@@ -3149,7 +3238,7 @@ public class Player : Library
 		((BaseNetworkable)player).net.connection.username = name;
 		player.displayName = name;
 		((BaseEntity)player)._name = name;
-		((BaseNetworkable)player).SendNetworkUpdateImmediate(false);
+		((BaseNetworkable)player).SendNetworkUpdateImmediate();
 		player.IPlayer.Name = name;
 		permission.UpdateNickname(player.UserIDString, name);
 		if (((BaseNetworkable)player).net.group == BaseNetworkable.LimboNetworkGroup)
@@ -3184,8 +3273,8 @@ public class Player : Library
 	public void Teleport(BasePlayer player, Vector3 destination)
 	{
 		//IL_0027: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0034: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0039: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0035: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003a: Unknown result type (might be due to invalid IL or missing references)
 		if (((BaseCombatEntity)player).IsAlive() && !player.IsSpectating())
 		{
 			try
@@ -3193,7 +3282,7 @@ public class Player : Library
 				player.EnsureDismounted();
 				((BaseEntity)player).SetParent((BaseEntity)null, true, true);
 				player.SetServerFall(true);
-				player.MovePosition(destination);
+				player.MovePosition(destination, true);
 				((BaseEntity)player).ClientRPC(RpcTarget.Player("ForcePositionTo", player), destination);
 			}
 			finally
@@ -4763,6 +4852,44 @@ public class RustServer : IServer
 	public void Command(string command, params object[] args)
 	{
 		Server.Command(command, args);
+	}
+}
+
+
+using System.Globalization;
+using System.IO;
+using System.Text;
+using Newtonsoft.Json;
+
+private class JsonWriterResources
+{
+	public readonly StringBuilder StringBuilder = new StringBuilder(65536);
+
+	public readonly StringWriter StringWriter;
+
+	public readonly JsonTextWriter JsonWriter;
+
+	public readonly JsonSerializer Serializer;
+
+	public JsonWriterResources()
+	{
+		//IL_0033: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0038: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0043: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004f: Expected O, but got Unknown
+		StringWriter = new StringWriter(StringBuilder, CultureInfo.InvariantCulture);
+		JsonWriter = new JsonTextWriter((TextWriter)StringWriter)
+		{
+			ArrayPool = JsonArrayPool<char>.Shared,
+			CloseOutput = false
+		};
+		Serializer = JsonSerializer.Create(Settings);
+	}
+
+	public void Reset(bool format = false)
+	{
+		StringBuilder.Clear();
+		((JsonWriter)JsonWriter).Formatting = (Formatting)(format ? 1 : 0);
 	}
 }
 
