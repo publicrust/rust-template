@@ -1,8 +1,12 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using Facepunch.Extend;
+using Rust;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 public class AssetBundleBackend : FileSystemBackend, IDisposable
 {
@@ -14,11 +18,15 @@ public class AssetBundleBackend : FileSystemBackend, IDisposable
 
 	private Dictionary<string, AssetBundle> files = new Dictionary<string, AssetBundle>(StringComparer.OrdinalIgnoreCase);
 
-	private string assetPath;
+	private Dictionary<string, string> prefabToAssetSceneName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+	private Dictionary<string, AsyncOperation> assetSceneLoads = new Dictionary<string, AsyncOperation>(StringComparer.OrdinalIgnoreCase);
+
+	private Dictionary<string, Dictionary<string, GameObject>> assetScenePrefabs = new Dictionary<string, Dictionary<string, GameObject>>(StringComparer.OrdinalIgnoreCase);
+
+	public string assetPath { get; private set; }
 
 	public static bool Enabled => true;
-
-	public float LoadProgress { get; private set; }
 
 	public void Load(string assetRoot)
 	{
@@ -46,6 +54,25 @@ public class AssetBundleBackend : FileSystemBackend, IDisposable
 			{
 				Debug.Log((object)("Loading " + text));
 				LoadBundle(text);
+			}
+			AssetSceneManifest.Load(this);
+			prefabToAssetSceneName.Clear();
+			foreach (AssetSceneManifest.Entry scene in AssetSceneManifest.Current.Scenes)
+			{
+				foreach (string includedAsset in scene.IncludedAssets)
+				{
+					if (!prefabToAssetSceneName.TryAdd(includedAsset, scene.Name))
+					{
+						Debug.LogError((object)("Duplicate prefab in asset scenes: " + includedAsset));
+					}
+				}
+			}
+			foreach (AssetSceneManifest.Entry scene2 in AssetSceneManifest.Current.Scenes)
+			{
+				if (scene2.AutoLoad)
+				{
+					((MonoBehaviour)Global.Runner).StartCoroutine(LoadAssetScene(scene2.Name));
+				}
 			}
 		}
 		catch (Exception ex)
@@ -81,7 +108,7 @@ public class AssetBundleBackend : FileSystemBackend, IDisposable
 		files.Clear();
 		foreach (KeyValuePair<string, AssetBundle> bundle in bundles)
 		{
-			if (!bundle.Key.StartsWith("content", StringComparison.InvariantCultureIgnoreCase))
+			if (!bundle.Key.StartsWith("content", StringComparison.OrdinalIgnoreCase))
 			{
 				string[] allAssetNames = bundle.Value.GetAllAssetNames();
 				foreach (string key in allAssetNames)
@@ -115,7 +142,7 @@ public class AssetBundleBackend : FileSystemBackend, IDisposable
 		string[] array = bundles.Keys.ToArray();
 		foreach (string text in array)
 		{
-			if (text.IndexOf(partialName, StringComparison.InvariantCultureIgnoreCase) < 0)
+			if (text.IndexOf(partialName, StringComparison.OrdinalIgnoreCase) < 0)
 			{
 				continue;
 			}
@@ -139,31 +166,231 @@ public class AssetBundleBackend : FileSystemBackend, IDisposable
 		return list;
 	}
 
+	public float GetAssetSceneProgress()
+	{
+		List<string> autoLoadScenes = AssetSceneManifest.Current.AutoLoadScenes;
+		return GetAssetSceneProgress(autoLoadScenes);
+	}
+
+	public float GetAssetSceneProgress(List<string> sceneNames)
+	{
+		if (sceneNames == null || sceneNames.Count == 0)
+		{
+			return 1f;
+		}
+		int num = 0;
+		float num2 = 0f;
+		foreach (string sceneName in sceneNames)
+		{
+			float assetSceneProgress = GetAssetSceneProgress(sceneName);
+			num2 += assetSceneProgress;
+			if (assetSceneProgress >= 1f)
+			{
+				num++;
+			}
+		}
+		if (num >= sceneNames.Count)
+		{
+			return 1f;
+		}
+		return Mathf.Min(num2 / (float)sceneNames.Count, 0.999f);
+	}
+
+	public float GetAssetSceneProgress(string sceneName)
+	{
+		if (!assetSceneLoads.TryGetValue(sceneName, out var value))
+		{
+			AssetSceneUtil.Log("Asset scene '" + sceneName + "' is not currently loading or loaded - cannot get progress.");
+			return 0f;
+		}
+		return value.progress / 0.9f * 0.99f;
+	}
+
+	public IEnumerator LoadAssetScenes(List<string> sceneNames)
+	{
+		if (sceneNames == null || sceneNames.Count == 0)
+		{
+			yield break;
+		}
+		foreach (string sceneName in sceneNames)
+		{
+			if (!assetSceneLoads.ContainsKey(sceneName))
+			{
+				((MonoBehaviour)Global.Runner).StartCoroutine(LoadAssetScene(sceneName));
+			}
+		}
+		while (GetAssetSceneProgress(sceneNames) < 1f)
+		{
+			yield return null;
+		}
+	}
+
+	public IEnumerator UnloadAssetScenes(List<string> sceneNames, Action<string, Dictionary<string, GameObject>> onAssetSceneUnloaded)
+	{
+		List<AsyncOperation> unloadOperations = new List<AsyncOperation>();
+		foreach (string sceneName in sceneNames)
+		{
+			if (!assetSceneLoads.TryGetValue(sceneName, out var asyncOperation))
+			{
+				continue;
+			}
+			AssetSceneManifest.Entry entry = List.FindWith<AssetSceneManifest.Entry, string>((IReadOnlyCollection<AssetSceneManifest.Entry>)AssetSceneManifest.Current.Scenes, (Func<AssetSceneManifest.Entry, string>)((AssetSceneManifest.Entry s) => s.Name), sceneName, (IEqualityComparer<string>)StringComparer.OrdinalIgnoreCase);
+			if (entry == null || !entry.CanUnload)
+			{
+				Debug.LogError((object)("Asset scene '" + sceneName + "' is not allowed to be unloaded."));
+				continue;
+			}
+			while (!asyncOperation.isDone)
+			{
+				yield return null;
+			}
+			AsyncOperation val = SceneManager.UnloadSceneAsync(sceneName);
+			if (val == null)
+			{
+				continue;
+			}
+			Dictionary<string, GameObject> valueOrDefault = assetScenePrefabs.GetValueOrDefault(sceneName);
+			if (valueOrDefault != null)
+			{
+				foreach (string key in valueOrDefault.Keys)
+				{
+					cache.Remove(key);
+				}
+			}
+			onAssetSceneUnloaded?.Invoke(sceneName, valueOrDefault);
+			assetSceneLoads.Remove(sceneName);
+			assetScenePrefabs.Remove(sceneName);
+			unloadOperations.Add(val);
+			asyncOperation = null;
+		}
+		while (unloadOperations.Any((AsyncOperation o) => !o.isDone))
+		{
+			yield return null;
+		}
+	}
+
+	public List<string> GetRequiredAssetScenesForPrefabs(IEnumerable<string> prefabPaths)
+	{
+		HashSet<string> hashSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		foreach (string prefabPath in prefabPaths)
+		{
+			if (prefabToAssetSceneName.TryGetValue(prefabPath, out var value))
+			{
+				hashSet.Add(value);
+			}
+			else
+			{
+				Debug.LogWarning((object)("Prefab '" + prefabPath + "' does not have an associated asset scene."));
+			}
+		}
+		return hashSet.ToList();
+	}
+
+	public List<(string Path, GameObject Prefab)> GetAssetScenePrefabs(List<string> assetSceneNames = null)
+	{
+		return (from kvp in assetScenePrefabs.Where((KeyValuePair<string, Dictionary<string, GameObject>> kvp) => assetSceneNames == null || assetSceneNames.Contains<string>(kvp.Key, StringComparer.OrdinalIgnoreCase)).SelectMany((KeyValuePair<string, Dictionary<string, GameObject>> d) => d.Value)
+			select (Path: kvp.Key, Prefab: kvp.Value)).ToList();
+	}
+
+	private IEnumerator LoadAssetScene(string sceneName)
+	{
+		LoadSceneParameters val = default(LoadSceneParameters);
+		((LoadSceneParameters)(ref val))..ctor((LoadSceneMode)1, (LocalPhysicsMode)2);
+		if (assetSceneLoads.ContainsKey(sceneName))
+		{
+			Debug.LogError((object)("Already loaded asset scene: " + sceneName));
+			yield break;
+		}
+		AssetSceneUtil.Log("Starting to load asset scene: " + sceneName);
+		AsyncOperation asyncLoad = SceneManager.LoadSceneAsync(sceneName, val);
+		if (asyncLoad == null)
+		{
+			isError = true;
+			loadingError = "Failed to load asset scene: " + sceneName;
+			Debug.LogError((object)loadingError);
+			yield break;
+		}
+		asyncLoad.allowSceneActivation = false;
+		assetSceneLoads[sceneName] = asyncLoad;
+		Scene currentActiveScene = SceneManager.GetActiveScene();
+		while (!asyncLoad.isDone)
+		{
+			yield return null;
+			if (asyncLoad.progress >= 0.9f)
+			{
+				AssetSceneUtil.Log("Asset scene " + sceneName + " loaded, activating...");
+				currentActiveScene = SceneManager.GetActiveScene();
+				asyncLoad.allowSceneActivation = true;
+				SceneManager.SetActiveScene(currentActiveScene);
+			}
+		}
+		SceneManager.SetActiveScene(currentActiveScene);
+		Scene sceneByName = SceneManager.GetSceneByName(sceneName);
+		if (!((Scene)(ref sceneByName)).IsValid() || !((Scene)(ref sceneByName)).isLoaded)
+		{
+			isError = true;
+			loadingError = "Failed to get asset scene after loading: " + sceneName;
+			Debug.LogError((object)loadingError);
+			yield break;
+		}
+		AssetSceneUtil.Log("Asset scene " + sceneName + " activated successfully.");
+		GameObject[] rootGameObjects = ((Scene)(ref sceneByName)).GetRootGameObjects();
+		Dictionary<string, GameObject> dictionary = new Dictionary<string, GameObject>(StringComparer.OrdinalIgnoreCase);
+		GameObject[] array = rootGameObjects;
+		foreach (GameObject val2 in array)
+		{
+			string name = ((Object)val2).name;
+			dictionary.TryAdd(name, val2);
+			((Object)val2).name = Path.GetFileNameWithoutExtension(name);
+		}
+		assetScenePrefabs[sceneName] = dictionary;
+		AssetSceneUtil.Log($"Asset scene {sceneName} root objects loaded: {rootGameObjects.Length}");
+	}
+
 	protected override T LoadAsset<T>(string filePath)
 	{
-		AssetBundle value = null;
-		if (!files.TryGetValue(filePath, out value))
+		if (filePath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
+		{
+			if (prefabToAssetSceneName.TryGetValue(filePath, out var value))
+			{
+				if (assetScenePrefabs.TryGetValue(value, out var value2) && value2.TryGetValue(filePath, out var value3))
+				{
+					return (T)(object)((value3 is T) ? value3 : null);
+				}
+				Debug.LogError((object)((GetAssetSceneProgress(value) < 1f) ? ("Prefab '" + filePath + "' requires asset scene '" + value + "' to be loaded first.") : ("Prefab '" + filePath + "' is supposed to be in asset scene '" + value + "' but it was not found.")));
+			}
+			else
+			{
+				AssetSceneUtil.Log("Prefab '" + filePath + "' not found in any asset scenes.");
+			}
+			return default(T);
+		}
+		if (!files.TryGetValue(filePath, out var value4))
 		{
 			return default(T);
 		}
-		return value.LoadAsset<T>(filePath);
-	}
-
-	protected override LoadAssetsResult LoadAssetsAsync(List<string> filePaths, int maxConcurrency, int priority)
-	{
-		return new CompositeLoadAssetsResult((from p in filePaths
-			where files.ContainsKey(p)
-			group p by files[p]).Select((Func<IGrouping<AssetBundle, string>, LoadAssetsResult>)((IGrouping<AssetBundle, string> g) => new AssetBundleLoadAssetsResult(g.Key, g.OrderBy<string, string>((string p) => p, StringComparer.OrdinalIgnoreCase).ToList(), maxConcurrency, priority))).ToList());
+		return value4.LoadAsset<T>(filePath);
 	}
 
 	protected override string[] LoadAssetList(string folder, string search)
 	{
 		List<string> list = new List<string>();
-		foreach (KeyValuePair<string, AssetBundle> item in files.Where((KeyValuePair<string, AssetBundle> x) => x.Key.StartsWith(folder, StringComparison.InvariantCultureIgnoreCase)))
+		foreach (KeyValuePair<string, Dictionary<string, GameObject>> assetScenePrefab in assetScenePrefabs)
 		{
-			if (string.IsNullOrEmpty(search) || item.Key.IndexOf(search, StringComparison.InvariantCultureIgnoreCase) != -1)
+			assetScenePrefab.Deconstruct(out var _, out var value);
+			foreach (KeyValuePair<string, GameObject> item in value.Where((KeyValuePair<string, GameObject> x) => x.Key.StartsWith(folder, StringComparison.OrdinalIgnoreCase)))
 			{
-				list.Add(item.Key);
+				if (string.IsNullOrEmpty(search) || item.Key.IndexOf(search, StringComparison.OrdinalIgnoreCase) != -1)
+				{
+					list.Add(item.Key);
+				}
+			}
+		}
+		foreach (KeyValuePair<string, AssetBundle> item2 in files.Where((KeyValuePair<string, AssetBundle> x) => x.Key.StartsWith(folder, StringComparison.OrdinalIgnoreCase)))
+		{
+			if (string.IsNullOrEmpty(search) || item2.Key.IndexOf(search, StringComparison.OrdinalIgnoreCase) != -1)
+			{
+				list.Add(item2.Key);
 			}
 		}
 		list.Sort(StringComparer.OrdinalIgnoreCase);
@@ -184,267 +411,107 @@ public class AssetBundleBackend : FileSystemBackend, IDisposable
 
 	public override bool HasAsset(string path)
 	{
-		return files.ContainsKey(path);
+		if (!assetScenePrefabs.ContainsKey(path))
+		{
+			return files.ContainsKey(path);
+		}
+		return true;
 	}
 }
 
 
 using System;
 using System.Collections.Generic;
-using Facepunch;
-using UnityEngine;
-
-internal class AssetBundleLoadAssetsResult : LoadAssetsResult
-{
-	private readonly AssetBundle _bundle;
-
-	private readonly List<string> _filePaths;
-
-	private readonly int _maxConcurrency;
-
-	private readonly int _priority;
-
-	private readonly List<AssetBundleRequest> _requests;
-
-	private readonly List<(string AssetPath, AssetBundleRequest Request)> _pendingRequests;
-
-	private int _index;
-
-	public override int TotalCount => _filePaths.Count;
-
-	public override bool keepWaiting => !Update();
-
-	internal AssetBundleLoadAssetsResult(AssetBundle bundle, List<string> filePaths, int maxConcurrency, int priority)
-	{
-		if ((Object)(object)bundle == (Object)null)
-		{
-			throw new ArgumentNullException("bundle");
-		}
-		if (filePaths == null)
-		{
-			throw new ArgumentNullException("filePaths");
-		}
-		foreach (string filePath in filePaths)
-		{
-			if (string.IsNullOrWhiteSpace(filePath))
-			{
-				throw new ArgumentException("Cannot load null or empty paths.", "filePaths");
-			}
-		}
-		_bundle = bundle;
-		_filePaths = filePaths;
-		_maxConcurrency = Mathf.Clamp(maxConcurrency, 1, 64);
-		_priority = priority;
-		_requests = new List<AssetBundleRequest>(_filePaths.Count);
-		_pendingRequests = new List<(string, AssetBundleRequest)>(_maxConcurrency);
-		_index = 0;
-	}
-
-	private bool Update()
-	{
-		if (_requests.Count == _filePaths.Count && _pendingRequests.Count == 0)
-		{
-			return true;
-		}
-		if ((Object)(object)_bundle == (Object)null)
-		{
-			CompletedCount = TotalCount;
-			return true;
-		}
-		List<(string, AssetBundleRequest)> list = Pool.Get<List<(string, AssetBundleRequest)>>();
-		for (int i = 0; i < _pendingRequests.Count; i++)
-		{
-			var (item, val) = _pendingRequests[i];
-			if (((AsyncOperation)val).isDone)
-			{
-				CompletedCount++;
-				_pendingRequests.RemoveAt(i);
-				i--;
-				list.Add((item, val));
-			}
-		}
-		foreach (var (path, val2) in list)
-		{
-			try
-			{
-				OnAssetLoaded?.Invoke(path, val2.asset);
-			}
-			catch (Exception ex)
-			{
-				Debug.LogException(ex);
-			}
-		}
-		Pool.FreeUnmanaged<(string, AssetBundleRequest)>(ref list);
-		while (_pendingRequests.Count < _maxConcurrency)
-		{
-			if (_index >= _filePaths.Count)
-			{
-				return false;
-			}
-			string text = _filePaths[_index++];
-			AssetBundleRequest val3 = _bundle.LoadAssetAsync(text);
-			((AsyncOperation)val3).priority = _priority;
-			_requests.Add(val3);
-			_pendingRequests.Add((text, val3));
-		}
-		return false;
-	}
-
-	public override Dictionary<string, Object> GetResult()
-	{
-		if (((CustomYieldInstruction)this).keepWaiting)
-		{
-			throw new InvalidOperationException("Cannot get results until the load is completed.");
-		}
-		Dictionary<string, Object> dictionary = new Dictionary<string, Object>();
-		for (int i = 0; i < _filePaths.Count; i++)
-		{
-			dictionary.Add(_filePaths[i], _requests[i].asset);
-		}
-		return dictionary;
-	}
-}
-
-
-using System;
-using System.Collections.Generic;
-using UnityEngine;
-
-public class AssetPreloadResult : CustomYieldInstruction
-{
-	private readonly FileSystemBackend _backend;
-
-	private readonly LoadAssetsResult _load;
-
-	private readonly List<(string, Object)> _loaded;
-
-	private readonly int _alreadyLoadedCount;
-
-	public int TotalCount => _alreadyLoadedCount + _load.TotalCount;
-
-	public int CompletedCount => _alreadyLoadedCount + _load.CompletedCount;
-
-	public IReadOnlyList<(string AssetPath, Object Object)> Results => _loaded;
-
-	public override bool keepWaiting => ((CustomYieldInstruction)_load).keepWaiting;
-
-	internal AssetPreloadResult(FileSystemBackend backend, LoadAssetsResult load, List<(string, Object)> loaded)
-	{
-		_backend = backend ?? throw new ArgumentNullException("backend");
-		_load = load ?? throw new ArgumentNullException("load");
-		_loaded = loaded ?? new List<(string, Object)>();
-		_alreadyLoadedCount = _loaded.Count;
-		LoadAssetsResult load2 = _load;
-		load2.OnAssetLoaded = (LoadAssetsResult.AssetLoaded)Delegate.Combine(load2.OnAssetLoaded, new LoadAssetsResult.AssetLoaded(OnAssetLoaded));
-	}
-
-	private void OnAssetLoaded(string path, Object obj)
-	{
-		if (_backend.cache.TryGetValue(path, out var value))
-		{
-			if (obj != value)
-			{
-				Debug.LogWarning((object)("Destroying duplicate of prefab: " + path));
-				Object.Destroy(obj);
-				obj = value;
-			}
-		}
-		else
-		{
-			_backend.cache.Add(path, obj);
-		}
-		_loaded.Add((path, obj));
-	}
-}
-
-
-using System;
-using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using Newtonsoft.Json;
 using UnityEngine;
 
-internal class CompositeLoadAssetsResult : LoadAssetsResult
+[JsonModel]
+public class AssetSceneManifest
 {
-	private readonly List<LoadAssetsResult> _loads;
-
-	public override int TotalCount => _loads.Sum((LoadAssetsResult l) => l.TotalCount);
-
-	public override int CompletedCount
+	[JsonModel]
+	public class Entry
 	{
-		get
-		{
-			return _loads.Sum((LoadAssetsResult l) => l.CompletedCount);
-		}
-		protected set
-		{
-		}
+		public string Name { get; set; }
+
+		public bool AutoLoad { get; set; }
+
+		public bool CanUnload { get; set; }
+
+		public List<string> IncludedAssets { get; set; }
 	}
 
-	public override bool keepWaiting
+	public const string FileName = "AssetSceneManifest.json";
+
+	public const string Prefix = "AssetScene-";
+
+	public const string BootstrapSceneName = "AssetScene-bootstrap";
+
+	public const string PrefabsSceneName = "AssetScene-prefabs";
+
+	public const string WorldSceneName = "AssetScene-world";
+
+	public const string MonumentSceneName = "AssetScene-monument";
+
+	public const string PropsSceneName = "AssetScene-props";
+
+	public List<Entry> Scenes { get; set; }
+
+	[JsonIgnore]
+	public List<string> AutoLoadScenes { get; private set; }
+
+	[JsonIgnore]
+	public List<string> UnloadableScenes { get; private set; }
+
+	[JsonIgnore]
+	public List<string> MonumentScenes { get; private set; }
+
+	public static AssetSceneManifest Current { get; private set; }
+
+	private void Initialize()
 	{
-		get
+		if (Scenes == null)
 		{
-			if (_loads.Count != 0)
-			{
-				return _loads.Any((LoadAssetsResult l) => ((CustomYieldInstruction)l).keepWaiting);
-			}
-			return false;
+			List<Entry> list2 = (Scenes = new List<Entry>());
 		}
+		AutoLoadScenes = (from s in Scenes
+			where s.AutoLoad
+			select s.Name).ToList();
+		UnloadableScenes = (from s in Scenes
+			where s.CanUnload
+			select s.Name).ToList();
+		MonumentScenes = (from s in Scenes
+			where s.Name.StartsWith("AssetScene-monument", StringComparison.OrdinalIgnoreCase)
+			select s.Name).ToList();
 	}
 
-	public CompositeLoadAssetsResult(List<LoadAssetsResult> loads)
+	public static void Load(AssetBundleBackend backend)
 	{
-		if (loads == null)
+		//IL_0012: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0018: Invalid comparison between Unknown and I4
+		if (Current != null)
 		{
-			throw new ArgumentNullException("loads");
+			throw new InvalidOperationException("AssetSceneManifest is already loaded.");
 		}
-		foreach (LoadAssetsResult load in loads)
+		Current = JsonConvert.DeserializeObject<AssetSceneManifest>(File.ReadAllText(((int)Application.platform == 1) ? Path.Combine(Application.dataPath, "../../Bundles/", "AssetSceneManifest.json") : Path.Combine(Application.dataPath, "../Bundles/", "AssetSceneManifest.json")));
+		if (Current == null)
 		{
-			if (load == null)
-			{
-				throw new ArgumentException("Cannot wait for null LoadAssetsResult.", "loads");
-			}
+			Current = new AssetSceneManifest();
 		}
-		_loads = loads;
-		AssetLoaded b = AssetLoadedHandler;
-		foreach (LoadAssetsResult load2 in loads)
-		{
-			load2.OnAssetLoaded = (AssetLoaded)Delegate.Combine(load2.OnAssetLoaded, b);
-		}
-	}
-
-	public override Dictionary<string, Object> GetResult()
-	{
-		if (((CustomYieldInstruction)this).keepWaiting)
-		{
-			throw new InvalidOperationException("Cannot get results until the load is completed.");
-		}
-		Dictionary<string, Object> dictionary = new Dictionary<string, Object>();
-		foreach (LoadAssetsResult load in _loads)
-		{
-			foreach (KeyValuePair<string, Object> item in load.GetResult())
-			{
-				dictionary.Add(item.Key, item.Value);
-			}
-		}
-		return dictionary;
-	}
-
-	private void AssetLoadedHandler(string assetPath, Object obj)
-	{
-		try
-		{
-			OnAssetLoaded?.Invoke(assetPath, obj);
-		}
-		catch (Exception ex)
-		{
-			Debug.LogException(ex);
-		}
+		Current.Initialize();
 	}
 }
 
 
-using System.Collections.Generic;
+public static class AssetSceneUtil
+{
+	public static void Log(string message)
+	{
+	}
+}
+
+
 using System.Diagnostics;
 using System.IO;
 using UnityEngine;
@@ -456,6 +523,18 @@ public static class FileSystem
 	public static bool LogTime;
 
 	public static FileSystemBackend Backend;
+
+	public static bool IsBundled
+	{
+		get
+		{
+			if (Application.isPlaying)
+			{
+				return Backend is AssetBundleBackend;
+			}
+			return false;
+		}
+	}
 
 	public static GameObject[] LoadPrefabs(string folder)
 	{
@@ -509,9 +588,9 @@ public static class FileSystem
 		return val;
 	}
 
-	public static AssetPreloadResult PreloadAssets(IEnumerable<string> filePaths, int maxConcurrency, int priority = 0)
+	public static bool HasAsset(string filePath)
 	{
-		return Backend.PreloadAssets(filePaths, maxConcurrency, priority);
+		return Backend.HasAsset(filePath);
 	}
 }
 
@@ -589,25 +668,6 @@ public abstract class FileSystemBackend
 		return val;
 	}
 
-	public AssetPreloadResult PreloadAssets(IEnumerable<string> filePaths, int maxConcurrency, int priority)
-	{
-		List<string> list = new List<string>();
-		List<(string, Object)> list2 = new List<(string, Object)>();
-		foreach (string filePath in filePaths)
-		{
-			if (cache.TryGetValue(filePath, out var value))
-			{
-				list2.Add((filePath, value));
-			}
-			else
-			{
-				list.Add(filePath);
-			}
-		}
-		LoadAssetsResult load = LoadAssetsAsync(list, maxConcurrency, priority);
-		return new AssetPreloadResult(this, load, list2);
-	}
-
 	protected void LoadError(string err)
 	{
 		Debug.LogError((object)err);
@@ -622,30 +682,11 @@ public abstract class FileSystemBackend
 
 	protected abstract T LoadAsset<T>(string filePath) where T : Object;
 
-	protected abstract LoadAssetsResult LoadAssetsAsync(List<string> filePaths, int maxConcurrency, int priority);
-
 	protected abstract string[] LoadAssetList(string folder, string search);
 
 	public abstract T[] LoadAllFromBundle<T>(string bundleName, string editorSearch) where T : Object;
 
 	public abstract bool HasAsset(string path);
-}
-
-
-using System.Collections.Generic;
-using UnityEngine;
-
-public abstract class LoadAssetsResult : CustomYieldInstruction
-{
-	public delegate void AssetLoaded(string path, Object obj);
-
-	public AssetLoaded OnAssetLoaded;
-
-	public abstract int TotalCount { get; }
-
-	public virtual int CompletedCount { get; protected set; }
-
-	public abstract Dictionary<string, Object> GetResult();
 }
 
 
@@ -675,7 +716,7 @@ internal class UnitySourceGeneratedAssemblyMonoScriptTypes_v1
 	private static MonoScriptData Get()
 	{
 		MonoScriptData result = default(MonoScriptData);
-		result.FilePathsData = new byte[432]
+		result.FilePathsData = new byte[292]
 		{
 			0, 0, 0, 1, 0, 0, 0, 53, 92, 65,
 			115, 115, 101, 116, 115, 92, 80, 108, 117, 103,
@@ -683,77 +724,69 @@ internal class UnitySourceGeneratedAssemblyMonoScriptTypes_v1
 			105, 108, 101, 83, 121, 115, 116, 101, 109, 92,
 			65, 115, 115, 101, 116, 66, 117, 110, 100, 108,
 			101, 66, 97, 99, 107, 101, 110, 100, 46, 99,
-			115, 0, 0, 0, 1, 0, 0, 0, 62, 92,
+			115, 0, 0, 0, 2, 0, 0, 0, 53, 92,
 			65, 115, 115, 101, 116, 115, 92, 80, 108, 117,
 			103, 105, 110, 115, 92, 82, 117, 115, 116, 46,
 			70, 105, 108, 101, 83, 121, 115, 116, 101, 109,
-			92, 65, 115, 115, 101, 116, 66, 117, 110, 100,
-			108, 101, 76, 111, 97, 100, 65, 115, 115, 101,
-			116, 115, 82, 101, 115, 117, 108, 116, 46, 99,
-			115, 0, 0, 0, 1, 0, 0, 0, 53, 92,
-			65, 115, 115, 101, 116, 115, 92, 80, 108, 117,
-			103, 105, 110, 115, 92, 82, 117, 115, 116, 46,
-			70, 105, 108, 101, 83, 121, 115, 116, 101, 109,
-			92, 65, 115, 115, 101, 116, 80, 114, 101, 108,
-			111, 97, 100, 82, 101, 115, 117, 108, 116, 46,
-			99, 115, 0, 0, 0, 1, 0, 0, 0, 60,
+			92, 65, 115, 115, 101, 116, 83, 99, 101, 110,
+			101, 77, 97, 110, 105, 102, 101, 115, 116, 46,
+			99, 115, 0, 0, 0, 1, 0, 0, 0, 49,
 			92, 65, 115, 115, 101, 116, 115, 92, 80, 108,
 			117, 103, 105, 110, 115, 92, 82, 117, 115, 116,
 			46, 70, 105, 108, 101, 83, 121, 115, 116, 101,
-			109, 92, 67, 111, 109, 112, 111, 115, 105, 116,
-			101, 76, 111, 97, 100, 65, 115, 115, 101, 116,
-			115, 82, 101, 115, 117, 108, 116, 46, 99, 115,
-			0, 0, 0, 1, 0, 0, 0, 45, 92, 65,
-			115, 115, 101, 116, 115, 92, 80, 108, 117, 103,
-			105, 110, 115, 92, 82, 117, 115, 116, 46, 70,
-			105, 108, 101, 83, 121, 115, 116, 101, 109, 92,
-			70, 105, 108, 101, 83, 121, 115, 116, 101, 109,
-			46, 99, 115, 0, 0, 0, 1, 0, 0, 0,
-			52, 92, 65, 115, 115, 101, 116, 115, 92, 80,
-			108, 117, 103, 105, 110, 115, 92, 82, 117, 115,
-			116, 46, 70, 105, 108, 101, 83, 121, 115, 116,
-			101, 109, 92, 70, 105, 108, 101, 83, 121, 115,
-			116, 101, 109, 66, 97, 99, 107, 101, 110, 100,
-			46, 99, 115, 0, 0, 0, 1, 0, 0, 0,
-			51, 92, 65, 115, 115, 101, 116, 115, 92, 80,
-			108, 117, 103, 105, 110, 115, 92, 82, 117, 115,
-			116, 46, 70, 105, 108, 101, 83, 121, 115, 116,
-			101, 109, 92, 76, 111, 97, 100, 65, 115, 115,
-			101, 116, 115, 82, 101, 115, 117, 108, 116, 46,
+			109, 92, 65, 115, 115, 101, 116, 83, 99, 101,
+			110, 101, 85, 116, 105, 108, 46, 99, 115, 0,
+			0, 0, 1, 0, 0, 0, 45, 92, 65, 115,
+			115, 101, 116, 115, 92, 80, 108, 117, 103, 105,
+			110, 115, 92, 82, 117, 115, 116, 46, 70, 105,
+			108, 101, 83, 121, 115, 116, 101, 109, 92, 70,
+			105, 108, 101, 83, 121, 115, 116, 101, 109, 46,
+			99, 115, 0, 0, 0, 1, 0, 0, 0, 52,
+			92, 65, 115, 115, 101, 116, 115, 92, 80, 108,
+			117, 103, 105, 110, 115, 92, 82, 117, 115, 116,
+			46, 70, 105, 108, 101, 83, 121, 115, 116, 101,
+			109, 92, 70, 105, 108, 101, 83, 121, 115, 116,
+			101, 109, 66, 97, 99, 107, 101, 110, 100, 46,
 			99, 115
 		};
-		result.TypesData = new byte[173]
+		result.TypesData = new byte[136]
 		{
 			0, 0, 0, 0, 19, 124, 65, 115, 115, 101,
 			116, 66, 117, 110, 100, 108, 101, 66, 97, 99,
-			107, 101, 110, 100, 0, 0, 0, 0, 28, 124,
-			65, 115, 115, 101, 116, 66, 117, 110, 100, 108,
-			101, 76, 111, 97, 100, 65, 115, 115, 101, 116,
-			115, 82, 101, 115, 117, 108, 116, 0, 0, 0,
-			0, 19, 124, 65, 115, 115, 101, 116, 80, 114,
-			101, 108, 111, 97, 100, 82, 101, 115, 117, 108,
-			116, 0, 0, 0, 0, 26, 124, 67, 111, 109,
-			112, 111, 115, 105, 116, 101, 76, 111, 97, 100,
-			65, 115, 115, 101, 116, 115, 82, 101, 115, 117,
-			108, 116, 0, 0, 0, 0, 11, 124, 70, 105,
-			108, 101, 83, 121, 115, 116, 101, 109, 0, 0,
-			0, 0, 18, 124, 70, 105, 108, 101, 83, 121,
-			115, 116, 101, 109, 66, 97, 99, 107, 101, 110,
-			100, 0, 0, 0, 0, 17, 124, 76, 111, 97,
-			100, 65, 115, 115, 101, 116, 115, 82, 101, 115,
-			117, 108, 116
+			107, 101, 110, 100, 0, 0, 0, 0, 19, 124,
+			65, 115, 115, 101, 116, 83, 99, 101, 110, 101,
+			77, 97, 110, 105, 102, 101, 115, 116, 0, 0,
+			0, 0, 24, 65, 115, 115, 101, 116, 83, 99,
+			101, 110, 101, 77, 97, 110, 105, 102, 101, 115,
+			116, 124, 69, 110, 116, 114, 121, 0, 0, 0,
+			0, 15, 124, 65, 115, 115, 101, 116, 83, 99,
+			101, 110, 101, 85, 116, 105, 108, 0, 0, 0,
+			0, 11, 124, 70, 105, 108, 101, 83, 121, 115,
+			116, 101, 109, 0, 0, 0, 0, 18, 124, 70,
+			105, 108, 101, 83, 121, 115, 116, 101, 109, 66,
+			97, 99, 107, 101, 110, 100
 		};
-		result.TotalFiles = 7;
-		result.TotalTypes = 7;
+		result.TotalFiles = 5;
+		result.TotalTypes = 6;
 		result.IsEditorOnly = false;
 		return result;
 	}
 }
 
 
-using UnityEngine;
+using System.Collections.Generic;
 
-public delegate void AssetLoaded(string path, Object obj);
+[JsonModel]
+public class Entry
+{
+	public string Name { get; set; }
+
+	public bool AutoLoad { get; set; }
+
+	public bool CanUnload { get; set; }
+
+	public List<string> IncludedAssets { get; set; }
+}
 
 
 private struct MonoScriptData
