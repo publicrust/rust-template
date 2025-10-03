@@ -1,6 +1,843 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Rust;
+using UnityEngine;
+
+public class Climate : SingletonComponent<Climate>
+{
+	[Serializable]
+	public class ClimateParameters
+	{
+		public AnimationCurve Temperature;
+
+		[Horizontal(4, -1)]
+		public Float4 AerialDensity;
+
+		[Horizontal(4, -1)]
+		public Float4 FogDensity;
+
+		[Horizontal(4, -1)]
+		public Color4 FogColorGrad;
+
+		[Horizontal(4, -1)]
+		public Float4 FogAmbientIntensity = Float4.One();
+
+		[Range(0f, 1f)]
+		[Horizontal(4, -1)]
+		public Float4 FogAmbientSaturation = Float4.One();
+
+		[Horizontal(4, -1)]
+		public Float4 FogLightBoost = Float4.One();
+
+		public float BiomeWeightExponent = 1f;
+
+		public float FogHeightFalloff = 0.02f;
+	}
+
+	[Serializable]
+	public class WeatherParameters
+	{
+		[Range(0f, 1f)]
+		public float ClearChance = 1f;
+
+		[Range(0f, 1f)]
+		public float DustChance;
+
+		[Range(0f, 1f)]
+		public float FogChance;
+
+		[Range(0f, 1f)]
+		public float OvercastChance;
+
+		[Range(0f, 1f)]
+		public float StormChance;
+
+		[Range(0f, 1f)]
+		public float RainChance;
+	}
+
+	public class Value4<T>
+	{
+		public T Dawn;
+
+		public T Noon;
+
+		public T Dusk;
+
+		public T Night;
+
+		public float FindBlendParameters(TOD_Sky sky, out T src, out T dst)
+		{
+			float num = Mathf.Abs(sky.SunriseTime - sky.Cycle.Hour);
+			float num2 = Mathf.Abs(sky.SunsetTime - sky.Cycle.Hour);
+			float num3 = (180f - sky.SunZenith) / 180f;
+			float num4 = 1f / 9f;
+			if (num < num2)
+			{
+				if (num3 < 0.5f)
+				{
+					src = Night;
+					dst = Dawn;
+					return Mathf.InverseLerp(0.5f - num4, 0.5f, num3);
+				}
+				src = Dawn;
+				dst = Noon;
+				return Mathf.InverseLerp(0.5f, 0.5f + num4, num3);
+			}
+			if (num3 > 0.5f)
+			{
+				src = Noon;
+				dst = Dusk;
+				return Mathf.InverseLerp(0.5f + num4, 0.5f, num3);
+			}
+			src = Dusk;
+			dst = Night;
+			return Mathf.InverseLerp(0.5f, 0.5f - num4, num3);
+		}
+	}
+
+	[Serializable]
+	public class Float4 : Value4<float>
+	{
+		public static Float4 One()
+		{
+			return new Float4
+			{
+				Dawn = 1f,
+				Dusk = 1f,
+				Noon = 1f,
+				Night = 1f
+			};
+		}
+	}
+
+	[Serializable]
+	public class Color4 : Value4<Color>
+	{
+	}
+
+	[Serializable]
+	public class Texture2D4 : Value4<Texture2D>
+	{
+	}
+
+	private const float fadeAngle = 20f;
+
+	private const float defaultTemp = 15f;
+
+	private const int weatherDurationHours = 18;
+
+	private const int weatherFadeHours = 6;
+
+	public float BiomeFogShoreDistanceFalloff = -25f;
+
+	[Range(0f, 1f)]
+	public float BlendingSpeed = 1f;
+
+	public float FogDarknessDistance = 200f;
+
+	public bool DebugLUTBlending;
+
+	public WeatherParameters Weather;
+
+	public WeatherPreset[] WeatherPresets;
+
+	public ClimateParameters Arid;
+
+	public ClimateParameters Temperate;
+
+	public ClimateParameters Tundra;
+
+	public ClimateParameters Arctic;
+
+	public ClimateParameters Jungle;
+
+	public float UndergroundFogDensity;
+
+	public Color UndergroundFogColor = Color.black;
+
+	public VolumeCloudsConfig[] DefaultCloudConfigs;
+
+	public VolumeCloudsCirrusConfig[] DefaultCirrusConfigs;
+
+	public VolumeCloudsConfig[] AllCloudConfigs;
+
+	public Dictionary<WeatherPresetType, WeatherPreset[]> presetLookup;
+
+	private ClimateParameters[] climateLookup;
+
+	public float WeatherStateBlend { get; set; }
+
+	public uint WeatherSeedPrevious { get; set; }
+
+	public uint WeatherSeedTarget { get; set; }
+
+	public uint WeatherSeedNext { get; set; }
+
+	public WeatherPreset WeatherStatePrevious { get; set; }
+
+	public WeatherPreset WeatherStateTarget { get; set; }
+
+	public WeatherPreset WeatherStateNext { get; set; }
+
+	public WeatherPreset WeatherState { get; set; }
+
+	public WeatherPreset WeatherClampsMin { get; private set; }
+
+	public WeatherPreset WeatherClampsMax { get; private set; }
+
+	public WeatherPreset WeatherOverrides { get; set; }
+
+	public LegacyWeatherState Overrides { get; set; }
+
+	protected override void Awake()
+	{
+		((SingletonComponent)this).Awake();
+		WeatherState = ScriptableObject.CreateInstance(typeof(WeatherPreset)) as WeatherPreset;
+		WeatherClampsMin = ScriptableObject.CreateInstance(typeof(WeatherPreset)) as WeatherPreset;
+		WeatherClampsMax = ScriptableObject.CreateInstance(typeof(WeatherPreset)) as WeatherPreset;
+		WeatherOverrides = ScriptableObject.CreateInstance(typeof(WeatherPreset)) as WeatherPreset;
+		WeatherState.Reset();
+		WeatherClampsMin.Reset();
+		WeatherClampsMax.Reset();
+		WeatherOverrides.Reset();
+		Overrides = new LegacyWeatherState(WeatherOverrides);
+	}
+
+	protected override void OnDestroy()
+	{
+		if (!Application.isQuitting)
+		{
+			((SingletonComponent)this).OnDestroy();
+			if ((Object)(object)WeatherState != (Object)null)
+			{
+				Object.Destroy((Object)(object)WeatherState);
+			}
+			if ((Object)(object)WeatherClampsMin != (Object)null)
+			{
+				Object.Destroy((Object)(object)WeatherClampsMin);
+			}
+			if ((Object)(object)WeatherClampsMax != (Object)null)
+			{
+				Object.Destroy((Object)(object)WeatherClampsMax);
+			}
+			if ((Object)(object)WeatherOverrides != (Object)null)
+			{
+				Object.Destroy((Object)(object)WeatherOverrides);
+			}
+		}
+	}
+
+	private void GetPresetVCloudConfigs(WeatherPreset preset, uint seed, out VolumeCloudsConfig cfg, out VolumeCloudsCirrusConfig cfgCirrus, out VolumeCloudsRadialWeatherLayerConfig cfgStorm)
+	{
+		if (preset.VolumeCloudsConfigs != null && preset.VolumeCloudsConfigs.Length != 0)
+		{
+			cfg = preset.VolumeCloudsConfigs[SeedRandom.Range(seed, 0, preset.VolumeCloudsConfigs.Length)];
+		}
+		else if (DefaultCloudConfigs.Length == 0)
+		{
+			Debug.LogError((object)"Current weather profile has no cloud config, and default cloud config list is empty!  This shouldn't be so");
+			cfg = null;
+		}
+		else
+		{
+			cfg = DefaultCloudConfigs[SeedRandom.Range(seed, 0, DefaultCloudConfigs.Length)];
+		}
+		if (preset.VolumeCloudsCirrusConfigs != null && preset.VolumeCloudsCirrusConfigs.Length != 0)
+		{
+			cfgCirrus = preset.VolumeCloudsCirrusConfigs[SeedRandom.Range(seed, 0, preset.VolumeCloudsCirrusConfigs.Length)];
+		}
+		else if (DefaultCirrusConfigs.Length == 0)
+		{
+			Debug.LogError((object)"Current weather profile has no cirrus cloud config, and default cirrus cloud config list is empty!  This shouldn't be so");
+			cfgCirrus = null;
+		}
+		else
+		{
+			cfgCirrus = DefaultCirrusConfigs[SeedRandom.Range(seed, 0, DefaultCirrusConfigs.Length)];
+		}
+		if (preset.VolumeCloudsStormLayers != null && preset.VolumeCloudsStormLayers.Length != 0)
+		{
+			cfgStorm = preset.VolumeCloudsStormLayers[SeedRandom.Range(seed, 0, preset.VolumeCloudsStormLayers.Length)];
+		}
+		else
+		{
+			cfgStorm = null;
+		}
+	}
+
+	public void Update()
+	{
+		if (!Application.isReceiving && !Application.isLoading && Object.op_Implicit((Object)(object)TOD_Sky.Instance))
+		{
+			TOD_Sky instance = TOD_Sky.Instance;
+			long num = World.Seed + instance.Cycle.Ticks;
+			long num2 = 648000000000L;
+			long num3 = 216000000000L;
+			long num4 = num / num2;
+			WeatherStateBlend = Mathf.InverseLerp(0f, (float)num3, (float)(num % num2));
+			uint seed = (WeatherSeedPrevious = GetSeedFromLong(num4));
+			WeatherStatePrevious = GetWeatherPreset(seed);
+			seed = (WeatherSeedTarget = GetSeedFromLong(num4 + 1));
+			WeatherStateTarget = GetWeatherPreset(seed);
+			seed = (WeatherSeedNext = GetSeedFromLong(num4 + 2));
+			WeatherStateNext = GetWeatherPreset(seed);
+			WeatherState.Fade(WeatherStatePrevious, WeatherStateTarget, WeatherStateBlend);
+			WeatherState.Override(WeatherOverrides);
+		}
+	}
+
+	private static bool Initialized()
+	{
+		if (!Object.op_Implicit((Object)(object)SingletonComponent<Climate>.Instance))
+		{
+			return false;
+		}
+		if (!Object.op_Implicit((Object)(object)SingletonComponent<Climate>.Instance.WeatherStatePrevious))
+		{
+			return false;
+		}
+		if (!Object.op_Implicit((Object)(object)SingletonComponent<Climate>.Instance.WeatherStateTarget))
+		{
+			return false;
+		}
+		if (!Object.op_Implicit((Object)(object)SingletonComponent<Climate>.Instance.WeatherStateNext))
+		{
+			return false;
+		}
+		if (!Object.op_Implicit((Object)(object)SingletonComponent<Climate>.Instance.WeatherState))
+		{
+			return false;
+		}
+		if (!Object.op_Implicit((Object)(object)SingletonComponent<Climate>.Instance.WeatherClampsMin))
+		{
+			return false;
+		}
+		if (!Object.op_Implicit((Object)(object)SingletonComponent<Climate>.Instance.WeatherOverrides))
+		{
+			return false;
+		}
+		return true;
+	}
+
+	public static float GetClouds(Vector3 position)
+	{
+		if (!Initialized())
+		{
+			return 0f;
+		}
+		return SingletonComponent<Climate>.Instance.WeatherState.Clouds.Coverage;
+	}
+
+	public static float GetFog(Vector3 position)
+	{
+		if (!Initialized())
+		{
+			return 0f;
+		}
+		return SingletonComponent<Climate>.Instance.WeatherState.Atmosphere.Fogginess;
+	}
+
+	public static float GetWind(Vector3 position)
+	{
+		if (!Initialized())
+		{
+			return 0f;
+		}
+		return SingletonComponent<Climate>.Instance.WeatherState.Wind;
+	}
+
+	public static float GetThunder(Vector3 position)
+	{
+		if (!Initialized())
+		{
+			return 0f;
+		}
+		float thunder = SingletonComponent<Climate>.Instance.WeatherOverrides.Thunder;
+		if (thunder >= 0f)
+		{
+			return thunder;
+		}
+		float thunder2 = SingletonComponent<Climate>.Instance.WeatherState.Thunder;
+		float thunder3 = SingletonComponent<Climate>.Instance.WeatherStatePrevious.Thunder;
+		float thunder4 = SingletonComponent<Climate>.Instance.WeatherStateTarget.Thunder;
+		if (thunder3 > 0f && thunder2 > 0.5f * thunder3)
+		{
+			return thunder2;
+		}
+		if (thunder4 > 0f && thunder2 > 0.5f * thunder4)
+		{
+			return thunder2;
+		}
+		return 0f;
+	}
+
+	public static float GetRainbow(Vector3 position)
+	{
+		//IL_0036: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0061: Unknown result type (might be due to invalid IL or missing references)
+		if (!Initialized())
+		{
+			return 0f;
+		}
+		TOD_Sky instance = TOD_Sky.Instance;
+		if (!Object.op_Implicit((Object)(object)instance) || !instance.IsDay || instance.LerpValue < 1f)
+		{
+			return 0f;
+		}
+		if (GetFog(position) > 0.25f)
+		{
+			return 0f;
+		}
+		float num = (Object.op_Implicit((Object)(object)TerrainMeta.BiomeMap) ? TerrainMeta.BiomeMap.GetBiome(position, 3) : 0f);
+		if (num <= 0f)
+		{
+			return 0f;
+		}
+		float rainbow = SingletonComponent<Climate>.Instance.WeatherOverrides.Rainbow;
+		if (rainbow >= 0f)
+		{
+			return rainbow * num;
+		}
+		if (SingletonComponent<Climate>.Instance.WeatherState.Rainbow <= 0f)
+		{
+			return 0f;
+		}
+		if (SingletonComponent<Climate>.Instance.WeatherStateTarget.Rainbow > 0f)
+		{
+			return 0f;
+		}
+		float rainbow2 = SingletonComponent<Climate>.Instance.WeatherStatePrevious.Rainbow;
+		float num2 = SeedRandom.Value(SingletonComponent<Climate>.Instance.WeatherSeedPrevious);
+		if (rainbow2 < num2)
+		{
+			return 0f;
+		}
+		return num;
+	}
+
+	public static float GetAurora(Vector3 position)
+	{
+		//IL_0036: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0049: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0073: Unknown result type (might be due to invalid IL or missing references)
+		if (!Initialized())
+		{
+			return 0f;
+		}
+		TOD_Sky instance = TOD_Sky.Instance;
+		if (!Object.op_Implicit((Object)(object)instance) || !instance.IsNight || instance.LerpValue > 0f)
+		{
+			return 0f;
+		}
+		if (GetClouds(position) > 0.1f)
+		{
+			return 0f;
+		}
+		if (GetFog(position) > 0.1f)
+		{
+			return 0f;
+		}
+		if (!Object.op_Implicit((Object)(object)TerrainMeta.BiomeMap))
+		{
+			return 0f;
+		}
+		return TerrainMeta.BiomeMap.GetBiome(position, 8);
+	}
+
+	public static float GetRain(Vector3 position)
+	{
+		//IL_0025: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0045: Unknown result type (might be due to invalid IL or missing references)
+		if (!Initialized())
+		{
+			return 0f;
+		}
+		float num = (Object.op_Implicit((Object)(object)TerrainMeta.BiomeMap) ? TerrainMeta.BiomeMap.GetBiome(position, 1) : 0f);
+		float num2 = (Object.op_Implicit((Object)(object)TerrainMeta.BiomeMap) ? TerrainMeta.BiomeMap.GetBiome(position, 8) : 0f);
+		return SingletonComponent<Climate>.Instance.WeatherState.Rain * Mathf.Lerp(1f, 0.5f, num) * (1f - num2);
+	}
+
+	public static float GetSnow(Vector3 position)
+	{
+		//IL_0025: Unknown result type (might be due to invalid IL or missing references)
+		if (!Initialized())
+		{
+			return 0f;
+		}
+		float num = (Object.op_Implicit((Object)(object)TerrainMeta.BiomeMap) ? TerrainMeta.BiomeMap.GetBiome(position, 8) : 0f);
+		return SingletonComponent<Climate>.Instance.WeatherState.Rain * num;
+	}
+
+	public static float GetTemperature(Vector3 position)
+	{
+		//IL_0026: Unknown result type (might be due to invalid IL or missing references)
+		if (!Initialized())
+		{
+			return 15f;
+		}
+		TOD_Sky instance = TOD_Sky.Instance;
+		if (!Object.op_Implicit((Object)(object)instance))
+		{
+			return 15f;
+		}
+		ClimateParameters src;
+		ClimateParameters dst;
+		float num = SingletonComponent<Climate>.Instance.FindBlendParameters(position, out src, out dst);
+		if (src == null || dst == null)
+		{
+			return 15f;
+		}
+		float hour = instance.Cycle.Hour;
+		float num2 = src.Temperature.Evaluate(hour);
+		float num3 = dst.Temperature.Evaluate(hour);
+		return Mathf.Lerp(num2, num3, num);
+	}
+
+	private uint GetSeedFromLong(long val)
+	{
+		uint result = (uint)((val % uint.MaxValue + uint.MaxValue) % uint.MaxValue);
+		SeedRandom.Wanghash(ref result);
+		SeedRandom.Wanghash(ref result);
+		SeedRandom.Wanghash(ref result);
+		return result;
+	}
+
+	private WeatherPreset GetWeatherPreset(uint seed)
+	{
+		float num = Weather.ClearChance + Weather.DustChance + Weather.FogChance + Weather.OvercastChance + Weather.StormChance + Weather.RainChance;
+		float num2 = SeedRandom.Range(ref seed, 0f, num);
+		if (num2 < Weather.RainChance)
+		{
+			return GetWeatherPreset(seed, WeatherPresetType.Rain);
+		}
+		if (num2 < Weather.RainChance + Weather.StormChance)
+		{
+			return GetWeatherPreset(seed, WeatherPresetType.Storm);
+		}
+		if (num2 < Weather.RainChance + Weather.StormChance + Weather.OvercastChance)
+		{
+			return GetWeatherPreset(seed, WeatherPresetType.Overcast);
+		}
+		if (num2 < Weather.RainChance + Weather.StormChance + Weather.OvercastChance + Weather.FogChance)
+		{
+			return GetWeatherPreset(seed, WeatherPresetType.Fog);
+		}
+		if (num2 < Weather.RainChance + Weather.StormChance + Weather.OvercastChance + Weather.FogChance + Weather.DustChance)
+		{
+			return GetWeatherPreset(seed, WeatherPresetType.Dust);
+		}
+		return GetWeatherPreset(seed, WeatherPresetType.Clear);
+	}
+
+	private WeatherPreset GetWeatherPreset(uint seed, WeatherPresetType type)
+	{
+		if (presetLookup == null)
+		{
+			presetLookup = new Dictionary<WeatherPresetType, WeatherPreset[]>();
+		}
+		if (!presetLookup.TryGetValue(type, out var value))
+		{
+			presetLookup.Add(type, value = CacheWeatherPresets(type));
+		}
+		return value.GetRandom(ref seed);
+	}
+
+	public WeatherPreset[] CacheWeatherPresets(WeatherPresetType type)
+	{
+		return WeatherPresets.Where((WeatherPreset x) => x.Type == type).ToArray();
+	}
+
+	private float FindBlendParameters(Vector3 pos, out ClimateParameters src, out ClimateParameters dst)
+	{
+		//IL_0069: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0076: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00a2: Unknown result type (might be due to invalid IL or missing references)
+		if (climateLookup == null)
+		{
+			climateLookup = new ClimateParameters[5] { Arid, Temperate, Tundra, Arctic, Jungle };
+		}
+		if ((Object)(object)TerrainMeta.BiomeMap == (Object)null)
+		{
+			src = Temperate;
+			dst = Temperate;
+			return 0.5f;
+		}
+		int biomeMaxType = TerrainMeta.BiomeMap.GetBiomeMaxType(pos);
+		int biomeMaxType2 = TerrainMeta.BiomeMap.GetBiomeMaxType(pos, ~biomeMaxType);
+		src = climateLookup[TerrainBiome.TypeToIndex(biomeMaxType)];
+		dst = climateLookup[TerrainBiome.TypeToIndex(biomeMaxType2)];
+		return TerrainMeta.BiomeMap.GetBiome(pos, biomeMaxType2);
+	}
+}
+
+
+using System;
+using UnityEngine;
+
+[Serializable]
+public class ClimateParameters
+{
+	public AnimationCurve Temperature;
+
+	[Horizontal(4, -1)]
+	public Float4 AerialDensity;
+
+	[Horizontal(4, -1)]
+	public Float4 FogDensity;
+
+	[Horizontal(4, -1)]
+	public Color4 FogColorGrad;
+
+	[Horizontal(4, -1)]
+	public Float4 FogAmbientIntensity = Float4.One();
+
+	[Range(0f, 1f)]
+	[Horizontal(4, -1)]
+	public Float4 FogAmbientSaturation = Float4.One();
+
+	[Horizontal(4, -1)]
+	public Float4 FogLightBoost = Float4.One();
+
+	public float BiomeWeightExponent = 1f;
+
+	public float FogHeightFalloff = 0.02f;
+}
+
+
+using System;
+using UnityEngine;
+
+[Serializable]
+public class WeatherParameters
+{
+	[Range(0f, 1f)]
+	public float ClearChance = 1f;
+
+	[Range(0f, 1f)]
+	public float DustChance;
+
+	[Range(0f, 1f)]
+	public float FogChance;
+
+	[Range(0f, 1f)]
+	public float OvercastChance;
+
+	[Range(0f, 1f)]
+	public float StormChance;
+
+	[Range(0f, 1f)]
+	public float RainChance;
+}
+
+
+using UnityEngine;
+
+public class Value4<T>
+{
+	public T Dawn;
+
+	public T Noon;
+
+	public T Dusk;
+
+	public T Night;
+
+	public float FindBlendParameters(TOD_Sky sky, out T src, out T dst)
+	{
+		float num = Mathf.Abs(sky.SunriseTime - sky.Cycle.Hour);
+		float num2 = Mathf.Abs(sky.SunsetTime - sky.Cycle.Hour);
+		float num3 = (180f - sky.SunZenith) / 180f;
+		float num4 = 1f / 9f;
+		if (num < num2)
+		{
+			if (num3 < 0.5f)
+			{
+				src = Night;
+				dst = Dawn;
+				return Mathf.InverseLerp(0.5f - num4, 0.5f, num3);
+			}
+			src = Dawn;
+			dst = Noon;
+			return Mathf.InverseLerp(0.5f, 0.5f + num4, num3);
+		}
+		if (num3 > 0.5f)
+		{
+			src = Noon;
+			dst = Dusk;
+			return Mathf.InverseLerp(0.5f + num4, 0.5f, num3);
+		}
+		src = Dusk;
+		dst = Night;
+		return Mathf.InverseLerp(0.5f, 0.5f - num4, num3);
+	}
+}
+
+
+using System;
+
+[Serializable]
+public class Float4 : Value4<float>
+{
+	public static Float4 One()
+	{
+		return new Float4
+		{
+			Dawn = 1f,
+			Dusk = 1f,
+			Noon = 1f,
+			Night = 1f
+		};
+	}
+}
+
+
+using System;
+using UnityEngine;
+
+[Serializable]
+public class Color4 : Value4<Color>
+{
+}
+
+
+using System;
+using UnityEngine;
+
+[Serializable]
+public class Texture2D4 : Value4<Texture2D>
+{
+}
+
+
+using System;
+using UnityEngine;
+
+public class ColliderInfo : MonoBehaviour
+{
+	[Flags]
+	public enum Flags
+	{
+		Usable = 1,
+		Shootable = 2,
+		Melee = 4,
+		Opaque = 8,
+		Airflow = 0x10,
+		OnlyBlockBuildingBlock = 0x20,
+		Monument = 0x40,
+		Tunnels = 0x80,
+		AllowBuildInsideMesh = 0x100
+	}
+
+	public const Flags FlagsNone = (Flags)0;
+
+	public const Flags FlagsEverything = (Flags)(-1);
+
+	public const Flags FlagsDefault = Flags.Usable | Flags.Shootable | Flags.Melee | Flags.Opaque;
+
+	[InspectorFlags]
+	public Flags flags = Flags.Usable | Flags.Shootable | Flags.Melee | Flags.Opaque;
+
+	public bool HasFlag(Flags f)
+	{
+		return (flags & f) == f;
+	}
+
+	public void SetFlag(Flags f, bool b)
+	{
+		if (b)
+		{
+			flags |= f;
+		}
+		else
+		{
+			flags &= ~f;
+		}
+	}
+
+	public bool Filter(HitTest info)
+	{
+		switch (info.type)
+		{
+		case HitTest.Type.MeleeAttack:
+			if ((flags & Flags.Melee) == 0)
+			{
+				return false;
+			}
+			break;
+		case HitTest.Type.ProjectileEffect:
+		case HitTest.Type.Projectile:
+			if ((flags & Flags.Shootable) == 0)
+			{
+				return false;
+			}
+			break;
+		case HitTest.Type.Use:
+			if ((flags & Flags.Usable) == 0)
+			{
+				return false;
+			}
+			break;
+		}
+		return true;
+	}
+}
+
+
+using System;
+
+[Flags]
+public enum Flags
+{
+	Usable = 1,
+	Shootable = 2,
+	Melee = 4,
+	Opaque = 8,
+	Airflow = 0x10,
+	OnlyBlockBuildingBlock = 0x20,
+	Monument = 0x40,
+	Tunnels = 0x80,
+	AllowBuildInsideMesh = 0x100
+}
+
+
+public class ColliderInfo_Pipe : ColliderInfo
+{
+	public int OutputSlotIndex;
+
+	public IOEntity ParentEntity;
+}
+
+
+using UnityEngine;
+
+public class ConditionalGibbable : MonoBehaviour
+{
+	[ReadOnly]
+	public int id;
+}
+
+
+using UnityEngine;
+
+public class CreateEffect : MonoBehaviour
+{
+	public GameObjectRef EffectToCreate;
+
+	public void OnEnable()
+	{
+		//IL_0011: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0027: Unknown result type (might be due to invalid IL or missing references)
+		Effect.client.Run(EffectToCreate.resourcePath, ((Component)this).transform.position, ((Component)this).transform.up, ((Component)this).transform.forward);
+	}
+}
+
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 
 public class CreationGibSpawner : BaseMonoBehaviour
@@ -2429,6 +3266,8 @@ public class FoliagePlacement : ScriptableObject
 	[Header("Placement")]
 	public float Density = 2f;
 
+	public float HeightOffset;
+
 	[Header("Filter")]
 	public SpawnFilter Filter;
 
@@ -2443,8 +3282,8 @@ public class FoliagePlacement : ScriptableObject
 	[Header("Randomization")]
 	public float RandomScaling = 0.2f;
 
-	[MinMax(0f, 1f)]
 	[Header("Placement Range")]
+	[MinMax(0f, 1f)]
 	public MinMax Range = new MinMax(0f, 1f);
 
 	public float RangeFade = 0.1f;
@@ -3429,11 +4268,11 @@ public class GameModeSoftcore : GameModeVanilla
 		base.OnPlayerRevived(instigator, victim);
 	}
 
-	public override bool CanMoveItemsFrom(PlayerInventory inv, BaseEntity source, Item item)
+	public override PlayerInventory.CanMoveFromResponse CanMoveItemsFrom(PlayerInventory inv, BaseEntity source, Item item)
 	{
 		if (item.parent != null && item.parent.HasFlag(ItemContainer.Flag.IsPlayer))
 		{
-			return !item.parent.IsLocked();
+			return new PlayerInventory.CanMoveFromResponse(!item.parent.IsLocked(), PlayerInventoryErrors.InventoryLockedError);
 		}
 		return base.CanMoveItemsFrom(inv, source, item);
 	}
@@ -4693,7 +5532,7 @@ public class HitInfo : IPooled
 		}
 	}
 
-	public Phrase bonePhrase
+	public string boneName
 	{
 		get
 		{
@@ -4710,20 +5549,7 @@ public class HitInfo : IPooled
 			{
 				return null;
 			}
-			return baseCombatEntity.skeletonProperties.FindBone(HitBone)?.name;
-		}
-	}
-
-	public string boneName
-	{
-		get
-		{
-			Phrase val = bonePhrase;
-			if (val != null)
-			{
-				return val.english;
-			}
-			return "N/A";
+			return baseCombatEntity.skeletonProperties.FindBone(HitBone)?.boneName;
 		}
 	}
 
@@ -5374,9 +6200,6 @@ public class LandmarkInfo : MonoBehaviour
 
 	public Phrase displayPhrase;
 
-	[Tooltip("For modders only, as they can't access the english field of 'displayPhrase' anymore")]
-	public string untranslatedName;
-
 	public Sprite mapIcon;
 
 	public virtual MapLayer MapLayer => MapLayer.Overworld;
@@ -5664,8 +6487,8 @@ public class CopyLODValues : MonoBehaviour, IEditorComponent
 	[SerializeField]
 	private LODGroup destination;
 
-	[Tooltip("Is false, exact values are copied. If true, values are scaled based on LODGroup size, so the changeover point will match.")]
 	[SerializeField]
+	[Tooltip("Is false, exact values are copied. If true, values are scaled based on LODGroup size, so the changeover point will match.")]
 	private bool scale = true;
 
 	public bool CanCopy()
@@ -6601,6 +7424,15 @@ public class MonumentInfo : LandmarkInfo, IPrefabPreProcess
 			return false;
 		}
 		return true;
+	}
+
+	public bool IsOilRig()
+	{
+		if (displayPhrase.IsValid())
+		{
+			return displayPhrase.english.ToLower().Contains("oil rig");
+		}
+		return false;
 	}
 }
 
@@ -8028,7 +8860,7 @@ public class SkeletonProperties : ScriptableObject
 	{
 		public GameObject bone;
 
-		public Phrase name;
+		public string boneName;
 
 		public HitArea area;
 	}
@@ -8043,10 +8875,6 @@ public class SkeletonProperties : ScriptableObject
 
 	public void OnValidate()
 	{
-		//IL_0095: Unknown result type (might be due to invalid IL or missing references)
-		//IL_009a: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00b0: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00cb: Expected O, but got Unknown
 		if ((Object)(object)boneReference == (Object)null)
 		{
 			Debug.LogWarning((object)("boneReference is null on " + ((Object)this).name), (Object)(object)this);
@@ -8060,11 +8888,7 @@ public class SkeletonProperties : ScriptableObject
 				list.Add(new BoneProperty
 				{
 					bone = ((Component)child).gameObject,
-					name = new Phrase("", "")
-					{
-						token = ((Object)child).name.ToLower(),
-						english = ((Object)child).name.ToLower()
-					}
+					boneName = ((Object)child).name.ToLower()
 				});
 			}
 		}
@@ -8123,7 +8947,7 @@ public class BoneProperty
 {
 	public GameObject bone;
 
-	public Phrase name;
+	public string boneName;
 
 	public HitArea area;
 }
@@ -8879,7 +9703,7 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 		writer.Write(JsonConvert.SerializeObject((object)saveExtraData));
 		writer.Write((sbyte)68);
 		writer.Write(Epoch.FromDateTime(SaveCreatedTime));
-		writer.Write(271u);
+		writer.Write(272u);
 	}
 
 	private static int WriteEntities(BinaryWriter writer)
@@ -9020,7 +9844,7 @@ public class SaveRestore : SingletonComponent<SaveRestore>
 					binaryReader.ReadChar();
 					SaveCreatedTime = Epoch.ToDateTime((long)binaryReader.ReadInt32());
 				}
-				if (binaryReader.ReadUInt32() != 271)
+				if (binaryReader.ReadUInt32() != 272)
 				{
 					if (allowOutOfDateSaves)
 					{
@@ -9661,6 +10485,7 @@ public class ConvarControlledSpawnPopulationRail : ConvarControlledSpawnPopulati
 
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using ConVar;
 using Facepunch;
 using Rust.Ai.Gen2;
@@ -9670,10 +10495,10 @@ using UnityEngine.Serialization;
 [CreateAssetMenu(menuName = "Rust/Density Spawn Population")]
 public class DensitySpawnPopulation : SpawnPopulationBase
 {
-	[Tooltip("Usually per square km")]
-	[SerializeField]
 	[FormerlySerializedAs("TargetDensity")]
+	[Tooltip("Usually per square km")]
 	[Header("Spawn Info")]
+	[SerializeField]
 	public float _targetDensity = 1f;
 
 	public int ClusterSizeMin = 1;
@@ -9887,7 +10712,7 @@ public class DensitySpawnPopulation : SpawnPopulationBase
 		byte[] baseValues = new byte[populationRes * populationRes];
 		SpawnFilter filter = Filter;
 		float cutoff = FilterCutoff;
-		Parallel.For(0, populationRes, (Action<int>)delegate(int z)
+		Parallel.For(0, populationRes, delegate(int z)
 		{
 			for (int i = 0; i < populationRes; i++)
 			{
@@ -10661,9 +11486,9 @@ public abstract class BaseSpawnPoint : MonoBehaviour, IServerComponent
 
 	public SpawnPointType spawnPointType;
 
-	[Tooltip("Min distance between the spawn area and any human players")]
-	[Range(1f, 25f)]
 	[SerializeField]
+	[Range(1f, 25f)]
+	[Tooltip("Min distance between the spawn area and any human players")]
 	protected float playerCheckMargin = 2f;
 
 	public static Dictionary<SpawnPointType, List<BaseSpawnPoint>> spawnPoints = new Dictionary<SpawnPointType, List<BaseSpawnPoint>>();
@@ -11284,8 +12109,8 @@ using UnityEngine;
 
 public class RadialSpawnPoint : BaseSpawnPoint
 {
-	[SerializeField]
 	[Tooltip("Circle to spawn within")]
+	[SerializeField]
 	public float radius = 10f;
 
 	public override void GetLocation(out Vector3 pos, out Quaternion rot)
@@ -11872,6 +12697,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 using ConVar;
 using UnityEngine;
 
@@ -12033,8 +12859,8 @@ public class SpawnHandler : SingletonComponent<SpawnHandler>
 		//IL_0031: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0032: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0037: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0120: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0121: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0122: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0087: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0088: Unknown result type (might be due to invalid IL or missing references)
 		if (World.Size == 0)
@@ -12062,7 +12888,7 @@ public class SpawnHandler : SingletonComponent<SpawnHandler>
 		byte[] map = new byte[char_res * char_res];
 		SpawnFilter filter = CharacterSpawn;
 		float cutoff = CharacterSpawnCutoff;
-		Parallel.For(0, char_res, (Action<int>)delegate(int z)
+		Parallel.For(0, char_res, delegate(int z)
 		{
 			for (int j = 0; j < char_res; j++)
 			{
@@ -13160,8 +13986,8 @@ public class TriggerBase : BaseMonoBehaviour
 
 	public bool HasAnyEntityContents => !entityContents.IsNullOrEmpty();
 
-	[ServerVar]
 	[ClientVar]
+	[ServerVar]
 	public static bool UseExcludeLayers
 	{
 		get
@@ -15467,6 +16293,122 @@ public class TriggerPlayerForce : TriggerBase, IServerComponent
 
 
 using System;
+using UnityEngine;
+
+public class TriggerPlayerMovePos : TriggerBase, IServerComponent
+{
+	public BoxCollider triggerCollider;
+
+	public Vector3 relativeMoveVector = Vector3.up;
+
+	public bool shouldPauseMarkHostile;
+
+	private const float HACK_DISABLE_TIME = 1.5f;
+
+	internal override GameObject InterestedInObject(GameObject obj)
+	{
+		obj = base.InterestedInObject(obj);
+		if ((Object)(object)obj == (Object)null)
+		{
+			return null;
+		}
+		BaseEntity baseEntity = obj.ToBaseEntity();
+		if ((Object)(object)baseEntity != (Object)null)
+		{
+			return ((Component)baseEntity).gameObject;
+		}
+		return null;
+	}
+
+	internal override void OnObjects()
+	{
+		((FacepunchBehaviour)this).InvokeRepeating((Action)HackDisableTick, 0f, 1.25f);
+	}
+
+	internal override void OnEmpty()
+	{
+		base.OnEmpty();
+		((FacepunchBehaviour)this).CancelInvoke((Action)HackDisableTick);
+	}
+
+	protected override void OnDisable()
+	{
+		((FacepunchBehaviour)this).CancelInvoke((Action)HackDisableTick);
+		base.OnDisable();
+	}
+
+	private void HackDisableTick()
+	{
+		if (entityContents == null || !((Behaviour)this).enabled)
+		{
+			return;
+		}
+		foreach (BaseEntity entityContent in entityContents)
+		{
+			if (IsInterested(entityContent))
+			{
+				BasePlayer basePlayer = entityContent.ToPlayer();
+				if ((Object)(object)basePlayer != (Object)null && !basePlayer.IsNpc)
+				{
+					basePlayer.PauseVehicleNoClipDetection(1.5f);
+					basePlayer.PauseSpeedHackDetection(1.5f);
+				}
+			}
+		}
+	}
+
+	protected void FixedUpdate()
+	{
+		//IL_0059: Unknown result type (might be due to invalid IL or missing references)
+		//IL_005e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0061: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0067: Unknown result type (might be due to invalid IL or missing references)
+		//IL_006c: Unknown result type (might be due to invalid IL or missing references)
+		if (entityContents == null)
+		{
+			return;
+		}
+		foreach (BaseEntity entityContent in entityContents)
+		{
+			if (IsInterested(entityContent))
+			{
+				BasePlayer basePlayer = entityContent.ToPlayer();
+				if ((Object)(object)basePlayer != (Object)null && shouldPauseMarkHostile)
+				{
+					basePlayer.SetHostilePauseTime();
+				}
+				Transform transform = ((Component)entityContent).transform;
+				Bounds bounds = ((Collider)triggerCollider).bounds;
+				transform.position = ((Bounds)(ref bounds)).center + relativeMoveVector;
+			}
+		}
+	}
+
+	private bool IsInterested(BaseEntity entity)
+	{
+		if ((Object)(object)entity == (Object)null || entity.isClient)
+		{
+			return false;
+		}
+		BasePlayer basePlayer = entity.ToPlayer();
+		if ((Object)(object)basePlayer != (Object)null)
+		{
+			if ((basePlayer.IsAdmin || basePlayer.IsDeveloper) && basePlayer.IsFlying)
+			{
+				return false;
+			}
+			if ((Object)(object)basePlayer != (Object)null && basePlayer.IsAlive())
+			{
+				return !basePlayer.isMounted;
+			}
+			return false;
+		}
+		return true;
+	}
+}
+
+
+using System;
 using Rust;
 using UnityEngine;
 
@@ -15586,68 +16528,111 @@ using UnityEngine.Serialization;
 
 public class TriggerRadiation : TriggerBase
 {
+	[Tooltip("Higher the tier, higher the radiations.")]
 	public Radiation.Tier radiationTier = Radiation.Tier.LOW;
+
+	[Tooltip("The radiation amount is determined by the radiation tier, setting this will ignore the tier and use that value instead.")]
+	public float RadiationAmountOverride;
 
 	public bool BypassArmor;
 
-	public float RadiationAmountOverride;
-
+	[Tooltip("The fraction of the radius where we fade in from 0-1 dosage.")]
+	[Min(0f)]
+	[Space]
 	public float falloff = 0.1f;
 
+	public bool usePerAxisFalloff;
+
+	public Vector3 falloffPerAxis;
+
+	[Space]
+	[Tooltip("Use sphere collider size instead of the transform scale. For sphere triggers only (doesn't make sense for boxes)")]
 	[FormerlySerializedAs("UseColliderRadius")]
 	public bool DontScaleRadiationSize;
 
 	public bool UseLOSCheck;
 
+	[Tooltip("For sphere triggers only. If enabled, player will take more rads when close to the center of the volume.")]
+	public bool IncreaseDamageNearCenter = true;
+
 	public bool ApplyLocalHeightCheck;
 
+	[Tooltip("For sprinklers needing an half sphere trigger.")]
 	public float MinLocalHeight;
 
 	private SphereCollider sphereCollider;
 
 	private BoxCollider boxCollider;
 
-	private float GetRadiationSize()
+	public bool UseColliderScale => DontScaleRadiationSize;
+
+	private bool UseSphere
 	{
-		//IL_0040: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0085: Unknown result type (might be due to invalid IL or missing references)
-		//IL_008a: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00d9: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00e2: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00eb: Unknown result type (might be due to invalid IL or missing references)
-		//IL_009b: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00a4: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00ad: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00c5: Unknown result type (might be due to invalid IL or missing references)
-		if (!Object.op_Implicit((Object)(object)sphereCollider))
+		get
 		{
-			sphereCollider = ((Component)this).GetComponent<SphereCollider>();
+			if ((Object)(object)sphereCollider == (Object)null)
+			{
+				sphereCollider = ((Component)this).GetComponent<SphereCollider>();
+			}
+			return (Object)(object)sphereCollider != (Object)null;
 		}
+	}
+
+	private bool UseBox
+	{
+		get
+		{
+			if ((Object)(object)boxCollider == (Object)null)
+			{
+				boxCollider = ((Component)this).GetComponent<BoxCollider>();
+			}
+			return (Object)(object)boxCollider != (Object)null;
+		}
+	}
+
+	protected override void Awake()
+	{
+		base.Awake();
+		boxCollider = ((Component)this).GetComponent<BoxCollider>();
+		sphereCollider = ((Component)this).GetComponent<SphereCollider>();
+	}
+
+	private float GetRadiationRadius()
+	{
+		//IL_0033: Unknown result type (might be due to invalid IL or missing references)
 		if ((Object)(object)sphereCollider != (Object)null)
 		{
-			if (!DontScaleRadiationSize)
+			if (UseColliderScale)
 			{
-				return sphereCollider.radius * Vector3Ex.Max(((Component)this).transform.localScale);
+				return sphereCollider.radius;
 			}
-			return sphereCollider.radius;
-		}
-		if (!Object.op_Implicit((Object)(object)boxCollider))
-		{
-			boxCollider = ((Component)this).GetComponent<BoxCollider>();
-		}
-		if ((Object)(object)boxCollider != (Object)null)
-		{
-			Vector3 size = boxCollider.size;
-			if (!DontScaleRadiationSize)
-			{
-				return Mathf.Max(new float[3] { size.x, size.y, size.z }) * 0.5f * Vector3Ex.Max(((Component)this).transform.localScale);
-			}
-			return Mathf.Max(new float[3] { size.x, size.y, size.z }) * 0.5f;
+			return sphereCollider.radius * Vector3Ex.Max(((Component)this).transform.localScale);
 		}
 		return 0f;
 	}
 
-	private float GetTriggerRadiation()
+	private (Vector3 center, Vector3 extents) GetRadiationBounds()
+	{
+		//IL_002a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_002f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0044: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0054: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0059: Unknown result type (might be due to invalid IL or missing references)
+		//IL_005a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_000e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0013: Unknown result type (might be due to invalid IL or missing references)
+		if ((Object)(object)boxCollider == (Object)null)
+		{
+			return (center: Vector3.zero, extents: Vector3.zero);
+		}
+		Vector3 item = ((Component)this).transform.TransformPoint(boxCollider.center);
+		Vector3 item2 = Vector3.Scale(boxCollider.size * 0.5f, ((Component)this).transform.lossyScale);
+		return (center: item, extents: item2);
+	}
+
+	private float GetRadiationAmount()
 	{
 		if (RadiationAmountOverride > 0f)
 		{
@@ -15656,14 +16641,61 @@ public class TriggerRadiation : TriggerBase
 		return Radiation.GetRadiation(radiationTier);
 	}
 
-	public float GetRadiation(Vector3 position, float radProtection)
+	public float GetRadiationForPosition(Vector3 position, float radProtection)
 	{
 		//IL_000e: Unknown result type (might be due to invalid IL or missing references)
 		//IL_000f: Unknown result type (might be due to invalid IL or missing references)
-		//IL_006b: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0070: Unknown result type (might be due to invalid IL or missing references)
 		//IL_003a: Unknown result type (might be due to invalid IL or missing references)
 		//IL_003f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00c7: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00cc: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00d1: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00d4: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00d9: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00de: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00e3: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00e7: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00f3: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00ff: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0112: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0117: Unknown result type (might be due to invalid IL or missing references)
+		//IL_011b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0120: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0088: Unknown result type (might be due to invalid IL or missing references)
+		//IL_008d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0198: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01a6: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01ab: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0131: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0155: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0179: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01ad: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01b4: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01e8: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01ef: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01bd: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01c4: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01fb: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0202: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01cd: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01d4: Unknown result type (might be due to invalid IL or missing references)
+		//IL_020e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0215: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0221: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0228: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0231: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0238: Unknown result type (might be due to invalid IL or missing references)
+		//IL_023f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0257: Unknown result type (might be due to invalid IL or missing references)
+		//IL_025e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0267: Unknown result type (might be due to invalid IL or missing references)
+		//IL_026e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0275: Unknown result type (might be due to invalid IL or missing references)
+		//IL_028f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0296: Unknown result type (might be due to invalid IL or missing references)
+		//IL_029f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02a6: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02ad: Unknown result type (might be due to invalid IL or missing references)
 		if (ApplyLocalHeightCheck && ((Component)this).transform.InverseTransformPoint(position).y < MinLocalHeight)
 		{
 			return 0f;
@@ -15672,16 +16704,54 @@ public class TriggerRadiation : TriggerBase
 		{
 			return 0f;
 		}
-		float radiationSize = GetRadiationSize();
-		float triggerRadiation = GetTriggerRadiation();
-		float num = Vector3.Distance(((Component)this).gameObject.transform.position, position);
-		float num2 = Mathf.InverseLerp(radiationSize, radiationSize * (1f - falloff), num);
-		float num3 = triggerRadiation;
+		float radiationAmount = GetRadiationAmount();
+		float num = 0f;
+		if (UseSphere)
+		{
+			float radiationRadius = GetRadiationRadius();
+			float num2 = (IncreaseDamageNearCenter ? Vector3.Distance(((Component)this).gameObject.transform.position, position) : 0f);
+			num = Mathf.InverseLerp(radiationRadius, radiationRadius * (1f - falloff), num2);
+		}
+		else if (UseBox)
+		{
+			(Vector3, Vector3) radiationBounds = GetRadiationBounds();
+			Vector3 val = Quaternion.Inverse(((Component)this).transform.rotation) * (position - radiationBounds.Item1);
+			Vector3 val2 = default(Vector3);
+			((Vector3)(ref val2))..ctor(Mathf.Abs(val.x), Mathf.Abs(val.y), Mathf.Abs(val.z));
+			Vector3 item = radiationBounds.Item2;
+			Vector3 val3 = radiationBounds.Item2;
+			if (usePerAxisFalloff)
+			{
+				val3.x = Mathf.Max(0f, item.x - falloffPerAxis.x);
+				val3.y = Mathf.Max(0f, item.y - falloffPerAxis.y);
+				val3.z = Mathf.Max(0f, item.z - falloffPerAxis.z);
+			}
+			else
+			{
+				val3 = item * (1f - falloff);
+			}
+			if (val2.x <= val3.x && val2.y <= val3.y && val2.z <= val3.z)
+			{
+				num = 1f;
+			}
+			else if (val2.x <= item.x && val2.y <= item.y && val2.z <= item.z)
+			{
+				float num3 = ((item.x == val3.x) ? 1f : Mathf.Clamp01(Mathf.InverseLerp(item.x, val3.x, val2.x)));
+				float num4 = ((item.y == val3.y) ? 1f : Mathf.Clamp01(Mathf.InverseLerp(item.y, val3.y, val2.y)));
+				float num5 = ((item.z == val3.z) ? 1f : Mathf.Clamp01(Mathf.InverseLerp(item.z, val3.z, val2.z)));
+				num = Mathf.Min(num3, Mathf.Min(num4, num5));
+			}
+			else
+			{
+				num = 0f;
+			}
+		}
+		float num6 = radiationAmount;
 		if (!BypassArmor)
 		{
-			num3 = Radiation.GetRadiationAfterProtection(triggerRadiation, radProtection);
+			num6 = Radiation.GetRadiationAfterProtection(radiationAmount, radProtection);
 		}
-		return num3 * num2;
+		return num6 * num;
 	}
 
 	public override GameObject InterestedInObject(GameObject obj)
@@ -15705,50 +16775,6 @@ public class TriggerRadiation : TriggerBase
 			return null;
 		}
 		return ((Component)baseEntity).gameObject;
-	}
-
-	public void OnDrawGizmosSelected()
-	{
-		//IL_0007: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0024: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0065: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0048: Unknown result type (might be due to invalid IL or missing references)
-		//IL_004e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0053: Unknown result type (might be due to invalid IL or missing references)
-		//IL_005a: Unknown result type (might be due to invalid IL or missing references)
-		//IL_005f: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0082: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00b2: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00b8: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00bd: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00c4: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00c9: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00d6: Unknown result type (might be due to invalid IL or missing references)
-		float radiationSize = GetRadiationSize();
-		Gizmos.color = Color.green;
-		if (Object.op_Implicit((Object)(object)sphereCollider))
-		{
-			Gizmos.DrawWireSphere(((Component)this).transform.position, radiationSize);
-		}
-		else if (Object.op_Implicit((Object)(object)boxCollider))
-		{
-			Vector3 val = default(Vector3);
-			((Vector3)(ref val))..ctor(radiationSize, radiationSize, radiationSize);
-			val *= 2f;
-			Gizmos.DrawWireCube(((Component)this).transform.position, val);
-		}
-		Gizmos.color = Color.red;
-		if (Object.op_Implicit((Object)(object)sphereCollider))
-		{
-			Gizmos.DrawWireSphere(((Component)this).transform.position, radiationSize * (1f - falloff));
-		}
-		else if (Object.op_Implicit((Object)(object)boxCollider))
-		{
-			Vector3 val2 = default(Vector3);
-			((Vector3)(ref val2))..ctor(radiationSize, radiationSize, radiationSize);
-			val2 *= 2f;
-			Gizmos.DrawWireCube(((Component)this).transform.position, val2 * (1f - falloff));
-		}
 	}
 }
 
@@ -16304,8 +17330,8 @@ using UnityEngine;
 
 public class TubeRenderer : FacepunchBehaviour
 {
-	[Header("Settings")]
 	[Range(3f, 64f)]
+	[Header("Settings")]
 	public int Segments = 12;
 
 	public float Radius = 0.1f;
@@ -18565,7 +19591,7 @@ public class WaterVolume : TriggerBase
 		//IL_0082: Unknown result type (might be due to invalid IL or missing references)
 		//IL_0097: Unknown result type (might be due to invalid IL or missing references)
 		//IL_009c: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00c4: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00d3: Unknown result type (might be due to invalid IL or missing references)
 		if (!waterEnabled)
 		{
 			info = default(WaterLevel.WaterInfo);
@@ -18586,6 +19612,7 @@ public class WaterVolume : TriggerBase
 			y2 = Mathf.Max(y2, bottomCutY);
 			info = default(WaterLevel.WaterInfo);
 			info.isValid = true;
+			info.artificalWater = !naturalSource;
 			info.currentDepth = Mathf.Max(0f, y - pos.y);
 			info.overallDepth = Mathf.Max(0f, y - y2);
 			info.surfaceLevel = y;
@@ -18612,7 +19639,7 @@ public class WaterVolume : TriggerBase
 		//IL_009f: Unknown result type (might be due to invalid IL or missing references)
 		//IL_00b4: Unknown result type (might be due to invalid IL or missing references)
 		//IL_00b9: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00e3: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00f2: Unknown result type (might be due to invalid IL or missing references)
 		if (!waterEnabled)
 		{
 			info = default(WaterLevel.WaterInfo);
@@ -18633,6 +19660,7 @@ public class WaterVolume : TriggerBase
 			y2 = Mathf.Max(y2, bottomCutY);
 			info = default(WaterLevel.WaterInfo);
 			info.isValid = true;
+			info.artificalWater = !naturalSource;
 			info.currentDepth = Mathf.Max(0f, y - ((Bounds)(ref bounds)).min.y);
 			info.overallDepth = Mathf.Max(0f, y - y2);
 			info.surfaceLevel = y;
@@ -18688,6 +19716,7 @@ public class WaterVolume : TriggerBase
 			y2 = Mathf.Max(y2, bottomCutY);
 			info = default(WaterLevel.WaterInfo);
 			info.isValid = true;
+			info.artificalWater = !naturalSource;
 			info.currentDepth = Mathf.Max(0f, y - num);
 			info.overallDepth = Mathf.Max(0f, y - y2);
 			info.surfaceLevel = y;
@@ -18922,12 +19951,12 @@ public class Wearable : MonoBehaviour, IItemSetup, IPrefabPreProcess
 
 	public bool HideInEyesView;
 
-	[Tooltip("If this is true, we'll hide this item in the first person view. Usually done for items that you definitely won't see in first person view, like facemasks and hats.")]
 	[Header("First Person Legs")]
+	[Tooltip("If this is true, we'll hide this item in the first person view. Usually done for items that you definitely won't see in first person view, like facemasks and hats.")]
 	public bool HideInFirstPerson;
 
-	[Range(0f, 5f)]
 	[Tooltip("Use this if the clothing item clips into the player view. It'll push the chest legs model backwards.")]
+	[Range(0f, 5f)]
 	public float ExtraLeanBack;
 
 	[Tooltip("Enable this to check for BoneRetargets which need to be preserved in first person view")]
@@ -20696,9 +21725,9 @@ public class MaterialOverlay : MonoBehaviour
 
 using UnityEngine;
 
-[ExecuteInEditMode]
 [RequireComponent(typeof(Camera))]
 [AddComponentMenu("Image Effects/Natural Bloom and Dirty Lens")]
+[ExecuteInEditMode]
 public class NaturalBloomAndDirtyLens : MonoBehaviour
 {
 	public Shader shader;
@@ -21588,6 +22617,8 @@ public class Item : IPooled
 	public float radioactivity;
 
 	public List<ItemOwnershipShare> ownershipShares;
+
+	public uint iconImageId;
 
 	public Flag flags;
 
@@ -23439,8 +24470,8 @@ public class Item : IPooled
 		//IL_007e: Unknown result type (might be due to invalid IL or missing references)
 		//IL_008a: Unknown result type (might be due to invalid IL or missing references)
 		//IL_008f: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0155: Unknown result type (might be due to invalid IL or missing references)
-		//IL_015a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0161: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0166: Unknown result type (might be due to invalid IL or missing references)
 		dirty = false;
 		Item val = Pool.Get<Item>();
 		val.UID = uid;
@@ -23458,6 +24489,7 @@ public class Item : IPooled
 		val.streamerName = streamerName;
 		val.text = text;
 		val.cooktime = cookTimeLeft;
+		val.iconImageId = iconImageId;
 		if (ownershipShares != null)
 		{
 			val.ownership = Pool.Get<List<ItemOwnershipAmount>>();
@@ -23529,6 +24561,7 @@ public class Item : IPooled
 		flags = (Flag)load.flags;
 		worldEnt.uid = load.worldEntity;
 		heldEntity.uid = load.heldEntity;
+		iconImageId = load.iconImageId;
 		if (load.ownership != null && load.ownership.Count > 0)
 		{
 			if (ownershipShares == null)
@@ -23559,7 +24592,7 @@ public class Item : IPooled
 		{
 			Net.sv.RegisterUID(uid.Value);
 		}
-		if (instanceData != null)
+		if (instanceData != null && load.instanceData != instanceData)
 		{
 			instanceData.ShouldPool = true;
 			instanceData.ResetToPool();
@@ -24946,6 +25979,18 @@ public sealed class ItemContainer : IAmmoContainer, IPooled
 		}
 	}
 
+	public bool TryMoveAllItems(ItemContainer target)
+	{
+		for (int num = itemList.Count - 1; num >= 0; num--)
+		{
+			if (!itemList[num].MoveToContainer(target))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
 	public void MoveAllItems(ItemContainer target)
 	{
 		for (int num = itemList.Count - 1; num >= 0; num--)
@@ -25321,8 +26366,8 @@ public class ItemBlueprint : MonoBehaviour
 
 	public int scrapFromRecycle;
 
-	[Header("Unlocking")]
 	[Tooltip("This item won't show anywhere unless you have the corresponding SteamItem in your inventory - which is defined on the ItemDefinition")]
+	[Header("Unlocking")]
 	public bool NeedsSteamItem;
 
 	public ItemDefinition RequireUnlockedItem;
@@ -25598,8 +26643,8 @@ public class ItemDefinition : MonoBehaviour
 	[Tooltip("If true, this item will support item ownership even if it's stacksize is >1")]
 	public bool supportsStackableOwnership;
 
-	[Tooltip("How rare this item is and how much it costs to research")]
 	[Header("Spawn Tables")]
+	[Tooltip("How rare this item is and how much it costs to research")]
 	public Rarity rarity;
 
 	public Rarity despawnRarity;
@@ -30893,9 +31938,9 @@ public class BaseMission : BaseScriptableObject
 
 		public MissionStatus status;
 
-		public float startTime;
+		public long startTimeUtcSeconds;
 
-		public float endTime;
+		public long endTimeUtcSeconds;
 
 		public Vector3 missionLocation;
 
@@ -30907,7 +31952,7 @@ public class BaseMission : BaseScriptableObject
 
 		private int playerInputCounter;
 
-		public ObjectiveStatus[] objectiveStatuses;
+		public ObjectiveStatus[] objectiveStatuses = Array.Empty<ObjectiveStatus>();
 
 		public BaseEntity ProviderEntity()
 		{
@@ -31109,15 +32154,16 @@ public class BaseMission : BaseScriptableObject
 		public void Reset()
 		{
 			//IL_0006: Unknown result type (might be due to invalid IL or missing references)
-			//IL_0031: Unknown result type (might be due to invalid IL or missing references)
-			//IL_0036: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0039: Unknown result type (might be due to invalid IL or missing references)
+			//IL_003e: Unknown result type (might be due to invalid IL or missing references)
 			providerID = default(NetworkableId);
 			missionID = 0u;
 			status = MissionStatus.Default;
-			startTime = -1f;
-			endTime = -1f;
+			startTimeUtcSeconds = long.MinValue;
+			endTimeUtcSeconds = long.MinValue;
 			missionLocation = Vector3.zero;
 			_cachedMission = null;
+			_cachedProviderEntity = null;
 			timePassed = 0f;
 			missionPoints.Clear();
 			missionEntities.Clear();
@@ -31793,14 +32839,15 @@ public class BaseMission : BaseScriptableObject
 		Interface.CallHook("OnMissionFailed", (object)this, (object)instance, (object)assignee, (object)failReason);
 		if (failReason == MissionFailReason.ResetPlayerState)
 		{
-			instance.endTime = 0f;
+			instance.endTimeUtcSeconds = long.MinValue;
 			instance.status = MissionStatus.Default;
-			assignee.MissionDirty();
 		}
+		assignee.MissionDirty();
 	}
 
 	public virtual void MissionEnded(MissionInstance instance, BasePlayer assignee)
 	{
+		instance.endTimeUtcSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 		if (instance.missionEntities != null)
 		{
 			List<MissionEntity> list = Pool.Get<List<MissionEntity>>();
@@ -31847,8 +32894,8 @@ public class BaseMission : BaseScriptableObject
 
 	public static bool AssignMission(BasePlayer assignee, IMissionProvider provider, BaseMission mission)
 	{
-		//IL_00ba: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00bf: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00c2: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00c7: Unknown result type (might be due to invalid IL or missing references)
 		if (!missionsenabled)
 		{
 			return false;
@@ -31878,7 +32925,7 @@ public class BaseMission : BaseScriptableObject
 			assignee.missions.Add(missionInstance);
 		}
 		missionInstance.missionID = mission.id;
-		missionInstance.startTime = Time.time;
+		missionInstance.startTimeUtcSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 		missionInstance.providerID = provider.ProviderID();
 		missionInstance.status = MissionStatus.Active;
 		missionInstance.objectiveStatuses = new MissionInstance.ObjectiveStatus[mission.objectives.Length];
@@ -32059,9 +33106,9 @@ public class MissionInstance : IPooled
 
 	public MissionStatus status;
 
-	public float startTime;
+	public long startTimeUtcSeconds;
 
-	public float endTime;
+	public long endTimeUtcSeconds;
 
 	public Vector3 missionLocation;
 
@@ -32073,7 +33120,7 @@ public class MissionInstance : IPooled
 
 	private int playerInputCounter;
 
-	public ObjectiveStatus[] objectiveStatuses;
+	public ObjectiveStatus[] objectiveStatuses = Array.Empty<ObjectiveStatus>();
 
 	public BaseEntity ProviderEntity()
 	{
@@ -32275,15 +33322,16 @@ public class MissionInstance : IPooled
 	public void Reset()
 	{
 		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0031: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0036: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0039: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003e: Unknown result type (might be due to invalid IL or missing references)
 		providerID = default(NetworkableId);
 		missionID = 0u;
 		status = MissionStatus.Default;
-		startTime = -1f;
-		endTime = -1f;
+		startTimeUtcSeconds = long.MinValue;
+		endTimeUtcSeconds = long.MinValue;
 		missionLocation = Vector3.zero;
 		_cachedMission = null;
+		_cachedProviderEntity = null;
 		timePassed = 0f;
 		missionPoints.Clear();
 		missionEntities.Clear();
@@ -32323,1111 +33371,6 @@ public enum ObjectiveType
 {
 	MOVE,
 	KILL
-}
-
-
-using System;
-using System.Collections.Generic;
-using Facepunch;
-using UnityEngine;
-
-[Serializable]
-public class PositionGenerator
-{
-	public enum RelativeType
-	{
-		Player,
-		Provider,
-		Position
-	}
-
-	public enum PositionType
-	{
-		MissionPoint,
-		WorldPositionGenerator,
-		DungeonPoint,
-		Radius
-	}
-
-	public class PositionPointAttribute : PropertyAttribute
-	{
-	}
-
-	public string identifier;
-
-	public float minDistForMovePoint;
-
-	public float maxDistForMovePoint = 25f;
-
-	public bool allowDoubleDistanceIfNoOptionsAreFound;
-
-	public bool positionsAreExclusive = true;
-
-	public RelativeType relativeTo;
-
-	public PositionType positionType;
-
-	public string centerOnPositionIdentifier = "";
-
-	[InspectorFlags]
-	public MissionPoint.MissionPointEnum Flags = (MissionPoint.MissionPointEnum)(-1);
-
-	[InspectorFlags]
-	public MissionPoint.MissionPointEnum ExclusionFlags;
-
-	public WorldPositionGenerator worldPositionGenerator;
-
-	public bool IsDependant()
-	{
-		return !string.IsNullOrEmpty(centerOnPositionIdentifier);
-	}
-
-	public bool Validate(BasePlayer assignee, BaseMission missionDef)
-	{
-		//IL_0016: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00aa: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0052: Unknown result type (might be due to invalid IL or missing references)
-		Vector3 position;
-		if (positionType == PositionType.MissionPoint)
-		{
-			List<MissionPoint> points = Pool.Get<List<MissionPoint>>();
-			bool missionPoints = MissionPoint.GetMissionPoints(ref points, ((Component)assignee).transform.position, minDistForMovePoint, maxDistForMovePoint, (int)Flags, (int)ExclusionFlags);
-			if (!missionPoints && allowDoubleDistanceIfNoOptionsAreFound)
-			{
-				points.Clear();
-				missionPoints = MissionPoint.GetMissionPoints(ref points, ((Component)assignee).transform.position, minDistForMovePoint, maxDistForMovePoint * 2f, (int)Flags, (int)ExclusionFlags);
-			}
-			Pool.FreeUnmanaged<MissionPoint>(ref points);
-			if (!missionPoints)
-			{
-				return false;
-			}
-		}
-		else if (positionType == PositionType.WorldPositionGenerator && (Object)(object)worldPositionGenerator != (Object)null && !worldPositionGenerator.TrySample(((Component)assignee).transform.position, minDistForMovePoint, maxDistForMovePoint, out position, blockedPoints))
-		{
-			return false;
-		}
-		return true;
-	}
-
-	public Vector3 GetPosition(MissionInstance instance, BasePlayer assignee, int depth = 0)
-	{
-		//IL_0035: Unknown result type (might be due to invalid IL or missing references)
-		//IL_003a: Unknown result type (might be due to invalid IL or missing references)
-		//IL_002b: Unknown result type (might be due to invalid IL or missing references)
-		//IL_004e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0150: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0155: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00cc: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00cd: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00ba: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00bf: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0080: Unknown result type (might be due to invalid IL or missing references)
-		//IL_015b: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0160: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0175: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0176: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0189: Unknown result type (might be due to invalid IL or missing references)
-		//IL_018e: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0193: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0197: Unknown result type (might be due to invalid IL or missing references)
-		//IL_01a6: Unknown result type (might be due to invalid IL or missing references)
-		//IL_01d2: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00fa: Unknown result type (might be due to invalid IL or missing references)
-		//IL_01b1: Unknown result type (might be due to invalid IL or missing references)
-		//IL_01b3: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0115: Unknown result type (might be due to invalid IL or missing references)
-		//IL_01c6: Unknown result type (might be due to invalid IL or missing references)
-		//IL_01c7: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0138: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0139: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0120: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0122: Unknown result type (might be due to invalid IL or missing references)
-		if (depth > 10)
-		{
-			Debug.LogError((object)$"Exceeded max depth while calculating position! missionID={instance.missionID} identifier={identifier}");
-			return ((Component)assignee).transform.position;
-		}
-		Vector3 relativeToPosition = GetRelativeToPosition(instance, assignee, depth);
-		Vector3 result;
-		if (positionType == PositionType.MissionPoint)
-		{
-			List<MissionPoint> points = Pool.Get<List<MissionPoint>>();
-			bool missionPoints = MissionPoint.GetMissionPoints(ref points, relativeToPosition, minDistForMovePoint, maxDistForMovePoint, (int)Flags, (int)ExclusionFlags);
-			if (!missionPoints && allowDoubleDistanceIfNoOptionsAreFound)
-			{
-				points.Clear();
-				missionPoints = MissionPoint.GetMissionPoints(ref points, relativeToPosition, minDistForMovePoint, maxDistForMovePoint * 2f, (int)Flags, (int)ExclusionFlags);
-			}
-			if (missionPoints)
-			{
-				result = points[Random.Range(0, points.Count)].GetPosition();
-			}
-			else
-			{
-				Debug.LogError((object)"UNABLE TO FIND MISSIONPOINT FOR MISSION!");
-				result = relativeToPosition;
-			}
-			Pool.FreeUnmanaged<MissionPoint>(ref points);
-		}
-		else if (positionType == PositionType.WorldPositionGenerator && (Object)(object)worldPositionGenerator != (Object)null)
-		{
-			int num = 0;
-			while (true)
-			{
-				if (worldPositionGenerator.TrySample(relativeToPosition, minDistForMovePoint, maxDistForMovePoint, out var position, blockedPoints) && TryAlignToGround(position, out var correctedPosition))
-				{
-					result = correctedPosition;
-					break;
-				}
-				if (num >= 10)
-				{
-					Debug.LogError((object)"UNABLE TO FIND WORLD POINT FOR MISSION!");
-					result = relativeToPosition;
-					break;
-				}
-				num++;
-			}
-		}
-		else if (positionType == PositionType.DungeonPoint)
-		{
-			result = DynamicDungeon.GetNextDungeonPoint();
-		}
-		else
-		{
-			int num2 = 0;
-			while (true)
-			{
-				Vector3 onUnitSphere = Random.onUnitSphere;
-				onUnitSphere.y = 0f;
-				((Vector3)(ref onUnitSphere)).Normalize();
-				Vector3 val = relativeToPosition + onUnitSphere * Random.Range(minDistForMovePoint, maxDistForMovePoint);
-				val.y = WaterLevel.GetWaterOrTerrainSurface(val, waves: false, volumes: false);
-				if (TryAlignToGround(val, out var correctedPosition2))
-				{
-					result = correctedPosition2;
-					break;
-				}
-				if (num2 >= 10)
-				{
-					Debug.LogError((object)"UNABLE TO FIND WORLD POINT FOR MISSION!");
-					result = relativeToPosition;
-					break;
-				}
-				num2++;
-			}
-		}
-		return result;
-	}
-
-	private Vector3 GetRelativeToPosition(MissionInstance instance, BasePlayer assignee, int depth)
-	{
-		//IL_0026: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0082: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0057: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0042: Unknown result type (might be due to invalid IL or missing references)
-		switch (relativeTo)
-		{
-		case RelativeType.Position:
-			return instance.GetMissionPoint(centerOnPositionIdentifier, assignee, depth + 1);
-		case RelativeType.Provider:
-		{
-			BaseEntity baseEntity = instance.ProviderEntity();
-			if ((Object)(object)baseEntity != (Object)null)
-			{
-				return ((Component)baseEntity).transform.position;
-			}
-			break;
-		}
-		}
-		if ((Object)(object)assignee != (Object)null)
-		{
-			return ((Component)assignee).transform.position;
-		}
-		Debug.LogError((object)$"Cannot get mission point origin - assigne playere is null! missionID={instance.missionID} relativeTo={relativeTo}");
-		return Vector3.zero;
-	}
-
-	private static bool TryAlignToGround(Vector3 wishPosition, out Vector3 correctedPosition)
-	{
-		//IL_0000: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
-		//IL_000d: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0012: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0013: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0014: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0019: Unknown result type (might be due to invalid IL or missing references)
-		//IL_003b: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0033: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0034: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0055: Unknown result type (might be due to invalid IL or missing references)
-		//IL_005a: Unknown result type (might be due to invalid IL or missing references)
-		//IL_004a: Unknown result type (might be due to invalid IL or missing references)
-		//IL_004b: Unknown result type (might be due to invalid IL or missing references)
-		Vector3 val = Vector3Ex.WithY(wishPosition, wishPosition.y + 50f);
-		RaycastHit hit = default(RaycastHit);
-		if (!Physics.Raycast(new Ray(val, Vector3.down), ref hit, 50f, 1218652417, (QueryTriggerInteraction)1))
-		{
-			correctedPosition = wishPosition;
-			return true;
-		}
-		if ((Object)(object)hit.GetEntity() != (Object)null)
-		{
-			correctedPosition = wishPosition;
-			return false;
-		}
-		correctedPosition = ((RaycastHit)(ref hit)).point;
-		return true;
-	}
-}
-
-
-public enum RelativeType
-{
-	Player,
-	Provider,
-	Position
-}
-
-
-public enum PositionType
-{
-	MissionPoint,
-	WorldPositionGenerator,
-	DungeonPoint,
-	Radius
-}
-
-
-using UnityEngine;
-
-public class PositionPointAttribute : PropertyAttribute
-{
-}
-
-
-using System;
-using UnityEngine.Serialization;
-
-[Serializable]
-public class MissionEntityEntry
-{
-	[FormerlySerializedAs("entityIdentifier")]
-	public string identifier;
-
-	public GameObjectRef entityRef;
-
-	public string spawnPositionToUse;
-
-	public bool spawnOnMissionStart = true;
-
-	public bool cleanupOnMissionFailed;
-
-	public bool cleanupOnMissionSuccess;
-
-	public ItemAmount[] overrideLootOnItem;
-}
-
-
-using System;
-using UnityEngine;
-
-[Serializable]
-public struct NonItemReward
-{
-	public Phrase DisplayPhrase;
-
-	public Sprite DisplaySprite;
-
-	public NonItemRewardType RewardType;
-}
-
-
-public enum NonItemRewardType
-{
-	None,
-	SafeZoneRespawnUnlock
-}
-
-
-using System;
-using Rust;
-
-[Serializable]
-public class MissionRewards
-{
-	public ItemAmount[] items;
-
-	public Era[] Eras;
-}
-
-
-public enum MissionFailReason
-{
-	TimeOut,
-	Disconnect,
-	ResetPlayerState,
-	Abandon,
-	ObjectiveFailed
-}
-
-
-public class DebugWorldPosition : ListComponent<DebugWorldPosition>
-{
-	public WorldPositionGenerator GeneratorToFake;
-}
-
-
-using UnityEngine;
-
-public class MissionEntity : BaseMonoBehaviour, IOnParentDestroying
-{
-	public string identifier;
-
-	public bool cleanupOnMissionSuccess = true;
-
-	public bool cleanupOnMissionFailed = true;
-
-	public void OnParentDestroying()
-	{
-		Object.Destroy((Object)(object)this);
-	}
-
-	public virtual void Setup(BasePlayer assignee, BaseMission.MissionInstance instance, string identifier, bool wantsSuccessCleanup, bool wantsFailedCleanup)
-	{
-		this.identifier = identifier;
-		cleanupOnMissionFailed = wantsFailedCleanup;
-		cleanupOnMissionSuccess = wantsSuccessCleanup;
-		BaseEntity entity = GetEntity();
-		if (Object.op_Implicit((Object)(object)entity))
-		{
-			((Component)entity).SendMessage("MissionSetupPlayer", (object)assignee, (SendMessageOptions)1);
-		}
-	}
-
-	public virtual void MissionStarted(BasePlayer assignee, BaseMission.MissionInstance instance)
-	{
-		IMissionEntityListener[] componentsInChildren = ((Component)this).GetComponentsInChildren<IMissionEntityListener>();
-		for (int i = 0; i < componentsInChildren.Length; i++)
-		{
-			componentsInChildren[i].MissionStarted(assignee, instance);
-		}
-	}
-
-	public virtual void MissionEnded(BasePlayer assignee, BaseMission.MissionInstance instance)
-	{
-		IMissionEntityListener[] componentsInChildren = ((Component)this).GetComponentsInChildren<IMissionEntityListener>();
-		for (int i = 0; i < componentsInChildren.Length; i++)
-		{
-			componentsInChildren[i].MissionEnded(assignee, instance);
-		}
-		instance.missionEntities.Remove(identifier);
-		if ((cleanupOnMissionSuccess && (instance.status == BaseMission.MissionStatus.Completed || instance.status == BaseMission.MissionStatus.Accomplished)) || (cleanupOnMissionFailed && instance.status == BaseMission.MissionStatus.Failed))
-		{
-			BaseEntity entity = GetEntity();
-			if (Object.op_Implicit((Object)(object)entity))
-			{
-				entity.Kill();
-			}
-		}
-	}
-
-	public BaseEntity GetEntity()
-	{
-		return ((Component)this).GetComponent<BaseEntity>();
-	}
-}
-
-
-public interface IMissionEntityListener
-{
-	void MissionStarted(BasePlayer assignee, BaseMission.MissionInstance instance);
-
-	void MissionEnded(BasePlayer assignee, BaseMission.MissionInstance instance);
-}
-
-
-using UnityEngine;
-
-public interface IMissionProvider
-{
-	NetworkableId ProviderID();
-
-	Vector3 ProviderPosition();
-
-	BaseEntity Entity();
-}
-
-
-using UnityEngine;
-
-[CreateAssetMenu(menuName = "Rust/MissionManifest")]
-public class MissionManifest : ScriptableObject
-{
-	public ScriptableObjectRef[] missionList;
-
-	public WorldPositionGenerator[] positionGenerators;
-
-	public static MissionManifest instance;
-
-	public static MissionManifest Get()
-	{
-		if ((Object)(object)instance == (Object)null)
-		{
-			instance = Resources.Load<MissionManifest>("MissionManifest");
-			WorldPositionGenerator[] array = instance.positionGenerators;
-			foreach (WorldPositionGenerator worldPositionGenerator in array)
-			{
-				if ((Object)(object)worldPositionGenerator != (Object)null)
-				{
-					worldPositionGenerator.PrecalculatePositions();
-				}
-			}
-		}
-		return instance;
-	}
-
-	public static BaseMission GetFromShortName(string shortname)
-	{
-		ScriptableObjectRef[] array = Get().missionList;
-		for (int i = 0; i < array.Length; i++)
-		{
-			BaseMission baseMission = array[i].Get() as BaseMission;
-			if (baseMission.shortname == shortname)
-			{
-				return baseMission;
-			}
-		}
-		return null;
-	}
-
-	public static BaseMission GetFromID(uint id)
-	{
-		MissionManifest missionManifest = Get();
-		if (missionManifest.missionList == null)
-		{
-			return null;
-		}
-		ScriptableObjectRef[] array = missionManifest.missionList;
-		for (int i = 0; i < array.Length; i++)
-		{
-			BaseMission baseMission = array[i].Get() as BaseMission;
-			if (baseMission.id == id)
-			{
-				return baseMission;
-			}
-		}
-		return null;
-	}
-
-	public static bool TryGet(uint id, out BaseMission mission)
-	{
-		mission = GetFromID(id);
-		return mission != null;
-	}
-}
-
-
-using System;
-using System.Collections.Generic;
-using Facepunch;
-using Rust;
-using UnityEngine;
-
-public class MissionPoint : MonoBehaviour
-{
-	public enum MissionPointEnum
-	{
-		EasyMonument = 1,
-		MediumMonument = 2,
-		HardMonument = 4,
-		Item_Hidespot = 8,
-		Underwater = 0x80,
-		Tutorial_Bear = 0x100,
-		AtmosphereSensor = 0x200,
-		SafeZoneMonument = 0x400
-	}
-
-	public bool dropToGround = true;
-
-	public const int COUNT = 8;
-
-	public const int EVERYTHING = -1;
-
-	public const int NOTHING = 0;
-
-	public const int EASY_MONUMENT = 1;
-
-	public const int MED_MONUMENT = 2;
-
-	public const int HARD_MONUMENT = 4;
-
-	public const int ITEM_HIDESPOT = 8;
-
-	public const int UNDERWATER = 128;
-
-	public const int TUTORIAL_BEAR = 256;
-
-	public const int ATMOSPHERE_SENSOR = 512;
-
-	public const int SAFE_ZONE_MONUMENT = 1024;
-
-	public const int EASY_MONUMENT_IDX = 0;
-
-	public const int MED_MONUMENT_IDX = 1;
-
-	public const int HARD_MONUMENT_IDX = 2;
-
-	public const int ITEM_HIDESPOT_IDX = 3;
-
-	public const int FOREST_IDX = 4;
-
-	public const int ROADSIDE_IDX = 5;
-
-	public const int BEACH = 6;
-
-	public const int UNDERWATER_IDX = 7;
-
-	public const int TUTORIAL_BEAR_IDX = 8;
-
-	public const int ATMOSPHERE_SENSOR_IDX = 9;
-
-	public const int SAFE_ZONE_MONUMENT_IDX = 10;
-
-	private static Dictionary<int, int> type2index = new Dictionary<int, int>
-	{
-		{ 1, 0 },
-		{ 2, 1 },
-		{ 4, 2 },
-		{ 8, 3 },
-		{ 128, 7 },
-		{ 256, 8 },
-		{ 512, 9 }
-	};
-
-	[InspectorFlags]
-	public MissionPointEnum Flags = (MissionPointEnum)(-1);
-
-	public static List<MissionPoint> all = new List<MissionPoint>();
-
-	public static int TypeToIndex(int id)
-	{
-		return type2index[id];
-	}
-
-	public static int IndexToType(int idx)
-	{
-		return 1 << idx;
-	}
-
-	public void Awake()
-	{
-		all.Add(this);
-	}
-
-	private void Start()
-	{
-		if (dropToGround)
-		{
-			((FacepunchBehaviour)SingletonComponent<InvokeHandler>.Instance).Invoke((Action)DropToGround, 0.5f);
-		}
-	}
-
-	private void DropToGround()
-	{
-		//IL_0032: Unknown result type (might be due to invalid IL or missing references)
-		if (Object.op_Implicit((Object)(object)this))
-		{
-			if (Application.isLoading)
-			{
-				((FacepunchBehaviour)SingletonComponent<InvokeHandler>.Instance).Invoke((Action)DropToGround, 0.5f);
-				return;
-			}
-			_ = ((Component)this).transform.position;
-			((Component)this).transform.DropToGround();
-		}
-	}
-
-	public void OnDisable()
-	{
-		if (all.Contains(this))
-		{
-			all.Remove(this);
-		}
-	}
-
-	public virtual Vector3 GetPosition()
-	{
-		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
-		return ((Component)this).transform.position;
-	}
-
-	public virtual Quaternion GetRotation()
-	{
-		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
-		return ((Component)this).transform.rotation;
-	}
-
-	public static bool GetMissionPoints(ref List<MissionPoint> points, Vector3 near, float minDistance, float maxDistance, int flags, int exclusionFlags)
-	{
-		//IL_0043: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0048: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0077: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0082: Unknown result type (might be due to invalid IL or missing references)
-		List<MissionPoint> list = Pool.Get<List<MissionPoint>>();
-		foreach (MissionPoint item in all)
-		{
-			if (((uint)item.Flags & (uint)flags) != (uint)flags || (exclusionFlags != 0 && ((uint)item.Flags & (uint)exclusionFlags) != 0))
-			{
-				continue;
-			}
-			float num = Vector3.Distance(((Component)item).transform.position, near);
-			if (!(num <= maxDistance) || !(num > minDistance))
-			{
-				continue;
-			}
-			if (BaseMission.blockedPoints.Count > 0)
-			{
-				bool flag = false;
-				foreach (Vector3 blockedPoint in BaseMission.blockedPoints)
-				{
-					if (Vector3.Distance(blockedPoint, ((Component)item).transform.position) < 3f)
-					{
-						flag = true;
-						break;
-					}
-				}
-				if (flag)
-				{
-					continue;
-				}
-			}
-			list.Add(item);
-		}
-		if (list.Count == 0)
-		{
-			return false;
-		}
-		foreach (MissionPoint item2 in list)
-		{
-			points.Add(item2);
-		}
-		Pool.FreeUnmanaged<MissionPoint>(ref list);
-		return true;
-	}
-}
-
-
-public enum MissionPointEnum
-{
-	EasyMonument = 1,
-	MediumMonument = 2,
-	HardMonument = 4,
-	Item_Hidespot = 8,
-	Underwater = 0x80,
-	Tutorial_Bear = 0x100,
-	AtmosphereSensor = 0x200,
-	SafeZoneMonument = 0x400
-}
-
-
-using UnityEngine;
-
-[CreateAssetMenu(menuName = "Rust/Missions/MoveMission")]
-public class MoveMission : BaseMission
-{
-	public float minDistForMovePoint = 20f;
-
-	public float maxDistForMovePoint = 25f;
-
-	private float minDistFromLocation = 3f;
-
-	public override void MissionStart(MissionInstance instance, BasePlayer assignee)
-	{
-		//IL_0000: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0005: Unknown result type (might be due to invalid IL or missing references)
-		//IL_001f: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0024: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0036: Unknown result type (might be due to invalid IL or missing references)
-		//IL_003b: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0040: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0043: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0052: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0053: Unknown result type (might be due to invalid IL or missing references)
-		Vector3 onUnitSphere = Random.onUnitSphere;
-		onUnitSphere.y = 0f;
-		((Vector3)(ref onUnitSphere)).Normalize();
-		Vector3 val = ((Component)assignee).transform.position + onUnitSphere * Random.Range(minDistForMovePoint, maxDistForMovePoint);
-		val.y = WaterLevel.GetWaterOrTerrainSurface(val, waves: false, volumes: false);
-		instance.missionLocation = val;
-		base.MissionStart(instance, assignee);
-	}
-
-	public override Sprite GetIcon(MissionInstance instance)
-	{
-		if (instance.status != MissionStatus.Accomplished)
-		{
-			return icon;
-		}
-		return providerIcon;
-	}
-
-	public override void Think(MissionInstance instance, BasePlayer assignee, float delta)
-	{
-		//IL_0001: Unknown result type (might be due to invalid IL or missing references)
-		//IL_000c: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0037: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0051: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0056: Unknown result type (might be due to invalid IL or missing references)
-		float num = Vector3.Distance(instance.missionLocation, ((Component)assignee).transform.position);
-		if (instance.status == MissionStatus.Active && num <= minDistFromLocation)
-		{
-			MissionSuccess(instance, assignee);
-			BaseNetworkable baseNetworkable = BaseNetworkable.serverEntities.Find(instance.providerID);
-			if (Object.op_Implicit((Object)(object)baseNetworkable))
-			{
-				instance.missionLocation = ((Component)baseNetworkable).transform.position;
-			}
-		}
-		else
-		{
-			if (instance.status == MissionStatus.Accomplished)
-			{
-				_ = minDistFromLocation;
-			}
-			base.Think(instance, assignee, delta);
-		}
-	}
-}
-
-
-using Rust.UI;
-using UnityEngine;
-
-public class MissionUIPanel : MonoBehaviour
-{
-	public GameObject activeMissionParent;
-
-	public RustText missionTitleText;
-
-	public RustText missionDescText;
-
-	public GameObject rewardsParent;
-
-	public VirtualItemIcon[] rewardIcons;
-
-	public GameObject bonusRewardsParent;
-
-	public VirtualItemIcon[] bonusIcons;
-
-	public Phrase noMissionText;
-
-	public GameObject abandonButton;
-}
-
-
-using System;
-using System.Collections.Generic;
-using Facepunch;
-using UnityEngine;
-
-public abstract class MissionObjective : ScriptableObject
-{
-	public virtual void MissionStarted(int index, BaseMission.MissionInstance instance, BasePlayer forPlayer)
-	{
-	}
-
-	public virtual void ObjectiveStarted(BasePlayer playerFor, int index, BaseMission.MissionInstance instance)
-	{
-		instance.objectiveStatuses[index].started = true;
-		BaseMission mission = instance.GetMission();
-		if (mission != null && mission.objectives[index].requiredEntities != null)
-		{
-			string[] requiredEntities = mission.objectives[index].requiredEntities;
-			foreach (string identifier in requiredEntities)
-			{
-				instance.GetMissionEntity(identifier, playerFor);
-			}
-		}
-		playerFor.MissionDirty();
-	}
-
-	public virtual void ObjectiveCompleted(BasePlayer playerFor, int index, BaseMission.MissionInstance instance)
-	{
-	}
-
-	public virtual void ObjectiveFailed(BasePlayer playerFor, int index, BaseMission.MissionInstance instance)
-	{
-	}
-
-	public bool IsStarted(int index, BaseMission.MissionInstance instance)
-	{
-		if (instance == null || instance.objectiveStatuses == null)
-		{
-			return false;
-		}
-		if (index < 0 || index >= instance.objectiveStatuses.Length)
-		{
-			return false;
-		}
-		if (instance.objectiveStatuses[index] == null)
-		{
-			return false;
-		}
-		return instance.objectiveStatuses[index].started;
-	}
-
-	public bool CanProgress(int index, BaseMission.MissionInstance instance)
-	{
-		if (instance.GetMission().objectives[index].onlyProgressIfStarted)
-		{
-			return IsStarted(index, instance);
-		}
-		return true;
-	}
-
-	public bool ShouldObjectiveStart(int index, BaseMission.MissionInstance instance)
-	{
-		BaseMission.MissionObjectiveEntry missionObjectiveEntry = instance.GetMission().objectives[index];
-		if (missionObjectiveEntry.startAfterPriorObjectives)
-		{
-			bool result = true;
-			for (int i = 0; i < instance.objectiveStatuses.Length; i++)
-			{
-				if (i != index && !instance.objectiveStatuses[i].completed)
-				{
-					result = false;
-					break;
-				}
-				if (i == index)
-				{
-					break;
-				}
-			}
-			return result;
-		}
-		int[] startAfterCompletedObjectives = missionObjectiveEntry.startAfterCompletedObjectives;
-		foreach (int num in startAfterCompletedObjectives)
-		{
-			if (!instance.objectiveStatuses[num].completed && !instance.objectiveStatuses[num].failed)
-			{
-				return false;
-			}
-		}
-		return true;
-	}
-
-	public bool IsCompleted(int index, BaseMission.MissionInstance instance)
-	{
-		if (!instance.objectiveStatuses[index].completed)
-		{
-			return instance.objectiveStatuses[index].failed;
-		}
-		return true;
-	}
-
-	public virtual bool ShouldThink(int index, BaseMission.MissionInstance instance)
-	{
-		return !IsCompleted(index, instance);
-	}
-
-	public void ResetObjective(int index, BaseMission.MissionInstance instance, BasePlayer playerFor)
-	{
-		if (instance.objectiveStatuses[index].completed || instance.objectiveStatuses[index].failed)
-		{
-			instance.objectiveStatuses[index].completed = false;
-			instance.objectiveStatuses[index].failed = false;
-			playerFor.MissionDirty();
-		}
-	}
-
-	public void CompleteObjective(int index, BaseMission.MissionInstance instance, BasePlayer playerFor)
-	{
-		if (!instance.objectiveStatuses[index].completed && !instance.objectiveStatuses[index].failed)
-		{
-			instance.objectiveStatuses[index].completed = true;
-			instance.GetMission().OnObjectiveCompleted(index, instance, playerFor);
-			playerFor.MissionDirty();
-			ObjectiveCompleted(playerFor, index, instance);
-		}
-	}
-
-	public void FailObjective(int index, BaseMission.MissionInstance instance, BasePlayer playerFor)
-	{
-		if (!instance.objectiveStatuses[index].completed && !instance.objectiveStatuses[index].failed)
-		{
-			instance.objectiveStatuses[index].failed = true;
-			instance.GetMission().OnObjectiveFailed(index, instance, playerFor);
-			playerFor.MissionDirty();
-			ObjectiveFailed(playerFor, index, instance);
-		}
-	}
-
-	public virtual void ProcessMissionEvent(BasePlayer playerFor, BaseMission.MissionInstance instance, int index, BaseMission.MissionEventType type, BaseMission.MissionEventPayload payload, float amount)
-	{
-	}
-
-	public virtual void Think(int index, BaseMission.MissionInstance instance, BasePlayer assignee, float delta)
-	{
-		if (ShouldObjectiveStart(index, instance) && !IsStarted(index, instance))
-		{
-			ObjectiveStarted(assignee, index, instance);
-		}
-	}
-
-	protected bool TryFindNearby<T>(Vector3 origin, Func<T, bool> filter, out T entity, float radius = 20f) where T : BaseEntity
-	{
-		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0044: Unknown result type (might be due to invalid IL or missing references)
-		//IL_0049: Unknown result type (might be due to invalid IL or missing references)
-		List<T> list = Pool.Get<List<T>>();
-		Vis.Entities(origin, radius, list, -1, (QueryTriggerInteraction)2);
-		int num = -1;
-		float num2 = float.PositiveInfinity;
-		for (int i = 0; i < list.Count; i++)
-		{
-			T val = list[i];
-			if (filter == null || filter(val))
-			{
-				float num3 = Vector3.Distance(((Component)val).transform.position, origin);
-				if (num3 < num2)
-				{
-					num = i;
-					num2 = num3;
-				}
-			}
-		}
-		bool flag = num != -1;
-		entity = (flag ? list[num] : null);
-		Pool.FreeUnmanaged<T>(ref list);
-		return flag;
-	}
-
-	public virtual void PostServerLoad(BasePlayer player, BaseMission.MissionInstance.ObjectiveStatus status)
-	{
-	}
-}
-
-
-using UnityEngine;
-
-[CreateAssetMenu(menuName = "Rust/Missions/OBJECTIVES/AcquireItem")]
-public class MissionObjective_AcquireItem : MissionObjective
-{
-	[ItemSelector]
-	public ItemDefinition targetItem;
-
-	public int targetItemAmount;
-
-	public bool allowStackEvents;
-
-	public bool showResourcePings;
-
-	public bool acceptExistingItems;
-
-	[BaseMission.PositionGenerator.PositionPoint]
-	public string requireProximityToPosition;
-
-	public override void MissionStarted(int index, BaseMission.MissionInstance instance, BasePlayer forPlayer)
-	{
-		base.MissionStarted(index, instance, forPlayer);
-		instance.objectiveStatuses[index].progressCurrent = 0f;
-		instance.objectiveStatuses[index].progressTarget = targetItemAmount;
-		if (showResourcePings)
-		{
-			forPlayer.EnableResourcePings(targetItem, BasePlayer.PingType.GoTo);
-		}
-		if (acceptExistingItems)
-		{
-			int amount = forPlayer.inventory.GetAmount(targetItem);
-			if (amount > 0)
-			{
-				ProcessMissionEvent(forPlayer, instance, index, BaseMission.MissionEventType.ACQUIRE_ITEM, new BaseMission.MissionEventPayload
-				{
-					IntIdentifier = targetItem.itemid
-				}, amount);
-			}
-		}
-	}
-
-	public override void ProcessMissionEvent(BasePlayer playerFor, BaseMission.MissionInstance instance, int index, BaseMission.MissionEventType type, BaseMission.MissionEventPayload payload, float amount)
-	{
-		base.ProcessMissionEvent(playerFor, instance, index, type, payload, amount);
-		if (((type == BaseMission.MissionEventType.ACQUITE_ITEM_STACK && allowStackEvents) || type == BaseMission.MissionEventType.ACQUIRE_ITEM) && !IsCompleted(index, instance) && CanProgress(index, instance) && targetItem.itemid == payload.IntIdentifier)
-		{
-			instance.objectiveStatuses[index].progressCurrent += (int)amount;
-			if (instance.objectiveStatuses[index].progressCurrent >= (float)targetItemAmount)
-			{
-				CompleteObjective(index, instance, playerFor);
-			}
-			if (showResourcePings)
-			{
-				playerFor.DisableResourcePings(targetItem, BasePlayer.PingType.GoTo);
-			}
-			playerFor.MissionDirty();
-		}
-	}
-
-	public override void Think(int index, BaseMission.MissionInstance instance, BasePlayer assignee, float delta)
-	{
-		base.Think(index, instance, assignee, delta);
-	}
-}
-
-
-using UnityEngine;
-
-[CreateAssetMenu(menuName = "Rust/Missions/OBJECTIVES/Activate Long Use Object")]
-public class MissionObjective_ActivateLongUseObject : MissionObjective
-{
-	public BaseEntity RequiredEntity;
-
-	public override void ProcessMissionEvent(BasePlayer playerFor, BaseMission.MissionInstance instance, int index, BaseMission.MissionEventType type, BaseMission.MissionEventPayload payload, float amount)
-	{
-		//IL_001c: Unknown result type (might be due to invalid IL or missing references)
-		base.ProcessMissionEvent(playerFor, instance, index, type, payload, amount);
-		if (type == BaseMission.MissionEventType.LONG_USE_OBJECT)
-		{
-			BaseNetworkable baseNetworkable = BaseNetworkable.serverEntities.Find(payload.NetworkIdentifier);
-			if ((Object)(object)baseNetworkable != (Object)null && (Object)(object)RequiredEntity != (Object)null && RequiredEntity.prefabID == baseNetworkable.prefabID)
-			{
-				CompleteObjective(index, instance, playerFor);
-				playerFor.MissionDirty();
-			}
-		}
-	}
-}
-
-
-using UnityEngine;
-
-[CreateAssetMenu(menuName = "Rust/Missions/OBJECTIVES/Consume")]
-public class MissionObjective_Consume : MissionObjective
-{
-	public ItemDefinition TargetItem;
-
-	public int RequiredAmount;
-
-	public override void MissionStarted(int index, BaseMission.MissionInstance instance, BasePlayer forPlayer)
-	{
-		base.MissionStarted(index, instance, forPlayer);
-		instance.objectiveStatuses[index].progressCurrent = 0f;
-		instance.objectiveStatuses[index].progressTarget = RequiredAmount;
-	}
-
-	public override void ProcessMissionEvent(BasePlayer playerFor, BaseMission.MissionInstance instance, int index, BaseMission.MissionEventType type, BaseMission.MissionEventPayload payload, float amount)
-	{
-		base.ProcessMissionEvent(playerFor, instance, index, type, payload, amount);
-		if (type == BaseMission.MissionEventType.CONSUME && !IsCompleted(index, instance) && CanProgress(index, instance) && payload.IntIdentifier == TargetItem.itemid)
-		{
-			instance.objectiveStatuses[index].progressCurrent += 1f;
-			if (instance.objectiveStatuses[index].progressCurrent >= instance.objectiveStatuses[index].progressTarget)
-			{
-				CompleteObjective(index, instance, playerFor);
-			}
-			playerFor.MissionDirty();
-		}
-	}
 }
 
 
