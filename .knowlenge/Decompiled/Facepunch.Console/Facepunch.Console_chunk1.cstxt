@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 using Facepunch;
 using Facepunch.Extend;
 using Network;
@@ -143,6 +146,10 @@ public class ConsoleSystem
 			}
 			if (cmd.ServerAdmin)
 			{
+				if (cmd.RconOnly && (Connection != null || Option.FromCommandBlock))
+				{
+					return false;
+				}
 				if (IsRcon)
 				{
 					return true;
@@ -168,6 +175,10 @@ public class ConsoleSystem
 			if (Option.IsUnrestricted)
 			{
 				return true;
+			}
+			if (command.RconOnly && (Connection != null || Option.FromCommandBlock))
+			{
+				return false;
 			}
 			if (IsClientside)
 			{
@@ -525,6 +536,8 @@ public class ConsoleSystem
 
 		public bool ServerUser;
 
+		public bool RconOnly;
+
 		public bool Replicated;
 
 		public bool ShowInAdminUI;
@@ -804,6 +817,10 @@ public class ConsoleSystem
 
 	public struct Option
 	{
+		public string RconIP;
+
+		public string RconName;
+
 		public static Option Unrestricted
 		{
 			get
@@ -856,21 +873,21 @@ public class ConsoleSystem
 
 		public bool PrintValueOnly { get; set; }
 
-		public int RconConnectionId { get; set; }
-
 		public bool IsFromServer { get; set; }
 
+		public bool FromCommandBlock { get; set; }
+
 		public Connection Connection { get; set; }
+
+		public bool ServerConsole { get; set; }
+
+		public bool ConfigFile { get; set; }
+
+		public int RconConnectionId { get; set; }
 
 		public Option Quiet()
 		{
 			PrintOutput = false;
-			return this;
-		}
-
-		public Option WithRconId(int id)
-		{
-			RconConnectionId = id;
 			return this;
 		}
 
@@ -892,11 +909,67 @@ public class ConsoleSystem
 			Connection = connection;
 			return this;
 		}
+
+		public Option FromRconConnection(int id, string ip, string connectionName)
+		{
+			RconConnectionId = id;
+			RconIP = ip;
+			RconName = connectionName;
+			return this;
+		}
+
+		public Option FromServerConsole()
+		{
+			ServerConsole = true;
+			return this;
+		}
+
+		public Option FromConfigFile()
+		{
+			ConfigFile = true;
+			return this;
+		}
+	}
+
+	public struct CommandResult
+	{
+		public CommandResultType Result;
+
+		public string Output;
+
+		public Command Command;
+
+		public CommandResult(CommandResultType result, string output, Command command)
+		{
+			Result = result;
+			Output = output;
+			Command = command;
+		}
+	}
+
+	public enum CommandResultType
+	{
+		Unknown,
+		Success,
+		PermissionDenied,
+		CommandNotFound
 	}
 
 	public static bool HasChanges = false;
 
 	public static Func<bool> ClientCanRunAdminCommands;
+
+	public static bool loggingEnabled = false;
+
+	public static string IdentityDirectory;
+
+	private static StreamWriter _logWriter;
+
+	private static DateTime _logTimestamp;
+
+	private static ConcurrentQueue<string> _logQueue = new ConcurrentQueue<string>();
+
+	private static Task _logThread;
 
 	public static Func<string, bool> OnSendToServer;
 
@@ -926,6 +999,95 @@ public class ConsoleSystem
 		}
 	}
 
+	private static void LogToFile(Arg arg)
+	{
+		if (arg.Connection == null || arg.Connection.authLevel != 0 || (arg.cmd.ServerAdmin && !arg.cmd.ServerUser))
+		{
+			if (_logThread == null || _logThread.IsCompleted)
+			{
+				_logThread = LogThread();
+			}
+			StringBuilder stringBuilder = new StringBuilder();
+			stringBuilder.Append($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}] ");
+			if (!string.IsNullOrEmpty(arg.Option.RconIP))
+			{
+				stringBuilder.Append("[RCON " + arg.Option.RconIP + " '" + arg.Option.RconName + "'] ");
+			}
+			else if (arg.Option.ServerConsole)
+			{
+				stringBuilder.Append("[SERVER CONSOLE] ");
+			}
+			else if (arg.Option.ConfigFile)
+			{
+				stringBuilder.Append("[CONFIG FILE] ");
+			}
+			else if (arg.Connection != null)
+			{
+				stringBuilder.Append($"[USER {arg.Connection.userid} {arg.Connection.ipaddress}] ");
+			}
+			else if (arg.IsClientside && !arg.IsServerside)
+			{
+				stringBuilder.Append("[CLIENTSIDE] ");
+			}
+			else
+			{
+				stringBuilder.Append("[UNKNOWN] ");
+			}
+			stringBuilder.Append(arg.RawCommand);
+			_logQueue.Enqueue(stringBuilder.ToString());
+		}
+	}
+
+	private static async Task LogThread()
+	{
+		while (Application.isPlaying)
+		{
+			await Task.Delay(1000);
+			if (!_logQueue.IsEmpty)
+			{
+				StreamWriter writer = await GetLogStream();
+				string result;
+				while (_logQueue.TryDequeue(out result))
+				{
+					await writer.WriteLineAsync(result);
+				}
+				await writer.FlushAsync();
+			}
+		}
+		await (await GetLogStream()).DisposeAsync();
+	}
+
+	private static async Task<StreamWriter> GetLogStream()
+	{
+		DateTime today = DateTime.UtcNow.Date;
+		if (_logWriter == null || today != _logTimestamp)
+		{
+			if (_logWriter != null)
+			{
+				await _logWriter.DisposeAsync();
+			}
+			_logTimestamp = today;
+			_logWriter = OpenLogFile();
+		}
+		return _logWriter;
+	}
+
+	private static StreamWriter OpenLogFile()
+	{
+		string text = IdentityDirectory;
+		if (string.IsNullOrEmpty(text))
+		{
+			text = "Logs";
+		}
+		text = Path.Combine(text, "command_history");
+		Directory.CreateDirectory(text);
+		string text2 = DateTime.UtcNow.Date.ToString("yyyy-MM-dd");
+		string path = "commands_" + text2 + ".log";
+		FileStream fileStream = new FileStream(Path.Combine(text, path), FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read);
+		fileStream.Position = fileStream.Length;
+		return new StreamWriter(fileStream, Encoding.UTF8);
+	}
+
 	internal static bool SendToServer(string command)
 	{
 		if (OnSendToServer != null)
@@ -943,13 +1105,18 @@ public class ConsoleSystem
 			string text = array[i].Trim();
 			if (!string.IsNullOrWhiteSpace(text) && text[0] != '#')
 			{
-				Run(options, text);
+				Run(options.FromConfigFile(), text);
 			}
 		}
 		HasChanges = false;
 	}
 
 	public static string Run(Option options, string strCommand, params object[] args)
+	{
+		return RunWithResult(options, strCommand, args).Output;
+	}
+
+	public static CommandResult RunWithResult(Option options, string strCommand, params object[] args)
 	{
 		LastError = null;
 		string text = BuildCommand(strCommand, args);
@@ -965,12 +1132,18 @@ public class ConsoleSystem
 			{
 				DebugEx.Log((object)arg.Reply, (StackTraceLogType)0);
 			}
-			return arg.Reply;
+			if (loggingEnabled)
+			{
+				LogToFile(arg);
+			}
+			return new CommandResult(CommandResultType.Success, arg.Reply, arg.cmd);
 		}
 		LastError = "Command not found";
+		CommandResultType result = CommandResultType.CommandNotFound;
 		if (!flag)
 		{
 			LastError = "Permission denied";
+			result = CommandResultType.PermissionDenied;
 		}
 		if (!options.IsServer && (!options.ForwardtoServerOnMissing || !SendToServer(text)))
 		{
@@ -979,7 +1152,7 @@ public class ConsoleSystem
 			{
 				DebugEx.Log((object)LastError, (StackTraceLogType)0);
 			}
-			return null;
+			return new CommandResult(CommandResultType.CommandNotFound, null, null);
 		}
 		if (options.IsServer && options.PrintOutput)
 		{
@@ -989,7 +1162,7 @@ public class ConsoleSystem
 				DebugEx.Log((object)LastError, (StackTraceLogType)0);
 			}
 		}
-		return null;
+		return new CommandResult(result, null, null);
 	}
 
 	private static bool Internal(Arg arg)
@@ -1267,6 +1440,10 @@ public class Arg
 		}
 		if (cmd.ServerAdmin)
 		{
+			if (cmd.RconOnly && (Connection != null || Option.FromCommandBlock))
+			{
+				return false;
+			}
 			if (IsRcon)
 			{
 				return true;
@@ -1292,6 +1469,10 @@ public class Arg
 		if (Option.IsUnrestricted)
 		{
 			return true;
+		}
+		if (command.RconOnly && (Connection != null || Option.FromCommandBlock))
+		{
+			return false;
 		}
 		if (IsClientside)
 		{
@@ -1657,6 +1838,8 @@ public class Command
 
 	public bool ServerUser;
 
+	public bool RconOnly;
+
 	public bool Replicated;
 
 	public bool ShowInAdminUI;
@@ -1999,6 +2182,10 @@ using Network;
 
 public struct Option
 {
+	public string RconIP;
+
+	public string RconName;
+
 	public static Option Unrestricted
 	{
 		get
@@ -2051,21 +2238,21 @@ public struct Option
 
 	public bool PrintValueOnly { get; set; }
 
-	public int RconConnectionId { get; set; }
-
 	public bool IsFromServer { get; set; }
 
+	public bool FromCommandBlock { get; set; }
+
 	public Connection Connection { get; set; }
+
+	public bool ServerConsole { get; set; }
+
+	public bool ConfigFile { get; set; }
+
+	public int RconConnectionId { get; set; }
 
 	public Option Quiet()
 	{
 		PrintOutput = false;
-		return this;
-	}
-
-	public Option WithRconId(int id)
-	{
-		RconConnectionId = id;
 		return this;
 	}
 
@@ -2087,6 +2274,52 @@ public struct Option
 		Connection = connection;
 		return this;
 	}
+
+	public Option FromRconConnection(int id, string ip, string connectionName)
+	{
+		RconConnectionId = id;
+		RconIP = ip;
+		RconName = connectionName;
+		return this;
+	}
+
+	public Option FromServerConsole()
+	{
+		ServerConsole = true;
+		return this;
+	}
+
+	public Option FromConfigFile()
+	{
+		ConfigFile = true;
+		return this;
+	}
+}
+
+
+public struct CommandResult
+{
+	public CommandResultType Result;
+
+	public string Output;
+
+	public Command Command;
+
+	public CommandResult(CommandResultType result, string output, Command command)
+	{
+		Result = result;
+		Output = output;
+		Command = command;
+	}
+}
+
+
+public enum CommandResultType
+{
+	Unknown,
+	Success,
+	PermissionDenied,
+	CommandNotFound
 }
 
 
@@ -2099,6 +2332,8 @@ public class ConsoleVar : Attribute
 	public bool ClientAdmin;
 
 	public bool ServerAdmin;
+
+	public bool RconOnly;
 
 	public bool ServerUser;
 
@@ -2132,6 +2367,15 @@ public class ServerVar : ConsoleVar
 	{
 		Serverside = true;
 		ServerAdmin = true;
+	}
+}
+
+
+public class RconVar : ServerVar
+{
+	public RconVar()
+	{
+		RconOnly = true;
 	}
 }
 
@@ -2202,8 +2446,8 @@ using UnityEngine;
 
 public class Commands : ConsoleSystem
 {
-	[ClientVar]
 	[ServerVar]
+	[ClientVar]
 	public static void Find(Arg arg)
 	{
 		if (!arg.HasArgs())
@@ -2232,8 +2476,8 @@ public class Commands : ConsoleSystem
 		arg.ReplyWith("Variables:\n" + text + "\nCommands:\n" + text2);
 	}
 
-	[ServerVar]
 	[ClientVar(AllowRunFromServer = true)]
+	[ServerVar]
 	public static void Echo(string fullString)
 	{
 		Debug.Log((object)fullString);
@@ -2245,9 +2489,9 @@ using System.CodeDom.Compiler;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 
-[GeneratedCode("Unity.MonoScriptGenerator.MonoScriptInfoGenerator", null)]
 [CompilerGenerated]
 [EditorBrowsable(EditorBrowsableState.Never)]
+[GeneratedCode("Unity.MonoScriptGenerator.MonoScriptInfoGenerator", null)]
 internal class UnitySourceGeneratedAssemblyMonoScriptTypes_v1
 {
 	private struct MonoScriptData
@@ -2267,14 +2511,14 @@ internal class UnitySourceGeneratedAssemblyMonoScriptTypes_v1
 	private static MonoScriptData Get()
 	{
 		MonoScriptData result = default(MonoScriptData);
-		result.FilePathsData = new byte[575]
+		result.FilePathsData = new byte[623]
 		{
 			0, 0, 0, 2, 0, 0, 0, 40, 92, 65,
 			115, 115, 101, 116, 115, 92, 80, 108, 117, 103,
 			105, 110, 115, 92, 70, 97, 99, 101, 112, 117,
 			110, 99, 104, 46, 67, 111, 110, 115, 111, 108,
 			101, 92, 65, 114, 103, 46, 99, 115, 0, 0,
-			0, 9, 0, 0, 0, 47, 92, 65, 115, 115,
+			0, 10, 0, 0, 0, 47, 92, 65, 115, 115,
 			101, 116, 115, 92, 80, 108, 117, 103, 105, 110,
 			115, 92, 70, 97, 99, 101, 112, 117, 110, 99,
 			104, 46, 67, 111, 110, 115, 111, 108, 101, 92,
@@ -2306,29 +2550,34 @@ internal class UnitySourceGeneratedAssemblyMonoScriptTypes_v1
 			117, 103, 105, 110, 115, 92, 70, 97, 99, 101,
 			112, 117, 110, 99, 104, 46, 67, 111, 110, 115,
 			111, 108, 101, 92, 73, 110, 100, 101, 120, 46,
-			99, 115, 0, 0, 0, 1, 0, 0, 0, 47,
+			99, 115, 0, 0, 0, 1, 0, 0, 0, 40,
 			92, 65, 115, 115, 101, 116, 115, 92, 80, 108,
 			117, 103, 105, 110, 115, 92, 70, 97, 99, 101,
 			112, 117, 110, 99, 104, 46, 67, 111, 110, 115,
-			111, 108, 101, 92, 78, 101, 116, 119, 111, 114,
-			107, 105, 110, 103, 46, 99, 115, 0, 0, 0,
-			2, 0, 0, 0, 43, 92, 65, 115, 115, 101,
-			116, 115, 92, 80, 108, 117, 103, 105, 110, 115,
-			92, 70, 97, 99, 101, 112, 117, 110, 99, 104,
-			46, 67, 111, 110, 115, 111, 108, 101, 92, 79,
-			112, 116, 105, 111, 110, 46, 99, 115, 0, 0,
-			0, 1, 0, 0, 0, 40, 92, 65, 115, 115,
-			101, 116, 115, 92, 80, 108, 117, 103, 105, 110,
-			115, 92, 70, 97, 99, 101, 112, 117, 110, 99,
-			104, 46, 67, 111, 110, 115, 111, 108, 101, 92,
-			82, 117, 110, 46, 99, 115, 0, 0, 0, 1,
-			0, 0, 0, 41, 92, 65, 115, 115, 101, 116,
+			111, 108, 101, 92, 76, 111, 103, 46, 99, 115,
+			0, 0, 0, 1, 0, 0, 0, 47, 92, 65,
+			115, 115, 101, 116, 115, 92, 80, 108, 117, 103,
+			105, 110, 115, 92, 70, 97, 99, 101, 112, 117,
+			110, 99, 104, 46, 67, 111, 110, 115, 111, 108,
+			101, 92, 78, 101, 116, 119, 111, 114, 107, 105,
+			110, 103, 46, 99, 115, 0, 0, 0, 2, 0,
+			0, 0, 43, 92, 65, 115, 115, 101, 116, 115,
+			92, 80, 108, 117, 103, 105, 110, 115, 92, 70,
+			97, 99, 101, 112, 117, 110, 99, 104, 46, 67,
+			111, 110, 115, 111, 108, 101, 92, 79, 112, 116,
+			105, 111, 110, 46, 99, 115, 0, 0, 0, 2,
+			0, 0, 0, 40, 92, 65, 115, 115, 101, 116,
 			115, 92, 80, 108, 117, 103, 105, 110, 115, 92,
 			70, 97, 99, 101, 112, 117, 110, 99, 104, 46,
-			67, 111, 110, 115, 111, 108, 101, 92, 83, 97,
-			118, 101, 46, 99, 115
+			67, 111, 110, 115, 111, 108, 101, 92, 82, 117,
+			110, 46, 99, 115, 0, 0, 0, 1, 0, 0,
+			0, 41, 92, 65, 115, 115, 101, 116, 115, 92,
+			80, 108, 117, 103, 105, 110, 115, 92, 70, 97,
+			99, 101, 112, 117, 110, 99, 104, 46, 67, 111,
+			110, 115, 111, 108, 101, 92, 83, 97, 118, 101,
+			46, 99, 115
 		};
-		result.TypesData = new byte[577]
+		result.TypesData = new byte[641]
 		{
 			1, 0, 0, 0, 14, 124, 67, 111, 110, 115,
 			111, 108, 101, 83, 121, 115, 116, 101, 109, 0,
@@ -2342,55 +2591,62 @@ internal class UnitySourceGeneratedAssemblyMonoScriptTypes_v1
 			11, 124, 67, 111, 110, 115, 111, 108, 101, 86,
 			97, 114, 0, 0, 0, 0, 10, 124, 83, 101,
 			114, 118, 101, 114, 86, 97, 114, 0, 0, 0,
-			0, 14, 124, 83, 101, 114, 118, 101, 114, 85,
-			115, 101, 114, 86, 97, 114, 0, 0, 0, 0,
-			13, 124, 83, 101, 114, 118, 101, 114, 65, 108,
-			108, 86, 97, 114, 0, 0, 0, 0, 10, 124,
-			67, 108, 105, 101, 110, 116, 86, 97, 114, 0,
-			0, 0, 0, 14, 124, 82, 101, 112, 108, 105,
-			99, 97, 116, 101, 100, 86, 97, 114, 0, 0,
-			0, 0, 14, 124, 72, 101, 108, 112, 65, 116,
-			116, 114, 105, 98, 117, 116, 101, 1, 0, 0,
-			0, 14, 124, 67, 111, 110, 115, 111, 108, 101,
-			83, 121, 115, 116, 101, 109, 0, 0, 0, 0,
-			21, 67, 111, 110, 115, 111, 108, 101, 83, 121,
-			115, 116, 101, 109, 124, 67, 111, 109, 109, 97,
-			110, 100, 1, 0, 0, 0, 14, 124, 67, 111,
-			110, 115, 111, 108, 101, 83, 121, 115, 116, 101,
-			109, 0, 0, 0, 0, 9, 124, 67, 111, 109,
-			109, 97, 110, 100, 115, 1, 0, 0, 0, 14,
+			0, 8, 124, 82, 99, 111, 110, 86, 97, 114,
+			0, 0, 0, 0, 14, 124, 83, 101, 114, 118,
+			101, 114, 85, 115, 101, 114, 86, 97, 114, 0,
+			0, 0, 0, 13, 124, 83, 101, 114, 118, 101,
+			114, 65, 108, 108, 86, 97, 114, 0, 0, 0,
+			0, 10, 124, 67, 108, 105, 101, 110, 116, 86,
+			97, 114, 0, 0, 0, 0, 14, 124, 82, 101,
+			112, 108, 105, 99, 97, 116, 101, 100, 86, 97,
+			114, 0, 0, 0, 0, 14, 124, 72, 101, 108,
+			112, 65, 116, 116, 114, 105, 98, 117, 116, 101,
+			1, 0, 0, 0, 14, 124, 67, 111, 110, 115,
+			111, 108, 101, 83, 121, 115, 116, 101, 109, 0,
+			0, 0, 0, 21, 67, 111, 110, 115, 111, 108,
+			101, 83, 121, 115, 116, 101, 109, 124, 67, 111,
+			109, 109, 97, 110, 100, 1, 0, 0, 0, 14,
 			124, 67, 111, 110, 115, 111, 108, 101, 83, 121,
-			115, 116, 101, 109, 0, 0, 0, 0, 29, 67,
-			111, 110, 115, 111, 108, 101, 83, 121, 115, 116,
-			101, 109, 124, 73, 67, 111, 110, 115, 111, 108,
-			101, 67, 111, 109, 109, 97, 110, 100, 0, 0,
-			0, 0, 28, 67, 111, 110, 115, 111, 108, 101,
-			83, 121, 115, 116, 101, 109, 124, 73, 67, 111,
-			110, 115, 111, 108, 101, 66, 117, 116, 116, 111,
-			110, 1, 0, 0, 0, 14, 124, 67, 111, 110,
-			115, 111, 108, 101, 83, 121, 115, 116, 101, 109,
-			0, 0, 0, 0, 19, 67, 111, 110, 115, 111,
-			108, 101, 83, 121, 115, 116, 101, 109, 124, 73,
-			110, 100, 101, 120, 0, 0, 0, 0, 26, 67,
-			111, 110, 115, 111, 108, 101, 83, 121, 115, 116,
-			101, 109, 43, 73, 110, 100, 101, 120, 124, 83,
-			101, 114, 118, 101, 114, 0, 0, 0, 0, 26,
+			115, 116, 101, 109, 0, 0, 0, 0, 9, 124,
+			67, 111, 109, 109, 97, 110, 100, 115, 1, 0,
+			0, 0, 14, 124, 67, 111, 110, 115, 111, 108,
+			101, 83, 121, 115, 116, 101, 109, 0, 0, 0,
+			0, 29, 67, 111, 110, 115, 111, 108, 101, 83,
+			121, 115, 116, 101, 109, 124, 73, 67, 111, 110,
+			115, 111, 108, 101, 67, 111, 109, 109, 97, 110,
+			100, 0, 0, 0, 0, 28, 67, 111, 110, 115,
+			111, 108, 101, 83, 121, 115, 116, 101, 109, 124,
+			73, 67, 111, 110, 115, 111, 108, 101, 66, 117,
+			116, 116, 111, 110, 1, 0, 0, 0, 14, 124,
 			67, 111, 110, 115, 111, 108, 101, 83, 121, 115,
-			116, 101, 109, 43, 73, 110, 100, 101, 120, 124,
-			67, 108, 105, 101, 110, 116, 1, 0, 0, 0,
-			14, 124, 67, 111, 110, 115, 111, 108, 101, 83,
-			121, 115, 116, 101, 109, 1, 0, 0, 0, 14,
-			124, 67, 111, 110, 115, 111, 108, 101, 83, 121,
-			115, 116, 101, 109, 0, 0, 0, 0, 20, 67,
-			111, 110, 115, 111, 108, 101, 83, 121, 115, 116,
-			101, 109, 124, 79, 112, 116, 105, 111, 110, 1,
+			116, 101, 109, 0, 0, 0, 0, 19, 67, 111,
+			110, 115, 111, 108, 101, 83, 121, 115, 116, 101,
+			109, 124, 73, 110, 100, 101, 120, 0, 0, 0,
+			0, 26, 67, 111, 110, 115, 111, 108, 101, 83,
+			121, 115, 116, 101, 109, 43, 73, 110, 100, 101,
+			120, 124, 83, 101, 114, 118, 101, 114, 0, 0,
+			0, 0, 26, 67, 111, 110, 115, 111, 108, 101,
+			83, 121, 115, 116, 101, 109, 43, 73, 110, 100,
+			101, 120, 124, 67, 108, 105, 101, 110, 116, 1,
 			0, 0, 0, 14, 124, 67, 111, 110, 115, 111,
 			108, 101, 83, 121, 115, 116, 101, 109, 1, 0,
 			0, 0, 14, 124, 67, 111, 110, 115, 111, 108,
-			101, 83, 121, 115, 116, 101, 109
+			101, 83, 121, 115, 116, 101, 109, 1, 0, 0,
+			0, 14, 124, 67, 111, 110, 115, 111, 108, 101,
+			83, 121, 115, 116, 101, 109, 0, 0, 0, 0,
+			20, 67, 111, 110, 115, 111, 108, 101, 83, 121,
+			115, 116, 101, 109, 124, 79, 112, 116, 105, 111,
+			110, 1, 0, 0, 0, 14, 124, 67, 111, 110,
+			115, 111, 108, 101, 83, 121, 115, 116, 101, 109,
+			0, 0, 0, 0, 27, 67, 111, 110, 115, 111,
+			108, 101, 83, 121, 115, 116, 101, 109, 124, 67,
+			111, 109, 109, 97, 110, 100, 82, 101, 115, 117,
+			108, 116, 1, 0, 0, 0, 14, 124, 67, 111,
+			110, 115, 111, 108, 101, 83, 121, 115, 116, 101,
+			109
 		};
-		result.TotalFiles = 11;
-		result.TotalTypes = 27;
+		result.TotalFiles = 12;
+		result.TotalTypes = 30;
 		result.IsEditorOnly = false;
 		return result;
 	}
